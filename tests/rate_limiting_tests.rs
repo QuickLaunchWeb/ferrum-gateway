@@ -1,6 +1,6 @@
 //! Tests for rate_limiting plugin
 
-use ferrum_gateway::plugins::{rate_limiting::RateLimiting, Plugin};
+use ferrum_gateway::plugins::{rate_limiting::RateLimiting, Plugin, PluginResult};
 use serde_json::json;
 
 mod plugin_utils;
