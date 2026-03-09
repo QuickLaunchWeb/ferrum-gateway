@@ -11,6 +11,8 @@ pub struct PoolConfig {
     pub enable_http_keep_alive: bool,
     pub enable_http2: bool,
     pub tcp_keepalive_seconds: u64,
+    pub http2_keep_alive_interval_seconds: u64,
+    pub http2_keep_alive_timeout_seconds: u64,
 }
 
 impl Default for PoolConfig {
@@ -21,6 +23,8 @@ impl Default for PoolConfig {
             enable_http_keep_alive: true,
             enable_http2: true,
             tcp_keepalive_seconds: 60,
+            http2_keep_alive_interval_seconds: 30,
+            http2_keep_alive_timeout_seconds: 45,  // More reasonable timeout comparable to HTTP read timeout
         }
     }
 }
@@ -57,6 +61,23 @@ impl PoolConfig {
             }
         }
         
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS") {
+            if let Ok(parsed) = val.parse::<u64>() {
+                config.http2_keep_alive_interval_seconds = parsed;
+            }
+        }
+        
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS") {
+            if let Ok(parsed) = val.parse::<u64>() {
+                config.http2_keep_alive_timeout_seconds = parsed;
+            }
+        }
+        
+        // Validate HTTP/2 timeout is reasonable compared to HTTP read timeout
+        if config.http2_keep_alive_timeout_seconds < 10 {
+            tracing::warn!("HTTP/2 keep-alive timeout ({}s) is very low, consider increasing to 30-45s", config.http2_keep_alive_timeout_seconds);
+        }
+        
         config
     }
     
@@ -83,6 +104,14 @@ impl PoolConfig {
         
         if let Some(val) = proxy.pool_tcp_keepalive_seconds {
             config.tcp_keepalive_seconds = val;
+        }
+        
+        if let Some(val) = proxy.pool_http2_keep_alive_interval_seconds {
+            config.http2_keep_alive_interval_seconds = val;
+        }
+        
+        if let Some(val) = proxy.pool_http2_keep_alive_timeout_seconds {
+            config.http2_keep_alive_timeout_seconds = val;
         }
         
         config
@@ -127,6 +156,8 @@ mod tests {
             pool_enable_http_keep_alive: None,
             pool_enable_http2: None,
             pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -138,6 +169,8 @@ mod tests {
         assert_eq!(config.max_idle_per_host, 10);
         assert_eq!(config.idle_timeout_seconds, 90);
         assert_eq!(config.tcp_keepalive_seconds, 60);
+        assert_eq!(config.http2_keep_alive_interval_seconds, 30);
+        assert_eq!(config.http2_keep_alive_timeout_seconds, 45);
         assert!(config.enable_http_keep_alive);
         assert!(config.enable_http2);
     }
@@ -151,11 +184,15 @@ mod tests {
         proxy.pool_max_idle_per_host = Some(25);
         proxy.pool_enable_http2 = Some(false);
         proxy.pool_tcp_keepalive_seconds = Some(30);
+        proxy.pool_http2_keep_alive_interval_seconds = Some(15);
+        proxy.pool_http2_keep_alive_timeout_seconds = Some(45);  // Updated to match new default
         
         let config = global.for_proxy(&proxy);
         assert_eq!(config.max_idle_per_host, 25);
         assert_eq!(config.idle_timeout_seconds, 90); // unchanged
         assert_eq!(config.tcp_keepalive_seconds, 30); // overridden
+        assert_eq!(config.http2_keep_alive_interval_seconds, 15); // overridden
+        assert_eq!(config.http2_keep_alive_timeout_seconds, 45); // overridden
         assert!(config.enable_http_keep_alive); // unchanged
         assert!(!config.enable_http2); // overridden
     }
@@ -169,6 +206,8 @@ mod tests {
         assert_eq!(config.max_idle_per_host, global.max_idle_per_host);
         assert_eq!(config.idle_timeout_seconds, global.idle_timeout_seconds);
         assert_eq!(config.tcp_keepalive_seconds, global.tcp_keepalive_seconds);
+        assert_eq!(config.http2_keep_alive_interval_seconds, global.http2_keep_alive_interval_seconds);
+        assert_eq!(config.http2_keep_alive_timeout_seconds, global.http2_keep_alive_timeout_seconds);
         assert_eq!(config.enable_http_keep_alive, global.enable_http_keep_alive);
         assert_eq!(config.enable_http2, global.enable_http2);
     }

@@ -271,6 +271,8 @@ FERRUM_POOL_IDLE_TIMEOUT_SECONDS=90
 FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
 FERRUM_POOL_ENABLE_HTTP2=true
 FERRUM_POOL_TCP_KEEPALIVE_SECONDS=60
+FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS=30
+FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS=45
 ```
 
 #### Per-Proxy Overrides (Optional)
@@ -281,6 +283,8 @@ proxies:
     pool_max_idle_per_host: 50
     pool_enable_http2: false
     pool_tcp_keepalive_seconds: 30
+    pool_http2_keep_alive_interval_seconds: 15
+    pool_http2_keep_alive_timeout_seconds: 5
     # Other settings use global defaults
 ```
 
@@ -301,6 +305,33 @@ proxies:
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse |
 | `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported |
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
+| `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
+| `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
+
+### Timeout Mechanisms Explained
+
+**Different Layers of Connection Management:**
+
+1. **TCP Keep-Alive** (Transport Layer)
+   - Prevents connection drops by NAT/firewalls
+   - Sends packets every N seconds when idle
+   - Applies to ALL connections (HTTP/1.1, HTTP/2, WebSocket)
+
+2. **HTTP/2 Keep-Alive** (Application Layer)
+   - Detects dead HTTP/2 connections via PING frames
+   - Only applies to HTTP/2 connections
+   - More responsive than TCP keep-alive for HTTP/2
+
+3. **HTTP Timeouts** (Request Layer)
+   - Controls request/response processing time
+   - `backend_connect_timeout_ms`: Connection establishment (default: 5000ms)
+   - `backend_read_timeout_ms`: Request processing (default: 30000ms)
+   - Applies during active requests
+
+**Recommended Relationships:**
+- HTTP/2 timeout should be **1.5x** the TCP keep-alive interval
+- HTTP read timeout should be **2-3x** the HTTP/2 timeout
+- TCP keep-alive should be **1.2-1.5x** the HTTP/2 interval
 
 ### Protocol-Specific Recommendations
 

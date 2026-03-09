@@ -85,8 +85,8 @@ impl ConnectionPool {
             .danger_accept_invalid_certs(!proxy.backend_tls_verify_server_cert)
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(config.http2_keep_alive_interval_seconds))
+            .http2_keep_alive_timeout(Duration::from_secs(config.http2_keep_alive_timeout_seconds))
             .tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
 
         // Enable HTTP/2 if configured
@@ -281,6 +281,8 @@ mod tests {
             pool_enable_http_keep_alive: None,
             pool_enable_http2: None,
             pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

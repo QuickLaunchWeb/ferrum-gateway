@@ -39,6 +39,8 @@ fn create_test_mtls_proxy() -> Proxy {
         pool_enable_http_keep_alive: None,
         pool_enable_http2: None,
         pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
