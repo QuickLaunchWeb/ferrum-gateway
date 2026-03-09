@@ -8,7 +8,6 @@ use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::config::db_loader::DatabaseStore;
 use crate::config::EnvConfig;
 use crate::dns::DnsCache;
-use crate::grpc::dp_client;
 use crate::proxy::{self, ProxyState};
 use crate::tls;
 
@@ -110,6 +109,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
         jwt_manager,
         proxy_state: Some(proxy_state.clone()),
         mode: "database".into(),
+        read_only: env_config.admin_read_only,
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -131,6 +131,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
                 .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?,
             proxy_state: Some(proxy_state.clone()),
             mode: "database".into(),
+            read_only: env_config.admin_read_only,
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
         

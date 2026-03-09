@@ -3,22 +3,29 @@
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Consumer, Proxy};
 use ferrum_gateway::plugins::{RequestContext, PluginResult};
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 /// Create a test consumer with all credential types
 pub fn create_test_consumer() -> Consumer {
+    let mut credentials = HashMap::new();
+    let mut keyauth_creds = Map::new();
+    keyauth_creds.insert("key".to_string(), Value::String("test-api-key".to_string()));
+    credentials.insert("keyauth".to_string(), Value::Object(keyauth_creds));
+
+    let mut basicauth_creds = Map::new();
+    basicauth_creds.insert("password_hash".to_string(), Value::String("$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBdXwtGtrmuPq6".to_string()));
+    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+
+    let mut jwt_creds = Map::new();
+    jwt_creds.insert("secret".to_string(), Value::String("test-jwt-secret".to_string()));
+    credentials.insert("jwt".to_string(), Value::Object(jwt_creds));
+
     Consumer {
         id: "test-consumer".to_string(),
         username: "testuser".to_string(),
         custom_id: Some("custom-123".to_string()),
-        credentials: {
-            let mut creds = HashMap::new();
-            creds.insert("keyauth".to_string(), json!({"key": "test-api-key"}));
-            creds.insert("basicauth".to_string(), json!({"password_hash": "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBdXwtGtrmuPq6"}));
-            creds.insert("jwt".to_string(), json!({"secret": "test-jwt-secret"}));
-            creds
-        },
+        credentials,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -30,10 +37,14 @@ pub fn create_test_context() -> RequestContext {
     ctx.headers.insert("Authorization".to_string(), "Bearer test-token".to_string());
     ctx.headers.insert("X-API-Key".to_string(), "test-api-key".to_string());
     ctx.headers.insert("User-Agent".to_string(), "test-agent".to_string());
+    
+    // Set a test consumer so access control plugin doesn't reject
+    ctx.identified_consumer = Some(create_test_consumer());
     ctx
 }
 
 /// Create a test proxy with default configuration
+#[allow(dead_code)]
 pub fn create_test_proxy() -> Proxy {
     Proxy {
         id: "test-proxy".to_string(),
@@ -66,6 +77,7 @@ pub fn create_test_proxy() -> Proxy {
 }
 
 /// Create a test transaction summary for logging plugins
+#[allow(dead_code)]
 pub fn create_test_transaction_summary() -> ferrum_gateway::plugins::TransactionSummary {
     ferrum_gateway::plugins::TransactionSummary {
         timestamp_received: Utc::now().to_rfc3339(),
@@ -87,20 +99,23 @@ pub fn create_test_transaction_summary() -> ferrum_gateway::plugins::Transaction
 }
 
 /// Assert that a plugin result is Continue
+#[allow(dead_code)]
 pub fn assert_continue(result: PluginResult) {
-    assert!(matches!(result, PluginResult::Continue), "Expected Continue, got {:?}", result);
+    match result {
+        PluginResult::Continue => {},
+        _ => panic!("Expected Continue, got {:?}", result),
+    }
 }
 
 /// Assert that a plugin result is Reject with optional status code check
+#[allow(dead_code)]
 pub fn assert_reject(result: PluginResult, expected_status: Option<u16>) {
     match result {
         PluginResult::Reject { status_code, .. } => {
             if let Some(expected) = expected_status {
                 assert_eq!(status_code, expected, "Expected status {}, got {}", expected, status_code);
             }
-        }
-        PluginResult::Continue => {
-            panic!("Expected Reject, got Continue");
-        }
+        },
+        _ => panic!("Expected Reject, got {:?}", result),
     }
 }

@@ -4,7 +4,6 @@
 
 use chrono::Utc;
 use ferrum_gateway::admin::{AdminState, jwt_auth::{JwtManager, JwtConfig}};
-use hyper::{Method, StatusCode};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -48,6 +47,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
         jwt_manager: create_test_jwt_manager(config),
         proxy_state: None,
         mode: "test".to_string(),
+        read_only: false,  // Default to read-write for existing tests
     }
 }
 

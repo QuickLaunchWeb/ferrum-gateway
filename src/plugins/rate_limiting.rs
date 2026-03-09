@@ -51,14 +51,40 @@ pub struct RateLimiting {
 
 impl RateLimiting {
     pub fn new(config: &Value) -> Self {
+        let limit_by = config["limit_by"]
+            .as_str()
+            .unwrap_or("ip")
+            .to_string();
+        
+        // Handle different configuration formats
+        let (per_second, per_minute, per_hour) = if let Some(window_seconds) = config["window_seconds"].as_u64() {
+            let max_requests = config["max_requests"].as_u64().unwrap_or(10);
+            
+            // Convert window_seconds to appropriate rate limits
+            match window_seconds {
+                1 => (Some(max_requests), None, None),
+                60 => (None, Some(max_requests), None),
+                3600 => (None, None, Some(max_requests)),
+                _ => {
+                    // For other window sizes, convert to per-minute rate
+                    let per_minute_rate = (max_requests * 60) / window_seconds.max(1);
+                    (None, Some(per_minute_rate), None)
+                }
+            }
+        } else {
+            // Use the explicit rate limits if provided
+            (
+                config["requests_per_second"].as_u64(),
+                config["requests_per_minute"].as_u64(),
+                config["requests_per_hour"].as_u64(),
+            )
+        };
+
         Self {
-            limit_by: config["limit_by"]
-                .as_str()
-                .unwrap_or("ip")
-                .to_string(),
-            per_second: config["requests_per_second"].as_u64(),
-            per_minute: config["requests_per_minute"].as_u64(),
-            per_hour: config["requests_per_hour"].as_u64(),
+            limit_by,
+            per_second,
+            per_minute,
+            per_hour,
             state: Arc::new(DashMap::new()),
         }
     }
@@ -109,5 +135,9 @@ impl Plugin for RateLimiting {
         }
 
         PluginResult::Continue
+    }
+
+    async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        self.on_request_received(ctx).await
     }
 }

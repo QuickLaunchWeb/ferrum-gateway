@@ -18,9 +18,10 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
 - **DNS Caching**: In-memory async DNS cache with startup warmup, per-proxy TTL overrides, and static overrides
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
+- **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
 - **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
-- **Observability**: Structured JSON logging via the `tracing` ecosystem and runtime metrics endpoint
+- **Observability**: Structured JSON logging via `tracing` ecosystem and runtime metrics endpoint
 
 ## Operating Modes
 
@@ -67,6 +68,35 @@ Handles proxy traffic only, receiving its configuration from a Control Plane nod
 - Receives initial config and subsequent updates
 - Continues serving with cached config if CP connection is lost
 - Automatically reconnects to CP
+
+## Admin Read-Only Mode
+
+Ferrum Gateway supports a configurable read-only mode for the Admin API, providing an additional layer of security for production deployments.
+
+### Behavior
+
+- **Read Operations**: All GET endpoints continue to work normally, allowing monitoring and health checks
+- **Write Operations**: POST, PUT, and DELETE requests are blocked and return `403 Forbidden`
+- **Error Response**: `{"error": "Admin API is in read-only mode"}`
+
+### Configuration
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `FERRUM_ADMIN_READ_ONLY` | `false` | Set Admin API to read-only mode (DP mode defaults to `true`) |
+
+### Mode-Specific Behavior
+
+- **Control Plane (CP)**: Respects the `FERRUM_ADMIN_READ_ONLY` environment variable
+- **Data Plane (DP)**: **Always** read-only regardless of environment variable
+- **Database/File Modes**: Respect the `FERRUM_ADMIN_READ_ONLY` environment variable
+
+### Use Cases
+
+- **Production Safety**: Prevent accidental configuration changes in production environments
+- **DP Mode Security**: Ensure data plane nodes cannot modify configuration
+- **Compliance**: Meet security requirements for immutable infrastructure
+- **Maintenance**: Allow monitoring without risking configuration changes
 
 ## Prerequisites
 
@@ -158,6 +188,7 @@ cargo run --release
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth |
+| `FERRUM_ADMIN_READ_ONLY` | All modes | `false` | Set Admin API to read-only mode (DP mode defaults to true) |
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string |
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls |

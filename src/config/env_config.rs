@@ -87,6 +87,8 @@ pub struct EnvConfig {
     pub admin_tls_client_ca_bundle_path: Option<String>,
     /// Disable backend TLS certificate verification (for testing only)
     pub backend_tls_no_verify: bool,
+    /// Admin API read-only mode (default: false, always true in DP mode)
+    pub admin_read_only: bool,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
 }
@@ -113,7 +115,6 @@ impl EnvConfig {
             admin_https_port: parse_env_u16("FERRUM_ADMIN_HTTPS_PORT", 9443),
             admin_tls_cert_path: env::var("FERRUM_ADMIN_TLS_CERT_PATH").ok(),
             admin_tls_key_path: env::var("FERRUM_ADMIN_TLS_KEY_PATH").ok(),
-
             admin_jwt_secret: env::var("FERRUM_ADMIN_JWT_SECRET").ok(),
             db_type: env::var("FERRUM_DB_TYPE").ok(),
             db_url: env::var("FERRUM_DB_URL").ok(),
@@ -148,6 +149,7 @@ impl EnvConfig {
             admin_tls_client_ca_bundle_path: env::var("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH").ok(),
             backend_tls_no_verify: env::var("FERRUM_BACKEND_TLS_NO_VERIFY").unwrap_or_default() == "true",
             admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default() == "true",
+            admin_read_only: env::var("FERRUM_ADMIN_READ_ONLY").unwrap_or_default() == "true",
         };
 
         config.validate()?;

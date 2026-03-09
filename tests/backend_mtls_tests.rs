@@ -44,6 +44,7 @@ fn create_test_mtls_proxy() -> Proxy {
 }
 
 /// Create a test proxy with proxy-specific mTLS configuration
+#[allow(dead_code)]
 fn create_test_proxy_specific_mtls() -> Proxy {
     let mut proxy = create_test_mtls_proxy();
     proxy.backend_tls_client_cert_path = Some("/path/to/proxy-specific-cert.pem".to_string());
@@ -64,6 +65,7 @@ fn create_test_env_config_with_mtls(cert_path: Option<String>, key_path: Option<
         admin_https_port: 9443,
         admin_tls_cert_path: None,
         admin_tls_key_path: None,
+        admin_read_only: false,
         admin_tls_client_ca_bundle_path: None,
         admin_tls_no_verify: false,
         backend_tls_no_verify: false,
@@ -208,7 +210,7 @@ async fn test_backend_mtls_no_certificates() {
     let result = pool.get_client(&proxy, None).await;
     
     match result {
-        Ok(client) => {
+        Ok(_client) => {
             println!("✅ Client created without mTLS configuration");
             assert!(true);
         }
@@ -240,7 +242,7 @@ async fn test_backend_mtls_partial_config() {
     let result = pool.get_client(&proxy, None).await;
     
     match result {
-        Ok(client) => {
+        Ok(_client) => {
             println!("✅ Client created without mTLS (partial config ignored)");
             assert!(true);
         }

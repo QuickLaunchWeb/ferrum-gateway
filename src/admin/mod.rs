@@ -34,6 +34,7 @@ pub struct AdminState {
     pub jwt_manager: JwtManager,
     pub proxy_state: Option<ProxyState>,
     pub mode: String,
+    pub read_only: bool,
 }
 
 /// Start the Admin API listener with dual-path handling.
@@ -138,7 +139,7 @@ async fn handle_admin_tls_connection(
 /// Handle a single admin connection.
 async fn handle_admin_connection(
     stream: tokio::net::TcpStream,
-    remote_addr: SocketAddr,
+    _remote_addr: SocketAddr,
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let io = TokioIo::new(stream);
@@ -332,6 +333,14 @@ async fn handle_create_proxy(
     state: &AdminState,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -416,6 +425,14 @@ async fn handle_update_proxy(
     id: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -472,6 +489,14 @@ async fn handle_delete_proxy(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -523,6 +548,14 @@ async fn handle_create_consumer(
     state: &AdminState,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -593,6 +626,14 @@ async fn handle_update_consumer(
     id: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -630,6 +671,14 @@ async fn handle_delete_consumer(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -787,6 +836,14 @@ async fn handle_create_plugin_config(
     state: &AdminState,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -854,6 +911,14 @@ async fn handle_update_plugin_config(
     id: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -890,6 +955,14 @@ async fn handle_delete_plugin_config(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Check if admin API is in read-only mode
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"})
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {

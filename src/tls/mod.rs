@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Load TLS server configuration from cert and key files.
+#[allow(dead_code)]
 pub fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>, anyhow::Error> {
     load_tls_config_with_client_auth(cert_path, key_path, None, false)
 }

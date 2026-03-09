@@ -9,6 +9,7 @@ use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
 
 /// Connect to the Control Plane and receive config updates.
+#[allow(dead_code)]
 pub async fn start_dp_client(
     cp_url: String,
     auth_token: String,
@@ -32,6 +33,7 @@ pub async fn start_dp_client(
     }
 }
 
+#[allow(dead_code)]
 async fn connect_and_subscribe(
     cp_url: &str,
     auth_token: &str,

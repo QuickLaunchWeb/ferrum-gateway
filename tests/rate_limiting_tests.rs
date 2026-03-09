@@ -1,6 +1,6 @@
 //! Tests for rate_limiting plugin
 
-use ferrum_gateway::plugins::{rate_limiting::RateLimiting, Plugin, PluginResult};
+use ferrum_gateway::plugins::{rate_limiting::RateLimiting, Plugin};
 use serde_json::json;
 
 mod plugin_utils;
@@ -36,7 +36,7 @@ async fn test_rate_limiting_plugin_consumer_limiting() {
     
     // Multiple requests for same consumer should be rate limited
     let mut rejected_count = 0;
-    for i in 0..6 {
+    for _i in 0..6 {
         let mut ctx_test = create_test_context();
         ctx_test.identified_consumer = Some(consumer.clone());
         let result = plugin.authorize(&mut ctx_test).await;
@@ -65,7 +65,7 @@ async fn test_rate_limiting_plugin_ip_limiting() {
     
     // Multiple requests should eventually be rate limited
     let mut rejected_count = 0;
-    for i in 0..10 {
+    for _i in 0..10 {
         let mut ctx_test = create_test_context();
         let result = plugin.authorize(&mut ctx_test).await;
         if matches!(result, PluginResult::Reject { .. }) {

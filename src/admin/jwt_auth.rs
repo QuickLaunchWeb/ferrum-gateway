@@ -1,9 +1,8 @@
 //! Enhanced JWT authentication for Admin API
 //! Supports ISS claim validation, TTL enforcement, and token generation
 
-use chrono::{Duration, TimeZone, Utc};
 use jsonwebtoken::{
-    decode, encode, DecodingKey, EncodingKey, Header, Validation,
+    decode, DecodingKey, Validation,
     Algorithm, TokenData, errors::Error as JwtEncodeError
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +33,7 @@ pub struct AdminClaims {
 pub struct JwtConfig {
     pub secret: String,
     pub issuer: String,
+    #[allow(dead_code)]
     pub max_ttl_seconds: u64,
     pub algorithm: Algorithm,
 }
@@ -108,6 +108,7 @@ impl JwtManager {
     }
 
     /// Get configuration
+    #[allow(dead_code)]
     pub fn config(&self) -> &JwtConfig {
         &self.config
     }
@@ -118,9 +119,13 @@ pub enum JwtError {
     MissingHeader,
     InvalidHeaderFormat,
     VerificationFailed(String),
+    #[allow(dead_code)]
     TokenExpired,
+    #[allow(dead_code)]
     TokenNotYetValid,
+    #[allow(dead_code)]
     InvalidTokenIssuer,
+    #[allow(dead_code)]
     InvalidTokenSignature,
 }
 
@@ -181,6 +186,8 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
 
     #[test]
@@ -234,7 +241,7 @@ mod tests {
             algorithm: Algorithm::HS256,
         };
 
-        let manager1 = JwtManager::new(config1);
+        let _manager1 = JwtManager::new(config1);
         let manager2 = JwtManager::new(config2);
 
         // Create token with issuer-1
@@ -263,20 +270,20 @@ mod tests {
         let config = JwtConfig {
             secret: "test-secret".to_string(),
             issuer: "test-issuer".to_string(),
-            max_ttl_seconds: 1, // 1 second TTL
+            max_ttl_seconds: 3600,
             algorithm: Algorithm::HS256,
         };
 
         let manager = JwtManager::new(config);
 
-        // Create expired token
+        // Create expired token (expired 10 minutes ago)
         let now = Utc::now();
         let claims = AdminClaims {
             iss: "test-issuer".to_string(),
             sub: "admin-user".to_string(),
-            iat: now.timestamp(),
-            nbf: now.timestamp(),
-            exp: (now - Duration::seconds(1)).timestamp(), // Expired 1 second ago
+            iat: (now - Duration::minutes(10)).timestamp(), // Issued 10 minutes ago
+            nbf: (now - Duration::minutes(10)).timestamp(),
+            exp: (now - Duration::minutes(5)).timestamp(), // Expired 5 minutes ago
             jti: uuid::Uuid::new_v4().to_string(),
             additional: json!({}),
         };
@@ -287,6 +294,16 @@ mod tests {
 
         // Should fail verification
         let result = manager.verify_token(&token);
-        assert!(result.is_err());
+        assert!(result.is_err(), "Expired token should fail verification");
+        
+        // Check that it's an error
+        match result {
+            Err(_) => {
+                // This is expected - any error is fine for this test
+            }
+            Ok(_) => {
+                panic!("Expected error, got Ok");
+            }
+        }
     }
 }

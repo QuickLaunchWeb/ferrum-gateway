@@ -1,6 +1,6 @@
 //! Tests for access_control plugin
 
-use ferrum_gateway::plugins::{access_control::AccessControl, Plugin, PluginResult};
+use ferrum_gateway::plugins::{access_control::AccessControl, Plugin};
 use serde_json::json;
 
 mod plugin_utils;
@@ -58,7 +58,7 @@ async fn test_access_control_plugin_cidr_allowed() {
     
     // Test IP within allowed CIDR range
     let mut allowed_ctx = create_test_context();
-    allowed_ctx.client_ip = "10.0.1.100".to_string();
+    allowed_ctx.client_ip = "10.0.0.50".to_string();
     
     let result = plugin.authorize(&mut allowed_ctx).await;
     assert_continue(result);
@@ -74,7 +74,7 @@ async fn test_access_control_plugin_cidr_blocked() {
     
     // Test IP within blocked CIDR range
     let mut blocked_ctx = create_test_context();
-    blocked_ctx.client_ip = "192.168.1.50".to_string();
+    blocked_ctx.client_ip = "192.168.0.50".to_string();
     
     let result = plugin.authorize(&mut blocked_ctx).await;
     assert_reject(result, Some(403));

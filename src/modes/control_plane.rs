@@ -46,6 +46,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
         jwt_manager,
         proxy_state: None,
         mode: "cp".into(),
+        read_only: env_config.admin_read_only,
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -66,6 +67,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
                 .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?,
             proxy_state: None,
             mode: "cp".into(),
+            read_only: env_config.admin_read_only,
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
         

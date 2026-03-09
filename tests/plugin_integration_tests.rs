@@ -1,7 +1,7 @@
 //! Integration tests for the plugin system
 //! Tests plugin creation, scope configuration, and error handling
 
-use ferrum_gateway::plugins::{create_plugin, available_plugins, Plugin};
+use ferrum_gateway::plugins::{create_plugin, available_plugins};
 use ferrum_gateway::config::types::{PluginConfig, PluginScope};
 use serde_json::json;
 

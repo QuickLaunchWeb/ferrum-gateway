@@ -1,5 +1,3 @@
-use ferrum_gateway::config::EnvConfig;
-
 /// Test frontend TLS configuration with client certificate verification
 #[test]
 fn test_frontend_tls_configuration() {

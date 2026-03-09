@@ -1,6 +1,6 @@
 //! Tests for key_auth plugin
 
-use ferrum_gateway::plugins::{key_auth::KeyAuth, Plugin, PluginResult};
+use ferrum_gateway::plugins::{key_auth::KeyAuth, Plugin};
 use serde_json::json;
 
 mod plugin_utils;

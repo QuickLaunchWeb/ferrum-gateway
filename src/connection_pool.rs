@@ -195,6 +195,7 @@ impl ConnectionPool {
     }
 
     /// Get pool statistics for monitoring
+    #[allow(dead_code)]
     pub fn get_stats(&self) -> PoolStats {
         let total_pools = self.pools.len();
         let mut entries_per_host = std::collections::HashMap::new();
@@ -216,12 +217,14 @@ impl ConnectionPool {
     }
 
     /// Clear all pooled connections
+    #[allow(dead_code)]
     pub fn clear(&self) {
         self.pools.clear();
     }
 }
 
 /// Connection pool statistics
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PoolStats {
     pub total_pools: usize,
@@ -296,6 +299,7 @@ mod tests {
             admin_https_port: 9443,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
+            admin_read_only: false,
             admin_jwt_secret: None,
             db_type: None,
             db_url: None,
@@ -315,12 +319,15 @@ mod tests {
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             frontend_tls_client_ca_bundle_path: None,
+            backend_tls_no_verify: false,
+            admin_tls_client_ca_bundle_path: None,
+            admin_tls_no_verify: false,
         };
         let pool = ConnectionPool::new(global_config, env_config);
         let proxy = create_test_proxy();
         
-        let client1 = pool.get_client(&proxy, None).await.unwrap();
-        let client2 = pool.get_client(&proxy, None).await.unwrap();
+        let _client1 = pool.get_client(&proxy, None).await.unwrap();
+        let _client2 = pool.get_client(&proxy, None).await.unwrap();
         
         // Should reuse the same client
         let stats = pool.get_stats();
@@ -341,6 +348,7 @@ mod tests {
             admin_https_port: 9443,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
+            admin_read_only: false,
             admin_jwt_secret: None,
             db_type: None,
             db_url: None,
@@ -360,6 +368,9 @@ mod tests {
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             frontend_tls_client_ca_bundle_path: None,
+            backend_tls_no_verify: false,
+            admin_tls_client_ca_bundle_path: None,
+            admin_tls_no_verify: false,
         };
         let pool = ConnectionPool::new(global_config, env_config);
         let proxy = create_test_proxy();
