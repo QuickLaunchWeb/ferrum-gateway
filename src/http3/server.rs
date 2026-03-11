@@ -1,0 +1,515 @@
+//! HTTP/3 server listener using Quinn (QUIC) and h3
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use bytes::{Buf, Bytes};
+use h3::server::RequestStream;
+use http::{Response, StatusCode};
+use quinn::crypto::rustls::QuicServerConfig;
+use tracing::{debug, error, info, warn};
+
+use super::config::Http3ServerConfig;
+use crate::config::types::{AuthMode, GatewayConfig, Proxy};
+use crate::plugins::{
+    create_plugin, Plugin, PluginResult, RequestContext, TransactionSummary,
+};
+use crate::proxy::ProxyState;
+
+/// Start the HTTP/3 (QUIC) proxy listener.
+pub async fn start_http3_listener(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Arc<rustls::ServerConfig>,
+    h3_config: Http3ServerConfig,
+) -> Result<(), anyhow::Error> {
+    // Configure QUIC server with the TLS config
+    let mut server_tls_config = (*tls_config).clone();
+    server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
+    server_tls_config.max_early_data_size = u32::MAX; // Enable 0-RTT
+
+    let quic_server_config = QuicServerConfig::try_from(server_tls_config)
+        .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
+
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_idle_timeout(Some(
+        h3_config
+            .idle_timeout
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
+    ));
+    transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    server_config.transport_config(Arc::new(transport_config));
+
+    let endpoint = quinn::Endpoint::server(server_config, addr)?;
+    info!("HTTP/3 (QUIC) listener started on {}", addr);
+
+    let mut shutdown_rx = shutdown;
+
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                match incoming {
+                    Some(connecting) => {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_h3_connection(connecting, state).await {
+                                debug!("HTTP/3 connection error: {}", e);
+                            }
+                        });
+                    }
+                    None => {
+                        info!("HTTP/3 endpoint closed");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("HTTP/3 listener shutting down");
+                endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a single HTTP/3 connection (may carry multiple streams/requests).
+async fn handle_h3_connection(
+    connecting: quinn::Incoming,
+    state: ProxyState,
+) -> Result<(), anyhow::Error> {
+    let connection = connecting.await?;
+    let remote_addr = connection.remote_address();
+    debug!("HTTP/3 connection established from {}", remote_addr);
+
+    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection))
+        .await?;
+
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    match resolver.resolve_request().await {
+                        Ok((req, stream)) => {
+                            if let Err(e) = handle_h3_request(req, stream, state, remote_addr).await {
+                                error!("HTTP/3 request error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("HTTP/3 request resolution error: {}", e);
+                        }
+                    }
+                });
+            }
+            Ok(None) => {
+                debug!("HTTP/3 connection closed from {}", remote_addr);
+                break;
+            }
+            Err(e) => {
+                warn!("HTTP/3 connection error from {}: {}", remote_addr, e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a single HTTP/3 request stream.
+async fn handle_h3_request(
+    req: http::Request<()>,
+    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: ProxyState,
+    remote_addr: SocketAddr,
+) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let config = state.current_config();
+
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let query_string = req.uri().query().unwrap_or("").to_string();
+
+    // Build request context
+    let mut ctx = RequestContext::new(
+        remote_addr.ip().to_string(),
+        method.clone(),
+        path.clone(),
+    );
+
+    // Extract headers
+    for (name, value) in req.headers() {
+        if let Ok(v) = value.to_str() {
+            ctx.headers
+                .insert(name.as_str().to_lowercase(), v.to_string());
+        }
+    }
+
+    // Parse query params
+    for pair in query_string.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            ctx.query_params.insert(k.to_string(), v.to_string());
+        }
+    }
+
+    // Route: longest prefix match
+    let matched_proxy = crate::proxy::find_matching_proxy(&config, &path);
+
+    let proxy = match matched_proxy {
+        Some(p) => p,
+        None => {
+            record_request(&state, 404);
+            send_h3_response(&mut stream, StatusCode::NOT_FOUND, r#"{"error":"Not Found"}"#).await?;
+            return Ok(());
+        }
+    };
+
+    ctx.matched_proxy = Some(proxy.clone());
+
+    // Resolve plugins for this proxy
+    let plugins = resolve_plugins(&config, &proxy);
+
+    // Execute on_request_received hooks
+    for plugin in &plugins {
+        match plugin.on_request_received(&mut ctx).await {
+            PluginResult::Reject { status_code, body } => {
+                record_request(&state, status_code);
+                send_h3_response(
+                    &mut stream,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &body,
+                ).await?;
+                return Ok(());
+            }
+            PluginResult::Continue => {}
+        }
+    }
+
+    // Authentication phase
+    let auth_plugins: Vec<&Arc<dyn Plugin>> = plugins
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.name(),
+                "jwt_auth" | "key_auth" | "basic_auth" | "oauth2_auth"
+            )
+        })
+        .collect();
+
+    let consumers = &config.consumers;
+
+    match proxy.auth_mode {
+        AuthMode::Multi => {
+            for auth_plugin in &auth_plugins {
+                let _ = auth_plugin.authenticate(&mut ctx, consumers).await;
+            }
+        }
+        AuthMode::Single => {
+            for auth_plugin in &auth_plugins {
+                match auth_plugin.authenticate(&mut ctx, consumers).await {
+                    PluginResult::Reject { status_code, body } => {
+                        record_request(&state, status_code);
+                        send_h3_response(
+                            &mut stream,
+                            StatusCode::from_u16(status_code)
+                                .unwrap_or(StatusCode::UNAUTHORIZED),
+                            &body,
+                        ).await?;
+                        return Ok(());
+                    }
+                    PluginResult::Continue => {}
+                }
+            }
+        }
+    }
+
+    // Authorization phase
+    for plugin in &plugins {
+        if plugin.name() == "access_control" {
+            match plugin.authorize(&mut ctx).await {
+                PluginResult::Reject { status_code, body } => {
+                    record_request(&state, status_code);
+                    send_h3_response(
+                        &mut stream,
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::FORBIDDEN),
+                        &body,
+                    ).await?;
+                    return Ok(());
+                }
+                PluginResult::Continue => {}
+            }
+        }
+    }
+
+    // before_proxy hooks
+    let mut proxy_headers = ctx.headers.clone();
+    for plugin in &plugins {
+        match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
+            PluginResult::Reject { status_code, body } => {
+                record_request(&state, status_code);
+                send_h3_response(
+                    &mut stream,
+                    StatusCode::from_u16(status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &body,
+                ).await?;
+                return Ok(());
+            }
+            PluginResult::Continue => {}
+        }
+    }
+
+    // Collect request body from the H3 stream
+    let mut body_data = Vec::new();
+    while let Some(chunk) = stream.recv_data().await? {
+        let bytes = chunk.chunk();
+        body_data.extend_from_slice(bytes);
+    }
+
+    // Build backend URL and proxy
+    let backend_url = crate::proxy::build_backend_url(&proxy, &path, &query_string);
+    let backend_start = std::time::Instant::now();
+
+    let (response_status, response_body, mut response_headers) =
+        proxy_to_backend_h3(&state, &proxy, &backend_url, &method, &proxy_headers, body_data)
+            .await;
+
+    let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+    let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+
+    // after_proxy hooks
+    for plugin in &plugins {
+        let _ = plugin
+            .after_proxy(&mut ctx, response_status, &mut response_headers)
+            .await;
+    }
+
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let gateway_processing_ms = total_ms - backend_total_ms;
+
+    // Build transaction summary for logging
+    let summary = TransactionSummary {
+        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+        client_ip: ctx.client_ip.clone(),
+        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+        http_method: method,
+        request_path: path,
+        matched_proxy_id: Some(proxy.id.clone()),
+        matched_proxy_name: proxy.name.clone(),
+        backend_target_url: Some(strip_query_params(&backend_url)),
+        response_status_code: response_status,
+        latency_total_ms: total_ms,
+        latency_gateway_processing_ms: gateway_processing_ms,
+        latency_backend_ttfb_ms: backend_ttfb_ms,
+        latency_backend_total_ms: backend_total_ms,
+        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        metadata: ctx.metadata.clone(),
+    };
+
+    // Log phase
+    for plugin in &plugins {
+        plugin.log(&summary).await;
+    }
+
+    record_request(&state, response_status);
+
+    // Build and send response
+    let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut resp_builder = Response::builder().status(status);
+
+    for (k, v) in &response_headers {
+        resp_builder = resp_builder.header(k.as_str(), v.as_str());
+    }
+
+    resp_builder = resp_builder.header("content-type", "application/json");
+
+    let resp = resp_builder.body(()).unwrap();
+    stream.send_response(resp).await?;
+    stream
+        .send_data(Bytes::from(response_body))
+        .await?;
+    stream.finish().await?;
+
+    Ok(())
+}
+
+/// Proxy a request to the backend (adapted for HTTP/3 - uses collected body bytes).
+async fn proxy_to_backend_h3(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &std::collections::HashMap<String, String>,
+    body_bytes: Vec<u8>,
+) -> (u16, Vec<u8>, std::collections::HashMap<String, String>) {
+    // Resolve backend hostname
+    let resolved_ip = state
+        .dns_cache
+        .resolve(
+            &proxy.backend_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await;
+
+    // Get client from connection pool
+    let client = match state.connection_pool.get_client(proxy, resolved_ip.ok()).await {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to get client from pool: {}", e);
+            let fallback_client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_millis(
+                    proxy.backend_connect_timeout_ms,
+                ))
+                .timeout(std::time::Duration::from_millis(
+                    proxy.backend_read_timeout_ms,
+                ))
+                .danger_accept_invalid_certs(!proxy.backend_tls_verify_server_cert)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            fallback_client
+        }
+    };
+
+    let req_method = match method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        _ => reqwest::Method::GET,
+    };
+
+    let mut req_builder = client.request(req_method, backend_url);
+
+    // Forward headers
+    for (k, v) in headers {
+        match k.as_str() {
+            "host" | ":authority" => {
+                if proxy.preserve_host_header {
+                    req_builder = req_builder.header("Host", v.as_str());
+                } else {
+                    req_builder = req_builder.header("Host", &proxy.backend_host);
+                }
+            }
+            "connection" | "transfer-encoding" => continue,
+            k if k.starts_with(':') => continue, // Skip HTTP/3 pseudo-headers
+            _ => {
+                req_builder = req_builder.header(k, v.as_str());
+            }
+        }
+    }
+
+    // Add proxy headers
+    if let Some(xff) = headers.get("x-forwarded-for") {
+        req_builder =
+            req_builder.header("X-Forwarded-For", format!("{}, {}", xff, "client_ip"));
+    }
+    req_builder = req_builder.header("X-Forwarded-Proto", "h3");
+    if let Some(host) = headers.get("host").or_else(|| headers.get(":authority")) {
+        req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
+    }
+
+    if !body_bytes.is_empty() {
+        req_builder = req_builder.body(body_bytes);
+    }
+
+    match req_builder.send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let mut resp_headers = std::collections::HashMap::new();
+            for (k, v) in response.headers() {
+                if let Ok(vs) = v.to_str() {
+                    resp_headers.insert(k.as_str().to_string(), vs.to_string());
+                }
+            }
+            let body = response.bytes().await.unwrap_or_default().to_vec();
+            (status, body, resp_headers)
+        }
+        Err(e) => {
+            error!("Backend request failed (HTTP/3 frontend): {}", e);
+            let body = format!(r#"{{"error":"Backend unavailable: {}"}}"#, e);
+            (502, body.into_bytes(), std::collections::HashMap::new())
+        }
+    }
+}
+
+/// Send an HTTP/3 response with a body.
+async fn send_h3_response(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
+    body: &str,
+) -> Result<(), anyhow::Error> {
+    let resp = Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(())
+        .unwrap();
+    stream.send_response(resp).await?;
+    stream
+        .send_data(Bytes::from(body.to_string()))
+        .await?;
+    stream.finish().await?;
+    Ok(())
+}
+
+/// Resolve which plugins apply to this proxy request.
+fn resolve_plugins(config: &GatewayConfig, proxy: &Proxy) -> Vec<Arc<dyn Plugin>> {
+    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+
+    for pc in &config.plugin_configs {
+        if !pc.enabled {
+            continue;
+        }
+        if pc.scope == crate::config::types::PluginScope::Global {
+            if let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config) {
+                plugins.push(plugin);
+            }
+        }
+    }
+
+    let proxy_plugin_ids: Vec<&str> = proxy
+        .plugins
+        .iter()
+        .map(|a| a.plugin_config_id.as_str())
+        .collect();
+
+    for pc in &config.plugin_configs {
+        if !pc.enabled {
+            continue;
+        }
+        if pc.scope == crate::config::types::PluginScope::Proxy
+            && pc.proxy_id.as_deref() == Some(&proxy.id)
+            && proxy_plugin_ids.contains(&pc.id.as_str())
+        {
+            if let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config) {
+                plugins.retain(|p| p.name() != plugin.name());
+                plugins.push(plugin);
+            }
+        }
+    }
+
+    plugins
+}
+
+fn strip_query_params(url: &str) -> String {
+    url.split('?').next().unwrap_or(url).to_string()
+}
+
+fn record_request(state: &ProxyState, status: u16) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    state
+        .status_counts
+        .entry(status)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}

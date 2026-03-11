@@ -222,16 +222,37 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
     });
 
     // HTTPS listener (only if TLS is configured)
-    if let Some(tls_config) = tls_config {
+    if let Some(ref tls_config) = tls_config {
         let https_addr: SocketAddr = format!("0.0.0.0:{}", env_config.proxy_https_port).parse()?;
         let https_state = proxy_state.clone();
         let https_shutdown = shutdown_tx.subscribe();
+        let tls_cfg = tls_config.clone();
         tokio::spawn(async move {
             info!("Starting HTTPS proxy listener on {}", https_addr);
-            if let Err(e) = crate::proxy::start_proxy_listener_with_tls(https_addr, https_state, https_shutdown.clone(), Some(tls_config)).await {
+            if let Err(e) = crate::proxy::start_proxy_listener_with_tls(https_addr, https_state, https_shutdown.clone(), Some(tls_cfg)).await {
                 error!("HTTPS proxy listener error: {}", e);
             }
         });
+    }
+
+    // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
+    if env_config.enable_http3 {
+        if let Some(tls_config) = tls_config {
+            let h3_addr: SocketAddr = format!("0.0.0.0:{}", env_config.http3_port).parse()?;
+            let h3_state = proxy_state.clone();
+            let h3_shutdown = shutdown_tx.subscribe();
+            let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
+            tokio::spawn(async move {
+                info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
+                if let Err(e) = crate::http3::server::start_http3_listener(
+                    h3_addr, h3_state, h3_shutdown, tls_config, h3_config,
+                ).await {
+                    error!("HTTP/3 proxy listener error: {}", e);
+                }
+            });
+        } else {
+            error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
+        }
     }
 
     Ok(())
