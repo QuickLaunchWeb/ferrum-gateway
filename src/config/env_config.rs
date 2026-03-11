@@ -91,6 +91,16 @@ pub struct EnvConfig {
     pub admin_read_only: bool,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
+
+    // HTTP/3 / QUIC
+    /// Enable HTTP/3 listener (default: false)
+    pub enable_http3: bool,
+    /// HTTP/3 (QUIC) port (default: 7843)
+    pub http3_port: u16,
+    /// HTTP/3 idle timeout in seconds (default: 30)
+    pub http3_idle_timeout: u64,
+    /// HTTP/3 max concurrent streams (default: 100)
+    pub http3_max_streams: u32,
 }
 
 impl EnvConfig {
@@ -150,6 +160,15 @@ impl EnvConfig {
             backend_tls_no_verify: env::var("FERRUM_BACKEND_TLS_NO_VERIFY").unwrap_or_default() == "true",
             admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default() == "true",
             admin_read_only: env::var("FERRUM_ADMIN_READ_ONLY").unwrap_or_default() == "true",
+
+            // HTTP/3 / QUIC
+            enable_http3: env::var("FERRUM_ENABLE_HTTP3").unwrap_or_default() == "true",
+            http3_port: parse_env_u16("FERRUM_HTTP3_PORT", 7843),
+            http3_idle_timeout: parse_env_u64("FERRUM_HTTP3_IDLE_TIMEOUT", 30),
+            http3_max_streams: env::var("FERRUM_HTTP3_MAX_STREAMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
         };
 
         config.validate()?;

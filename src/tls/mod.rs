@@ -70,3 +70,37 @@ pub fn load_tls_config_with_client_auth(
 
     Ok(Arc::new(config))
 }
+
+/// Build a rustls ClientConfig suitable for HTTP/3 backend connections.
+#[allow(dead_code)]
+pub fn build_h3_client_tls_config(
+    no_verify: bool,
+    ca_bundle_path: Option<&str>,
+) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    if let Some(ca_path) = ca_bundle_path {
+        let ca_file = File::open(ca_path)?;
+        let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
+            .filter_map(|r| r.ok())
+            .collect();
+        let (added, _) = root_store.add_parsable_certificates(ca_certs);
+        if added == 0 {
+            return Err(anyhow::anyhow!("No valid CA certificates found in {}", ca_path));
+        }
+    } else {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    config.alpn_protocols = vec![b"h3".to_vec()];
+
+    if no_verify {
+        warn!("HTTP/3 client TLS verification DISABLED (testing mode)");
+    }
+
+    Ok(Arc::new(config))
+}

@@ -834,7 +834,7 @@ fn resolve_plugins(config: &GatewayConfig, proxy: &Proxy) -> Vec<Arc<dyn Plugin>
 pub fn build_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
     let scheme = match proxy.backend_protocol {
         BackendProtocol::Http | BackendProtocol::Ws => "http",
-        BackendProtocol::Https | BackendProtocol::Wss => "https",
+        BackendProtocol::Https | BackendProtocol::Wss | BackendProtocol::H3 => "https",
         BackendProtocol::Grpc => "http", // gRPC over HTTP/2
     };
 

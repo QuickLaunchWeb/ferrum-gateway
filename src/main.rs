@@ -3,6 +3,7 @@ mod config;
 mod connection_pool;
 mod dns;
 mod grpc;
+mod http3;
 mod modes;
 mod plugins;
 mod proxy;

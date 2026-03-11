@@ -325,6 +325,10 @@ mod tests {
             backend_tls_no_verify: false,
             admin_tls_client_ca_bundle_path: None,
             admin_tls_no_verify: false,
+            enable_http3: false,
+            http3_port: 7843,
+            http3_idle_timeout: 30,
+            http3_max_streams: 100,
         };
         let pool = ConnectionPool::new(global_config, env_config);
         let proxy = create_test_proxy();
@@ -374,6 +378,10 @@ mod tests {
             backend_tls_no_verify: false,
             admin_tls_client_ca_bundle_path: None,
             admin_tls_no_verify: false,
+            enable_http3: false,
+            http3_port: 7843,
+            http3_idle_timeout: 30,
+            http3_max_streams: 100,
         };
         let pool = ConnectionPool::new(global_config, env_config);
         let proxy = create_test_proxy();
