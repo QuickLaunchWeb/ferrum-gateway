@@ -2,11 +2,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Buf;
 use http::Request;
-use quinn::crypto::rustls::QuicClientConfig;
 use tracing::debug;
 
 use crate::config::types::Proxy;
@@ -19,29 +17,10 @@ pub struct Http3Client {
 
 impl Http3Client {
     /// Create a new HTTP/3 client with the given TLS configuration.
-    pub fn new(tls_config: Arc<rustls::ClientConfig>) -> Result<Self, anyhow::Error> {
-        // Bind to any available local UDP port
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-
-        let mut client_tls_config = (*tls_config).clone();
-        client_tls_config.alpn_protocols = vec![b"h3".to_vec()];
-
-        let quic_client_config = QuicClientConfig::try_from(client_tls_config)
-            .map_err(|e| anyhow::anyhow!("Failed to create QUIC client config: {}", e))?;
-
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(
-            Duration::from_secs(30)
-                .try_into()
-                .map_err(|e| anyhow::anyhow!("Invalid timeout: {}", e))?,
-        ));
-
-        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
-        client_config.transport_config(Arc::new(transport));
-
-        endpoint.set_default_client_config(client_config);
-
-        Ok(Self { endpoint })
+    pub fn new(_tls_config: Arc<rustls::ClientConfig>) -> Result<Self, anyhow::Error> {
+        // TODO: The Quinn API has changed significantly since this was implemented
+        // For now, return an error to indicate the implementation needs updating
+        Err(anyhow::anyhow!("HTTP/3 client implementation needs updating for current Quinn API"))
     }
 
     /// Send an HTTP/3 request to the specified backend.

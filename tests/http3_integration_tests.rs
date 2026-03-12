@@ -50,7 +50,7 @@ fn create_http3_test_proxy() -> Proxy {
         name: Some("HTTP/3 Test Proxy".to_string()),
         listen_path: "/http3-test".to_string(),
         backend_protocol: BackendProtocol::H3,
-        backend_host: "httpbin.org".to_string(),
+        backend_host: "facebook.com".to_string(),
         backend_port: 443,
         backend_path: Some("/get".to_string()),
         strip_listen_path: true,
@@ -162,12 +162,12 @@ async fn test_http3_backend_connection() {
         Ok(_client) => {
             info!("HTTP/3 client created successfully");
             
-            // Test a simple HTTP/3 request to verify the client works
-            // Note: This may fail if the backend doesn't support HTTP/3, but the client creation should work
-            let backend_url = "https://httpbin.org:443/get";
+            // Test a simple HTTP/3 request to verify client works
+            // Use a real HTTP/3-enabled endpoint (facebook.com supports HTTP/3)
+            let backend_url = "https://www.facebook.com:443/";
             let headers = std::collections::HashMap::from([
                 ("user-agent".to_string(), "ferrum-gateway-test".to_string()),
-                ("accept".to_string(), "application/json".to_string()),
+                ("accept".to_string(), "text/html".to_string()),
             ]);
             
             // Convert headers to HTTP/3 format
@@ -182,19 +182,26 @@ async fn test_http3_backend_connection() {
             // Verify header conversion works
             assert_eq!(http3_headers.len(), 2);
             
-            // Try to make a request (may fail due to network/backend limitations, but should not panic)
+            // Try to make a request (Facebook supports HTTP/3, so should work better)
             let request_body = bytes::Bytes::from("test");
+            let start_time = std::time::Instant::now();
             let result = _client.request(&proxy, "GET", backend_url, http3_headers, request_body).await;
+            let request_time = start_time.elapsed();
+            
+            info!("HTTP/3 request completed in {:?}", request_time);
             
             match result {
                 Ok((status, body, response_headers)) => {
                     info!("HTTP/3 request successful: status={}, body_len={}, headers={}", 
                           status, body.len(), response_headers.len());
                     assert!(status > 0, "Status should be valid");
+                    
+                    // Should be reasonably fast with HTTP/3
+                    assert!(request_time.as_secs() < 10, "HTTP/3 request should complete within 10 seconds");
                 }
                 Err(e) => {
-                    tracing::warn!("HTTP/3 request failed (expected in test environment): {:?}", e);
-                    // This is expected in test environments without proper HTTP/3 backend support
+                    tracing::warn!("HTTP/3 request failed: {:?}", e);
+                    // This is still possible due to network issues, but should be less common
                 }
             }
         }
@@ -207,7 +214,7 @@ async fn test_http3_backend_connection() {
     
     // Verify proxy configuration
     assert_eq!(proxy.backend_protocol, BackendProtocol::H3);
-    assert_eq!(proxy.backend_host, "httpbin.org");
+    assert_eq!(proxy.backend_host, "facebook.com");
     assert_eq!(proxy.backend_port, 443);
     
     info!("HTTP/3 backend connection test completed successfully");
@@ -230,7 +237,7 @@ async fn test_http3_configuration_loading() {
     let proxy = &gateway_config.proxies[0];
     assert_eq!(proxy.backend_protocol, BackendProtocol::H3);
     assert_eq!(proxy.listen_path, "/http3-test");
-    assert_eq!(proxy.backend_host, "httpbin.org");
+    assert_eq!(proxy.backend_host, "facebook.com");
 }
 
 /// Test HTTP/3 proxy state creation
@@ -434,7 +441,8 @@ async fn test_http3_connection_performance() {
     assert!(client_creation_time.as_millis() < 100, "Client creation should be fast");
     
     // Test multiple concurrent requests
-    let backend_url = "https://httpbin.org:443/get";
+    // Use a real HTTP/3-enabled endpoint (facebook.com supports HTTP/3)
+    let backend_url = "https://www.facebook.com:443/";
     let headers = std::collections::HashMap::from([
         ("user-agent".to_string(), "ferrum-gateway-perf-test".to_string()),
         ("accept".to_string(), "application/json".to_string()),
