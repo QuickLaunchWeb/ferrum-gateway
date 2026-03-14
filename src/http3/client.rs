@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use bytes::Buf;
 use http::Request;
+use quinn::crypto::rustls::{QuicClientConfig, Suite};
 use tracing::debug;
 
 use crate::config::types::Proxy;
@@ -17,10 +18,21 @@ pub struct Http3Client {
 
 impl Http3Client {
     /// Create a new HTTP/3 client with the given TLS configuration.
-    pub fn new(_tls_config: Arc<rustls::ClientConfig>) -> Result<Self, anyhow::Error> {
-        // TODO: The Quinn API has changed significantly since this was implemented
-        // For now, return an error to indicate the implementation needs updating
-        Err(anyhow::anyhow!("HTTP/3 client implementation needs updating for current Quinn API"))
+    pub fn new(tls_config: Arc<rustls::ClientConfig>) -> Result<Self, anyhow::Error> {
+        // Initialize crypto provider for this thread
+        rustls::crypto::ring::default_provider().install_default()
+            .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))?;
+        
+        // Bind to any available local UDP port
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+        
+        // For now, create a simple client config without complex crypto setup
+        // This is a temporary solution - the full HTTP/3 implementation needs 
+        // proper Quinn 0.11.9 API integration which is complex due to private APIs
+        let client_config = quinn::ClientConfig::new(Arc::new(tls_config));
+        endpoint.set_default_client_config(client_config);
+
+        Ok(Self { endpoint })
     }
 
     /// Send an HTTP/3 request to the specified backend.
