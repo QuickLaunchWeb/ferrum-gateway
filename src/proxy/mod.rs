@@ -789,19 +789,21 @@ async fn handle_proxy_request(
         }))
 }
 
-/// Find the matching proxy using longest prefix match with optimized route table.
+/// Find the matching proxy using longest prefix match.
+/// Iterates proxies directly to avoid per-request allocation.
 pub fn find_matching_proxy(config: &GatewayConfig, path: &str) -> Option<Proxy> {
-    let route_table = config.build_route_table();
-    
-    // Route table is already sorted by path length descending for longest prefix match
-    for (listen_path, proxy_id) in route_table {
-        if path.starts_with(&listen_path) {
-            // Find the proxy by ID
-            return config.proxies.iter().find(|p| p.id == proxy_id).cloned();
+    let mut best_match: Option<&Proxy> = None;
+    let mut best_len = 0;
+
+    for proxy in &config.proxies {
+        let lp = &proxy.listen_path;
+        if lp.len() > best_len && path.starts_with(lp.as_str()) {
+            best_match = Some(proxy);
+            best_len = lp.len();
         }
     }
-    
-    None
+
+    best_match.cloned()
 }
 
 /// Resolve which plugins apply to this proxy request.

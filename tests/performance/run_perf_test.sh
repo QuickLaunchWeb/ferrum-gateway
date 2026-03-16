@@ -22,8 +22,17 @@ WRK_DURATION=${WRK_DURATION:-30s}
 WRK_THREADS=${WRK_THREADS:-8}
 WRK_CONNECTIONS=${WRK_CONNECTIONS:-100}
 
-echo -e "${BLUE}🚀 Starting Ferrum Gateway Performance Test${NC}"
+echo -e "${BLUE}Starting Ferrum Gateway Performance Test${NC}"
 echo "=================================================="
+
+# Kill any existing processes on test ports to prevent conflicts
+kill_existing() {
+    echo -e "${YELLOW}Cleaning up existing processes on ports $BACKEND_PORT and $GATEWAY_PORT...${NC}"
+    lsof -ti:$BACKEND_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
+    lsof -ti:$GATEWAY_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 1
+    echo -e "${GREEN}Ports cleared${NC}"
+}
 
 # Check if required tools are installed
 check_dependencies() {
@@ -56,25 +65,26 @@ build_project() {
 
 # Start backend server
 start_backend() {
-    echo -e "${YELLOW}🌐 Starting backend server on port $BACKEND_PORT...${NC}"
+    echo -e "${YELLOW}Starting backend server on port $BACKEND_PORT...${NC}"
     "$PERF_DIR/target/release/backend_server" > "$PERF_DIR/backend.log" 2>&1 &
     BACKEND_PID=$!
-    
-    # Wait for backend to start
-    sleep 2
-    
-    if curl -s "http://localhost:$BACKEND_PORT/health" > /dev/null; then
-        echo -e "${GREEN}✅ Backend server started (PID: $BACKEND_PID)${NC}"
-    else
-        echo -e "${RED}❌ Backend server failed to start${NC}"
-        cat "$PERF_DIR/backend.log"
-        exit 1
-    fi
+
+    # Wait for backend to start with retry
+    for i in 1 2 3 4 5; do
+        if curl -sf "http://localhost:$BACKEND_PORT/health" > /dev/null 2>&1; then
+            echo -e "${GREEN}Backend server started (PID: $BACKEND_PID)${NC}"
+            return
+        fi
+        sleep 1
+    done
+    echo -e "${RED}Backend server failed to start${NC}"
+    cat "$PERF_DIR/backend.log"
+    exit 1
 }
 
 # Start gateway
 start_gateway() {
-    echo -e "${YELLOW}🚪 Starting gateway on port $GATEWAY_PORT...${NC}"
+    echo -e "${YELLOW}Starting gateway on port $GATEWAY_PORT...${NC}"
     cd "$PROJECT_ROOT"
     # Set global connection pool defaults optimized for performance testing
     FERRUM_MODE=file \
@@ -85,17 +95,18 @@ start_gateway() {
     FERRUM_POOL_ENABLE_HTTP2=false \
     ./target/release/ferrum-gateway > "$PERF_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
-    
-    # Wait for gateway to start
-    sleep 3
-    
-    if curl -s "http://localhost:$GATEWAY_PORT/health" > /dev/null; then
-        echo -e "${GREEN}✅ Gateway started (PID: $GATEWAY_PID)${NC}"
-    else
-        echo -e "${RED}❌ Gateway failed to start${NC}"
-        cat "$PERF_DIR/gateway.log"
-        exit 1
-    fi
+
+    # Wait for gateway to start with retry — verify it's actually our process
+    for i in 1 2 3 4 5; do
+        if kill -0 $GATEWAY_PID 2>/dev/null && curl -sf "http://localhost:$GATEWAY_PORT/health" > /dev/null 2>&1; then
+            echo -e "${GREEN}Gateway started (PID: $GATEWAY_PID)${NC}"
+            return
+        fi
+        sleep 1
+    done
+    echo -e "${RED}Gateway failed to start${NC}"
+    cat "$PERF_DIR/gateway.log"
+    exit 1
 }
 
 # Run performance tests
@@ -141,16 +152,19 @@ run_load_tests() {
     echo ""
 }
 
-# Generate performance report
+# Generate performance report (optional — requires generate_report.py)
 generate_report() {
-    echo -e "${YELLOW}📈 Generating performance report...${NC}"
-    
-    python3 "$PERF_DIR/generate_report.py" \
-        --gateway-results "$PERF_DIR/health_results.txt" \
-        --backend-results "$PERF_DIR/backend_results.txt" \
-        --output "$PERF_DIR/performance_report.html"
-    
-    echo -e "${GREEN}✅ Performance report generated: $PERF_DIR/performance_report.html${NC}"
+    if [ -f "$PERF_DIR/generate_report.py" ]; then
+        echo -e "${YELLOW}Generating performance report...${NC}"
+        python3 "$PERF_DIR/generate_report.py" \
+            --gateway-results "$PERF_DIR/health_results.txt" \
+            --backend-results "$PERF_DIR/backend_results.txt" \
+            --output "$PERF_DIR/performance_report.html" 2>/dev/null \
+            && echo -e "${GREEN}Performance report generated: $PERF_DIR/performance_report.html${NC}" \
+            || echo -e "${YELLOW}Report generation skipped (generate_report.py error)${NC}"
+    else
+        echo -e "${YELLOW}Report generation skipped (generate_report.py not found)${NC}"
+    fi
 }
 
 # Cleanup
@@ -173,14 +187,16 @@ main() {
     trap cleanup EXIT
     
     check_dependencies
+    kill_existing
     build_project
     start_backend
     start_gateway
     run_load_tests
     generate_report
     
-    echo -e "${GREEN}🎉 Performance test completed successfully!${NC}"
-    echo -e "${BLUE}📄 Results saved to: $PERF_DIR/performance_report.html${NC}"
+    echo ""
+    echo -e "${GREEN}Performance test completed successfully!${NC}"
+    echo -e "${BLUE}Results saved to: $PERF_DIR/${NC}"
 }
 
 # Run main function

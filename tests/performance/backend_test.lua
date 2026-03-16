@@ -13,5 +13,9 @@ end
 
 done = function(summary, latency, requests)
     io.write("\n--- Backend Baseline Statistics ---\n")
-    io.write(string.format("Direct backend requests: %d\n", summary.status_200 or 0))
+    io.write(string.format("Total requests: %d\n", summary.requests))
+    io.write(string.format("Non-2xx responses: %d\n", summary.errors.status))
+    io.write(string.format("Socket errors: connect %d, read %d, write %d, timeout %d\n",
+        summary.errors.connect, summary.errors.read,
+        summary.errors.write, summary.errors.timeout))
 end
