@@ -9,6 +9,10 @@ pub struct PoolConfig {
     pub max_idle_per_host: usize,
     pub idle_timeout_seconds: u64,
     pub enable_http_keep_alive: bool,
+    /// Controls HTTP/2 keep-alive PING frames on backend connections.
+    /// When true, reqwest sends periodic PING frames to keep HTTP/2 connections alive.
+    /// HTTP/2 itself is auto-negotiated via ALPN on HTTPS connections — this does NOT
+    /// force h2c (cleartext HTTP/2) via http2_prior_knowledge().
     pub enable_http2: bool,
     pub tcp_keepalive_seconds: u64,
     pub http2_keep_alive_interval_seconds: u64,

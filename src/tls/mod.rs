@@ -28,7 +28,7 @@ pub fn load_tls_config_with_client_auth(
     let key = private_key(&mut BufReader::new(key_file))?
         .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
 
-    let config = if no_verify {
+    let mut config = if no_verify {
         // No verification mode (for testing only)
         warn!("TLS configuration loaded with certificate verification DISABLED (testing mode) from cert: {}, key: {}", 
               cert_path, key_path);
@@ -67,6 +67,9 @@ pub fn load_tls_config_with_client_auth(
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)?
     };
+
+    // Advertise HTTP/2 and HTTP/1.1 via ALPN so clients can negotiate HTTP/2 over TLS
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }

@@ -43,16 +43,17 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
         env_config.dns_overrides.clone(),
     );
 
-    // DNS warmup
+    // DNS warmup — await before accepting requests to avoid cold-cache
+    // DNS lookups in the hot request path
     let hostnames: Vec<_> = config
         .proxies
         .iter()
         .map(|p| (p.backend_host.clone(), p.dns_override.clone(), p.dns_cache_ttl_seconds))
         .collect();
-    let dns_warmup = dns_cache.clone();
-    tokio::spawn(async move {
-        dns_warmup.warmup(hostnames).await;
-    });
+    dns_cache.warmup(hostnames).await;
+
+    // Start background TTL refresh to keep cache warm
+    dns_cache.start_background_refresh();
 
     let proxy_state = ProxyState::new(config, dns_cache, env_config.clone());
 

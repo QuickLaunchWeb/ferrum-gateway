@@ -92,6 +92,66 @@ impl DnsCache {
         Ok(addrs)
     }
 
+    /// Returns the number of entries currently in the cache.
+    #[allow(dead_code)]
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Start a background task that proactively refreshes cache entries before
+    /// they expire. Entries are refreshed when they reach 75% of their TTL,
+    /// keeping DNS resolution out of the hot request path.
+    pub fn start_background_refresh(&self) {
+        let cache = self.clone();
+        let check_interval = std::cmp::max(cache.default_ttl.as_secs() / 4, 5);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(check_interval));
+
+            loop {
+                interval.tick().await;
+
+                // Collect entries that are nearing expiration (past 75% of TTL)
+                let now = Instant::now();
+                let mut to_refresh: Vec<(String, Option<u64>)> = Vec::new();
+
+                for entry in cache.cache.iter() {
+                    let remaining = entry.expires_at.saturating_duration_since(now);
+                    let total_ttl = cache.default_ttl;
+                    // Refresh if less than 25% of TTL remaining
+                    if remaining < total_ttl / 4 && remaining > Duration::ZERO {
+                        to_refresh.push((entry.key().clone(), None));
+                    }
+                }
+
+                // Refresh entries in the background
+                for (hostname, ttl) in to_refresh {
+                    match cache.do_resolve(&hostname).await {
+                        Ok(addrs) if !addrs.is_empty() => {
+                            let refresh_ttl = ttl
+                                .map(Duration::from_secs)
+                                .unwrap_or(cache.default_ttl);
+                            cache.cache.insert(
+                                hostname.clone(),
+                                DnsCacheEntry {
+                                    addresses: addrs,
+                                    expires_at: Instant::now() + refresh_ttl,
+                                },
+                            );
+                            debug!("DNS background refresh: {} refreshed", hostname);
+                        }
+                        Ok(_) => {
+                            warn!("DNS background refresh: {} returned no addresses", hostname);
+                        }
+                        Err(e) => {
+                            warn!("DNS background refresh failed for {}: {}", hostname, e);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Warmup: resolve all hostnames from the config at startup.
     pub async fn warmup(&self, hostnames: Vec<(String, Option<String>, Option<u64>)>) {
         info!("DNS warmup: resolving {} hostnames", hostnames.len());
