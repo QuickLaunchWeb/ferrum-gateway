@@ -138,3 +138,95 @@ async fn test_dns_resolve_nonexistent_domain() {
     let result = cache.resolve("this-domain-absolutely-does-not-exist.invalid", None, None).await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn test_dns_cache_len_starts_empty() {
+    let cache = DnsCache::new(300, HashMap::new());
+    assert_eq!(cache.cache_len(), 0);
+}
+
+#[tokio::test]
+async fn test_dns_warmup_populates_cache() {
+    let cache = DnsCache::new(300, HashMap::new());
+    assert_eq!(cache.cache_len(), 0);
+
+    let hostnames = vec![
+        ("localhost".to_string(), None, None),
+        ("127.0.0.1".to_string(), None, None),
+    ];
+    cache.warmup(hostnames).await;
+
+    // After warmup, cache should contain entries for resolved hostnames
+    assert!(cache.cache_len() >= 1, "Warmup should populate at least one cache entry");
+}
+
+#[tokio::test]
+async fn test_dns_ttl_expiration_causes_re_resolution() {
+    // Use a very short TTL (1 second)
+    let cache = DnsCache::new(1, HashMap::new());
+
+    // First resolution populates cache
+    let result1 = cache.resolve("localhost", None, Some(1)).await.unwrap();
+    assert_eq!(cache.cache_len(), 1);
+
+    // Wait for TTL to expire
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Second resolution should still succeed (re-resolves from DNS)
+    let result2 = cache.resolve("localhost", None, Some(1)).await.unwrap();
+    assert_eq!(result1, result2, "Re-resolution should return same IP for localhost");
+}
+
+#[tokio::test]
+async fn test_dns_concurrent_resolution_safety() {
+    let cache = DnsCache::new(300, HashMap::new());
+    let mut handles = Vec::new();
+
+    // Spawn 100 concurrent resolutions for the same host
+    for _ in 0..100 {
+        let cache = cache.clone();
+        handles.push(tokio::spawn(async move {
+            cache.resolve("localhost", None, None).await
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "Concurrent resolution should not panic or error");
+        results.push(result.unwrap());
+    }
+
+    // All should resolve to the same IP
+    let first = results[0];
+    for ip in &results {
+        assert_eq!(*ip, first, "All concurrent resolutions should return the same IP");
+    }
+}
+
+#[tokio::test]
+async fn test_dns_per_proxy_override_bypasses_cache() {
+    let cache = DnsCache::new(300, HashMap::new());
+
+    // Resolve with override — should NOT populate cache
+    let result = cache.resolve("some-host.example.com", Some("10.0.0.1"), None).await.unwrap();
+    assert_eq!(result.to_string(), "10.0.0.1");
+
+    // Cache should be empty since overrides bypass caching
+    assert_eq!(cache.cache_len(), 0, "Per-proxy override should bypass cache");
+}
+
+#[tokio::test]
+async fn test_dns_cache_serves_from_cache_within_ttl() {
+    let cache = DnsCache::new(300, HashMap::new());
+
+    // First call populates cache
+    let _result1 = cache.resolve("localhost", None, None).await.unwrap();
+    assert_eq!(cache.cache_len(), 1);
+
+    // Second call should use cache (no way to directly verify but we can
+    // confirm it returns immediately and gives same result)
+    let result2 = cache.resolve("localhost", None, None).await.unwrap();
+    assert_eq!(cache.cache_len(), 1, "Cache should still have exactly 1 entry");
+    assert!(result2.to_string() == "127.0.0.1" || result2.to_string() == "::1");
+}

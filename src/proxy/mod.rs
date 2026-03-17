@@ -2,7 +2,6 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
@@ -84,42 +83,55 @@ impl ProxyState {
     }
 }
 
-/// Handle a TCP connection and route to appropriate handler
+/// Handle a plain HTTP TCP connection (HTTP/1.1 only for cleartext).
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: ProxyState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Set TCP keepalive on inbound connection to detect stale clients
+    set_tcp_keepalive(&stream);
+
     // Use TokioIo to adapt the TCP stream for hyper
     let io = TokioIo::new(stream);
-    
+
     // Create a service function that can handle both HTTP and WebSocket
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
         async move {
-            // Check if this is a WebSocket upgrade request
             if is_websocket_upgrade(&req) {
                 debug!("Detected WebSocket upgrade request, routing to WebSocket handler");
-                // For WebSocket, we need to handle it differently
                 handle_websocket_request(req, state, addr).await
             } else {
-                // For regular HTTP requests, use the normal handler
                 handle_proxy_request(req, state, addr).await
             }
         }
     });
-    
-    // Use hyper's upgrade support to handle WebSocket upgrades properly
-    if let Err(e) = http1::Builder::new()
+
+    // Plain HTTP uses HTTP/1.1 only (HTTP/2 cleartext requires prior knowledge
+    // or upgrade which is rarely used; HTTP/2 is negotiated via ALPN on TLS)
+    if let Err(e) = hyper::server::conn::http1::Builder::new()
         .serve_connection(io, svc)
         .with_upgrades()
         .await
     {
         debug!("Connection error: {}", e);
     }
-    
+
     Ok(())
+}
+
+/// Set TCP keepalive on a stream to detect dead connections.
+fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    use std::os::fd::AsFd;
+    let fd = stream.as_fd();
+    let socket = socket2::SockRef::from(&fd);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60));
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+        debug!("Failed to set TCP keepalive: {}", e);
+    }
 }
 
 /// Handle WebSocket requests with proper connection takeover
@@ -520,7 +532,7 @@ pub async fn start_proxy_listener_with_tls(
     }
 }
 
-/// Handle TLS connections with client certificate verification.
+/// Handle TLS connections with HTTP/1.1 and HTTP/2 auto-negotiation via ALPN.
 async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
@@ -528,11 +540,14 @@ async fn handle_tls_connection(
     tls_config: Arc<rustls::ServerConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
-    
+
+    // Set TCP keepalive on inbound connection
+    set_tcp_keepalive(&stream);
+
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_stream = match acceptor.accept(stream).await {
         Ok(stream) => {
-            info!("TLS connection established with client certificate verification from {}", remote_addr.ip());
+            info!("TLS connection established from {}", remote_addr.ip());
             stream
         }
         Err(e) => {
@@ -540,16 +555,15 @@ async fn handle_tls_connection(
             return Err(e.into());
         }
     };
-    
+
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
-    
+
     // Use the same HTTP service function
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
         async move {
-            // Check if this is a WebSocket upgrade request
             if is_websocket_upgrade(&req) {
                 debug!("Detected WebSocket upgrade request over TLS, routing to WebSocket handler");
                 handle_websocket_request(req, state, addr).await
@@ -559,14 +573,13 @@ async fn handle_tls_connection(
         }
     });
 
-    // Serve the HTTP service over TLS
-    let conn = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, svc);
-    
-    if let Err(e) = conn.await {
+    // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.
+    // HTTP/2 clients get multiplexed streams; HTTP/1.1 clients get upgrade support.
+    let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         error!("HTTP connection error over TLS: {}", e);
     }
-    
+
     Ok(())
 }
 
