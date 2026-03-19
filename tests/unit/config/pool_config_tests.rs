@@ -1,8 +1,8 @@
 //! Tests for connection pool configuration
 
 use chrono::Utc;
-use ferrum_gateway::config::pool_config::{MAX_IDLE_PER_HOST, MIN_IDLE_PER_HOST};
 use ferrum_gateway::config::PoolConfig;
+use ferrum_gateway::config::pool_config::{MAX_IDLE_PER_HOST, MIN_IDLE_PER_HOST};
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy};
 
 fn create_test_proxy() -> Proxy {
