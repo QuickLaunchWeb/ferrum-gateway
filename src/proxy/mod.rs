@@ -85,8 +85,12 @@ impl ProxyState {
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
         let max_body_size_bytes = env_config.max_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
-        // Create connection pool with global configuration from environment
+        // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
+        let grpc_pool = Arc::new(GrpcConnectionPool::new(
+            global_pool_config.clone(),
+            env_config.clone(),
+        ));
         let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
@@ -104,7 +108,7 @@ impl ProxyState {
             consumer_index,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
-            grpc_pool: Arc::new(GrpcConnectionPool::new()),
+            grpc_pool,
             enable_http3,
             proxy_https_port,
             max_header_size_bytes,

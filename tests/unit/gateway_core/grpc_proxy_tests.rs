@@ -190,8 +190,8 @@ fn test_backend_protocol_grpcs_deserialize() {
 
 // --- GrpcConnectionPool creation ---
 
-#[test]
-fn test_grpc_connection_pool_creation() {
-    // Verify the pool can be created without panicking
-    let _pool = grpc_proxy::GrpcConnectionPool::new();
+#[tokio::test]
+async fn test_grpc_connection_pool_creation() {
+    // Verify the pool can be created without panicking (requires tokio runtime for cleanup task)
+    let _pool = grpc_proxy::GrpcConnectionPool::default();
 }
