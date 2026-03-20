@@ -26,8 +26,8 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
@@ -302,10 +302,9 @@ impl GrpcConnectionPool {
                     cert_path, e
                 ))
             })?;
-            let certs: Vec<_> =
-                rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
-                    .flatten()
-                    .collect();
+            let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
+                .flatten()
+                .collect();
 
             // Load client private key
             let key_pem = std::fs::read(key_path).map_err(|e| {
@@ -319,10 +318,7 @@ impl GrpcConnectionPool {
                     GrpcProxyError::Internal(format!("Failed to parse client key: {}", e))
                 })?
                 .ok_or_else(|| {
-                    GrpcProxyError::Internal(format!(
-                        "No private key found in {}",
-                        key_path
-                    ))
+                    GrpcProxyError::Internal(format!("No private key found in {}", key_path))
                 })?;
 
             debug!(
