@@ -713,13 +713,13 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 
 | Priority | Band | Plugins |
 |----------|------|---------|
-| 10 | Early | `cors` |
-| 100–130 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth` |
-| 200 | Authorization | `access_control` |
-| 299 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
-| 300 | Transform | `request_transformer` |
-| 400 | Response | `response_transformer` |
-| 900–920 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger` |
+| 100 | Early | `cors` |
+| 1000–1300 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth` |
+| 2000 | Authorization | `access_control` |
+| 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
+| 3000 | Transform | `request_transformer` |
+| 4000 | Response | `response_transformer` |
+| 9000–9200 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger` |
 
 Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
 

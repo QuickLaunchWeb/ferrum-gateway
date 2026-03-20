@@ -55,13 +55,13 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
-| **Early** | 0–99 | Pre-processing that must run before auth | `cors` (10) |
-| **AuthN** | 100–199 | Authentication / identity verification | `oauth2_auth` (100), `jwt_auth` (110), `key_auth` (120), `basic_auth` (130) |
-| **AuthZ** | 200–299 | Authorization & post-auth enforcement | `access_control` (200), `rate_limiting` (299) |
-| **Transform** | 300–399 | Request modification before backend call | `request_transformer` (300) |
-| **Response** | 400–499 | Response modification after backend call | `response_transformer` (400) |
-| **Custom** | 500 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 900–999 | Observability, runs outside the hot path | `stdout_logging` (900), `http_logging` (910), `transaction_debugger` (920) |
+| **Early** | 0–999 | Pre-processing that must run before auth | `cors` (100) |
+| **AuthN** | 1000–1999 | Authentication / identity verification | `oauth2_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300) |
+| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `rate_limiting` (2900) |
+| **Transform** | 3000–3999 | Request modification before backend call | `request_transformer` (3000) |
+| **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000) |
+| **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
+| **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `http_logging` (9100), `transaction_debugger` (9200) |
 
 ## Complete Execution Order
 
@@ -69,44 +69,44 @@ Given all built-in plugins enabled, the execution order is:
 
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
-| 1 | `cors` | 10 | on_request_received, after_proxy |
-| 2 | `oauth2_auth` | 100 | authenticate |
-| 3 | `jwt_auth` | 110 | authenticate |
-| 4 | `key_auth` | 120 | authenticate |
-| 5 | `basic_auth` | 130 | authenticate |
-| 6 | `access_control` | 200 | authorize |
-| 7 | `rate_limiting` | 299 | on_request_received (IP mode), authorize (consumer mode) |
-| 8 | `request_transformer` | 300 | before_proxy |
-| 9 | `response_transformer` | 400 | after_proxy |
-| 10 | `stdout_logging` | 900 | log |
-| 11 | `http_logging` | 910 | log |
-| 12 | `transaction_debugger` | 920 | on_request_received, after_proxy, log |
+| 1 | `cors` | 100 | on_request_received, after_proxy |
+| 2 | `oauth2_auth` | 1000 | authenticate |
+| 3 | `jwt_auth` | 1100 | authenticate |
+| 4 | `key_auth` | 1200 | authenticate |
+| 5 | `basic_auth` | 1300 | authenticate |
+| 6 | `access_control` | 2000 | authorize |
+| 7 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
+| 8 | `request_transformer` | 3000 | before_proxy |
+| 9 | `response_transformer` | 4000 | after_proxy |
+| 10 | `stdout_logging` | 9000 | log |
+| 11 | `http_logging` | 9100 | log |
+| 12 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
 
 ## Why This Order Matters
 
-### CORS runs first (priority 10)
+### CORS runs first (priority 100)
 
-Browser preflight (`OPTIONS`) requests must be answered before authentication. If an auth plugin ran first, it would reject the preflight with `401` and the browser would never complete the CORS handshake. CORS at priority 10 ensures preflight responses are returned immediately.
+Browser preflight (`OPTIONS`) requests must be answered before authentication. If an auth plugin ran first, it would reject the preflight with `401` and the browser would never complete the CORS handshake. CORS at priority 100 ensures preflight responses are returned immediately.
 
-### Authentication before authorization (100s before 200s)
+### Authentication before authorization (1000s before 2000s)
 
 Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer`). Authorization plugins like `access_control` then decide *whether* that consumer is allowed. Running auth first is required — ACL checks are meaningless without a verified identity.
 
-### Rate limiting runs after auth (priority 299)
+### Rate limiting runs after auth (priority 2900)
 
-Rate limiting sits at the end of the AuthZ band (priority 299) so it can enforce limits by **authenticated consumer identity**, not just by IP address. When `limit_by: "consumer"`, the plugin needs `ctx.identified_consumer` which is only available after the authenticate phase.
+Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforce limits by **authenticated consumer identity**, not just by IP address. When `limit_by: "consumer"`, the plugin needs `ctx.identified_consumer` which is only available after the authenticate phase.
 
 **Dual-phase behavior:**
 - `limit_by: "ip"` — enforces IP-based limits in `on_request_received` (phase 1, before auth). This protects auth endpoints from brute-force attacks.
 - `limit_by: "consumer"` — enforces consumer-based limits in `authorize` (phase 3, after auth). If no consumer is identified (unauthenticated request), falls back to IP-based keying.
 
-### Transforms after auth (300+)
+### Transforms after auth (3000+)
 
 Request transformers run after authentication and authorization, so they only modify requests that are already permitted. This prevents wasted transformation work on requests that will be rejected.
 
-### Logging runs last (900+)
+### Logging runs last (9000+)
 
-Logging plugins run in phase 6 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (900–920) does not impact behavior.
+Logging plugins run in phase 6 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9200) does not impact behavior.
 
 ## Adding a New Plugin
 
@@ -118,13 +118,13 @@ impl Plugin for MyPlugin {
 
     fn priority(&self) -> u16 {
         // Pick a value in the appropriate band:
-        // 0-99: pre-processing (before auth)
-        // 100-199: authentication
-        // 200-299: authorization / post-auth enforcement
-        // 300-399: request transformation
-        // 400-499: response transformation
-        // 900-999: logging
-        50  // Example: runs after CORS (10), before auth (100+)
+        // 0-999: pre-processing (before auth)
+        // 1000-1999: authentication
+        // 2000-2999: authorization / post-auth enforcement
+        // 3000-3999: request transformation
+        // 4000-4999: response transformation
+        // 9000-9999: logging
+        500  // Example: runs after CORS (100), before auth (1000+)
     }
 }
 ```
@@ -133,9 +133,9 @@ Add the constant to `src/plugins/mod.rs` in the `priority` module for discoverab
 
 ```rust
 pub mod priority {
-    pub const MY_PLUGIN: u16 = 50;
+    pub const MY_PLUGIN: u16 = 500;
     // ...
 }
 ```
 
-The default priority is `500` (the Custom band), which runs after all transforms but before logging. This is a safe default for plugins that don't have strong ordering requirements.
+The default priority is `5000` (the Custom band), which runs after all transforms but before logging. This is a safe default for plugins that don't have strong ordering requirements.

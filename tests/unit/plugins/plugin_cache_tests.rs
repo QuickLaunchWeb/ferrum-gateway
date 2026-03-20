@@ -290,7 +290,7 @@ fn test_plugins_sorted_by_priority() {
     let plugins = cache.get_plugins("p1");
 
     assert_eq!(plugins.len(), 3);
-    // CORS (10) < key_auth (120) < stdout_logging (900)
+    // CORS (100) < key_auth (1200) < stdout_logging (9000)
     assert_eq!(plugins[0].name(), "cors");
     assert_eq!(plugins[1].name(), "key_auth");
     assert_eq!(plugins[2].name(), "stdout_logging");
@@ -320,13 +320,13 @@ fn test_full_plugin_priority_chain() {
     assert_eq!(
         names,
         vec![
-            "cors",                 // 10  — Early
-            "key_auth",             // 120 — AuthN
-            "access_control",       // 200 — AuthZ
-            "rate_limiting",        // 299 — AuthZ (tail)
-            "request_transformer",  // 300 — Transform
-            "response_transformer", // 400 — Response
-            "stdout_logging",       // 900 — Logging
+            "cors",                 // 100  — Early
+            "key_auth",             // 1200 — AuthN
+            "access_control",       // 2000 — AuthZ
+            "rate_limiting",        // 2900 — AuthZ (tail)
+            "request_transformer",  // 3000 — Transform
+            "response_transformer", // 4000 — Response
+            "stdout_logging",       // 9000 — Logging
         ]
     );
 }
@@ -345,8 +345,8 @@ fn test_global_plugins_also_sorted() {
     // Even for unknown proxy (global fallback), should be sorted
     let plugins = cache.get_plugins("unknown");
     assert_eq!(plugins.len(), 2);
-    assert_eq!(plugins[0].name(), "cors");          // 10
-    assert_eq!(plugins[1].name(), "stdout_logging"); // 900
+    assert_eq!(plugins[0].name(), "cors");          // 100
+    assert_eq!(plugins[1].name(), "stdout_logging"); // 9000
 }
 
 // ---- Rate limiting state persistence ----

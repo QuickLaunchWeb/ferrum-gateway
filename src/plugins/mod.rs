@@ -90,29 +90,29 @@ pub struct TransactionSummary {
 /// phase. Plugins at the same priority have no guaranteed relative order.
 /// Gaps between bands leave room for future plugins to slot in.
 ///
-/// | Band    | Range   | Purpose                                      | Plugins                          |
-/// |---------|---------|----------------------------------------------|----------------------------------|
-/// | Early   | 0–99    | Pre-processing: CORS preflight               | cors (10)                        |
-/// | AuthN   | 100–199 | Authentication: identity verification         | oauth2 (100), jwt (110), key (120), basic (130) |
-/// | AuthZ   | 200–299 | Authorization & post-auth enforcement         | access_control (200), rate_limiting (299) |
-/// | Transform | 300–399 | Request transformation before backend       | request_transformer (300)        |
-/// | Response | 400–499 | Response transformation after backend        | response_transformer (400)       |
-/// | Logging | 900–999 | Logging & observability (fire-and-forget)     | stdout (900), http (910), debugger (920) |
+/// | Band    | Range       | Purpose                                      | Plugins                          |
+/// |---------|-------------|----------------------------------------------|----------------------------------|
+/// | Early   | 0–999       | Pre-processing: CORS preflight               | cors (100)                       |
+/// | AuthN   | 1000–1999   | Authentication: identity verification         | oauth2 (1000), jwt (1100), key (1200), basic (1300) |
+/// | AuthZ   | 2000–2999   | Authorization & post-auth enforcement         | access_control (2000), rate_limiting (2900) |
+/// | Transform | 3000–3999 | Request transformation before backend         | request_transformer (3000)       |
+/// | Response | 4000–4999  | Response transformation after backend         | response_transformer (4000)      |
+/// | Logging | 9000–9999   | Logging & observability (fire-and-forget)     | stdout (9000), http (9100), debugger (9200) |
 pub mod priority {
-    pub const CORS: u16 = 10;
-    pub const RATE_LIMITING: u16 = 299;
-    pub const OAUTH2_AUTH: u16 = 100;
-    pub const JWT_AUTH: u16 = 110;
-    pub const KEY_AUTH: u16 = 120;
-    pub const BASIC_AUTH: u16 = 130;
-    pub const ACCESS_CONTROL: u16 = 200;
-    pub const REQUEST_TRANSFORMER: u16 = 300;
-    pub const RESPONSE_TRANSFORMER: u16 = 400;
-    pub const STDOUT_LOGGING: u16 = 900;
-    pub const HTTP_LOGGING: u16 = 910;
-    pub const TRANSACTION_DEBUGGER: u16 = 920;
+    pub const CORS: u16 = 100;
+    pub const OAUTH2_AUTH: u16 = 1000;
+    pub const JWT_AUTH: u16 = 1100;
+    pub const KEY_AUTH: u16 = 1200;
+    pub const BASIC_AUTH: u16 = 1300;
+    pub const ACCESS_CONTROL: u16 = 2000;
+    pub const RATE_LIMITING: u16 = 2900;
+    pub const REQUEST_TRANSFORMER: u16 = 3000;
+    pub const RESPONSE_TRANSFORMER: u16 = 4000;
+    pub const STDOUT_LOGGING: u16 = 9000;
+    pub const HTTP_LOGGING: u16 = 9100;
+    pub const TRANSACTION_DEBUGGER: u16 = 9200;
     /// Default priority for unknown/custom plugins — runs after transforms, before logging.
-    pub const DEFAULT: u16 = 500;
+    pub const DEFAULT: u16 = 5000;
 }
 
 /// Plugin lifecycle hooks.
