@@ -40,7 +40,7 @@ A direct backend baseline (no gateway) is run first for comparison.
 
 Installing Kong natively eliminates Docker overhead and provides the fairest comparison against Ferrum. The script auto-detects a native `kong` binary and uses it automatically.
 
-**macOS:** Kong dropped Homebrew support in 2023. No native macOS binary is officially available — Docker is the only supported option on macOS. If you have a Kong binary from another source, place it on your `$PATH` and the script will use it.
+**macOS:** No native macOS binary is officially available — Docker is the only supported option on macOS. If you have a Kong binary from another source, place it on your `$PATH` and the script will use it.
 
 **Ubuntu/Debian:**
 ```bash
@@ -152,6 +152,40 @@ Per-gateway comparison of HTTP vs HTTPS performance. Shows the RPS drop and late
 - **Green cells** = best in category (highest RPS, lowest latency)
 - **Red cells** = worst in category
 
+## Initial Findings
+
+The following results were collected on macOS (Apple Silicon) with 8 threads, 100 connections, and 30-second measured runs. Kong and Tyk ran in Docker; Ferrum ran natively.
+
+### Raw Results
+
+| Gateway | Protocol | /health req/s | /api/users req/s | /health latency | /api/users latency |
+|---------|----------|--------------|-----------------|-----------------|-------------------|
+| **Baseline** (no gateway) | HTTP | 212,146 | 53,223 | 0.38 ms | 1.71 ms |
+| **Ferrum** (native) | HTTP | 97,846 | 40,610 | 0.98 ms | 2.34 ms |
+| **Ferrum** (native) | HTTPS | 93,481 | 41,240 | 1.04 ms | 2.32 ms |
+| **Kong 3.9** (Docker) | HTTP | 26,527 | 24,706 | 3.70 ms | 3.92 ms |
+| **Kong 3.9** (Docker) | HTTPS | 23,462 | 21,870 | 4.97 ms | 4.79 ms |
+| **Tyk v5.7** (Docker) | HTTP | 2,350 | 2,703 | 3.82 ms | 6.67 ms |
+| **Tyk v5.7** (Docker) | HTTPS | 3,406 | 3,772 | 2.63 ms | 1.85 ms |
+
+### Adjusting for Docker Overhead
+
+Kong and Tyk ran in Docker on macOS, which adds ~0.1–0.5 ms latency per request and reduces throughput by ~5–15% (see [Docker Overhead](#docker-overhead)). Even after generously accounting for this:
+
+| Gateway | /health req/s (adjusted) | Ferrum Advantage |
+|---------|-------------------------|-----------------|
+| **Ferrum** (native) | 97,846 | — |
+| **Kong** (Docker, +15% adjusted) | ~30,500 | **3.2x faster** |
+| **Tyk** (Docker, +15% adjusted) | ~2,700 | **36x faster** |
+
+**Key takeaways:**
+- **Ferrum is 3–4x faster than Kong** on pure proxy throughput, even after giving Kong a generous 15% Docker adjustment. The latency gap (0.98 ms vs 3.70 ms) far exceeds the ~0.1–0.5 ms Docker overhead — most of Kong's overhead is real gateway processing time.
+- **Ferrum is 36x+ faster than Tyk** on the /health endpoint. Tyk's throughput numbers are an order of magnitude lower regardless of Docker overhead adjustments.
+- **Ferrum's TLS overhead is near zero** — HTTPS throughput (93,481 req/s) is within 5% of HTTP (97,846 req/s), indicating an efficient TLS implementation.
+- **Docker overhead accounts for at most ~0.5 ms of the latency gap.** Ferrum's latency advantage over Kong is ~2.7 ms and over Tyk is ~2.8–4.9 ms — the vast majority of this is real gateway overhead, not Docker artifact.
+
+For the most apples-to-apples comparison, run on Linux where all three gateways can be installed natively.
+
 ## Adding a New Gateway
 
 To add a new gateway (e.g., Envoy, NGINX, Traefik):
@@ -180,9 +214,9 @@ When a gateway runs in Docker instead of natively, there is measurable overhead 
 **On macOS**, Docker overhead is the most significant. Docker Desktop 4.19+ improved this with the gVisor TCP/IP stack (5x faster than the older vpnkit), but the VM boundary remains. CPU scheduling variance is also ~9.5x higher in the VM compared to native.
 
 **To minimize Docker overhead:**
-1. Install Kong natively (`brew install kong` on macOS) — the script auto-detects and prefers it
-2. On Linux, use `--network host` (already configured automatically)
-3. For Tyk on macOS, acknowledge ~5-15% throughput disadvantage vs native gateways in results
+1. On Linux, install Kong and Tyk natively via package managers (see Prerequisites above)
+2. On Linux with Docker, `--network host` is used automatically (negligible overhead)
+3. On macOS, no native Kong or Tyk binaries exist — Docker overhead is unavoidable. Interpret results with the overhead estimates above in mind
 
 The HTML report's "Methodology & Caveats" section notes which gateways ran natively vs in Docker.
 
