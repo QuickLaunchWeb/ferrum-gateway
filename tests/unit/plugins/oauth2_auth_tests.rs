@@ -1,11 +1,15 @@
 //! Tests for oauth2_auth plugin
 
 use ferrum_gateway::ConsumerIndex;
-use ferrum_gateway::plugins::{Plugin, RequestContext, oauth2_auth::OAuth2Auth};
+use ferrum_gateway::plugins::{Plugin, PluginHttpClient, RequestContext, oauth2_auth::OAuth2Auth};
 use serde_json::json;
 use std::collections::HashMap;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+
+fn default_client() -> PluginHttpClient {
+    PluginHttpClient::default()
+}
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -46,26 +50,32 @@ fn create_jwt_token(claims: &serde_json::Value, secret: &str) -> String {
 
 #[tokio::test]
 async fn test_oauth2_auth_plugin_creation() {
-    let plugin = OAuth2Auth::new(&json!({}));
+    let plugin = OAuth2Auth::new(&json!({}), default_client());
     assert_eq!(plugin.name(), "oauth2_auth");
 }
 
 #[tokio::test]
 async fn test_oauth2_auth_creation_with_config() {
-    let plugin = OAuth2Auth::new(&json!({
-        "validation_mode": "jwks",
-        "expected_issuer": "https://auth.example.com",
-        "expected_audience": "my-api"
-    }));
+    let plugin = OAuth2Auth::new(
+        &json!({
+            "validation_mode": "jwks",
+            "expected_issuer": "https://auth.example.com",
+            "expected_audience": "my-api"
+        }),
+        default_client(),
+    );
     assert_eq!(plugin.name(), "oauth2_auth");
     assert_eq!(plugin.jwks_uri(), None);
 }
 
 #[tokio::test]
 async fn test_oauth2_auth_jwks_uri_config() {
-    let plugin = OAuth2Auth::new(&json!({
-        "jwks_uri": "https://auth.example.com/.well-known/jwks.json"
-    }));
+    let plugin = OAuth2Auth::new(
+        &json!({
+            "jwks_uri": "https://auth.example.com/.well-known/jwks.json"
+        }),
+        default_client(),
+    );
     assert_eq!(
         plugin.jwks_uri(),
         Some("https://auth.example.com/.well-known/jwks.json")
@@ -74,7 +84,7 @@ async fn test_oauth2_auth_jwks_uri_config() {
 
 #[tokio::test]
 async fn test_oauth2_auth_jwks_mode_valid_token() {
-    let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}));
+    let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}), default_client());
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -93,7 +103,7 @@ async fn test_oauth2_auth_jwks_mode_valid_token() {
 
 #[tokio::test]
 async fn test_oauth2_auth_jwks_mode_invalid_token() {
-    let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}));
+    let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}), default_client());
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -109,7 +119,7 @@ async fn test_oauth2_auth_jwks_mode_invalid_token() {
 
 #[tokio::test]
 async fn test_oauth2_auth_missing_bearer_token() {
-    let plugin = OAuth2Auth::new(&json!({}));
+    let plugin = OAuth2Auth::new(&json!({}), default_client());
     let consumer_index = ConsumerIndex::new(&[create_oauth2_consumer("oauth-user", "secret")]);
 
     let mut ctx = make_ctx();
@@ -121,7 +131,7 @@ async fn test_oauth2_auth_missing_bearer_token() {
 
 #[tokio::test]
 async fn test_oauth2_auth_non_bearer_scheme() {
-    let plugin = OAuth2Auth::new(&json!({}));
+    let plugin = OAuth2Auth::new(&json!({}), default_client());
     let consumer_index = ConsumerIndex::new(&[create_oauth2_consumer("oauth-user", "secret")]);
 
     let mut ctx = make_ctx();
@@ -137,7 +147,10 @@ async fn test_oauth2_auth_non_bearer_scheme() {
 #[tokio::test]
 async fn test_oauth2_auth_introspection_mode_no_url() {
     // Introspection mode without a URL should reject
-    let plugin = OAuth2Auth::new(&json!({"validation_mode": "introspection"}));
+    let plugin = OAuth2Auth::new(
+        &json!({"validation_mode": "introspection"}),
+        default_client(),
+    );
     let consumer_index = ConsumerIndex::new(&[create_oauth2_consumer("oauth-user", "secret")]);
 
     let token = create_jwt_token(&json!({"sub": "oauth-user"}), "secret");
@@ -152,7 +165,7 @@ async fn test_oauth2_auth_introspection_mode_no_url() {
 
 #[tokio::test]
 async fn test_oauth2_auth_empty_consumers() {
-    let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}));
+    let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}), default_client());
     let consumer_index = ConsumerIndex::new(&[]);
 
     let token = create_jwt_token(&json!({"sub": "nobody"}), "any-secret");
@@ -167,10 +180,13 @@ async fn test_oauth2_auth_empty_consumers() {
 
 #[tokio::test]
 async fn test_oauth2_auth_jwks_with_issuer_validation() {
-    let plugin = OAuth2Auth::new(&json!({
-        "validation_mode": "jwks",
-        "expected_issuer": "https://auth.example.com"
-    }));
+    let plugin = OAuth2Auth::new(
+        &json!({
+            "validation_mode": "jwks",
+            "expected_issuer": "https://auth.example.com"
+        }),
+        default_client(),
+    );
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -191,10 +207,13 @@ async fn test_oauth2_auth_jwks_with_issuer_validation() {
 
 #[tokio::test]
 async fn test_oauth2_auth_jwks_wrong_issuer_rejected() {
-    let plugin = OAuth2Auth::new(&json!({
-        "validation_mode": "jwks",
-        "expected_issuer": "https://auth.example.com"
-    }));
+    let plugin = OAuth2Auth::new(
+        &json!({
+            "validation_mode": "jwks",
+            "expected_issuer": "https://auth.example.com"
+        }),
+        default_client(),
+    );
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -214,10 +233,13 @@ async fn test_oauth2_auth_jwks_wrong_issuer_rejected() {
 
 #[tokio::test]
 async fn test_oauth2_auth_jwks_with_audience_validation() {
-    let plugin = OAuth2Auth::new(&json!({
-        "validation_mode": "jwks",
-        "expected_audience": "my-api"
-    }));
+    let plugin = OAuth2Auth::new(
+        &json!({
+            "validation_mode": "jwks",
+            "expected_audience": "my-api"
+        }),
+        default_client(),
+    );
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -238,7 +260,7 @@ async fn test_oauth2_auth_jwks_with_audience_validation() {
 #[tokio::test]
 async fn test_oauth2_auth_default_mode_is_jwks() {
     // Default validation_mode should be "jwks"
-    let plugin = OAuth2Auth::new(&json!({}));
+    let plugin = OAuth2Auth::new(&json!({}), default_client());
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
     let consumer_index = ConsumerIndex::new(&[consumer]);
 

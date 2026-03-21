@@ -6,6 +6,7 @@ use tracing::{debug, warn};
 
 use crate::consumer_index::ConsumerIndex;
 
+use super::utils::PluginHttpClient;
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct OAuth2Auth {
@@ -14,10 +15,11 @@ pub struct OAuth2Auth {
     jwks_uri: Option<String>,
     expected_issuer: Option<String>,
     expected_audience: Option<String>,
+    http_client: PluginHttpClient,
 }
 
 impl OAuth2Auth {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
         Self {
             validation_mode: config["validation_mode"]
                 .as_str()
@@ -27,6 +29,7 @@ impl OAuth2Auth {
             jwks_uri: config["jwks_uri"].as_str().map(|s| s.to_string()),
             expected_issuer: config["expected_issuer"].as_str().map(|s| s.to_string()),
             expected_audience: config["expected_audience"].as_str().map(|s| s.to_string()),
+            http_client,
         }
     }
 
@@ -71,8 +74,14 @@ impl Plugin for OAuth2Auth {
             "introspection" => {
                 // Token introspection via HTTP POST
                 if let Some(ref url) = self.introspection_url {
-                    let client = reqwest::Client::new();
-                    match client.post(url).form(&[("token", &token)]).send().await {
+                    match self
+                        .http_client
+                        .get()
+                        .post(url)
+                        .form(&[("token", &token)])
+                        .send()
+                        .await
+                    {
                         Ok(resp) => {
                             if let Ok(body) = resp.json::<Value>().await {
                                 let active = body["active"].as_bool().unwrap_or(false);
