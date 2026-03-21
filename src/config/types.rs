@@ -11,6 +11,7 @@ pub enum BackendProtocol {
     Ws,
     Wss,
     Grpc,
+    Grpcs,
     H3,
 }
 
@@ -22,23 +23,19 @@ impl std::fmt::Display for BackendProtocol {
             Self::Ws => write!(f, "ws"),
             Self::Wss => write!(f, "wss"),
             Self::Grpc => write!(f, "grpc"),
+            Self::Grpcs => write!(f, "grpcs"),
             Self::H3 => write!(f, "h3"),
         }
     }
 }
 
 /// Authentication mode for a proxy.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
+    #[default]
     Single,
     Multi,
-}
-
-impl Default for AuthMode {
-    fn default() -> Self {
-        Self::Single
-    }
 }
 
 /// Plugin scope (global or per-proxy).
@@ -178,6 +175,7 @@ impl GatewayConfig {
     }
 
     /// Build a sorted list of listen_paths for longest prefix matching.
+    #[allow(dead_code)]
     pub fn build_route_table(&self) -> Vec<(String, String)> {
         let mut routes: Vec<(String, String)> = self
             .proxies

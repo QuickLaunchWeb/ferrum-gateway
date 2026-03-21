@@ -3,8 +3,8 @@ use crate::config::types::{
     PluginScope, Proxy,
 };
 use chrono::Utc;
-use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use sqlx::Row;
+use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use tracing::{error, info};
 
 /// Database configuration store.
@@ -16,13 +16,41 @@ pub struct DatabaseStore {
 
 impl DatabaseStore {
     /// Connect to the database and run migrations.
+    #[allow(dead_code)]
     pub async fn connect(db_type: &str, db_url: &str) -> Result<Self, anyhow::Error> {
+        Self::connect_with_tls_config(db_type, db_url, false, None, None, None, false).await
+    }
+
+    /// Connect to the database with optional TLS configuration and run migrations.
+    pub async fn connect_with_tls_config(
+        db_type: &str,
+        db_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<Self, anyhow::Error> {
         // Install all drivers
         sqlx::any::install_default_drivers();
 
+        // Construct TLS-aware connection URL
+        let final_url = if tls_enabled && (db_type == "postgres" || db_type == "mysql") {
+            Self::build_tls_connection_url(
+                db_url,
+                db_type,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )?
+        } else {
+            db_url.to_string()
+        };
+
         let pool = AnyPoolOptions::new()
             .max_connections(10)
-            .connect(db_url)
+            .connect(&final_url)
             .await?;
 
         let store = Self {
@@ -32,8 +60,70 @@ impl DatabaseStore {
 
         store.run_migrations().await?;
 
-        info!("Database connected and migrations applied (type={})", db_type);
+        info!(
+            "Database connected and migrations applied (type={}, tls_enabled={})",
+            db_type, tls_enabled
+        );
         Ok(store)
+    }
+
+    /// Build a TLS-aware connection URL for Postgres and MySQL.
+    fn build_tls_connection_url(
+        base_url: &str,
+        db_type: &str,
+        ca_cert_path: Option<&str>,
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
+        insecure: bool,
+    ) -> Result<String, anyhow::Error> {
+        let mut url = base_url.to_string();
+
+        // Add a separator if the URL doesn't already have query parameters
+        let separator = if url.contains('?') { '&' } else { '?' };
+
+        match db_type {
+            "postgres" => {
+                if insecure {
+                    url.push_str(&format!("{}sslmode=require", separator));
+                } else {
+                    url.push_str(&format!("{}sslmode=require", separator));
+                    if let Some(ca_path) = ca_cert_path {
+                        url.push_str(&format!("&sslrootcert={}", ca_path));
+                    }
+                    if let Some(cert_path) = client_cert_path {
+                        url.push_str(&format!("&sslcert={}", cert_path));
+                    }
+                    if let Some(key_path) = client_key_path {
+                        url.push_str(&format!("&sslkey={}", key_path));
+                    }
+                }
+            }
+            "mysql" => {
+                if insecure {
+                    url.push_str(&format!("{}ssl-mode=REQUIRED", separator));
+                } else {
+                    url.push_str(&format!("{}ssl-mode=REQUIRED", separator));
+                    if let Some(ca_path) = ca_cert_path {
+                        url.push_str(&format!("&ssl-ca={}", ca_path));
+                    }
+                    if let Some(cert_path) = client_cert_path {
+                        url.push_str(&format!("&ssl-client-cert={}", cert_path));
+                    }
+                    if let Some(key_path) = client_key_path {
+                        url.push_str(&format!("&ssl-client-key={}", key_path));
+                    }
+                }
+            }
+            _ => {
+                // SQLite and others don't use network TLS
+                info!(
+                    "TLS configuration not supported for database type: {}",
+                    db_type
+                );
+            }
+        }
+
+        Ok(url)
     }
 
     /// Run schema migrations.
@@ -170,9 +260,7 @@ impl DatabaseStore {
                     .unwrap_or(80),
                 backend_path: row.try_get("backend_path").ok(),
                 strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
-                preserve_host_header: row
-                    .try_get::<i32, _>("preserve_host_header")
-                    .unwrap_or(0)
+                preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0)
                     != 0,
                 backend_connect_timeout_ms: row
                     .try_get::<i64, _>("backend_connect_timeout_ms")
@@ -352,7 +440,7 @@ impl DatabaseStore {
     pub async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         sqlx::query(
-            "UPDATE consumers SET username=?, custom_id=?, credentials=?, updated_at=? WHERE id=?"
+            "UPDATE consumers SET username=?, custom_id=?, credentials=?, updated_at=? WHERE id=?",
         )
         .bind(&consumer.username)
         .bind(&consumer.custom_id)
@@ -471,6 +559,7 @@ fn parse_protocol(s: &str) -> BackendProtocol {
         "ws" => BackendProtocol::Ws,
         "wss" => BackendProtocol::Wss,
         "grpc" => BackendProtocol::Grpc,
+        "grpcs" => BackendProtocol::Grpcs,
         _ => BackendProtocol::Http,
     }
 }

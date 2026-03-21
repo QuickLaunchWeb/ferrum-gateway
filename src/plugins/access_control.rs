@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::debug;
 
 use super::{Plugin, PluginResult, RequestContext};
@@ -64,32 +65,43 @@ impl Plugin for AccessControl {
         "access_control"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::ACCESS_CONTROL
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Check IP-based access control first
         let client_ip = &ctx.client_ip;
-        
+
         // Check if IP is explicitly blocked
-        if self.blocked_ips.iter().any(|blocked_ip| {
-            ip_matches(client_ip, blocked_ip)
-        }) {
+        if self
+            .blocked_ips
+            .iter()
+            .any(|blocked_ip| ip_matches(client_ip, blocked_ip))
+        {
             debug!("access_control: IP '{}' is blocked", client_ip);
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address is blocked"}"#.into(),
+                headers: HashMap::new(),
             };
         }
-        
+
         // Check if allowed IPs are configured and IP is not in allowed list
-        if !self.allowed_ips.is_empty() && !self.allowed_ips.iter().any(|allowed_ip| {
-            ip_matches(client_ip, allowed_ip)
-        }) {
+        if !self.allowed_ips.is_empty()
+            && !self
+                .allowed_ips
+                .iter()
+                .any(|allowed_ip| ip_matches(client_ip, allowed_ip))
+        {
             debug!("access_control: IP '{}' not in allowed list", client_ip);
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address not allowed"}"#.into(),
+                headers: HashMap::new(),
             };
         }
-        
+
         let consumer = match &ctx.identified_consumer {
             Some(c) => c,
             None => {
@@ -97,6 +109,7 @@ impl Plugin for AccessControl {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"No consumer identified"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -109,6 +122,7 @@ impl Plugin for AccessControl {
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),
+                headers: HashMap::new(),
             };
         }
 
@@ -121,6 +135,7 @@ impl Plugin for AccessControl {
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),
+                headers: HashMap::new(),
             };
         }
 
@@ -136,37 +151,37 @@ fn ip_matches(client_ip: &str, rule: &str) -> bool {
     }
 
     // CIDR notation matching
-    if rule.contains('/') {
-        if let Some((network_str, prefix_str)) = rule.split_once('/') {
-            let prefix_len: u8 = match prefix_str.parse() {
-                Ok(p) => p,
-                Err(_) => return false,
-            };
+    if rule.contains('/')
+        && let Some((network_str, prefix_str)) = rule.split_once('/')
+    {
+        let prefix_len: u8 = match prefix_str.parse() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
 
-            // Parse both IPs as IPv4
-            let client_octets = match parse_ipv4(client_ip) {
-                Some(o) => o,
-                None => return false,
-            };
-            let network_octets = match parse_ipv4(network_str) {
-                Some(o) => o,
-                None => return false,
-            };
+        // Parse both IPs as IPv4
+        let client_octets = match parse_ipv4(client_ip) {
+            Some(o) => o,
+            None => return false,
+        };
+        let network_octets = match parse_ipv4(network_str) {
+            Some(o) => o,
+            None => return false,
+        };
 
-            if prefix_len > 32 {
-                return false;
-            }
-
-            let client_bits = u32::from_be_bytes(client_octets);
-            let network_bits = u32::from_be_bytes(network_octets);
-            let mask = if prefix_len == 0 {
-                0u32
-            } else {
-                !0u32 << (32 - prefix_len)
-            };
-
-            return (client_bits & mask) == (network_bits & mask);
+        if prefix_len > 32 {
+            return false;
         }
+
+        let client_bits = u32::from_be_bytes(client_octets);
+        let network_bits = u32::from_be_bytes(network_octets);
+        let mask = if prefix_len == 0 {
+            0u32
+        } else {
+            !0u32 << (32 - prefix_len)
+        };
+
+        return (client_bits & mask) == (network_bits & mask);
     }
 
     false

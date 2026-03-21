@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use crate::consumer_index::ConsumerIndex;
@@ -30,15 +31,13 @@ impl OAuth2Auth {
     }
 
     fn extract_bearer_token(ctx: &RequestContext) -> Option<String> {
-        ctx.headers
-            .get("authorization")
-            .and_then(|v| {
-                if v.starts_with("Bearer ") || v.starts_with("bearer ") {
-                    Some(v[7..].to_string())
-                } else {
-                    None
-                }
-            })
+        ctx.headers.get("authorization").and_then(|v| {
+            if v.starts_with("Bearer ") || v.starts_with("bearer ") {
+                Some(v[7..].to_string())
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -46,6 +45,10 @@ impl OAuth2Auth {
 impl Plugin for OAuth2Auth {
     fn name(&self) -> &str {
         "oauth2_auth"
+    }
+
+    fn priority(&self) -> u16 {
+        super::priority::OAUTH2_AUTH
     }
 
     async fn authenticate(
@@ -59,6 +62,7 @@ impl Plugin for OAuth2Auth {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Missing Bearer token"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -68,25 +72,19 @@ impl Plugin for OAuth2Auth {
                 // Token introspection via HTTP POST
                 if let Some(ref url) = self.introspection_url {
                     let client = reqwest::Client::new();
-                    match client
-                        .post(url)
-                        .form(&[("token", &token)])
-                        .send()
-                        .await
-                    {
+                    match client.post(url).form(&[("token", &token)]).send().await {
                         Ok(resp) => {
                             if let Ok(body) = resp.json::<Value>().await {
                                 let active = body["active"].as_bool().unwrap_or(false);
                                 if active {
                                     // O(1) lookup by subject via ConsumerIndex
-                                    if let Some(sub) = body["sub"].as_str() {
-                                        if let Some(consumer) = consumer_index.find_by_identity(sub) {
-                                            if ctx.identified_consumer.is_none() {
-                                                ctx.identified_consumer =
-                                                    Some((*consumer).clone());
-                                            }
-                                            return PluginResult::Continue;
+                                    if let Some(sub) = body["sub"].as_str()
+                                        && let Some(consumer) = consumer_index.find_by_identity(sub)
+                                    {
+                                        if ctx.identified_consumer.is_none() {
+                                            ctx.identified_consumer = Some((*consumer).clone());
                                         }
+                                        return PluginResult::Continue;
                                     }
                                     return PluginResult::Continue;
                                 }
@@ -100,39 +98,38 @@ impl Plugin for OAuth2Auth {
                 PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Token introspection failed"}"#.into(),
+                    headers: HashMap::new(),
                 }
             }
-            "jwks" | _ => {
+            _ => {
                 // For JWKS-based validation, try consumer OAuth2 credentials with local secrets
-                debug!("OAuth2 JWKS validation mode, jwks_uri: {:?}", self.jwks_uri());
+                debug!(
+                    "OAuth2 JWKS validation mode, jwks_uri: {:?}",
+                    self.jwks_uri()
+                );
                 let consumers = consumer_index.consumers();
                 for consumer in consumers.iter() {
-                    if let Some(oauth_creds) = consumer.credentials.get("oauth2") {
-                        if let Some(secret) = oauth_creds.get("secret").and_then(|s| s.as_str()) {
-                            let key = DecodingKey::from_secret(secret.as_bytes());
-                            let mut validation = Validation::new(Algorithm::HS256);
-                            validation.validate_exp = false;
-                            validation.required_spec_claims.clear();
+                    if let Some(oauth_creds) = consumer.credentials.get("oauth2")
+                        && let Some(secret) = oauth_creds.get("secret").and_then(|s| s.as_str())
+                    {
+                        let key = DecodingKey::from_secret(secret.as_bytes());
+                        let mut validation = Validation::new(Algorithm::HS256);
+                        validation.validate_exp = false;
+                        validation.required_spec_claims.clear();
 
-                            if let Some(ref iss) = self.expected_issuer {
-                                validation.set_issuer(&[iss]);
-                            }
-                            if let Some(ref aud) = self.expected_audience {
-                                validation.set_audience(&[aud]);
-                            }
+                        if let Some(ref iss) = self.expected_issuer {
+                            validation.set_issuer(&[iss]);
+                        }
+                        if let Some(ref aud) = self.expected_audience {
+                            validation.set_audience(&[aud]);
+                        }
 
-                            if let Ok(_token_data) =
-                                decode::<Value>(&token, &key, &validation)
-                            {
-                                if ctx.identified_consumer.is_none() {
-                                    debug!(
-                                        "oauth2_auth: identified consumer '{}'",
-                                        consumer.username
-                                    );
-                                    ctx.identified_consumer = Some((**consumer).clone());
-                                }
-                                return PluginResult::Continue;
+                        if let Ok(_token_data) = decode::<Value>(&token, &key, &validation) {
+                            if ctx.identified_consumer.is_none() {
+                                debug!("oauth2_auth: identified consumer '{}'", consumer.username);
+                                ctx.identified_consumer = Some((**consumer).clone());
                             }
+                            return PluginResult::Continue;
                         }
                     }
                 }
@@ -140,6 +137,7 @@ impl Plugin for OAuth2Auth {
                 PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Invalid OAuth2 token"}"#.into(),
+                    headers: HashMap::new(),
                 }
             }
         }

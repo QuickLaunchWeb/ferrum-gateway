@@ -24,6 +24,10 @@ impl Plugin for TransactionDebugger {
         "transaction_debugger"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::TRANSACTION_DEBUGGER
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         println!("[DEBUG] === Incoming Request ===");
         println!("[DEBUG] {} {} from {}", ctx.method, ctx.path, ctx.client_ip);
@@ -41,7 +45,10 @@ impl Plugin for TransactionDebugger {
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         println!("[DEBUG] === Backend Response ===");
-        println!("[DEBUG] Status: {} for {} {}", response_status, ctx.method, ctx.path);
+        println!(
+            "[DEBUG] Status: {} for {} {}",
+            response_status, ctx.method, ctx.path
+        );
         println!("[DEBUG] Response Headers: {:?}", response_headers);
         if self.log_response_body {
             println!("[DEBUG] (Response body logging enabled)");

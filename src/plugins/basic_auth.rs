@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
@@ -21,6 +22,10 @@ impl Plugin for BasicAuth {
         "basic_auth"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::BASIC_AUTH
+    }
+
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
@@ -32,6 +37,7 @@ impl Plugin for BasicAuth {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Missing Authorization header"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -40,6 +46,7 @@ impl Plugin for BasicAuth {
             return PluginResult::Reject {
                 status_code: 401,
                 body: r#"{"error":"Invalid Basic auth format"}"#.into(),
+                headers: HashMap::new(),
             };
         }
 
@@ -50,6 +57,7 @@ impl Plugin for BasicAuth {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Invalid base64 in Basic auth"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -60,6 +68,7 @@ impl Plugin for BasicAuth {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Invalid UTF-8 in Basic auth"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -69,6 +78,7 @@ impl Plugin for BasicAuth {
             return PluginResult::Reject {
                 status_code: 401,
                 body: r#"{"error":"Invalid Basic auth format"}"#.into(),
+                headers: HashMap::new(),
             };
         }
 
@@ -76,24 +86,24 @@ impl Plugin for BasicAuth {
         let password = parts[1];
 
         // O(1) lookup by username via ConsumerIndex
-        if let Some(consumer) = consumer_index.find_by_username(username) {
-            if let Some(basic_creds) = consumer.credentials.get("basicauth") {
-                if let Some(hashed) = basic_creds.get("password_hash").and_then(|s| s.as_str()) {
-                    // Verify bcrypt hash
-                    if bcrypt::verify(password, hashed).unwrap_or(false) {
-                        if ctx.identified_consumer.is_none() {
-                            debug!("basic_auth: identified consumer '{}'", consumer.username);
-                            ctx.identified_consumer = Some((*consumer).clone());
-                        }
-                        return PluginResult::Continue;
-                    }
+        if let Some(consumer) = consumer_index.find_by_username(username)
+            && let Some(basic_creds) = consumer.credentials.get("basicauth")
+            && let Some(hashed) = basic_creds.get("password_hash").and_then(|s| s.as_str())
+        {
+            // Verify bcrypt hash
+            if bcrypt::verify(password, hashed).unwrap_or(false) {
+                if ctx.identified_consumer.is_none() {
+                    debug!("basic_auth: identified consumer '{}'", consumer.username);
+                    ctx.identified_consumer = Some((*consumer).clone());
                 }
+                return PluginResult::Continue;
             }
         }
 
         PluginResult::Reject {
             status_code: 401,
             body: r#"{"error":"Invalid credentials"}"#.into(),
+            headers: HashMap::new(),
         }
     }
 }

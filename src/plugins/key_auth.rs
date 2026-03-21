@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
@@ -23,14 +24,18 @@ impl KeyAuth {
     fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
         if self.key_location.starts_with("header:") {
             let header_name = &self.key_location["header:".len()..];
-            ctx.headers.get(&header_name.to_lowercase())
+            ctx.headers
+                .get(&header_name.to_lowercase())
                 .or_else(|| ctx.headers.get(header_name))
                 .cloned()
         } else if self.key_location.starts_with("query:") {
             let param_name = &self.key_location["query:".len()..];
             ctx.query_params.get(param_name).cloned()
         } else {
-            ctx.headers.get("x-api-key").or_else(|| ctx.headers.get("X-API-Key")).cloned()
+            ctx.headers
+                .get("x-api-key")
+                .or_else(|| ctx.headers.get("X-API-Key"))
+                .cloned()
         }
     }
 }
@@ -39,6 +44,10 @@ impl KeyAuth {
 impl Plugin for KeyAuth {
     fn name(&self) -> &str {
         "key_auth"
+    }
+
+    fn priority(&self) -> u16 {
+        super::priority::KEY_AUTH
     }
 
     async fn authenticate(
@@ -52,6 +61,7 @@ impl Plugin for KeyAuth {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Missing API key"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -68,6 +78,7 @@ impl Plugin for KeyAuth {
         PluginResult::Reject {
             status_code: 401,
             body: r#"{"error":"Invalid API key"}"#.into(),
+            headers: HashMap::new(),
         }
     }
 }

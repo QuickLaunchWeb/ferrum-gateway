@@ -1,5 +1,6 @@
 pub mod access_control;
 pub mod basic_auth;
+pub mod cors;
 pub mod http_logging;
 pub mod jwt_auth;
 pub mod key_auth;
@@ -27,7 +28,7 @@ pub struct RequestContext {
     pub path: String,
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
-    pub matched_proxy: Option<Proxy>,
+    pub matched_proxy: Option<Arc<Proxy>>,
     pub identified_consumer: Option<Consumer>,
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
@@ -59,6 +60,7 @@ pub enum PluginResult {
     Reject {
         status_code: u16,
         body: String,
+        headers: HashMap<String, String>,
     },
 }
 
@@ -82,11 +84,50 @@ pub struct TransactionSummary {
     pub metadata: HashMap<String, String>,
 }
 
+/// Plugin execution priority bands.
+///
+/// Plugins are sorted by priority (lowest runs first) within each lifecycle
+/// phase. Plugins at the same priority have no guaranteed relative order.
+/// Gaps between bands leave room for future plugins to slot in.
+///
+/// | Band    | Range       | Purpose                                      | Plugins                          |
+/// |---------|-------------|----------------------------------------------|----------------------------------|
+/// | Early   | 0–999       | Pre-processing: CORS preflight               | cors (100)                       |
+/// | AuthN   | 1000–1999   | Authentication: identity verification         | oauth2 (1000), jwt (1100), key (1200), basic (1300) |
+/// | AuthZ   | 2000–2999   | Authorization & post-auth enforcement         | access_control (2000), rate_limiting (2900) |
+/// | Transform | 3000–3999 | Request transformation before backend         | request_transformer (3000)       |
+/// | Response | 4000–4999  | Response transformation after backend         | response_transformer (4000)      |
+/// | Logging | 9000–9999   | Logging & observability (fire-and-forget)     | stdout (9000), http (9100), debugger (9200) |
+pub mod priority {
+    pub const CORS: u16 = 100;
+    pub const OAUTH2_AUTH: u16 = 1000;
+    pub const JWT_AUTH: u16 = 1100;
+    pub const KEY_AUTH: u16 = 1200;
+    pub const BASIC_AUTH: u16 = 1300;
+    pub const ACCESS_CONTROL: u16 = 2000;
+    pub const RATE_LIMITING: u16 = 2900;
+    pub const REQUEST_TRANSFORMER: u16 = 3000;
+    pub const RESPONSE_TRANSFORMER: u16 = 4000;
+    pub const STDOUT_LOGGING: u16 = 9000;
+    pub const HTTP_LOGGING: u16 = 9100;
+    pub const TRANSACTION_DEBUGGER: u16 = 9200;
+    /// Default priority for unknown/custom plugins — runs after transforms, before logging.
+    pub const DEFAULT: u16 = 5000;
+}
+
 /// Plugin lifecycle hooks.
 #[async_trait]
 pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
+
+    /// Returns the execution priority (lower = runs first).
+    ///
+    /// Plugins are sorted by priority within each lifecycle phase.
+    /// See [`priority`] module for standard bands and assignments.
+    fn priority(&self) -> u16 {
+        priority::DEFAULT
+    }
 
     /// Called when a request is first received (before routing).
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
@@ -135,20 +176,21 @@ pub fn create_plugin(name: &str, config: &Value) -> Option<Arc<dyn Plugin>> {
     match name {
         "stdout_logging" => Some(Arc::new(stdout_logging::StdoutLogging::new(config))),
         "http_logging" => Some(Arc::new(http_logging::HttpLogging::new(config))),
-        "transaction_debugger" => Some(Arc::new(
-            transaction_debugger::TransactionDebugger::new(config),
-        )),
+        "transaction_debugger" => Some(Arc::new(transaction_debugger::TransactionDebugger::new(
+            config,
+        ))),
         "oauth2_auth" => Some(Arc::new(oauth2_auth::OAuth2Auth::new(config))),
         "jwt_auth" => Some(Arc::new(jwt_auth::JwtAuth::new(config))),
         "key_auth" => Some(Arc::new(key_auth::KeyAuth::new(config))),
         "basic_auth" => Some(Arc::new(basic_auth::BasicAuth::new(config))),
+        "cors" => Some(Arc::new(cors::CorsPlugin::new(config))),
         "access_control" => Some(Arc::new(access_control::AccessControl::new(config))),
-        "request_transformer" => Some(Arc::new(
-            request_transformer::RequestTransformer::new(config),
-        )),
-        "response_transformer" => Some(Arc::new(
-            response_transformer::ResponseTransformer::new(config),
-        )),
+        "request_transformer" => Some(Arc::new(request_transformer::RequestTransformer::new(
+            config,
+        ))),
+        "response_transformer" => Some(Arc::new(response_transformer::ResponseTransformer::new(
+            config,
+        ))),
         "rate_limiting" => Some(Arc::new(rate_limiting::RateLimiting::new(config))),
         _ => {
             tracing::warn!("Unknown plugin: {}", name);
@@ -167,6 +209,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "jwt_auth",
         "key_auth",
         "basic_auth",
+        "cors",
         "access_control",
         "request_transformer",
         "response_transformer",

@@ -110,6 +110,8 @@ Ferrum Gateway supports a configurable read-only mode for the Admin API, providi
 
 ## Installation
 
+### From Source
+
 ```bash
 # Clone the repository
 git clone https://github.com/your-org/ferrum-gateway.git
@@ -120,6 +122,48 @@ cargo build --release
 
 # The binary is at target/release/ferrum-gateway
 ```
+
+### From Release Binaries
+
+Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/your-org/ferrum-gateway/releases) page:
+
+```bash
+# Download the latest release for your platform
+# Linux x86_64
+wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-linux-x86_64
+chmod +x ferrum-gateway-linux-x86_64
+
+# macOS x86_64 (Intel)
+wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-x86_64
+chmod +x ferrum-gateway-macos-x86_64
+
+# macOS ARM64 (Apple Silicon)
+wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-aarch64
+chmod +x ferrum-gateway-macos-aarch64
+
+# Verify checksum
+sha256sum -c ferrum-gateway-linux-x86_64.sha256
+```
+
+### Using Docker
+
+```bash
+# Pull and run the latest Docker image
+docker pull your-registry/ferrum-gateway:latest
+
+docker run -d \
+  --name ferrum-gateway \
+  -p 8000:8000 \
+  -p 9000:9000 \
+  -e FERRUM_MODE=database \
+  -e FERRUM_DB_TYPE=sqlite \
+  -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
+  -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
+  -v ferrum_data:/data \
+  your-registry/ferrum-gateway:latest
+```
+
+See [Docker Deployment Guide](docs/docker.md) for comprehensive Docker and Docker Compose examples.
 
 ## Getting Started
 
@@ -175,6 +219,80 @@ FERRUM_DP_GRPC_AUTH_TOKEN="<HS256-JWT-signed-with-grpc-secret>" \
 cargo run --release
 ```
 
+## Docker Deployment
+
+Ferrum Gateway can be deployed using Docker or Docker Compose for development, testing, and production.
+
+### Quick Start with Docker Compose
+
+**SQLite Single-Node** (simplest):
+```bash
+docker-compose up ferrum-sqlite
+```
+
+**PostgreSQL Single-Node** (production-ready):
+```bash
+docker-compose --profile postgres up ferrum-postgres
+```
+
+**CP/DP Distributed** (horizontal scaling):
+```bash
+docker-compose --profile cp-dp up
+```
+
+### Building Docker Image
+
+```bash
+# Build locally
+docker build -t ferrum-gateway:latest .
+
+# Build for specific platform
+docker buildx build --platform linux/amd64,linux/arm64 -t ferrum-gateway:latest .
+```
+
+**Image Features**:
+- Multi-stage build for minimal size (~200MB)
+- Non-root user execution
+- Health check endpoint
+- Comprehensive metadata labels
+
+See [Docker Deployment Guide](docs/docker.md) for detailed examples, configuration, and production best practices.
+
+## CI/CD Pipeline
+
+Ferrum Gateway includes automated CI/CD workflows for testing, building, and releasing.
+
+### Automated Testing & Builds
+
+On every push to `main` and pull request:
+- Run all tests (`cargo test`)
+- Check code quality (clippy, fmt)
+- Build release binaries for Linux x86_64, macOS x86_64, and macOS ARM64
+- Build Docker image (pushed to registry on main branch only)
+
+### Automated Releases
+
+When you create a version tag (e.g., `v0.2.0`):
+1. Builds optimized binaries for all platforms (Linux x86_64/ARM64, macOS x86_64/ARM64)
+2. Generates SHA256 checksums
+3. Creates GitHub Release with binaries, checksums, and release notes
+4. Builds Docker image with version tag
+
+### Creating a Release
+
+```bash
+# 1. Update version in Cargo.toml
+# 2. Commit changes to main branch
+# 3. Create and push version tag
+git tag -a v0.2.0 -m "Release version 0.2.0"
+git push origin v0.2.0
+
+# Binaries automatically available at:
+# https://github.com/your-org/ferrum-gateway/releases/tag/v0.2.0
+```
+
+See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets configuration, and customization.
+
 ## Configuration
 
 ### Environment Variables
@@ -198,6 +316,15 @@ cargo run --release
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls |
 | `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
 | `FERRUM_DB_INCREMENTAL_POLLING` | No | `true` | Enable incremental (delta) DB polling |
+| `FERRUM_DB_TLS_ENABLED` | No | `false` | Enable TLS for database connections |
+| `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database TLS verification |
+| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS |
+| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS |
+| `FERRUM_DB_TLS_INSECURE` | No | `false` | Skip certificate verification for database TLS (testing only) |
+| `FERRUM_DB_SSL_MODE` | No | — | Database SSL mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
+| `FERRUM_DB_SSL_ROOT_CERT` | No | — | Path to CA certificate for database server verification |
+| `FERRUM_DB_SSL_CLIENT_CERT` | No | — | Path to client certificate for database mTLS |
+| `FERRUM_DB_SSL_CLIENT_KEY` | No | — | Path to client private key for database mTLS |
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | CP mode | — | gRPC listen address (e.g., `0.0.0.0:50051`) |
 | `FERRUM_CP_GRPC_JWT_SECRET` | CP mode | — | HS256 secret for DP node authentication |
@@ -226,6 +353,9 @@ cargo run --release
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to admin client CA bundle for mTLS verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Disable admin TLS certificate verification (testing only) |
 | `FERRUM_BACKEND_TLS_NO_VERIFY` | No | `false` | Disable backend TLS certificate verification (testing only) |
+| `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
+| `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
+| `FERRUM_HTTP3_MAX_STREAMS` | No | `100` | Maximum concurrent HTTP/3 streams per connection |
 
 ### Configuration File Format (File Mode)
 
@@ -278,7 +408,7 @@ Connection pooling uses a **hybrid configuration** with global defaults and per-
 #### Global Environment Variables
 ```bash
 # Set global defaults (optional - shown with defaults)
-FERRUM_POOL_MAX_IDLE_PER_HOST=10
+FERRUM_POOL_MAX_IDLE_PER_HOST=64
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=90
 FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
 FERRUM_POOL_ENABLE_HTTP2=true
@@ -292,7 +422,7 @@ FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS=45
 proxies:
   - id: "high-traffic-api"
     # Override specific settings for this proxy
-    pool_max_idle_per_host: 50
+    pool_max_idle_per_host: 128
     pool_enable_http2: false
     pool_tcp_keepalive_seconds: 30
     pool_http2_keep_alive_interval_seconds: 15
@@ -312,13 +442,48 @@ proxies:
 
 | Setting | Global Default | Description |
 |---------|----------------|-------------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `10` | Maximum idle connections per backend host |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `64` | Maximum idle connections per backend host (min: 4, max: 1024) |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Seconds before idle connections are closed |
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse |
 | `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported |
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
+
+### Sizing `pool_max_idle_per_host`
+
+This is the single most important pool setting for performance and reliability.
+It controls how many idle backend connections are kept alive and ready for reuse
+per backend host. Values that are too low cause connection churn under load (new
+TCP handshakes per request), while values that are too high waste file
+descriptors and memory.
+
+**Safety bounds:** The gateway enforces a minimum of **4** and a maximum of
+**1024**. Values outside this range are automatically clamped with a warning in
+the logs.
+
+#### Recommended values by workload
+
+| Workload | Expected Concurrency | Recommended Value | Notes |
+|----------|---------------------|-------------------|-------|
+| Low-traffic internal API | < 20 concurrent requests | `16`–`32` | Default of 64 is fine; keep-alive reuses connections efficiently |
+| Standard production API | 20–100 concurrent requests | `64`–`128` | Match or slightly exceed your expected peak concurrency per backend host |
+| High-traffic public API | 100–500 concurrent requests | `128`–`256` | Higher values prevent connection churn at peak; monitor backend capacity |
+| Health checks / monitoring | Low volume, high frequency | `16`–`32` | Small responses finish quickly; fewer idle connections needed |
+| WebSocket services | Long-lived connections | `16`–`64` | WebSocket connections are persistent; pool mainly holds upgrade handshakes |
+
+#### How to choose
+
+1. **Start with the default (64).** This handles most workloads well.
+2. **Match your expected peak concurrency.** If your gateway handles 200
+   concurrent requests to a single backend, set the value to at least `200`.
+   Idle connections beyond the limit are closed, so requests that arrive when no
+   idle connection is available must open a new TCP connection, adding latency.
+3. **Monitor for connection churn.** If your logs show frequent
+   "Backend request failed" errors under load, increase this value.
+4. **Do not exceed your backend's capacity.** Setting this to 1024 does not help
+   if your backend can only handle 100 concurrent connections — it just moves
+   the bottleneck.
 
 ### Timeout Mechanisms Explained
 
@@ -350,7 +515,7 @@ proxies:
 #### HTTP/HTTPS APIs
 ```bash
 # Global environment
-FERRUM_POOL_MAX_IDLE_PER_HOST=25
+FERRUM_POOL_MAX_IDLE_PER_HOST=128
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
 FERRUM_POOL_ENABLE_HTTP2=true
 ```
@@ -358,7 +523,7 @@ FERRUM_POOL_ENABLE_HTTP2=true
 #### WebSocket Services
 ```yaml
 # Per-proxy override for WS/WSS
-pool_max_idle_per_host: 10
+pool_max_idle_per_host: 32
 pool_idle_timeout_seconds: 300
 pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
 ```
@@ -366,27 +531,26 @@ pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
 #### Auth-Protected APIs
 ```yaml
 # Per-proxy override for auth-heavy services
-pool_max_idle_per_host: 15
+pool_max_idle_per_host: 64
 pool_enable_http2: false  # Better compatibility with auth plugins
 ```
 
 ### Performance Impact
 
-In performance tests, connection pooling provides:
-- **~150,000 RPS** vs ~56,000 RPS direct backend access
-- **~600μs latency** vs ~1.6ms without pooling
+In performance tests (8 threads, 100 connections, 30 seconds), connection
+pooling with properly tuned `pool_max_idle_per_host` provides:
+- **~97,000 RPS** for lightweight health checks through the gateway
+- **~85,000 RPS** for API proxy vs ~54,000 RPS direct backend access
+- **Sub-millisecond p50 latency** for health checks, ~1.15ms for API proxy
 - **Zero errors** under sustained load
 
 ### Performance Testing
 
-Ferrum Gateway includes a comprehensive performance testing suite in the `perftest/` directory:
+Ferrum Gateway includes a comprehensive performance testing suite in the `tests/performance/` directory:
 
 ```bash
-# Quick performance test
-cd perftest && ./quick_test.sh
-
 # Full performance test suite with HTML report
-cd perftest && ./run_perf_test.sh
+cd tests/performance && ./run_perf_test.sh
 
 # Custom test parameters
 WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./run_perf_test.sh
@@ -399,7 +563,7 @@ The testing suite provides:
 - **Configurable load testing** with wrk
 - **Protocol support** for HTTP, HTTPS, and WebSockets
 
-See `perftest/README.md` for detailed usage instructions.
+See `tests/performance/README.md` for detailed usage instructions.
 
 ### Database Schema
 
@@ -523,8 +687,12 @@ Returns:
 
 ```bash
 curl http://localhost:9000/health
-# Returns: {"status": "ok"}
+# or equivalently:
+curl http://localhost:9000/status
+# Returns: {"status": "ok", "timestamp": "...", "mode": "database"}
 ```
+
+Both `/health` and `/status` return the same response and do not require JWT authentication, making them suitable for load balancer health probes and monitoring systems.
 
 ## Plugin System
 
@@ -532,12 +700,28 @@ curl http://localhost:9000/health
 
 Plugins execute in a defined pipeline for each request:
 
-1. **`on_request_received`** — Called immediately when a request arrives (rate limiting executes here)
+1. **`on_request_received`** — Called immediately when a request arrives (CORS preflight, rate limiting)
 2. **`authenticate`** — Identifies the consumer (JWT, API Key, Basic Auth, OAuth2)
 3. **`authorize`** — Checks consumer permissions (Access Control)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`after_proxy`** — Modifies the response from the backend (Response Transformer)
+5. **`after_proxy`** — Modifies the response from the backend (Response Transformer, CORS headers)
 6. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
+
+### Execution Order
+
+Within each phase, plugins run in **priority order** (lowest number first). This ensures predictable behavior — for example, CORS preflight responses are sent before authentication can reject them, and rate limiting fires before expensive auth operations.
+
+| Priority | Band | Plugins |
+|----------|------|---------|
+| 100 | Early | `cors` |
+| 1000–1300 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth` |
+| 2000 | Authorization | `access_control` |
+| 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
+| 3000 | Transform | `request_transformer` |
+| 4000 | Response | `response_transformer` |
+| 9000–9200 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger` |
+
+Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
 
 ### Global vs. Proxy Scope
 
@@ -659,6 +843,34 @@ Authorizes requests based on IP address, CIDR range, and/or the identified consu
 | `allowed_consumers` | String[] | Usernames allowed access (empty = allow all) |
 | `disallowed_consumers` | String[] | Usernames explicitly denied |
 
+#### `cors`
+
+Handles Cross-Origin Resource Sharing (CORS) at the gateway level. Intercepts preflight `OPTIONS` requests, validates origins and methods against configured allow-lists, and injects CORS response headers on actual cross-origin requests. Disallowed origins or methods are rejected with `403 Forbidden`.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `allowed_origins` | String[] | `["*"]` | Permitted origins; `["*"]` allows any origin |
+| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Methods returned in preflight `Access-Control-Allow-Methods` |
+| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Headers returned in preflight `Access-Control-Allow-Headers` |
+| `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
+| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` (cannot combine with wildcard origins) |
+| `max_age` | u64 | `86400` | Preflight cache duration in seconds |
+| `preflight_continue` | bool | `false` | Pass preflight requests to backend instead of short-circuiting |
+
+```yaml
+plugin_name: cors
+config:
+  allowed_origins: ["https://app.example.com", "https://admin.example.com"]
+  allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+  allowed_headers: ["Authorization", "Content-Type", "X-Request-ID"]
+  exposed_headers: ["X-Request-ID", "X-RateLimit-Remaining"]
+  allow_credentials: true
+  max_age: 3600
+```
+
+See [docs/cors_plugin.md](docs/cors_plugin.md) for detailed configuration, request flow diagrams, and troubleshooting.
+
 #### `request_transformer`
 
 Modifies request headers and query parameters before proxying.
@@ -688,15 +900,19 @@ config:
 
 #### `rate_limiting`
 
-Enforces request rate limits per time window. State is maintained in-memory per node.
+Enforces request rate limits per time window. Supports limiting by client IP address or by authenticated consumer identity. State is maintained in-memory per node.
 
 **Config**:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `limit_by` | String | `ip` | Rate limit key: `consumer` or `ip` |
+| `limit_by` | String | `ip` | Rate limit key: `ip` (client IP) or `consumer` (authenticated consumer username) |
 | `requests_per_second` | u64 (optional) | — | Max requests per second |
 | `requests_per_minute` | u64 (optional) | — | Max requests per minute |
 | `requests_per_hour` | u64 (optional) | — | Max requests per hour |
+
+**Behavior by mode:**
+- `limit_by: "ip"` — Enforces limits in the `on_request_received` phase (before authentication), keyed by client IP. This protects auth endpoints from brute-force attacks.
+- `limit_by: "consumer"` — Enforces limits in the `authorize` phase (after authentication), keyed by the authenticated consumer's username. If no consumer is identified, falls back to client IP as the key.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
@@ -720,7 +936,42 @@ Set `backend_protocol: ws` or `wss`. Ferrum handles the HTTP Upgrade and proxies
 
 ### gRPC Proxying
 
-Set `backend_protocol: grpc`. Ferrum proxies gRPC requests over HTTP/2.
+Set `backend_protocol: grpc` (cleartext h2c) or `grpcs` (TLS with ALPN h2). Ferrum uses hyper's HTTP/2 client directly to proxy gRPC requests with full trailer support (`grpc-status`, `grpc-message`).
+
+**How it works**: gRPC runs on HTTP/2, so the gateway transparently forwards HTTP/2 frames — it does not need to understand protobuf. gRPC metadata maps directly to HTTP/2 headers, so all existing auth plugins (JWT, API key, Basic, OAuth2) work unchanged with gRPC. Clients send `authorization: Bearer <token>` as gRPC metadata, which plugins already inspect.
+
+**Configuration example** (YAML):
+```yaml
+proxies:
+  - id: grpc-users
+    listen_path: /grpc
+    backend_protocol: grpc        # h2c (cleartext HTTP/2)
+    backend_host: grpc-backend
+    backend_port: 50051
+    strip_listen_path: true
+    plugins:
+      - name: jwt_auth             # Works with gRPC metadata
+        config:
+          secret: "my-jwt-secret"
+```
+
+**Configuration example** (gRPC over TLS):
+```yaml
+proxies:
+  - id: grpc-secure
+    listen_path: /grpc
+    backend_protocol: grpcs       # HTTP/2 over TLS with ALPN
+    backend_host: grpc-backend
+    backend_port: 443
+```
+
+**Protocol details**:
+- `grpc` — h2c (cleartext HTTP/2 via prior knowledge handshake). Use for internal backends without TLS.
+- `grpcs` — HTTP/2 over TLS with ALPN `h2` negotiation. Use for external or secured backends.
+- gRPC error responses follow the spec: HTTP 200 with `grpc-status` and `grpc-message` headers.
+- When the backend is unavailable, the gateway returns `grpc-status: 14` (UNAVAILABLE).
+- When the backend times out, the gateway returns `grpc-status: 4` (DEADLINE_EXCEEDED).
+- The frontend listener accepts both HTTP/1.1 and h2c connections, so gRPC clients can connect to the standard HTTP port without TLS.
 
 ## Resilience & Caching
 
@@ -754,6 +1005,20 @@ All modes maintain an in-memory cache of the last valid configuration. If the co
 - Non-blocking startup warmup resolves all backend hostnames
 - See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
 
+### HTTP/3 (QUIC) Support
+
+Ferrum supports HTTP/3 over QUIC on the same port as HTTPS. HTTP/3 requires TLS to be configured.
+
+```bash
+FERRUM_PROXY_TLS_CERT_PATH=/path/to/cert.pem \
+FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem \
+FERRUM_ENABLE_HTTP3=true \
+FERRUM_HTTP3_IDLE_TIMEOUT=30 \
+FERRUM_HTTP3_MAX_STREAMS=100
+```
+
+When enabled, the gateway listens for QUIC connections on `FERRUM_PROXY_HTTPS_PORT` alongside the standard HTTPS listener. Clients that support HTTP/3 (e.g., `curl --http3`) can connect via QUIC for lower-latency connections with built-in multiplexing and improved head-of-line blocking behavior.
+
 ## Security
 
 ### TLS Configuration
@@ -766,6 +1031,89 @@ FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem \
 FERRUM_ADMIN_TLS_CERT_PATH=/path/to/admin-cert.pem \
 FERRUM_ADMIN_TLS_KEY_PATH=/path/to/admin-key.pem
 ```
+
+### Database TLS/SSL
+
+Ferrum supports TLS encryption for PostgreSQL and MySQL database connections. There are two configuration approaches — use whichever fits your workflow.
+
+#### Option 1: `FERRUM_DB_SSL_*` variables (recommended)
+
+These variables give you granular control over SSL mode and are translated into connection string parameters automatically, so you don't need to embed them in `FERRUM_DB_URL`.
+
+**PostgreSQL with server certificate verification:**
+```bash
+FERRUM_DB_TYPE=postgres \
+FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
+FERRUM_DB_SSL_MODE=verify-ca \
+FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem
+```
+
+**PostgreSQL with mutual TLS (mTLS):**
+```bash
+FERRUM_DB_TYPE=postgres \
+FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
+FERRUM_DB_SSL_MODE=verify-full \
+FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem \
+FERRUM_DB_SSL_CLIENT_CERT=/certs/client.pem \
+FERRUM_DB_SSL_CLIENT_KEY=/certs/client-key.pem
+```
+
+**MySQL with TLS:**
+```bash
+FERRUM_DB_TYPE=mysql \
+FERRUM_DB_URL="mysql://user:pass@db.example.com/ferrum" \
+FERRUM_DB_SSL_MODE=require \
+FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem
+```
+
+**SSL mode values:**
+
+| Mode | Description |
+|------|-------------|
+| `disable` | No SSL |
+| `prefer` | Try SSL, fall back to plain |
+| `require` | Require SSL, skip CA verification |
+| `verify-ca` | Require SSL, verify server CA certificate |
+| `verify-full` | Require SSL, verify CA and hostname |
+
+> **Note:** SQLite connections ignore SSL settings (file-based, no network TLS). MySQL mode values are automatically mapped to the MySQL-native format (e.g., `require` → `REQUIRED`, `verify-ca` → `VERIFY_CA`).
+
+#### Option 2: `FERRUM_DB_TLS_*` variables
+
+A simpler toggle-based approach. Set `FERRUM_DB_TLS_ENABLED=true` to enable TLS with `sslmode=require` (PostgreSQL) or `ssl-mode=REQUIRED` (MySQL), then optionally provide certificate paths.
+
+```bash
+FERRUM_DB_TYPE=postgres \
+FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
+FERRUM_DB_TLS_ENABLED=true \
+FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem \
+FERRUM_DB_TLS_CLIENT_CERT_PATH=/certs/client.pem \
+FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client-key.pem
+```
+
+Set `FERRUM_DB_TLS_INSECURE=true` to skip certificate verification (testing only).
+
+> **Note:** If both `FERRUM_DB_SSL_*` and `FERRUM_DB_TLS_*` variables are set, the SSL parameters are appended to the connection URL first, then the TLS layer applies on top. Use one approach or the other to avoid confusion.
+
+### Frontend mTLS (Client Certificate Verification)
+
+Ferrum can require clients to present a valid TLS certificate when connecting to the proxy HTTPS listener. This is configured by providing a CA bundle containing the trusted certificate authorities used to verify client certificates.
+
+```bash
+# Enable frontend mTLS on the proxy listener
+FERRUM_PROXY_TLS_CERT_PATH=/certs/server.pem \
+FERRUM_PROXY_TLS_KEY_PATH=/certs/server-key.pem \
+FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH=/certs/client-ca-bundle.pem
+```
+
+Clients must then present a valid certificate signed by one of the CAs in the bundle:
+
+```bash
+curl --cert /certs/client.pem --key /certs/client-key.pem \
+  https://gateway.example.com:8443/api/v1/resource
+```
+
+The admin API supports the same pattern with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` for mTLS on the admin HTTPS listener.
 
 ### Backend mTLS
 

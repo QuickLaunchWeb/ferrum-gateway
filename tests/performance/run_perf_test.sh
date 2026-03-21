@@ -71,7 +71,7 @@ start_backend() {
 
     # Wait for backend to start with retry
     for i in 1 2 3 4 5; do
-        if curl -sf "http://localhost:$BACKEND_PORT/health" > /dev/null 2>&1; then
+        if curl -sf "http://127.0.0.1:$BACKEND_PORT/health" > /dev/null 2>&1; then
             echo -e "${GREEN}Backend server started (PID: $BACKEND_PID)${NC}"
             return
         fi
@@ -86,10 +86,15 @@ start_backend() {
 start_gateway() {
     echo -e "${YELLOW}Starting gateway on port $GATEWAY_PORT...${NC}"
     cd "$PROJECT_ROOT"
-    # Set global connection pool defaults optimized for performance testing
+    # ⚠️  IMPORTANT: These pool settings are tuned for performance benchmarking.
+    # FERRUM_POOL_MAX_IDLE_PER_HOST MUST be kept at 200 (or higher) to avoid
+    # connection churn under high-concurrency wrk load. Lowering this value
+    # causes severe throughput degradation and non-2xx errors under load as the
+    # pool exhausts idle connections and must re-establish them mid-benchmark.
+    # DO NOT reduce FERRUM_POOL_MAX_IDLE_PER_HOST below 200 for perf testing.
     FERRUM_MODE=file \
     FERRUM_FILE_CONFIG_PATH="$PERF_DIR/perf_config.yaml" \
-    FERRUM_POOL_MAX_IDLE_PER_HOST=15 \
+    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
     FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
     FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
     FERRUM_POOL_ENABLE_HTTP2=false \
@@ -98,7 +103,7 @@ start_gateway() {
 
     # Wait for gateway to start with retry — verify it's actually our process
     for i in 1 2 3 4 5; do
-        if kill -0 $GATEWAY_PID 2>/dev/null && curl -sf "http://localhost:$GATEWAY_PORT/health" > /dev/null 2>&1; then
+        if kill -0 $GATEWAY_PID 2>/dev/null && curl -sf "http://127.0.0.1:$GATEWAY_PORT/health" > /dev/null 2>&1; then
             echo -e "${GREEN}Gateway started (PID: $GATEWAY_PID)${NC}"
             return
         fi
@@ -117,10 +122,10 @@ run_load_tests() {
     
     # Test 1: Health check endpoint (lightweight)
     echo -e "${BLUE}📊 Test 1: Health Check Endpoint${NC}"
-    echo "URL: http://localhost:$GATEWAY_PORT/health"
+    echo "URL: http://127.0.0.1:$GATEWAY_PORT/health"
     wrk -t$WRK_THREADS -c$WRK_CONNECTIONS -d$WRK_DURATION --latency \
         -s "$PERF_DIR/health_test.lua" \
-        "http://localhost:$GATEWAY_PORT/health" \
+        "http://127.0.0.1:$GATEWAY_PORT/health" \
         > "$PERF_DIR/health_results.txt"
     
     echo -e "${GREEN}✅ Health check test completed${NC}"
@@ -129,10 +134,10 @@ run_load_tests() {
     
     # Test 2: Users API endpoint (moderate load)
     echo -e "${BLUE}📊 Test 2: Users API Endpoint${NC}"
-    echo "URL: http://localhost:$GATEWAY_PORT/api/users"
+    echo "URL: http://127.0.0.1:$GATEWAY_PORT/api/users"
     wrk -t$WRK_THREADS -c$WRK_CONNECTIONS -d$WRK_DURATION --latency \
         -s "$PERF_DIR/users_test.lua" \
-        "http://localhost:$GATEWAY_PORT/api/users" \
+        "http://127.0.0.1:$GATEWAY_PORT/api/users" \
         > "$PERF_DIR/users_results.txt"
     
     echo -e "${GREEN}✅ Users API test completed${NC}"
@@ -141,10 +146,10 @@ run_load_tests() {
     
     # Test 3: Direct backend test (baseline)
     echo -e "${BLUE}📊 Test 3: Direct Backend (Baseline)${NC}"
-    echo "URL: http://localhost:$BACKEND_PORT/api/users"
+    echo "URL: http://127.0.0.1:$BACKEND_PORT/api/users"
     wrk -t$WRK_THREADS -c$WRK_CONNECTIONS -d$WRK_DURATION --latency \
         -s "$PERF_DIR/backend_test.lua" \
-        "http://localhost:$BACKEND_PORT/api/users" \
+        "http://127.0.0.1:$BACKEND_PORT/api/users" \
         > "$PERF_DIR/backend_results.txt"
     
     echo -e "${GREEN}✅ Direct backend test completed${NC}"
