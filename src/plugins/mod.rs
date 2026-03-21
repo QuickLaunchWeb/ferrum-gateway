@@ -5,14 +5,14 @@ pub mod http_logging;
 pub mod jwt_auth;
 pub mod key_auth;
 pub mod oauth2_auth;
-pub mod plugin_http_client;
 pub mod rate_limiting;
 pub mod request_transformer;
 pub mod response_transformer;
 pub mod stdout_logging;
 pub mod transaction_debugger;
+pub mod utils;
 
-pub use plugin_http_client::PluginHttpClient;
+pub use utils::PluginHttpClient;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -206,7 +206,10 @@ pub fn create_plugin_with_http_client(
         "transaction_debugger" => Some(Arc::new(transaction_debugger::TransactionDebugger::new(
             config,
         ))),
-        "oauth2_auth" => Some(Arc::new(oauth2_auth::OAuth2Auth::new(config))),
+        "oauth2_auth" => Some(Arc::new(oauth2_auth::OAuth2Auth::new(
+            config,
+            http_client.clone(),
+        ))),
         "jwt_auth" => Some(Arc::new(jwt_auth::JwtAuth::new(config))),
         "key_auth" => Some(Arc::new(key_auth::KeyAuth::new(config))),
         "basic_auth" => Some(Arc::new(basic_auth::BasicAuth::new(config))),
