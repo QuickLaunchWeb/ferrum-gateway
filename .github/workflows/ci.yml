@@ -100,12 +100,23 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Build gateway binary for end-to-end tests
+        run: cargo build --bin ferrum-gateway
+
+      - name: Run end-to-end tests (gRPC, WebSocket, file mode, database, CP/DP)
+        run: cargo test --tests --verbose --all-features -- --ignored
+        env:
+          RUST_BACKTRACE: 1
+        timeout-minutes: 15
+
       - name: Summarize test results
         if: always()
         run: |
           echo "## Functional Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All integration and functional tests from \`tests/\` directory executed." >> $GITHUB_STEP_SUMMARY
+          echo "All integration, functional, and end-to-end tests executed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Includes \`--ignored\` tests: gRPC proxying, WebSocket proxying, file mode reload, database mode, and CP/DP sync." >> $GITHUB_STEP_SUMMARY
 
   lint:
     name: Lint
