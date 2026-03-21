@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::warn;
 
-use super::plugin_http_client::PluginHttpClient;
+use super::utils::PluginHttpClient;
 use super::{Plugin, TransactionSummary};
 
 pub struct HttpLogging {
