@@ -103,7 +103,11 @@ impl ProxyState {
             global_pool_config.clone(),
             env_config.clone(),
         ));
-        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config.clone(), env_config));
+        let connection_pool = Arc::new(ConnectionPool::new(
+            global_pool_config.clone(),
+            env_config,
+            dns_cache.clone(),
+        ));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
@@ -1155,7 +1159,7 @@ pub async fn handle_proxy_request(
         let mut current_target = upstream_target.clone();
         let mut current_url = backend_url.clone();
         let mut result =
-            proxy_to_backend(&state, &proxy, &current_url, &method, proxy_headers, req).await;
+            proxy_to_backend(&state, &proxy, &current_url, &method, proxy_headers, req, upstream_target.as_ref()).await;
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
             let delay = retry::retry_delay(retry_config, attempt);
@@ -1188,11 +1192,11 @@ pub async fn handle_proxy_request(
 
             // Build a minimal request for retry (body was consumed on first attempt)
             result =
-                proxy_to_backend_retry(&state, &proxy, &current_url, &method, proxy_headers).await;
+                proxy_to_backend_retry(&state, &proxy, &current_url, &method, proxy_headers, current_target.as_ref()).await;
         }
         result
     } else {
-        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req).await
+        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req, upstream_target.as_ref()).await
     };
     let response_status = backend_resp.status_code;
     let response_body = backend_resp.body;
@@ -1393,20 +1397,19 @@ async fn proxy_to_backend_retry(
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
+    upstream_target: Option<&UpstreamTarget>,
 ) -> retry::BackendResponse {
-    // Resolve backend hostname
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            &proxy.backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await;
+    // All reqwest clients use our DnsCacheResolver, so DNS resolution is
+    // always served from the warmed cache — never hitting DNS on the hot path.
+    // For both single-backend and load-balanced proxies, the client transparently
+    // resolves hostnames through the DNS cache.
+    let effective_host = upstream_target
+        .map(|t| t.host.as_str())
+        .unwrap_or(&proxy.backend_host);
 
     let client = match state
         .connection_pool
-        .get_client(proxy, resolved_ip.ok())
+        .get_client(proxy)
         .await
     {
         Ok(client) => client,
@@ -1440,7 +1443,9 @@ async fn proxy_to_backend_retry(
                 if proxy.preserve_host_header {
                     req_builder = req_builder.header("Host", v.as_str());
                 } else {
-                    req_builder = req_builder.header("Host", &proxy.backend_host);
+                    // Use upstream target host when load balancing, so SNI-based
+                    // ingress routers see the correct Host header for the target.
+                    req_builder = req_builder.header("Host", effective_host);
                 }
             }
             "connection" | "transfer-encoding" => continue,
@@ -1488,16 +1493,15 @@ async fn proxy_to_backend(
     method: &str,
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
+    upstream_target: Option<&UpstreamTarget>,
 ) -> retry::BackendResponse {
-    // Resolve backend hostname
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            &proxy.backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await;
+    // All reqwest clients use our DnsCacheResolver, so DNS resolution is
+    // always served from the warmed cache — never hitting DNS on the hot path.
+    // For both single-backend and load-balanced proxies, the client transparently
+    // resolves hostnames through the DNS cache.
+    let effective_host = upstream_target
+        .map(|t| t.host.as_str())
+        .unwrap_or(&proxy.backend_host);
 
     // Handle HTTP/3 backend requests differently
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
@@ -1511,10 +1515,13 @@ async fn proxy_to_backend(
         };
     }
 
-    // Get client from connection pool for HTTP/1.1 and HTTP/2
+    // Get client from connection pool for HTTP/1.1 and HTTP/2.
+    // The client uses our DnsCacheResolver for transparent DNS cache lookups.
+    // All upstream targets share one reqwest::Client since it handles
+    // per-host pooling and SNI internally.
     let client = match state
         .connection_pool
-        .get_client(proxy, resolved_ip.ok())
+        .get_client(proxy)
         .await
     {
         Ok(client) => client,
@@ -1554,7 +1561,9 @@ async fn proxy_to_backend(
                 if proxy.preserve_host_header {
                     req_builder = req_builder.header("Host", v.as_str());
                 } else {
-                    req_builder = req_builder.header("Host", &proxy.backend_host);
+                    // Use upstream target host when load balancing, so SNI-based
+                    // ingress routers see the correct Host header for the target.
+                    req_builder = req_builder.header("Host", effective_host);
                 }
             }
             "connection" | "transfer-encoding" => continue, // hop-by-hop
