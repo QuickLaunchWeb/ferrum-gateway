@@ -116,8 +116,10 @@ impl ProxyState {
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
         // Build load balancer cache for upstream target selection
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
-        // Initialize health checker and start active checks
-        let mut health_checker = HealthChecker::new();
+        // Initialize health checker with the gateway's pool settings so active
+        // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
+        // regular proxy traffic.
+        let mut health_checker = HealthChecker::with_pool_config(&global_pool_config);
         health_checker.start(&config);
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache

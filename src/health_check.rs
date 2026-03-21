@@ -2,7 +2,13 @@
 //!
 //! Supports active health checks (periodic HTTP probes) and passive health
 //! checks (monitoring response status codes from proxied requests).
+//!
+//! Active health checks share a single `reqwest::Client` configured with the
+//! gateway's global connection pool settings (keep-alive, idle timeout, HTTP/2,
+//! TCP keep-alive) so that probe connections behave like real proxy traffic and
+//! benefit from connection reuse across targets.
 
+use crate::config::pool_config::PoolConfig;
 use crate::config::types::{ActiveHealthCheck, GatewayConfig, PassiveHealthCheck, UpstreamTarget};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -41,21 +47,42 @@ pub struct HealthChecker {
     pub unhealthy_targets: Arc<DashMap<String, ()>>,
     /// Per-target health state.
     target_states: Arc<DashMap<String, Arc<TargetHealth>>>,
+    /// Shared HTTP client for active health check probes, configured with
+    /// the gateway's connection pool settings for proper keep-alive and reuse.
+    http_client: Arc<reqwest::Client>,
     /// Active check abort handles.
     active_check_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for HealthChecker {
     fn default() -> Self {
-        Self::new()
+        Self::with_pool_config(&PoolConfig::default())
     }
 }
 
 impl HealthChecker {
+    /// Create a health checker using default pool settings.
+    ///
+    /// Prefer [`with_pool_config`] in production to inherit the gateway's
+    /// tuned connection pool settings. Kept for tests and integration code
+    /// that constructs `HealthChecker` without a full `PoolConfig`.
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a health checker with an HTTP client configured from the
+    /// gateway's global pool settings.
+    ///
+    /// The shared client inherits keep-alive, idle timeout, HTTP/2, and
+    /// TCP keep-alive settings so that health probe connections behave
+    /// like real proxy traffic and benefit from connection reuse.
+    pub fn with_pool_config(pool_config: &PoolConfig) -> Self {
+        let client = build_health_check_client(pool_config);
         Self {
             unhealthy_targets: Arc::new(DashMap::new()),
             target_states: Arc::new(DashMap::new()),
+            http_client: Arc::new(client),
             active_check_handles: Vec::new(),
         }
     }
@@ -148,6 +175,12 @@ impl HealthChecker {
     }
 
     /// Start an active health check background task for a target.
+    ///
+    /// Uses the shared `http_client` (configured with the gateway's pool
+    /// settings) instead of creating a per-target client. The per-probe
+    /// timeout from `ActiveHealthCheck::timeout_ms` is applied at the
+    /// request level so each probe respects its configured timeout while
+    /// the underlying connections benefit from pooling and keep-alive.
     fn start_active_check(
         &self,
         target: &UpstreamTarget,
@@ -162,14 +195,9 @@ impl HealthChecker {
         let healthy_status_codes = config.healthy_status_codes.clone();
         let unhealthy_targets = self.unhealthy_targets.clone();
         let target_states = self.target_states.clone();
+        let client = self.http_client.clone();
 
         tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(timeout)
-                .danger_accept_invalid_certs(true)
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
-
             let mut timer = tokio::time::interval(interval);
 
             loop {
@@ -180,7 +208,9 @@ impl HealthChecker {
                     .or_insert_with(|| Arc::new(TargetHealth::new()))
                     .clone();
 
-                let result = client.get(&url).send().await;
+                // Apply per-probe timeout at request level; the shared client
+                // handles pooling, keep-alive, and connection reuse.
+                let result = client.get(&url).timeout(timeout).send().await;
 
                 match result {
                     Ok(resp) => {
@@ -244,6 +274,44 @@ impl Drop for HealthChecker {
             handle.abort();
         }
     }
+}
+
+/// Build a shared `reqwest::Client` for active health check probes using the
+/// gateway's global pool configuration.
+///
+/// The client inherits:
+/// - `pool_max_idle_per_host` — connection reuse across periodic probes
+/// - `pool_idle_timeout` — stale probe connections cleaned up automatically
+/// - TCP keep-alive — detects dead connections between probe intervals
+/// - HTTP/2 keep-alive — multiplexed probe streams stay healthy
+///
+/// TLS verification is relaxed for health probes since backends may use
+/// self-signed certs in internal environments. The per-probe timeout is
+/// applied at the request level in `start_active_check`, not here.
+fn build_health_check_client(pool_config: &PoolConfig) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+        .danger_accept_invalid_certs(true);
+
+    if pool_config.enable_http_keep_alive {
+        builder =
+            builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
+    }
+
+    if pool_config.enable_http2 {
+        builder = builder
+            .http2_keep_alive_interval(Duration::from_secs(
+                pool_config.http2_keep_alive_interval_seconds,
+            ))
+            .http2_keep_alive_timeout(Duration::from_secs(
+                pool_config.http2_keep_alive_timeout_seconds,
+            ));
+    }
+
+    builder
+        .build()
+        .expect("Failed to build health check HTTP client")
 }
 
 fn now_epoch_ms() -> u64 {
