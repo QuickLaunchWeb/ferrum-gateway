@@ -14,9 +14,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::TcpListener;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{WebSocketStream, tungstenite::handshake::derive_accept_key};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::{
+    WebSocketStream, connect_async_tls_with_config, tungstenite::handshake::derive_accept_key,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
@@ -78,6 +80,8 @@ pub struct ProxyState {
     pub enable_http3: bool,
     /// The HTTPS port (shared by HTTP/3 QUIC listener)
     pub proxy_https_port: u16,
+    /// Environment config for backend TLS settings (WebSocket, etc.)
+    pub env_config: Arc<crate::config::EnvConfig>,
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
@@ -103,6 +107,7 @@ impl ProxyState {
             global_pool_config.clone(),
             env_config.clone(),
         ));
+        let env_config_arc = Arc::new(env_config.clone());
         let connection_pool = Arc::new(ConnectionPool::new(
             global_pool_config.clone(),
             env_config,
@@ -144,6 +149,7 @@ impl ProxyState {
             grpc_pool,
             enable_http3,
             proxy_https_port,
+            env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,
             max_body_size_bytes,
@@ -268,12 +274,9 @@ async fn handle_websocket_request(
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(&state, 101); // Switching Protocols
 
-    // Get backend URL
-    let backend_url = match proxy.backend_protocol {
-        BackendProtocol::Ws => format!("ws://{}:{}", proxy.backend_host, proxy.backend_port),
-        BackendProtocol::Wss => format!("wss://{}:{}", proxy.backend_host, proxy.backend_port),
-        _ => unreachable!(), // We already checked this above
-    };
+    // Build backend URL using the standard URL builder (respects strip_listen_path, backend_path, query)
+    let query_string = req.uri().query().unwrap_or("");
+    let backend_url = build_websocket_backend_url(&proxy, &path, query_string);
 
     // Get the upgrade parts from the request
     let (mut parts, _body) = req.into_parts();
@@ -311,18 +314,28 @@ async fn handle_websocket_request(
     // Generate accept key
     let accept_key = derive_accept_key(ws_key.as_bytes());
 
+    // Collect client headers to forward to backend
+    let client_headers = collect_forwardable_headers(&parts.headers);
+
     // Spawn a task to handle the WebSocket connection after upgrade
-    let proxy_id = proxy.id.clone();
+    let proxy_clone = proxy.clone();
+    let env_config = state.env_config.clone();
     let backend_url_clone = backend_url.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
                 info!(
                     "WebSocket connection upgraded successfully for: {}",
-                    proxy_id
+                    proxy_clone.id
                 );
-                if let Err(e) =
-                    handle_websocket_proxying(upgraded, &backend_url_clone, &proxy_id).await
+                if let Err(e) = handle_websocket_proxying(
+                    upgraded,
+                    &backend_url_clone,
+                    &proxy_clone,
+                    &env_config,
+                    &client_headers,
+                )
+                .await
                 {
                     error!("WebSocket proxying error: {}", e);
                 }
@@ -371,12 +384,9 @@ async fn handle_websocket_request_authenticated(
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(&state, 101); // Switching Protocols
 
-    // Get backend URL
-    let backend_url = match proxy.backend_protocol {
-        BackendProtocol::Ws => format!("ws://{}:{}", proxy.backend_host, proxy.backend_port),
-        BackendProtocol::Wss => format!("wss://{}:{}", proxy.backend_host, proxy.backend_port),
-        _ => unreachable!(), // We already checked this above
-    };
+    // Build backend URL using the standard URL builder (respects strip_listen_path, backend_path, query)
+    let query_string = req.uri().query().unwrap_or("");
+    let backend_url = build_websocket_backend_url(&proxy, &ctx.path, query_string);
 
     // Log the WebSocket connection attempt
     let start_time = std::time::Instant::now();
@@ -440,22 +450,32 @@ async fn handle_websocket_request_authenticated(
         .body(Full::new(Bytes::from("")))
         .unwrap();
 
+    // Collect client headers to forward to backend
+    let client_headers = collect_forwardable_headers(&parts.headers);
+
     // Spawn the WebSocket proxying task
-    let proxy_id = proxy.id.clone();
+    let proxy_clone = proxy.clone();
+    let env_config = state.env_config.clone();
     let backend_url_for_spawn = backend_url.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                if let Err(e) =
-                    handle_websocket_proxying(upgraded, &backend_url_for_spawn, &proxy_id).await
+                if let Err(e) = handle_websocket_proxying(
+                    upgraded,
+                    &backend_url_for_spawn,
+                    &proxy_clone,
+                    &env_config,
+                    &client_headers,
+                )
+                .await
                 {
-                    error!("WebSocket proxying error for {}: {}", proxy_id, e);
+                    error!("WebSocket proxying error for {}: {}", proxy_clone.id, e);
                 }
             }
             Err(e) => {
                 error!(
                     "Failed to upgrade WebSocket connection for {}: {}",
-                    proxy_id, e
+                    proxy_clone.id, e
                 );
             }
         }
@@ -469,27 +489,281 @@ async fn handle_websocket_request_authenticated(
     Ok(upgrade_response)
 }
 
+/// Collect headers from the client request that should be forwarded to the backend WebSocket.
+/// Hop-by-hop headers and WebSocket handshake headers are excluded.
+fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+    /// Headers that must not be forwarded (hop-by-hop + WS handshake).
+    const SKIP_HEADERS: &[&str] = &[
+        "connection",
+        "upgrade",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-accept",
+        "host",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+    ];
+
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name_lower = name.as_str().to_lowercase();
+            if SKIP_HEADERS.contains(&name_lower.as_str()) {
+                return None;
+            }
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Build a WebSocket backend URL with the proper ws:// or wss:// scheme,
+/// respecting strip_listen_path, backend_path, and query string.
+fn build_websocket_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
+    let scheme = match proxy.backend_protocol {
+        BackendProtocol::Ws => "ws",
+        BackendProtocol::Wss => "wss",
+        _ => "ws", // fallback, should not happen
+    };
+
+    let remaining_path = if proxy.strip_listen_path {
+        incoming_path.strip_prefix(&proxy.listen_path).unwrap_or("")
+    } else {
+        incoming_path
+    };
+
+    let backend_path = proxy.backend_path.as_deref().unwrap_or("");
+    let full_path = format!("{}{}", backend_path, remaining_path);
+    let full_path = if full_path.is_empty() {
+        "/".to_string()
+    } else if !full_path.starts_with('/') {
+        format!("/{}", full_path)
+    } else {
+        full_path
+    };
+
+    let base = format!(
+        "{}://{}:{}{}",
+        scheme, proxy.backend_host, proxy.backend_port, full_path
+    );
+
+    if query_string.is_empty() {
+        base
+    } else {
+        format!("{}?{}", base, query_string)
+    }
+}
+
+/// Build a rustls TLS connector for WebSocket backends that respects
+/// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
+fn build_websocket_tls_connector(
+    proxy: &Proxy,
+    env_config: &crate::config::EnvConfig,
+) -> Option<tokio_tungstenite::Connector> {
+    // Only build a TLS connector for wss:// backends
+    if proxy.backend_protocol != BackendProtocol::Wss {
+        return None;
+    }
+
+    // Determine if we should skip server cert verification
+    let skip_verify = env_config.backend_tls_no_verify || !proxy.backend_tls_verify_server_cert;
+
+    // Build root certificate store
+    let mut root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Add custom CA bundle (proxy-level takes priority over global)
+    let ca_path = proxy
+        .backend_tls_server_ca_cert_path
+        .as_ref()
+        .or(env_config.backend_tls_ca_bundle_path.as_ref());
+    if let Some(ca_path) = ca_path {
+        match std::fs::read(ca_path) {
+            Ok(ca_pem) => {
+                let mut cursor = std::io::Cursor::new(ca_pem);
+                let certs = rustls_pemfile::certs(&mut cursor);
+                for cert in certs.flatten() {
+                    if let Err(e) = root_store.add(cert) {
+                        warn!("Failed to add CA certificate for WebSocket TLS: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to read CA bundle '{}' for WebSocket TLS: {}",
+                    ca_path, e
+                );
+            }
+        }
+    }
+
+    // Build client config
+    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+
+    // Add client certificate for mTLS (proxy-level overrides take priority)
+    let cert_path = proxy
+        .backend_tls_client_cert_path
+        .as_ref()
+        .or(env_config.backend_tls_client_cert_path.as_ref());
+    let key_path = proxy
+        .backend_tls_client_key_path
+        .as_ref()
+        .or(env_config.backend_tls_client_key_path.as_ref());
+
+    let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+        match (std::fs::read(cert_path), std::fs::read(key_path)) {
+            (Ok(cert_pem), Ok(key_pem)) => {
+                let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
+                    .flatten()
+                    .collect();
+                let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key_pem))
+                    .ok()
+                    .flatten();
+                match key {
+                    Some(key) => match builder.clone().with_client_auth_cert(certs, key) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            warn!("Failed to configure WebSocket mTLS client cert: {}", e);
+                            builder.with_no_client_auth()
+                        }
+                    },
+                    None => {
+                        warn!("No private key found in '{}' for WebSocket mTLS", key_path);
+                        builder.with_no_client_auth()
+                    }
+                }
+            }
+            _ => {
+                warn!("Failed to read client cert/key for WebSocket mTLS");
+                builder.with_no_client_auth()
+            }
+        }
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    // Disable server certificate verification if configured
+    if skip_verify {
+        warn!(
+            "WebSocket backend TLS certificate verification DISABLED for proxy {}",
+            proxy.id
+        );
+        client_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoVerifier));
+    }
+
+    Some(tokio_tungstenite::Connector::Rustls(Arc::new(
+        client_config,
+    )))
+}
+
+/// A certificate verifier that accepts all server certificates (for testing/dev).
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Handle actual WebSocket proxying after connection upgrade
 async fn handle_websocket_proxying(
     upgraded: Upgraded,
     backend_url: &str,
-    proxy_id: &str,
+    proxy: &Proxy,
+    env_config: &crate::config::EnvConfig,
+    client_headers: &[(String, String)],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "Starting WebSocket proxying for {} to backend: {}",
-        proxy_id, backend_url
+        proxy.id, backend_url
     );
+
+    // WebSocket configuration with frame/message size limits
+    let ws_config = WebSocketConfig {
+        max_frame_size: Some(16 << 20),   // 16 MiB max frame size
+        max_message_size: Some(64 << 20), // 64 MiB max message size
+        ..Default::default()
+    };
 
     // Convert the upgraded connection to a WebSocket stream
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),
         tokio_tungstenite::tungstenite::protocol::Role::Server,
-        None,
+        Some(ws_config),
     )
     .await;
 
-    // Connect to backend WebSocket server
-    let (backend_ws_stream, backend_response) = connect_async(backend_url).await?;
+    // Build a tungstenite HTTP request with forwarded client headers
+    let mut ws_request = backend_url.into_client_request()?;
+    for (name, value) in client_headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            ws_request.headers_mut().insert(header_name, header_value);
+        }
+    }
+
+    // Build TLS connector that respects proxy-level settings
+    let connector = build_websocket_tls_connector(proxy, env_config);
+
+    // Connect to backend with timeout
+    let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let connect_future =
+        connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);
+
+    let (backend_ws_stream, backend_response) =
+        match tokio::time::timeout(connect_timeout, connect_future).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(format!(
+                    "WebSocket backend connect timeout ({}ms) for proxy {}",
+                    proxy.backend_connect_timeout_ms, proxy.id
+                )
+                .into());
+            }
+        };
+
     info!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
 
@@ -603,7 +877,7 @@ async fn handle_websocket_proxying(
         }
     }
 
-    info!("WebSocket proxy connection closed for {}", proxy_id);
+    info!("WebSocket proxy connection closed for {}", proxy.id);
     Ok(())
 }
 
