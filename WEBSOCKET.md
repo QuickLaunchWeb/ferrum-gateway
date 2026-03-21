@@ -21,26 +21,45 @@ The gateway terminates the client WebSocket connection and opens a separate conn
 
 ## TLS for `wss://` Backends
 
-Backend WebSocket connections use `tokio_tungstenite::connect_async()` with the `rustls-tls-webpki-roots` feature. This means:
+Backend WebSocket connections use `tokio_tungstenite::connect_async_tls_with_config()` with a custom `rustls` TLS connector that respects both proxy-level and global TLS settings:
 
 - **TLS library**: rustls (not native-tls/OpenSSL)
-- **Root CA store**: `webpki-roots` (Mozilla's root certificates compiled into the binary) — **not** the OS system trust store
-- **Client certificates**: Not supported for WebSocket backends
-- **Custom CA bundles**: Not supported for WebSocket backends
+- **Root CA store**: `webpki-roots` (Mozilla's root certificates compiled into the binary), plus any custom CA bundles
+- **Server certificate verification**: Controlled by proxy-level `backend_tls_verify_server_cert` (default: `true`) and global `FERRUM_BACKEND_TLS_NO_VERIFY`
+- **Custom CA bundles**: Proxy-level `backend_tls_server_ca_cert_path` takes priority; falls back to global `FERRUM_BACKEND_TLS_CA_BUNDLE_PATH`
+- **Client certificates (mTLS)**: Proxy-level `backend_tls_client_cert_path`/`backend_tls_client_key_path` take priority; falls back to global `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`/`FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`
 
-This is a known gap compared to HTTP/HTTPS backends, which support `danger_accept_invalid_certs`, custom CA bundles, and client certificates via the `reqwest::Client` configuration in `connection_pool.rs`.
+This matches the same TLS configuration hierarchy used by HTTP/HTTPS backends in `connection_pool.rs`.
+
+## Header Forwarding
+
+Client request headers are forwarded to the backend WebSocket server during the upgrade handshake. The following hop-by-hop and WebSocket handshake headers are excluded:
+
+- `connection`, `upgrade`, `transfer-encoding`, `te`, `trailer`, `keep-alive`
+- `sec-websocket-key`, `sec-websocket-version`, `sec-websocket-accept`
+- `host`, `proxy-authorization`, `proxy-connection`
+
+All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`, custom headers, etc.) are forwarded to the backend.
+
+## Timeouts and Limits
+
+- **Connect timeout**: Uses the proxy's `backend_connect_timeout_ms` setting (default: 5000ms) for the backend WebSocket connection
+- **Max frame size**: 16 MiB per WebSocket frame
+- **Max message size**: 64 MiB per WebSocket message (a message can span multiple frames)
+
+## URL Routing
+
+WebSocket backend URLs are built using the same path logic as HTTP proxying:
+
+- `strip_listen_path`: When `true`, the proxy's `listen_path` prefix is stripped from the forwarded path
+- `backend_path`: Prepended to the forwarded path
+- Query strings are preserved and forwarded
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/proxy/mod.rs` | WebSocket upgrade handling and bidirectional proxying |
+| `src/proxy/mod.rs` | WebSocket upgrade handling, TLS connector, and bidirectional proxying |
 | `tests/functional/functional_websocket_test.rs` | Functional tests |
 | `tests/unit/gateway_core/websocket_auth_tests.rs` | Auth integration tests |
 | `tests/helpers/bin/websocket_echo_server.rs` | Echo server for testing |
-
-## Known Limitations
-
-- WebSocket backend TLS does not respect proxy-level settings (`backend_tls_verify_server_cert`, `backend_tls_ca_bundle_path`, `backend_tls_client_cert_path`)
-- No WebSocket-specific timeouts or frame size limits are configured (uses tokio-tungstenite defaults)
-- No header forwarding from the original client request to the backend WebSocket connection

@@ -335,6 +335,7 @@ async fn test_http3_proxy_state_creation() {
         max_single_header_size_bytes: 16384,
         max_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
+        env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
     };
 
     // Verify proxy state is created successfully
@@ -469,6 +470,7 @@ async fn test_http3_full_integration() {
         max_single_header_size_bytes: 16384,
         max_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
+        env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
     };
 
     // Verify proxy state is created successfully
