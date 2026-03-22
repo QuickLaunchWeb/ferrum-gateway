@@ -591,7 +591,7 @@ impl DatabaseStore {
         let health_checks_json = upstream
             .health_checks
             .as_ref()
-            .map(|hc| serde_json::to_string(hc))
+            .map(serde_json::to_string)
             .transpose()?;
 
         sqlx::query(
@@ -618,7 +618,7 @@ impl DatabaseStore {
         let health_checks_json = upstream
             .health_checks
             .as_ref()
-            .map(|hc| serde_json::to_string(hc))
+            .map(serde_json::to_string)
             .transpose()?;
 
         sqlx::query(
