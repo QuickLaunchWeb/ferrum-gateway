@@ -560,8 +560,7 @@ impl DatabaseStore {
 
             let algo_str: String = row.try_get("algorithm").unwrap_or("round_robin".into());
             let algorithm: LoadBalancerAlgorithm =
-                serde_json::from_value(serde_json::Value::String(algo_str))
-                    .unwrap_or_default();
+                serde_json::from_value(serde_json::Value::String(algo_str)).unwrap_or_default();
 
             let health_checks: Option<HealthCheckConfig> = row
                 .try_get::<String, _>("health_checks")
