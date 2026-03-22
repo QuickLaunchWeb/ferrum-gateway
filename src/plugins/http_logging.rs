@@ -20,6 +20,7 @@ struct BatchConfig {
 
 pub struct HttpLogging {
     sender: mpsc::Sender<TransactionSummary>,
+    endpoint_hostname: Option<String>,
 }
 
 impl HttpLogging {
@@ -45,10 +46,22 @@ impl HttpLogging {
             ),
         };
 
+        let endpoint_url = batch_config.endpoint_url.clone();
+        let endpoint_hostname = if endpoint_url.is_empty() {
+            None
+        } else {
+            Url::parse(&endpoint_url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()))
+        };
+
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         tokio::spawn(flush_loop(receiver, batch_config));
 
-        Self { sender }
+        Self {
+            sender,
+            endpoint_hostname,
+        }
     }
 }
 
@@ -69,12 +82,9 @@ impl Plugin for HttpLogging {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        if self.endpoint_url.is_empty() {
-            return Vec::new();
-        }
-        Url::parse(&self.endpoint_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| vec![h.to_string()]))
+        self.endpoint_hostname
+            .as_ref()
+            .map(|h| vec![h.clone()])
             .unwrap_or_default()
     }
 }
