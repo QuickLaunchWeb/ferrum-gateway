@@ -64,10 +64,10 @@ pub async fn run(
         error_ttl_seconds: env_config.dns_error_ttl,
     });
 
-    // DNS warmup — await before accepting requests to avoid cold-cache
-    // DNS lookups in the hot request path. Includes both proxy backend hosts
-    // and upstream target hostnames so load-balanced proxies also benefit
-    // from pre-warmed DNS entries.
+    // DNS warmup — resolve all hostnames (proxy backends, upstream targets,
+    // and plugin endpoints) before accepting requests. Hostnames are
+    // deduplicated inside DnsCache::warmup() so shared hostnames across
+    // proxies/plugins only trigger one DNS lookup.
     let mut hostnames: Vec<_> = config
         .proxies
         .iter()
@@ -86,12 +86,21 @@ pub async fn run(
             hostnames.push((target.host.clone(), None, None));
         }
     }
+
+    // Build ProxyState first so the plugin cache exists with the shared DNS
+    // cache, then collect plugin hostnames to include in warmup.
+    let proxy_state = ProxyState::new(config, dns_cache.clone(), env_config.clone());
+
+    // Collect plugin endpoint hostnames (http_logging, oauth2_auth, etc.)
+    let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
+    for host in plugin_hosts {
+        hostnames.push((host, None, None));
+    }
+
     dns_cache.warmup(hostnames).await;
 
     // Start background TTL refresh to keep cache warm
     dns_cache.start_background_refresh();
-
-    let proxy_state = ProxyState::new(config, dns_cache, env_config.clone());
 
     // Build TLS hardening policy from environment
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;

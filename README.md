@@ -20,7 +20,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Load Balancing**: Five algorithms (round robin, weighted round robin, least connections, consistent hashing, random) with active/passive health checks, automatic failover, retry, and circuit breaker — see [docs/load_balancing.md](docs/load_balancing.md)
 - **Response Body Streaming**: Configurable per-proxy response body mode (`stream` default / `buffer`) — streaming forwards chunks as they arrive for lower latency and memory; plugins can force buffering via `requires_response_body_buffering()` — see [docs/response_body_streaming.md](docs/response_body_streaming.md)
 - **Client Observability Headers**: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded` for failure categorization
-- **DNS Caching**: In-memory async DNS cache with startup warmup (proxy backends + upstream targets), background refresh at 75% TTL, transparent `DnsCacheResolver` for all HTTP clients, per-proxy TTL overrides, and static overrides
+- **DNS Caching**: In-memory async DNS cache with startup warmup (proxy backends + upstream targets + plugin endpoints, deduplicated), background refresh at 75% TTL, transparent `DnsCacheResolver` for all HTTP clients including plugin outbound calls, per-proxy TTL overrides, and static overrides
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
@@ -1007,7 +1007,8 @@ All modes maintain an in-memory cache of the last valid configuration. If the co
 - Per-proxy TTL override via `dns_cache_ttl_seconds`
 - Static overrides: global (`FERRUM_DNS_OVERRIDES`) and per-proxy (`dns_override`)
 - Respects system `RES_OPTIONS` and `LOCALDOMAIN` environment variables
-- Non-blocking startup warmup resolves all backend hostnames
+- Non-blocking startup warmup resolves all backend, upstream, and plugin endpoint hostnames (deduplicated)
+- Shared DNS cache for plugin outbound calls (http_logging, oauth2_auth, etc.) via custom reqwest resolver
 - See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
 
 ### HTTP/3 (QUIC) Support

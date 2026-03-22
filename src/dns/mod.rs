@@ -448,11 +448,28 @@ impl DnsCache {
     }
 
     /// Warmup: resolve all hostnames from the config at startup.
+    ///
+    /// Hostnames are deduplicated before resolution — if multiple proxies or
+    /// plugins share the same hostname, only one DNS lookup is performed.
+    /// Each unique hostname is resolved concurrently.
     pub async fn warmup(&self, hostnames: Vec<(String, Option<String>, Option<u64>)>) {
-        info!("DNS warmup: resolving {} hostnames", hostnames.len());
+        // Deduplicate by hostname, keeping the first override/TTL seen for each.
+        // Hostnames with a static override still go through resolve() to populate
+        // the cache, but they won't trigger actual DNS queries.
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<_> = hostnames
+            .into_iter()
+            .filter(|(host, _, _)| seen.insert(host.clone()))
+            .collect();
+
+        info!(
+            "DNS warmup: resolving {} unique hostnames ({} after dedup)",
+            seen.len(),
+            unique.len()
+        );
         let mut handles = Vec::new();
 
-        for (host, override_ip, ttl) in hostnames {
+        for (host, override_ip, ttl) in unique {
             let cache = self.clone();
             handles.push(tokio::spawn(async move {
                 match cache.resolve(&host, override_ip.as_deref(), ttl).await {

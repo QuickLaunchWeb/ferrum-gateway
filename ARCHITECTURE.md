@@ -332,9 +332,9 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 
 **Key Features**:
 - In-memory `DashMap` caching with configurable TTL
-- **Startup warmup** — resolves all proxy backend and upstream target hostnames before accepting requests
+- **Startup warmup** — resolves all proxy backend, upstream target, and plugin endpoint hostnames (deduplicated) before accepting requests
 - **Background refresh** — proactively re-resolves entries at 75% TTL before expiration
-- **`DnsCacheResolver`** — custom `reqwest::dns::Resolve` implementation that routes all HTTP client DNS lookups through the cache, keeping DNS off the hot request path
+- **`DnsCacheResolver` / `DnsCacheResolver`** — custom `reqwest::dns::Resolve` implementations that route all HTTP client DNS lookups (proxy backends, health checks, and plugin outbound calls) through the cache, keeping DNS off the hot request path
 - Static DNS overrides (global and per-proxy)
 - Per-proxy DNS configuration and TTL overrides
 - Graceful degradation on resolution failures
