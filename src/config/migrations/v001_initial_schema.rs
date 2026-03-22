@@ -43,6 +43,7 @@ impl V001InitialSchema {
                 dns_override TEXT,
                 dns_cache_ttl_seconds INTEGER,
                 auth_mode TEXT NOT NULL DEFAULT 'single',
+                upstream_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

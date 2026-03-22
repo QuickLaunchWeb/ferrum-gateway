@@ -243,8 +243,8 @@ impl DatabaseStore {
                     .map(|v| v as u64),
                 auth_mode: parse_auth_mode(&auth_mode_str),
                 plugins,
-                // Load balancing, circuit breaker, retry - None to use defaults
-                upstream_id: None,
+                // Load balancing
+                upstream_id: row.try_get::<String, _>("upstream_id").ok(),
                 circuit_breaker: None,
                 retry: None,
                 response_body_mode: crate::config::types::ResponseBodyMode::default(),
@@ -321,7 +321,7 @@ impl DatabaseStore {
 
     pub async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
         sqlx::query(
-            "INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, auth_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, auth_mode, upstream_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&proxy.id)
         .bind(&proxy.name)
@@ -336,6 +336,7 @@ impl DatabaseStore {
         .bind(proxy.backend_read_timeout_ms as i64)
         .bind(proxy.backend_write_timeout_ms as i64)
         .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
+        .bind(&proxy.upstream_id)
         .bind(proxy.created_at.to_rfc3339())
         .bind(proxy.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -346,7 +347,7 @@ impl DatabaseStore {
 
     pub async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
         sqlx::query(
-            "UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, auth_mode=?, updated_at=? WHERE id=?"
+            "UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, auth_mode=?, upstream_id=?, updated_at=? WHERE id=?"
         )
         .bind(&proxy.name)
         .bind(&proxy.listen_path)
@@ -360,6 +361,7 @@ impl DatabaseStore {
         .bind(proxy.backend_read_timeout_ms as i64)
         .bind(proxy.backend_write_timeout_ms as i64)
         .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
+        .bind(&proxy.upstream_id)
         .bind(Utc::now().to_rfc3339())
         .bind(&proxy.id)
         .execute(&self.pool)

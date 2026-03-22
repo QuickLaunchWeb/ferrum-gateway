@@ -1,4 +1,5 @@
 pub mod v001_initial_schema;
+pub mod v002_add_upstream_id;
 
 use chrono::Utc;
 use sqlx::any::AnyRow;
@@ -54,9 +55,10 @@ impl MigrationRunner {
 
     /// Build the ordered list of all known migrations.
     fn all_migrations(&self) -> Vec<Box<dyn MigrationEntry>> {
-        vec![Box::new(MigrationEntryV001(
-            v001_initial_schema::V001InitialSchema,
-        ))]
+        vec![
+            Box::new(MigrationEntryV001(v001_initial_schema::V001InitialSchema)),
+            Box::new(MigrationEntryV002(v002_add_upstream_id::V002AddUpstreamId)),
+        ]
     }
 
     /// Ensure the `_ferrum_migrations` tracking table exists.
@@ -293,6 +295,29 @@ impl MigrationEntry for MigrationEntryV001 {
     }
 }
 
+/// Wrapper for V002AddUpstreamId.
+struct MigrationEntryV002(v002_add_upstream_id::V002AddUpstreamId);
+
+impl MigrationEntry for MigrationEntryV002 {
+    fn version(&self) -> i64 {
+        self.0.version()
+    }
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn checksum(&self) -> &str {
+        self.0.checksum()
+    }
+    fn run_up<'a>(
+        &'a self,
+        pool: &'a AnyPool,
+        db_type: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>
+    {
+        Box::pin(self.0.up(pool, db_type))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,10 +342,12 @@ mod tests {
         let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
         let applied = runner.run_pending().await.unwrap();
 
-        // V1 should be applied on a fresh database
-        assert_eq!(applied.len(), 1);
+        // V1 and V2 should be applied on a fresh database
+        assert_eq!(applied.len(), 2);
         assert_eq!(applied[0].version, 1);
         assert_eq!(applied[0].name, "initial_schema");
+        assert_eq!(applied[1].version, 2);
+        assert_eq!(applied[1].name, "add_upstream_id");
 
         // Running again should apply nothing
         let applied_again = runner.run_pending().await.unwrap();
@@ -342,13 +369,16 @@ mod tests {
         let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
         let applied = runner.run_pending().await.unwrap();
 
-        // V1 should NOT be applied (bootstrapped instead), so nothing new
-        assert!(applied.is_empty());
+        // V1 should NOT be applied (bootstrapped instead), but V2 should run
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].version, 2);
+        assert_eq!(applied[0].name, "add_upstream_id");
 
-        // Check that V1 is recorded as applied via bootstrapping
+        // Check that both V1 (bootstrapped) and V2 (applied) are recorded
         let status = runner.status().await.unwrap();
-        assert_eq!(status.applied.len(), 1);
+        assert_eq!(status.applied.len(), 2);
         assert_eq!(status.applied[0].version, 1);
+        assert_eq!(status.applied[1].version, 2);
         assert!(status.pending.is_empty());
     }
 
@@ -361,14 +391,14 @@ mod tests {
         // Before running: everything should be pending
         let status = runner.status().await.unwrap();
         assert!(status.applied.is_empty());
-        assert_eq!(status.pending.len(), 1);
+        assert_eq!(status.pending.len(), 2);
 
         // Run migrations
         runner.run_pending().await.unwrap();
 
         // After running: everything should be applied
         let status = runner.status().await.unwrap();
-        assert_eq!(status.applied.len(), 1);
+        assert_eq!(status.applied.len(), 2);
         assert!(status.pending.is_empty());
     }
 }
