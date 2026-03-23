@@ -160,6 +160,8 @@ fn create_http3_test_env_config() -> EnvConfig {
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        trusted_proxies: String::new(),
+        real_ip_header: None,
     }
 }
 
@@ -338,6 +340,7 @@ async fn test_http3_proxy_state_creation() {
         max_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
         env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
+        trusted_proxies: Arc::new(ferrum_gateway::proxy::client_ip::TrustedProxies::parse("")),
     };
 
     // Verify proxy state is created successfully
@@ -473,6 +476,7 @@ async fn test_http3_full_integration() {
         max_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
         env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
+        trusted_proxies: Arc::new(ferrum_gateway::proxy::client_ip::TrustedProxies::parse("")),
     };
 
     // Verify proxy state is created successfully

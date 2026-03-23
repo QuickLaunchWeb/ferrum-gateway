@@ -8,6 +8,9 @@ on:
     branches:
       - main
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   unit-test:
     name: Unit Tests
@@ -20,29 +23,24 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
 
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-git-
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
 
-      - name: Cache cargo build
-        uses: actions/cache@v4
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-target-
+          shared-key: "ci-unit"
 
       - name: Install protoc
         run: |
@@ -66,29 +64,24 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
 
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-git-
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
 
-      - name: Cache cargo build
-        uses: actions/cache@v4
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-target-
+          shared-key: "ci-functional"
 
       - name: Install protoc
         run: |
@@ -130,22 +123,29 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
+
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-lint"
+
       - name: Install protoc
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -165,21 +165,24 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
 
-      - name: Cache cargo build
-        uses: actions/cache@v4
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-target-
+          shared-key: "ci-perf"
 
       - name: Install protoc
         run: |
@@ -199,9 +202,9 @@ jobs:
             perf-baseline-${{ github.base_ref || 'main' }}-
             perf-baseline-main-
 
-      - name: Build release binaries
+      - name: Build release binaries (ci-release profile)
         run: |
-          cargo build --release --bin ferrum-gateway
+          cargo build --profile ci-release --bin ferrum-gateway
           cd tests/performance && cargo build --release --bin backend_server
 
       - name: Start backend server
@@ -229,7 +232,7 @@ jobs:
           FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
           FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
           FERRUM_POOL_ENABLE_HTTP2=false \
-          ./target/release/ferrum-gateway > /tmp/gateway.log 2>&1 &
+          ./target/ci-release/ferrum-gateway > /tmp/gateway.log 2>&1 &
           echo "GATEWAY_PID=$!" >> $GITHUB_ENV
           for i in $(seq 1 15); do
             if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then

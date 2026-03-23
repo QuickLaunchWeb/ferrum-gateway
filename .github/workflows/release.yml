@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build-release-binaries:
     name: Build Release Binaries
@@ -41,6 +44,25 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        continue-on-error: true
+
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.target }}"
+
       - name: Install protoc (Ubuntu)
         if: runner.os == 'Linux'
         run: |
@@ -55,21 +77,12 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
       - name: Build release binary (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target ${{ matrix.target }}
+        env:
+          # cross manages its own container, sccache doesn't work inside it
+          RUSTC_WRAPPER: ""
 
       - name: Build release binary (cargo)
         if: matrix.target != 'aarch64-unknown-linux-gnu'
