@@ -519,6 +519,7 @@ async fn handle_websocket_request_authenticated(
         latency_backend_ttfb_ms: 0.0,
         latency_backend_total_ms: 0.0,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
+        response_streamed: false,
         client_disconnected: false,
         metadata: ctx.metadata.clone(),
     };
@@ -1145,6 +1146,7 @@ pub async fn log_rejected_request(
         latency_backend_ttfb_ms: -1.0,
         latency_backend_total_ms: -1.0,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
+        response_streamed: false,
         client_disconnected: false,
         metadata,
     };
@@ -1540,6 +1542,7 @@ pub async fn handle_proxy_request(
                         latency_backend_ttfb_ms: backend_total_ms,
                         latency_backend_total_ms: backend_total_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        response_streamed: false,
                         client_disconnected: false,
                         metadata: ctx.metadata.clone(),
                     };
@@ -1791,10 +1794,16 @@ pub async fn handle_proxy_request(
     }
 
     let backend_elapsed = backend_start.elapsed().as_secs_f64() * 1000.0;
-    // For streaming responses, TTFB is approximately when proxy_to_backend returned
-    // (first byte received); total time includes plugin processing that follows.
     let backend_ttfb_ms = backend_elapsed;
-    let backend_total_ms = backend_elapsed;
+    // For buffered responses, backend_elapsed includes full body download (accurate total).
+    // For streaming responses, the body is still being sent to the client at log time,
+    // so we mark total as unknown (-1.0) to avoid silently reporting TTFB as total.
+    let is_streaming_response = matches!(&response_body, ResponseBody::Streaming(_));
+    let backend_total_ms = if is_streaming_response {
+        -1.0
+    } else {
+        backend_elapsed
+    };
 
     // after_proxy hooks (these only modify headers, not the body,
     // so they are compatible with both streaming and buffered modes)
@@ -1826,6 +1835,7 @@ pub async fn handle_proxy_request(
             latency_backend_ttfb_ms: backend_ttfb_ms,
             latency_backend_total_ms: backend_total_ms,
             request_user_agent: ctx.headers.get("user-agent").cloned(),
+            response_streamed: is_streaming_response,
             client_disconnected: false,
             metadata: ctx.metadata.clone(),
         };
