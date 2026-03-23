@@ -196,6 +196,31 @@ impl ProxyState {
             self.plugin_cache.rebuild(&new_config);
             self.consumer_index.rebuild(&new_config.consumers);
             self.load_balancer_cache.rebuild(&new_config);
+
+            // DNS warmup for all hostnames in the new config
+            let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
+                .proxies
+                .iter()
+                .map(|p| {
+                    (
+                        p.backend_host.clone(),
+                        p.dns_override.clone(),
+                        p.dns_cache_ttl_seconds,
+                    )
+                })
+                .collect();
+            for upstream in &new_config.upstreams {
+                for target in &upstream.targets {
+                    hostnames.push((target.host.clone(), None, None));
+                }
+            }
+            if !hostnames.is_empty() {
+                let dns = self.dns_cache.clone();
+                tokio::spawn(async move {
+                    dns.warmup(hostnames).await;
+                });
+            }
+
             self.config.store(Arc::new(new_config));
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
@@ -249,6 +274,37 @@ impl ProxyState {
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
+        }
+
+        // --- DNS warmup for new/modified hostnames ---
+        // Collect backend hostnames from added/modified proxies and upstreams
+        // so the DNS cache is warm before the first request hits them.
+        let mut new_hostnames: Vec<(String, Option<String>, Option<u64>)> = Vec::new();
+        for proxy in delta
+            .added_proxies
+            .iter()
+            .chain(delta.modified_proxies.iter())
+        {
+            new_hostnames.push((
+                proxy.backend_host.clone(),
+                proxy.dns_override.clone(),
+                proxy.dns_cache_ttl_seconds,
+            ));
+        }
+        for upstream in delta
+            .added_upstreams
+            .iter()
+            .chain(delta.modified_upstreams.iter())
+        {
+            for target in &upstream.targets {
+                new_hostnames.push((target.host.clone(), None, None));
+            }
+        }
+        if !new_hostnames.is_empty() {
+            let dns = self.dns_cache.clone();
+            tokio::spawn(async move {
+                dns.warmup(new_hostnames).await;
+            });
         }
 
         // Swap the canonical config last (readers may still be using old caches
