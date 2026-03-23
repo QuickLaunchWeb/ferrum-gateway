@@ -91,7 +91,10 @@ impl PluginHttpClient {
                 ));
         }
 
-        let client = builder.build().expect("Failed to build plugin HTTP client");
+        let client = builder.build().unwrap_or_else(|e| {
+            tracing::error!("Failed to build plugin HTTP client: {}, using default", e);
+            reqwest::Client::new()
+        });
 
         Self {
             client: Arc::new(client),
@@ -123,7 +126,10 @@ impl PluginHttpClient {
                 ));
         }
 
-        let client = builder.build().expect("Failed to build plugin HTTP client");
+        let client = builder.build().unwrap_or_else(|e| {
+            tracing::error!("Failed to build plugin HTTP client: {}, using default", e);
+            reqwest::Client::new()
+        });
 
         Self {
             client: Arc::new(client),

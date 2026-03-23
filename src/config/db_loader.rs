@@ -191,10 +191,16 @@ impl DatabaseStore {
 
         // Batch-load all proxy_plugins in one query (eliminates N+1)
         let assoc_rows: Vec<AnyRow> =
-            sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
+            match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
                 .fetch_all(&self.pool)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    error!("Failed to load proxy_plugins associations: {}", e);
+                    Vec::new()
+                }
+            };
 
         let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
             std::collections::HashMap::new();
@@ -267,6 +273,15 @@ impl DatabaseStore {
         .bind(proxy.updated_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
+
+        // Persist plugin associations in the junction table
+        for assoc in &proxy.plugins {
+            sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+                .bind(&proxy.id)
+                .bind(&assoc.plugin_config_id)
+                .execute(&self.pool)
+                .await?;
+        }
 
         Ok(())
     }
@@ -347,16 +362,24 @@ impl DatabaseStore {
         };
 
         let assoc_rows: Vec<AnyRow> =
-            sqlx::query("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?")
+            match sqlx::query("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?")
                 .bind(id)
                 .fetch_all(&self.pool)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    error!("Failed to load plugin associations for proxy {}: {}", id, e);
+                    Vec::new()
+                }
+            };
 
         let plugins: Vec<PluginAssociation> = assoc_rows
             .iter()
-            .map(|r| PluginAssociation {
-                plugin_config_id: r.try_get("plugin_config_id").unwrap_or_default(),
+            .filter_map(|r| {
+                r.try_get::<String, _>("plugin_config_id")
+                    .ok()
+                    .map(|plugin_config_id| PluginAssociation { plugin_config_id })
             })
             .collect();
 
@@ -648,6 +671,7 @@ fn parse_protocol(s: &str) -> BackendProtocol {
         "wss" => BackendProtocol::Wss,
         "grpc" => BackendProtocol::Grpc,
         "grpcs" => BackendProtocol::Grpcs,
+        "h3" => BackendProtocol::H3,
         _ => BackendProtocol::Http,
     }
 }
@@ -715,8 +739,8 @@ fn row_to_proxy(
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: parse_datetime_column(row, "created_at"),
+        updated_at: parse_datetime_column(row, "updated_at"),
     })
 }
 
@@ -730,8 +754,8 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
         username: row.try_get("username")?,
         custom_id: row.try_get("custom_id").ok(),
         credentials,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: parse_datetime_column(row, "created_at"),
+        updated_at: parse_datetime_column(row, "updated_at"),
     })
 }
 
@@ -752,8 +776,8 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
         },
         proxy_id: row.try_get("proxy_id").ok(),
         enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: parse_datetime_column(row, "created_at"),
+        updated_at: parse_datetime_column(row, "updated_at"),
     })
 }
 
@@ -778,7 +802,27 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         algorithm,
         hash_on: row.try_get("hash_on").ok(),
         health_checks,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: parse_datetime_column(row, "created_at"),
+        updated_at: parse_datetime_column(row, "updated_at"),
     })
+}
+
+/// Parse a datetime column from a database row, falling back to `Utc::now()` if
+/// the column is missing or the value cannot be parsed. Database stores timestamps
+/// as RFC 3339 strings or SQLite `CURRENT_TIMESTAMP` format.
+fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
+    row.try_get::<String, _>(column)
+        .ok()
+        .and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+                .or_else(|| {
+                    // SQLite CURRENT_TIMESTAMP format: "YYYY-MM-DD HH:MM:SS"
+                    chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                        .map(|ndt| ndt.and_utc())
+                        .ok()
+                })
+        })
+        .unwrap_or_else(Utc::now)
 }

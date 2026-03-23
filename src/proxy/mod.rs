@@ -478,7 +478,7 @@ async fn handle_websocket_request(
         .header("sec-websocket-accept", accept_key)
         .header("x-websocket-proxy", "ferrum-gateway")
         .body(ProxyBody::empty())
-        .unwrap();
+        .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
 
     info!(
         "WebSocket upgrade response sent for: {} -> {}",
@@ -549,8 +549,10 @@ async fn handle_websocket_request_authenticated(
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(&state, 101);
 
-    let start_time = std::time::Instant::now();
-    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    // Measure total latency from when the request was received
+    let total_ms = (chrono::Utc::now() - ctx.timestamp_received)
+        .num_milliseconds()
+        .max(0) as f64;
 
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -591,7 +593,7 @@ async fn handle_websocket_request_authenticated(
             ),
         )
         .body(ProxyBody::empty())
-        .unwrap();
+        .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
 
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
@@ -641,14 +643,15 @@ fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, Strin
     headers
         .iter()
         .filter_map(|(name, value)| {
-            let name_lower = name.as_str().to_lowercase();
-            if SKIP_HEADERS.contains(&name_lower.as_str()) {
+            // hyper already lowercases header names per HTTP/2 spec
+            let name_str = name.as_str();
+            if SKIP_HEADERS.contains(&name_str) {
                 return None;
             }
             value
                 .to_str()
                 .ok()
-                .map(|v| (name.as_str().to_string(), v.to_string()))
+                .map(|v| (name_str.to_string(), v.to_string()))
         })
         .collect()
 }
@@ -1958,7 +1961,13 @@ async fn proxy_to_backend_retry(
         "PATCH" => reqwest::Method::PATCH,
         "HEAD" => reqwest::Method::HEAD,
         "OPTIONS" => reqwest::Method::OPTIONS,
-        other => reqwest::Method::from_bytes(other.as_bytes()).unwrap_or(reqwest::Method::GET),
+        other => match reqwest::Method::from_bytes(other.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                warn!("Unsupported HTTP method: {}, forwarding as-is", other);
+                reqwest::Method::GET
+            }
+        },
     };
 
     let mut req_builder = client.request(req_method, backend_url);
@@ -2114,7 +2123,13 @@ async fn proxy_to_backend(
         "PATCH" => reqwest::Method::PATCH,
         "HEAD" => reqwest::Method::HEAD,
         "OPTIONS" => reqwest::Method::OPTIONS,
-        other => reqwest::Method::from_bytes(other.as_bytes()).unwrap_or(reqwest::Method::GET),
+        other => match reqwest::Method::from_bytes(other.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                warn!("Unsupported HTTP method: {}, forwarding as-is", other);
+                reqwest::Method::GET
+            }
+        },
     };
 
     let mut req_builder = client.request(req_method, backend_url);
@@ -2368,11 +2383,16 @@ fn record_request(state: &ProxyState, status: u16) {
 }
 
 fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
+    // Response::builder with a valid status and static header name cannot fail
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
         .body(ProxyBody::from_string(body))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            Response::new(ProxyBody::from_string(
+                r#"{"error":"Internal server error"}"#,
+            ))
+        })
 }
 
 fn build_reject_response(
@@ -2453,11 +2473,11 @@ async fn proxy_to_backend_http3(
     // Convert headers to HTTP/3 format
     let mut http3_headers = Vec::new();
     for (name, value) in headers {
-        http3_headers.push((
-            name.parse()
-                .unwrap_or_else(|_| http::header::HeaderName::from_static("x-custom")),
-            value.parse().unwrap(),
-        ));
+        if let (Ok(header_name), Ok(header_value)) = (name.parse(), value.parse()) {
+            http3_headers.push((header_name, header_value));
+        } else {
+            debug!("Skipping invalid HTTP/3 header: {}={}", name, value);
+        }
     }
 
     // Make HTTP/3 request

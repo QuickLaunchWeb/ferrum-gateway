@@ -95,9 +95,11 @@
 
 ### Database Integration
 - **Multi-DB Support** - PostgreSQL, MySQL, SQLite via sqlx
-- **Database Schema** - Auto-migration on startup
+- **Database Schema** - Auto-migration on startup with indexed foreign keys
 - **Connection Pooling** - Efficient DB connections
 - **Uniqueness Constraints** - listen_path uniqueness enforced
+- **Referential Integrity** - Foreign keys with CASCADE/RESTRICT, plugin association persistence
+- **Timestamp Preservation** - Database timestamps parsed and preserved across config reloads
 - **Resilient Caching** - In-memory config cache for outages
 
 ### Plugin System
@@ -190,8 +192,8 @@
 - **Performance Tracking** - Latency and throughput metrics
 
 ### Testing Coverage
-- **58 test files** with **433 tests** (183 `#[test]` + 250 `#[tokio::test]`)
-- **Unit tests** - Config, plugins, gateway core, admin
+- **62 test files** with **519+ tests**
+- **Unit tests** - Config, all 20 plugins, gateway core, admin
 - **Integration tests** - Backend mTLS, connection pool, CP/DP gRPC, gRPC proxy, HTTP/3
 - **Functional tests** - File mode, database, CP/DP, gRPC, WebSocket
 - **Performance tests** - Automated benchmarks
@@ -232,7 +234,7 @@
 - HTTP/3 support with QUIC listener and backend proxying
 - Full gRPC proxying with dedicated connection pool and trailer forwarding
 - Prometheus metrics and OpenTelemetry tracing for production observability
-- 58 test files with 433 tests across unit, integration, functional, and performance suites
+- 62 test files with 519+ tests across unit, integration, functional, and performance suites
 - Missing: certificate pinning
 
 ### Production Readiness: 98% Complete

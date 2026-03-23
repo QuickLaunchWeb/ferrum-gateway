@@ -25,8 +25,13 @@ tests/
 │   │   ├── plugin_cache_tests.rs       # Plugin cache logic
 │   │   ├── plugin_integration_tests.rs # Plugin creation and scope
 │   │   ├── rate_limiting_tests.rs      # Rate limiting plugin
+│   │   ├── rejection_logging_tests.rs  # Rejection logging behavior
 │   │   ├── request_transformer_tests.rs
 │   │   ├── response_transformer_tests.rs
+│   │   ├── hmac_auth_tests.rs          # HMAC auth plugin (24 tests)
+│   │   ├── ip_restriction_tests.rs     # IP restriction plugin (32 tests)
+│   │   ├── bot_detection_tests.rs      # Bot detection plugin (39 tests)
+│   │   ├── correlation_id_tests.rs     # Correlation ID plugin (23 tests)
 │   │   ├── stdout_logging_tests.rs     # Stdout logging plugin
 │   │   └── transaction_debugger_tests.rs
 │   ├── config/                         # Configuration parsing tests
@@ -95,7 +100,7 @@ cargo test
 
 ### By Category
 ```bash
-# Unit tests only (~280 tests, runs in seconds)
+# Unit tests only (~519 tests, runs in seconds)
 cargo test --test unit_tests
 
 # Integration tests only (in-process servers, mock certs)

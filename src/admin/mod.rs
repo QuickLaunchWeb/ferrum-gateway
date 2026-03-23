@@ -253,30 +253,6 @@ pub async fn handle_admin_request(
                 &json!({"error": "Invalid Authorization header format"}),
             ));
         }
-        Err(JwtError::TokenExpired) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Token expired"}),
-            ));
-        }
-        Err(JwtError::TokenNotYetValid) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Token not yet valid"}),
-            ));
-        }
-        Err(JwtError::InvalidTokenIssuer) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Invalid token issuer"}),
-            ));
-        }
-        Err(JwtError::InvalidTokenSignature) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Invalid token signature"}),
-            ));
-        }
         Err(JwtError::VerificationFailed(msg)) => {
             return Ok(json_response(
                 StatusCode::UNAUTHORIZED,
@@ -1411,7 +1387,17 @@ fn hash_consumer_secrets(consumer: &mut Consumer) {
     if let Some(basic) = consumer.credentials.get_mut("basicauth")
         && let Some(pass) = basic.get("password").and_then(|p| p.as_str())
     {
-        let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST).unwrap_or_default();
+        let hash = match bcrypt::hash(pass, bcrypt::DEFAULT_COST) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to hash password for consumer {}: {}",
+                    consumer.id,
+                    e
+                );
+                return;
+            }
+        };
         basic["password_hash"] = json!(hash);
         if let Some(obj) = basic.as_object_mut() {
             obj.remove("password");

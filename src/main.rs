@@ -26,8 +26,12 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() {
     // Initialize rustls crypto provider
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-        .expect("Failed to install crypto provider");
+    if rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .is_err()
+    {
+        eprintln!("Failed to install crypto provider");
+        std::process::exit(1);
+    }
 
     // Initialize tracing/logging
     let log_level = std::env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "info".into());
@@ -62,7 +66,13 @@ async fn main() {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM");
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to register SIGTERM handler: {}", e);
+                    return;
+                }
+            };
             tokio::select! {
                 _ = ctrl_c => {
                     info!("SIGINT received, initiating graceful shutdown...");

@@ -16,7 +16,7 @@ impl Migration for V001InitialSchema {
     }
 
     fn checksum(&self) -> &str {
-        "v001_initial_schema_fk_constraints"
+        "v001_initial_schema_fk_constraints_indexes"
     }
 }
 
@@ -110,6 +110,21 @@ impl V001InitialSchema {
         sqlx::query(create_proxies).execute(pool).await?;
         sqlx::query(create_plugin_configs).execute(pool).await?;
         sqlx::query(create_proxy_plugins).execute(pool).await?;
+
+        // Indexes on foreign key columns for query performance
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxies_upstream_id ON proxies (upstream_id)")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_proxy_id ON plugin_configs (proxy_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_proxy_plugins_plugin_config_id ON proxy_plugins (plugin_config_id)",
+        )
+        .execute(pool)
+        .await?;
 
         Ok(())
     }

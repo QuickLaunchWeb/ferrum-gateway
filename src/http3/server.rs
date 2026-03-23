@@ -660,8 +660,12 @@ async fn proxy_to_backend_h3(
         }
         Err(e) => {
             error!("Backend request failed (HTTP/3 frontend): {}", e);
-            let body = format!(r#"{{"error":"Backend unavailable: {}"}}"#, e);
-            (502, body.into_bytes(), std::collections::HashMap::new())
+            let error_msg = serde_json::json!({"error": format!("Backend unavailable: {}", e)});
+            (
+                502,
+                error_msg.to_string().into_bytes(),
+                std::collections::HashMap::new(),
+            )
         }
     }
 }
@@ -741,7 +745,8 @@ async fn collect_response_with_limit_h3(
             }
             Err(e) => {
                 error!("Error reading backend response: {}", e);
-                return Err(format!(r#"{{"error":"Backend error: {}"}}"#, e).into_bytes());
+                let error_msg = serde_json::json!({"error": format!("Backend error: {}", e)});
+                return Err(error_msg.to_string().into_bytes());
             }
         }
     }

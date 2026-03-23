@@ -121,14 +121,6 @@ pub enum JwtError {
     MissingHeader,
     InvalidHeaderFormat,
     VerificationFailed(String),
-    #[allow(dead_code)]
-    TokenExpired,
-    #[allow(dead_code)]
-    TokenNotYetValid,
-    #[allow(dead_code)]
-    InvalidTokenIssuer,
-    #[allow(dead_code)]
-    InvalidTokenSignature,
 }
 
 impl std::fmt::Debug for JwtError {
@@ -137,10 +129,6 @@ impl std::fmt::Debug for JwtError {
             JwtError::MissingHeader => write!(f, "MissingHeader"),
             JwtError::InvalidHeaderFormat => write!(f, "InvalidHeaderFormat"),
             JwtError::VerificationFailed(msg) => write!(f, "VerificationFailed({})", msg),
-            JwtError::TokenExpired => write!(f, "TokenExpired"),
-            JwtError::TokenNotYetValid => write!(f, "TokenNotYetValid"),
-            JwtError::InvalidTokenIssuer => write!(f, "InvalidTokenIssuer"),
-            JwtError::InvalidTokenSignature => write!(f, "InvalidTokenSignature"),
         }
     }
 }
@@ -151,10 +139,6 @@ impl std::fmt::Display for JwtError {
             JwtError::MissingHeader => "Missing Authorization header",
             JwtError::InvalidHeaderFormat => "Invalid Authorization header format",
             JwtError::VerificationFailed(msg) => msg.as_str(),
-            JwtError::TokenExpired => "Token expired",
-            JwtError::TokenNotYetValid => "Token not yet valid",
-            JwtError::InvalidTokenIssuer => "Invalid token issuer",
-            JwtError::InvalidTokenSignature => "Invalid token signature",
         };
         write!(f, "{}", msg)
     }

@@ -36,20 +36,18 @@ impl HmacAuth {
         Self { clock_skew_seconds }
     }
 
-    fn compute_hmac(secret: &[u8], data: &[u8], algorithm: &str) -> Vec<u8> {
+    fn compute_hmac(secret: &[u8], data: &[u8], algorithm: &str) -> Option<Vec<u8>> {
         match algorithm {
             "hmac-sha512" => {
-                let mut mac =
-                    HmacSha512::new_from_slice(secret).expect("HMAC can take key of any size");
+                let mut mac = HmacSha512::new_from_slice(secret).ok()?;
                 mac.update(data);
-                mac.finalize().into_bytes().to_vec()
+                Some(mac.finalize().into_bytes().to_vec())
             }
             _ => {
                 // Default to hmac-sha256
-                let mut mac =
-                    HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
+                let mut mac = HmacSha256::new_from_slice(secret).ok()?;
                 mac.update(data);
-                mac.finalize().into_bytes().to_vec()
+                Some(mac.finalize().into_bytes().to_vec())
             }
         }
     }
@@ -224,7 +222,17 @@ impl Plugin for HmacAuth {
 
         // Compute expected signature using the requested algorithm
         let expected_mac =
-            Self::compute_hmac(secret.as_bytes(), signing_string.as_bytes(), &algorithm);
+            match Self::compute_hmac(secret.as_bytes(), signing_string.as_bytes(), &algorithm) {
+                Some(mac) => mac,
+                None => {
+                    warn!("hmac_auth: failed to create HMAC for user '{}'", username);
+                    return PluginResult::Reject {
+                        status_code: 401,
+                        body: r#"{"error":"Invalid credentials"}"#.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+            };
         let expected_sig = base64::engine::general_purpose::STANDARD.encode(&expected_mac);
 
         // Constant-time comparison to prevent timing attacks

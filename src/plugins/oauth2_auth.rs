@@ -146,12 +146,32 @@ impl Plugin for OAuth2Auth {
                             validation.set_audience(&[aud]);
                         }
 
-                        if let Ok(_token_data) = decode::<Value>(&token, &key, &validation) {
-                            if ctx.identified_consumer.is_none() {
-                                debug!("oauth2_auth: identified consumer '{}'", consumer.username);
-                                ctx.identified_consumer = Some((**consumer).clone());
+                        if let Ok(token_data) = decode::<Value>(&token, &key, &validation) {
+                            // Verify the token's subject matches this consumer to prevent
+                            // a token signed with consumer A's secret from authenticating as
+                            // consumer B if secrets happen to match
+                            let sub_matches = token_data
+                                .claims
+                                .get("sub")
+                                .and_then(|s| s.as_str())
+                                .is_none_or(|sub| {
+                                    sub == consumer.username
+                                        || consumer
+                                            .custom_id
+                                            .as_deref()
+                                            .is_some_and(|cid| cid == sub)
+                                });
+
+                            if sub_matches {
+                                if ctx.identified_consumer.is_none() {
+                                    debug!(
+                                        "oauth2_auth: identified consumer '{}'",
+                                        consumer.username
+                                    );
+                                    ctx.identified_consumer = Some((**consumer).clone());
+                                }
+                                return PluginResult::Continue;
                             }
-                            return PluginResult::Continue;
                         }
                     }
                 }
