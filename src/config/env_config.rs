@@ -56,7 +56,11 @@ pub struct EnvConfig {
     pub db_type: Option<String>,
     pub db_url: Option<String>,
     pub db_poll_interval: u64,
+    /// Seconds between DB connectivity checks (parsed from env, reserved for incremental polling)
+    #[allow(dead_code)]
     pub db_poll_check_interval: u64,
+    /// Enable incremental (delta) DB polling (parsed from env, reserved for incremental polling)
+    #[allow(dead_code)]
     pub db_incremental_polling: bool,
     pub db_tls_enabled: bool,
     pub db_tls_ca_cert_path: Option<String>,

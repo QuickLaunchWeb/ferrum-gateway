@@ -382,9 +382,13 @@ fn build_health_check_client(pool_config: &PoolConfig) -> reqwest::Client {
             ));
     }
 
-    builder
-        .build()
-        .expect("Failed to build health check HTTP client")
+    builder.build().unwrap_or_else(|e| {
+        tracing::error!(
+            "Failed to build health check HTTP client: {}, using default",
+            e
+        );
+        reqwest::Client::new()
+    })
 }
 
 fn now_epoch_ms() -> u64 {

@@ -31,16 +31,6 @@ pub async fn run(
     if env_config.admin_tls_cert_path.is_some() || env_config.admin_tls_key_path.is_some() {
         info!("Admin API TLS certificates configured");
     }
-    if env_config.db_incremental_polling {
-        info!("Database incremental polling enabled");
-    }
-    if env_config.db_poll_check_interval != 5 {
-        info!(
-            "Custom database poll check interval: {} seconds",
-            env_config.db_poll_check_interval
-        );
-    }
-
     let config_path = env_config
         .file_config_path
         .as_deref()
@@ -143,13 +133,13 @@ pub async fn run(
     };
 
     // Log size limits if non-default
-    if env_config.max_header_size_bytes != 8192 {
+    if env_config.max_header_size_bytes != 32_768 {
         info!(
             "Custom max header size: {} bytes",
             env_config.max_header_size_bytes
         );
     }
-    if env_config.max_body_size_bytes != 1048576 {
+    if env_config.max_body_size_bytes != 10_485_760 {
         info!(
             "Custom max body size: {} bytes",
             env_config.max_body_size_bytes
@@ -163,8 +153,13 @@ pub async fn run(
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
-            let mut sighup =
-                signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to register SIGHUP handler: {}", e);
+                    return;
+                }
+            };
             loop {
                 sighup.recv().await;
                 info!("SIGHUP received, reloading configuration...");

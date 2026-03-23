@@ -48,6 +48,9 @@ impl SlidingWindow {
     }
 }
 
+/// Maximum entries before triggering eviction of stale rate-limit state.
+const MAX_STATE_ENTRIES: usize = 100_000;
+
 pub struct RateLimiting {
     limit_by: String,
     per_second: Option<u64>,
@@ -106,7 +109,28 @@ impl RateLimiting {
         }
     }
 
+    /// Evict entries whose sliding windows are all empty (no recent requests).
+    /// Called periodically to prevent unbounded memory growth.
+    fn evict_stale_entries(&self) {
+        if self.state.len() <= MAX_STATE_ENTRIES {
+            return;
+        }
+
+        let now = Instant::now();
+        self.state.retain(|_, windows| {
+            // Keep the entry if any window still has timestamps within its duration
+            windows.iter().any(|w| {
+                w.timestamps
+                    .back()
+                    .is_some_and(|last| now.duration_since(*last) < w.window_duration)
+            })
+        });
+    }
+
     fn check_rate(&self, key: &str) -> PluginResult {
+        // Periodically evict stale entries to bound memory usage
+        self.evict_stale_entries();
+
         let mut entry = self.state.entry(key.to_string()).or_insert_with(|| {
             let mut windows = Vec::new();
             if let Some(limit) = self.per_second {
