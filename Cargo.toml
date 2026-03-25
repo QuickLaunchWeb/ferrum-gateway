@@ -80,6 +80,10 @@ sha2 = "0.10.9"
 hmac = "0.12.1"
 hex = "0.4"
 
+# DTLS (secure UDP)
+webrtc-dtls = { package = "dtls", version = "0.17.1", features = ["pem"] }
+webrtc-util = { version = "0.17.1", default-features = false, features = ["conn"] }
+
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Dev: optimise for fast compile-edit-run cycles
 [profile.dev]
@@ -114,5 +118,6 @@ wiremock = "0.6"
 # Functional testing dependencies
 rand = "0.8"
 futures = "0.3"
+rcgen = "0.13"
 # Simple HTTP server dependencies
 tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }

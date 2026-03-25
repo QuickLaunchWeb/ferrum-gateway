@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Gateway co
 
 ## Project Overview
 
-Ferrum Gateway is a high-performance API Gateway and reverse proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, and gRPC proxying with a plugin architecture (20 built-in plugins), four operating modes, and load balancing with health checks.
+Ferrum Gateway is a high-performance API Gateway and reverse proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (20 built-in plugins), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -108,7 +108,10 @@ src/
 │   ├── handler.rs             # HTTP request/response processing, plugin lifecycle
 │   ├── body.rs                # ProxyBody sum type (Full vs Tracked) with StreamingMetrics
 │   ├── client_ip.rs           # Client IP resolution (trusted proxies, XFF)
-│   └── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
+│   ├── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
+│   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
+│   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
+│   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
 ├── plugins/                   # Plugin system (20 plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   └── [plugin_name].rs       # Individual plugin implementations
@@ -116,7 +119,7 @@ src/
 │   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service)
 │   └── dp_client.rs           # Data Plane gRPC client (subscribe + reconnect)
 ├── load_balancer.rs           # Load balancing algorithms + per-upstream cache
-├── health_check.rs            # Active + passive health checking
+├── health_check.rs            # Active (HTTP/TCP/UDP probes) + passive health checking
 ├── circuit_breaker.rs         # Three-state circuit breaker
 ├── retry.rs                   # Retry logic with fixed/exponential backoff
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS
@@ -124,6 +127,7 @@ src/
 ├── plugin_cache.rs            # Plugin config cache (O(1) lookup by proxy_id)
 ├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
 ├── config_delta.rs            # Incremental config updates for CP/DP
+├── dtls/                      # DTLS support (frontend termination, backend origination, cert helpers)
 ├── dns/                       # DNS resolution with caching
 ├── tls/                       # TLS/mTLS listener configuration
 ├── http3/                     # HTTP/3 (QUIC) support
@@ -284,6 +288,9 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | (none) | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt) |
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |
+| `FERRUM_DTLS_CERT_PATH` | (none) | PEM cert for frontend DTLS termination (ECDSA P-256 / Ed25519) |
+| `FERRUM_DTLS_KEY_PATH` | (none) | PEM key for frontend DTLS termination |
+| `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA cert for verifying DTLS client certs (frontend mTLS) |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 
