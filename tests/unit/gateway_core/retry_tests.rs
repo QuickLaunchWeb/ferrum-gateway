@@ -15,6 +15,7 @@ fn http_response(status_code: u16) -> BackendResponse {
         body: ResponseBody::Buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: false,
+        backend_resolved_ip: None,
     }
 }
 
@@ -24,6 +25,7 @@ fn connection_failure() -> BackendResponse {
         body: ResponseBody::Buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: true,
+        backend_resolved_ip: None,
     }
 }
 

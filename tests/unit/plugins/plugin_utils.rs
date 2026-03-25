@@ -108,6 +108,7 @@ pub fn create_test_transaction_summary() -> ferrum_gateway::plugins::Transaction
         matched_proxy_id: Some("test-proxy".to_string()),
         matched_proxy_name: Some("Test Proxy".to_string()),
         backend_target_url: Some("http://localhost:3000/test".to_string()),
+        backend_resolved_ip: Some("127.0.0.1".to_string()),
         response_status_code: 200,
         latency_total_ms: 100.0,
         latency_gateway_processing_ms: 10.0,
