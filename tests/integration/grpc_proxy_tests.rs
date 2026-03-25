@@ -131,6 +131,8 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
         real_ip_header: None,
+        dtls_cert_path: None,
+        dtls_key_path: None,
     }
 }
 

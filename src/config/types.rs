@@ -457,7 +457,8 @@ pub struct Proxy {
     #[serde(default)]
     pub listen_port: Option<u16>,
     /// Whether to terminate TLS on the gateway side for incoming TCP connections.
-    /// Uses the gateway's TLS certificate. Only applicable for Tcp/TcpTls protocols.
+    /// For TCP: uses the gateway's TLS certificate for TLS termination.
+    /// For UDP: uses the DTLS certificate for DTLS termination (ECDSA P-256 or Ed25519).
     #[serde(default)]
     pub frontend_tls: bool,
     /// UDP session idle timeout in seconds. After this duration of inactivity,

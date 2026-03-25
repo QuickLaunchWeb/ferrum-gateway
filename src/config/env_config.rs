@@ -159,6 +159,13 @@ pub struct EnvConfig {
     #[allow(dead_code)] // Used in Phase 2 (stream listener startup)
     pub stream_proxy_bind_address: String,
 
+    // DTLS frontend certificates (ECDSA P-256 or Ed25519 required)
+    /// Path to DTLS server certificate (PEM) for frontend DTLS termination.
+    /// If not set, a self-signed ECDSA P-256 certificate is generated at startup.
+    pub dtls_cert_path: Option<String>,
+    /// Path to DTLS server private key (PEM) for frontend DTLS termination.
+    pub dtls_key_path: Option<String>,
+
     // Client IP resolution
     /// Comma-separated trusted proxy CIDRs/IPs for X-Forwarded-For resolution.
     /// When set, the gateway walks the XFF chain right-to-left, skipping trusted
@@ -227,6 +234,8 @@ impl Default for EnvConfig {
             admin_read_only: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
+            dtls_cert_path: None,
+            dtls_key_path: None,
             enable_http3: false,
             http3_idle_timeout: 30,
             http3_max_streams: 100,
@@ -336,6 +345,8 @@ impl EnvConfig {
             admin_read_only: env::var("FERRUM_ADMIN_READ_ONLY").unwrap_or_default() == "true",
             stream_proxy_bind_address: env::var("FERRUM_STREAM_PROXY_BIND_ADDRESS")
                 .unwrap_or_else(|_| "0.0.0.0".into()),
+            dtls_cert_path: env::var("FERRUM_DTLS_CERT_PATH").ok(),
+            dtls_key_path: env::var("FERRUM_DTLS_KEY_PATH").ok(),
 
             // HTTP/3 / QUIC
             enable_http3: env::var("FERRUM_ENABLE_HTTP3").unwrap_or_default() == "true",

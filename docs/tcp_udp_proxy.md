@@ -72,14 +72,34 @@ proxies:
 |-------|------|---------|-------------|
 | `listen_port` | `u16` | (required) | Dedicated port for this stream proxy (1024-65535) |
 | `backend_protocol` | `string` | (required) | One of: `tcp`, `tcp_tls`, `udp`, `dtls` |
-| `frontend_tls` | `bool` | `false` | Terminate TLS on incoming TCP connections |
+| `frontend_tls` | `bool` | `false` | Terminate TLS (TCP) or DTLS (UDP) on incoming connections |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
 
 ### Synthetic `listen_path`
 
 Stream proxies use synthetic `listen_path` values (`__tcp:PORT` or `__udp:PORT`) to maintain the UNIQUE constraint on `listen_path` without conflicting with HTTP path-based routing. These are auto-generated during config normalization if `listen_path` is empty.
 
-## TLS Support
+## Encryption Support
+
+All combinations of frontend and backend encryption are supported:
+
+### TCP Encryption Matrix
+
+| Configuration | Client → Gateway | Gateway → Backend |
+|---------------|------------------|-------------------|
+| `tcp` | Plain TCP | Plain TCP |
+| `tcp` + `frontend_tls: true` | TLS | Plain TCP |
+| `tcp_tls` | Plain TCP | TLS |
+| `tcp_tls` + `frontend_tls: true` | TLS | TLS (full e2e) |
+
+### UDP Encryption Matrix
+
+| Configuration | Client → Gateway | Gateway → Backend |
+|---------------|------------------|-------------------|
+| `udp` | Plain UDP | Plain UDP |
+| `udp` + `frontend_tls: true` | DTLS | Plain UDP |
+| `dtls` | Plain UDP | DTLS |
+| `dtls` + `frontend_tls: true` | DTLS | DTLS (full e2e) |
 
 ### Frontend TLS Termination (TCP)
 
@@ -94,7 +114,29 @@ Backend TLS settings are controlled by the proxy's `backend_tls_*` fields:
 - `backend_tls_server_ca_cert_path` — custom CA certificate for verification
 - `backend_tls_client_cert_path` + `backend_tls_client_key_path` — client certificate for mutual TLS
 
-### Backend DTLS (UDP)
+### Frontend DTLS Termination (UDP)
+
+Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections from clients. The gateway uses ECDSA P-256 or Ed25519 certificates (configured via env vars) to terminate DTLS, then forwards decrypted datagrams to the backend.
+
+```yaml
+proxies:
+  - id: "secure-iot-frontend"
+    listen_port: 5684
+    backend_protocol: udp          # Plain UDP to backend
+    backend_host: "iot.internal"
+    backend_port: 5684
+    frontend_tls: true             # Accept DTLS from clients
+```
+
+Set the DTLS certificate via environment variables:
+```bash
+FERRUM_DTLS_CERT_PATH=/path/to/dtls-cert.pem
+FERRUM_DTLS_KEY_PATH=/path/to/dtls-key.pem
+```
+
+**Important:** DTLS requires ECDSA P-256 or Ed25519 certificates. RSA keys are not supported.
+
+### Backend DTLS Origination (UDP)
 
 Use `backend_protocol: dtls` to encrypt UDP datagrams to the backend using DTLS 1.2. The gateway accepts plain UDP from clients and establishes a DTLS session per client to the backend.
 
@@ -102,8 +144,8 @@ DTLS uses the same `backend_tls_*` proxy fields as TCP TLS:
 
 ```yaml
 proxies:
-  - id: "secure-udp"
-    listen_port: 5684
+  - id: "secure-udp-backend"
+    listen_port: 5685
     backend_protocol: dtls
     backend_host: "backend.internal"
     backend_port: 5684
@@ -113,11 +155,30 @@ proxies:
     # backend_tls_client_key_path: "/path/to/client-key.pem"
 ```
 
-**Key differences from TCP TLS:**
+### Full DTLS (Frontend + Backend)
+
+Combine `frontend_tls: true` with `backend_protocol: dtls` for end-to-end DTLS encryption:
+
+```yaml
+proxies:
+  - id: "full-dtls-proxy"
+    listen_port: 5686
+    backend_protocol: dtls           # DTLS to backend
+    backend_host: "secure-backend.internal"
+    backend_port: 5684
+    frontend_tls: true               # DTLS from clients
+    backend_tls_verify_server_cert: false
+```
+
+This provides full encryption: DTLS client → gateway (DTLS termination) → gateway (DTLS origination) → backend.
+
+### DTLS Key Differences from TCP TLS
+
 - DTLS uses ECDSA P-256 or Ed25519 certificates only (RSA is not supported by the underlying DTLS library)
 - Each UDP client session gets its own DTLS connection to the backend
 - DTLS handshake occurs when the first datagram arrives from a new client
 - The `udp_idle_timeout_seconds` setting applies to DTLS sessions the same as plain UDP
+- Frontend DTLS uses separate certificates from TLS (set via `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`)
 
 ## Load Balancing
 
@@ -200,6 +261,8 @@ HTTP-specific plugins (auth, CORS, body transformer, request/response transforme
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for all TCP/UDP listeners |
+| `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519) |
+| `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 
 ## Validation Rules
 
@@ -226,4 +289,4 @@ Stream proxy connections track:
 - **Session isolation**: UDP sessions are keyed by source address — NAT'd clients sharing an IP:port will share a session
 - **DTLS key types**: DTLS only supports ECDSA P-256 and Ed25519 certificates — RSA keys are not supported by the underlying `webrtc-dtls` library
 - **DTLS protocol version**: Only DTLS 1.2 is supported (no DTLS 1.3)
-- **Frontend DTLS**: Frontend DTLS termination (client → gateway encryption) is not yet implemented; only backend DTLS (gateway → backend) is supported
+- **DTLS cert separation**: Frontend DTLS uses separate cert/key from TLS (`FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` env vars, not the gateway's TLS cert)

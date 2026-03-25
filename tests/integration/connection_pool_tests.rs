@@ -110,6 +110,8 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         stream_proxy_bind_address: "0.0.0.0".into(),
         trusted_proxies: String::new(),
         real_ip_header: None,
+        dtls_cert_path: None,
+        dtls_key_path: None,
     }
 }
 

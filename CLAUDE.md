@@ -110,7 +110,7 @@ src/
 │   ├── client_ip.rs           # Client IP resolution (trusted proxies, XFF)
 │   ├── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
-│   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking and DTLS
+│   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
 ├── plugins/                   # Plugin system (20 plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
@@ -127,7 +127,7 @@ src/
 ├── plugin_cache.rs            # Plugin config cache (O(1) lookup by proxy_id)
 ├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
 ├── config_delta.rs            # Incremental config updates for CP/DP
-├── dtls/                      # DTLS support (webrtc-dtls config builders, connection helpers)
+├── dtls/                      # DTLS support (frontend termination, backend origination, cert helpers)
 ├── dns/                       # DNS resolution with caching
 ├── tls/                       # TLS/mTLS listener configuration
 ├── http3/                     # HTTP/3 (QUIC) support
@@ -288,6 +288,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | (none) | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt) |
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |
+| `FERRUM_DTLS_CERT_PATH` | (none) | PEM cert for frontend DTLS termination (ECDSA P-256 / Ed25519) |
+| `FERRUM_DTLS_KEY_PATH` | (none) | PEM key for frontend DTLS termination |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

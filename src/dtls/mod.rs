@@ -66,7 +66,6 @@ pub fn build_backend_dtls_config(
 /// Build a DTLS server config for frontend termination (client → gateway).
 ///
 /// Requires ECDSA P-256 or Ed25519 certificates (DTLS does not support RSA).
-#[allow(dead_code)]
 pub fn build_frontend_dtls_config(
     cert_path: &str,
     key_path: &str,
@@ -131,7 +130,6 @@ pub async fn connect_dtls_backend(
 /// Returns a `DTLSListener` that accepts DTLS connections from clients and
 /// performs the DTLS handshake automatically. Each accepted connection yields
 /// an `Arc<dyn Conn>` with transparent encryption/decryption.
-#[allow(dead_code)]
 pub async fn start_dtls_listener(
     addr: std::net::SocketAddr,
     config: DtlsConfig,

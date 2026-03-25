@@ -961,6 +961,7 @@ dependencies = [
  "prost",
  "quinn",
  "rand 0.8.5",
+ "rcgen",
  "regex",
  "reqwest",
  "rustls",

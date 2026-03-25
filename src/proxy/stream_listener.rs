@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::types::{BackendProtocol, GatewayConfig};
 use crate::dns::DnsCache;
@@ -35,10 +35,14 @@ pub struct StreamListenerManager {
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
     load_balancer_cache: Arc<LoadBalancerCache>,
-    /// Frontend TLS config for stream proxies with `frontend_tls: true`.
+    /// Frontend TLS config for TCP stream proxies with `frontend_tls: true`.
     /// Uses `ArcSwap` because the TLS config may be loaded after `ProxyState::new()`
     /// (e.g., in file mode where TLS certs are validated after the proxy state is built).
     frontend_tls_config: arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>,
+    /// DTLS cert/key paths for frontend DTLS termination on UDP proxies.
+    /// When a UDP proxy has `frontend_tls: true`, these paths are used to build
+    /// the DTLS server config. Requires ECDSA P-256 or Ed25519 certificates.
+    frontend_dtls_cert_key: arc_swap::ArcSwap<Option<(String, String)>>,
 }
 
 impl StreamListenerManager {
@@ -56,15 +60,25 @@ impl StreamListenerManager {
             dns_cache,
             load_balancer_cache,
             frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
+            frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
         }
     }
 
-    /// Update the frontend TLS configuration used for stream proxies with `frontend_tls: true`.
+    /// Update the frontend TLS configuration used for TCP stream proxies with `frontend_tls: true`.
     ///
     /// Call this once the gateway's TLS certificates are loaded, then call
     /// `reconcile()` to restart any listeners that need frontend TLS.
     pub fn set_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
         self.frontend_tls_config.store(Arc::new(tls_config));
+    }
+
+    /// Update the DTLS cert/key paths used for UDP stream proxies with `frontend_tls: true`.
+    ///
+    /// Call this after loading DTLS certificates, then call `reconcile()` to start
+    /// any deferred DTLS frontend listeners.
+    pub fn set_frontend_dtls_cert_key(&self, cert_path: String, key_path: String) {
+        self.frontend_dtls_cert_key
+            .store(Arc::new(Some((cert_path, key_path))));
     }
 
     /// Reconcile active listeners against the current config.
@@ -121,17 +135,27 @@ impl StreamListenerManager {
                 continue;
             }
 
-            // Skip frontend_tls proxies when TLS config is not yet loaded.
-            // This happens at initial startup before the mode sets the TLS config.
-            // The mode will call reconcile() again after setting TLS, at which point
-            // the listener will be started with the TLS config.
-            if *frontend_tls && self.frontend_tls_config.load().is_none() {
-                info!(
-                    proxy_id = %proxy_id,
-                    port = port,
-                    "Deferring stream listener start: frontend_tls requires TLS config"
-                );
-                continue;
+            // Skip frontend_tls proxies when the required encryption config is not yet loaded.
+            // For TCP: needs rustls ServerConfig. For UDP: needs DTLS cert/key paths.
+            // The mode will call reconcile() again after setting the config.
+            if *frontend_tls {
+                if protocol.is_udp() {
+                    if self.frontend_dtls_cert_key.load().is_none() {
+                        info!(
+                            proxy_id = %proxy_id,
+                            port = port,
+                            "Deferring UDP listener start: frontend_tls requires DTLS cert/key"
+                        );
+                        continue;
+                    }
+                } else if self.frontend_tls_config.load().is_none() {
+                    info!(
+                        proxy_id = %proxy_id,
+                        port = port,
+                        "Deferring TCP listener start: frontend_tls requires TLS config"
+                    );
+                    continue;
+                }
             }
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -144,6 +168,29 @@ impl StreamListenerManager {
 
             let join_handle = if protocol.is_udp() {
                 // UDP or DTLS listener
+                let frontend_dtls_config = if *frontend_tls {
+                    let paths = self.frontend_dtls_cert_key.load();
+                    match paths.as_ref() {
+                        Some((cert_path, key_path)) => {
+                            match crate::dtls::build_frontend_dtls_config(cert_path, key_path) {
+                                Ok(cfg) => Some(cfg),
+                                Err(e) => {
+                                    warn!(
+                                        proxy_id = %proxy_id,
+                                        "Failed to build frontend DTLS config: {}", e
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        None => {
+                            // Should not happen — guarded above, but be safe
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let metrics = Arc::new(UdpProxyMetrics::default());
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
@@ -155,6 +202,7 @@ impl StreamListenerManager {
                         load_balancer_cache: lb_cache,
                         shutdown: shutdown_rx,
                         metrics,
+                        frontend_dtls_config,
                     })
                     .await
                     {

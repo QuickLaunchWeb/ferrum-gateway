@@ -10,7 +10,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 
 - **Multiple Operating Modes**: Database, File, Control Plane (CP), and Data Plane (DP) modes
 - **Protocol Support**: HTTP/1.1, HTTP/2 (ALPN-negotiated on TLS), HTTP/3, WebSocket (`ws`/`wss`), gRPC proxying, and raw TCP/UDP/DTLS stream proxying
-- **TCP/UDP Proxy**: Dedicated-port TCP and UDP stream proxying with TLS termination/origination, DTLS 1.2 backend encryption, session tracking, load balancing, health checks (TCP SYN, UDP probe), and plugin support (IP restriction, rate limiting, logging) — see [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md)
+- **TCP/UDP Proxy**: Dedicated-port TCP and UDP stream proxying with full TLS/DTLS support (frontend termination + backend origination for both TCP and UDP), session tracking, load balancing, health checks (TCP SYN, UDP probe), and plugin support (IP restriction, rate limiting, logging) — see [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md)
 - **Connection Pooling**: Lock-free connection reuse with per-proxy pool keys, AtomicU64 cleanup, HTTP/2 via ALPN (no forced h2c)
 - **Router Cache**: Pre-sorted route table with bounded O(1) path cache; rebuilt atomically on config changes, never on hot path
 - **Longest Prefix Match Routing**: Efficient route matching with wildcard path-suffix forwarding and unique `listen_path` enforcement
@@ -375,6 +375,8 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
 | `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for TCP/UDP/DTLS stream proxy listeners |
+| `FERRUM_DTLS_CERT_PATH` | No | — | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519 only) |
+| `FERRUM_DTLS_KEY_PATH` | No | — | PEM private key for frontend DTLS termination |
 
 See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the security model, deployment examples, and troubleshooting guide.
 
@@ -443,6 +445,16 @@ proxies:
     backend_port: 5684
     backend_tls_verify_server_cert: false
     udp_idle_timeout_seconds: 120
+
+  # Full DTLS e2e: DTLS client → gateway → DTLS backend
+  - id: "secure-iot"
+    listen_path: ""
+    listen_port: 5685
+    backend_protocol: dtls
+    backend_host: "secure-iot.internal"
+    backend_port: 5684
+    frontend_tls: true               # Accept DTLS from clients
+    backend_tls_verify_server_cert: false
 ```
 
 See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for full documentation.
