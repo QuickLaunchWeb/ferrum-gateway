@@ -151,7 +151,7 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 50 concurrent c
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
 |----------|-------------|-------------|------|------|------|--------|
-| HTTP/2 (TLS) | 3,480 | 14.37ms | 13.15ms | 30.86ms | 125.18ms | 0 |
+| HTTP/2 (TLS) | 3,469 | 14.40ms | 11.94ms | 36.32ms | 66.30ms | 0 |
 | HTTP/3 (QUIC) | 43,323 | 1.15ms | 1.05ms | 2.06ms | 61.53ms | 0 |
 | WebSocket | 88,516 | 563μs | 506μs | 1.51ms | 31.98ms | 0 |
 | gRPC | 31,835 | 1.57ms | 1.47ms | 3.37ms | 46.75ms | 0 |
@@ -164,7 +164,7 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 50 concurrent c
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max |
 |----------|-------------|-------------|------|------|------|
-| HTTP/2 (TLS) | 29,087 | 1.72ms | 1.71ms | 2.79ms | 22.05ms |
+| HTTP/2 (TLS) | 34,183 | 1.46ms | 1.48ms | 1.89ms | 7.32ms |
 | HTTP/3 (QUIC) | 81,338 | 613μs | 606μs | 841μs | 3.59ms |
 | WebSocket | 220,230 | 226μs | 216μs | 491μs | 24.53ms |
 | gRPC | 115,473 | 431μs | 394μs | 1.17ms | 38.59ms |
@@ -179,7 +179,7 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 50 concurrent c
 
 | Protocol | Gateway RPS | Direct RPS | Overhead | Notes |
 |----------|------------|------------|----------|-------|
-| HTTP/2 (TLS) | 3,480 | 29,087 | ~88% | Full TLS + H2 negotiation per-connection |
+| HTTP/2 (TLS) | 3,469 | 34,183 | ~90% | reqwest creates new TLS connections per burst (see note) |
 | HTTP/3 (QUIC) | 43,323 | 81,338 | ~47% | QUIC connection coalescing helps |
 | WebSocket | 88,516 | 220,230 | ~60% | Upgrade overhead amortized over many messages |
 | gRPC | 31,835 | 115,473 | ~72% | H2 multiplexing + protobuf passthrough |
@@ -187,6 +187,12 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 50 concurrent c
 | TCP+TLS | 111,739 | 226,244 | ~51% | TLS termination + bidirectional copy |
 | UDP | 84,242 | 269,510 | ~69% | Per-datagram session lookup + forwarding |
 | UDP+DTLS | 79,640 | — | — | DTLS termination + plain UDP forwarding |
+
+### Note: HTTP/2 Gateway Overhead
+
+HTTP/2 through the gateway shows higher overhead than other protocols. At low concurrency (1 connection), latency is only **727μs** (healthy). Under concurrent load, the gateway's `reqwest` client creates multiple short-lived TLS connections to the backend rather than multiplexing HTTP/2 streams over a single persistent connection. This causes each connection to pay a full TLS handshake cost (~10ms), resulting in the elevated average latency. The throughput plateaus at ~3.5K rps regardless of concurrency level.
+
+This is a `reqwest` connection pool behavior — when concurrent requests arrive before the first HTTP/2 connection completes ALPN negotiation, reqwest opens additional connections instead of queuing requests for multiplexing on the first one. Potential mitigations include switching to a lower-level `hyper` HTTP/2 client with explicit connection management, or pre-warming the reqwest connection pool before load arrives.
 
 ## Prerequisites
 

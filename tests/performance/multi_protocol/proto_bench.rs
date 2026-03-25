@@ -138,7 +138,6 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     let path = url.path().to_string();
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
-    let mut handles = Vec::new();
 
     let tls_cfg = if is_tls {
         Some(Arc::new(tls_utils::make_client_tls_config_insecure()))
@@ -146,38 +145,48 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         None
     };
 
-    for _ in 0..args.concurrency {
-        let path = path.clone();
-        let tls_cfg = tls_cfg.clone();
+    // HTTP/2 multiplexes many streams over fewer connections. Use a
+    // connection pool sized to balance multiplexing benefit vs contention.
+    // ~10 streams per connection is a good balance for throughput.
+    let num_conns = std::cmp::max(1, std::cmp::min(args.concurrency as usize, args.concurrency as usize / 10 + 1));
+    let mut senders = Vec::with_capacity(num_conns);
+
+    for _ in 0..num_conns {
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
         let host_str = host.to_string();
+
+        let send_req = if let Some(ref tls_cfg) = tls_cfg {
+            let connector = tokio_rustls::TlsConnector::from(tls_cfg.clone());
+            let server_name = rustls::pki_types::ServerName::try_from(host_str)
+                .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
+            let tls_stream = connector.connect(server_name, tcp).await?;
+            let io = hyper_util::rt::TokioIo::new(tls_stream);
+            let (sr, conn) =
+                http2::handshake(TokioExecutor::new(), io).await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            sr
+        } else {
+            let io = hyper_util::rt::TokioIo::new(tcp);
+            let (sr, conn) =
+                http2::handshake(TokioExecutor::new(), io).await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            sr
+        };
+        senders.push(send_req);
+    }
+
+    // Distribute concurrent tasks across the connection pool.
+    // hyper's http2 SendRequest is Clone and supports concurrent streams.
+    let mut handles = Vec::new();
+    for i in 0..args.concurrency {
+        let mut send_req = senders[i as usize % num_conns].clone();
+        let path = path.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
-
-            let tcp = tokio::net::TcpStream::connect(addr).await?;
-
-            let send_req = if let Some(tls_cfg) = tls_cfg {
-                let connector = tokio_rustls::TlsConnector::from(tls_cfg);
-                let server_name = rustls::pki_types::ServerName::try_from(host_str)
-                    .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
-                let tls_stream = connector.connect(server_name, tcp).await?;
-                let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let (sr, conn) =
-                    http2::handshake(TokioExecutor::new(), io).await?;
-                tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                sr
-            } else {
-                let io = hyper_util::rt::TokioIo::new(tcp);
-                let (sr, conn) =
-                    http2::handshake(TokioExecutor::new(), io).await?;
-                tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                sr
-            };
-
-            let mut send_req = send_req;
             while Instant::now() < deadline {
                 let req = hyper::Request::get(&path)
                     .body(http_body_util::Full::new(Bytes::new()))
@@ -196,7 +205,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                     Err(_) => {
                         metrics.record_error();
-                        break; // Connection broken, exit
+                        break;
                     }
                 }
             }
