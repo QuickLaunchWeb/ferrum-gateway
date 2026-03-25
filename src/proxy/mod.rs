@@ -710,6 +710,18 @@ async fn handle_websocket_request_authenticated(
         .num_milliseconds()
         .max(0) as f64;
 
+    // Resolve backend IP from DNS cache for WebSocket tx log
+    let ws_resolved_ip = state
+        .dns_cache
+        .resolve(
+            &proxy.backend_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .ok()
+        .map(|ip| ip.to_string());
+
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
@@ -719,6 +731,7 @@ async fn handle_websocket_request_authenticated(
         matched_proxy_id: Some(proxy.id.clone()),
         matched_proxy_name: proxy.name.clone(),
         backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+        backend_resolved_ip: ws_resolved_ip,
         response_status_code: 101,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
@@ -1346,6 +1359,7 @@ pub async fn log_rejected_request(
             let url = build_backend_url(p, &ctx.path, "");
             strip_query_params(&url).to_string()
         }),
+        backend_resolved_ip: None,
         response_status_code: status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
@@ -1740,6 +1754,18 @@ pub async fn handle_proxy_request(
 
                 // Log phase
                 if !plugins.is_empty() {
+                    // Resolve backend IP from DNS cache for gRPC tx log
+                    let grpc_resolved_ip = state
+                        .dns_cache
+                        .resolve(
+                            &proxy.backend_host,
+                            proxy.dns_override.as_deref(),
+                            proxy.dns_cache_ttl_seconds,
+                        )
+                        .await
+                        .ok()
+                        .map(|ip| ip.to_string());
+
                     let summary = TransactionSummary {
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
@@ -1752,6 +1778,7 @@ pub async fn handle_proxy_request(
                         matched_proxy_id: Some(proxy.id.clone()),
                         matched_proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+                        backend_resolved_ip: grpc_resolved_ip,
                         response_status_code: grpc_resp.status,
                         latency_total_ms: total_ms,
                         latency_gateway_processing_ms: gateway_processing_ms,
@@ -1976,6 +2003,7 @@ pub async fn handle_proxy_request(
     let response_status = backend_resp.status_code;
     let response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+    let backend_resolved_ip = backend_resp.backend_resolved_ip;
 
     debug!(
         proxy_id = %proxy.id,
@@ -2058,6 +2086,7 @@ pub async fn handle_proxy_request(
             matched_proxy_id: Some(proxy.id.clone()),
             matched_proxy_name: proxy.name.clone(),
             backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+            backend_resolved_ip,
             response_status_code: response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
@@ -2256,6 +2285,18 @@ async fn proxy_to_backend_retry(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    // Resolve backend IP from DNS cache (O(1) cached lookup).
+    let resolved_ip = state
+        .dns_cache
+        .resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .ok()
+        .map(|ip| ip.to_string());
+
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
@@ -2267,6 +2308,7 @@ async fn proxy_to_backend_retry(
                 ),
                 headers: HashMap::new(),
                 connection_error: true,
+                backend_resolved_ip: resolved_ip.clone(),
             };
         }
     };
@@ -2290,6 +2332,7 @@ async fn proxy_to_backend_retry(
                     ),
                     headers: HashMap::new(),
                     connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
                 };
             }
         },
@@ -2346,6 +2389,7 @@ async fn proxy_to_backend_retry(
                     body: ResponseBody::Streaming(response),
                     headers: resp_headers,
                     connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
@@ -2354,6 +2398,7 @@ async fn proxy_to_backend_retry(
                     body: ResponseBody::Buffered(body),
                     headers: resp_headers,
                     connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
                 }
             }
         }
@@ -2381,6 +2426,7 @@ async fn proxy_to_backend_retry(
                 ),
                 headers: HashMap::new(),
                 connection_error: is_connect || is_timeout,
+                backend_resolved_ip: resolved_ip.clone(),
             }
         }
     }
@@ -2408,6 +2454,20 @@ async fn proxy_to_backend(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
+    // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
+    // This is the same cache reqwest will use internally via DnsCacheResolver,
+    // so the IP will match the actual connection target.
+    let resolved_ip = state
+        .dns_cache
+        .resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .ok()
+        .map(|ip| ip.to_string());
+
     // Handle HTTP/3 backend requests differently (always buffered — h3 crate
     // doesn't expose a streaming body API compatible with reqwest::Response)
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
@@ -2426,6 +2486,7 @@ async fn proxy_to_backend(
             body: ResponseBody::Buffered(body),
             headers: hdrs,
             connection_error: false,
+            backend_resolved_ip: resolved_ip.clone(),
         };
     }
 
@@ -2470,6 +2531,7 @@ async fn proxy_to_backend(
                     ),
                     headers: HashMap::new(),
                     connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
                 };
             }
         },
@@ -2532,6 +2594,7 @@ async fn proxy_to_backend(
                 ),
                 headers: HashMap::new(),
                 connection_error: false,
+                backend_resolved_ip: resolved_ip.clone(),
             };
         }
 
@@ -2558,6 +2621,7 @@ async fn proxy_to_backend(
                         ),
                         headers: HashMap::new(),
                         connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
                     };
                 }
             }
@@ -2579,6 +2643,7 @@ async fn proxy_to_backend(
                         ),
                         headers: HashMap::new(),
                         connection_error: true,
+                        backend_resolved_ip: resolved_ip.clone(),
                     };
                 }
             }
@@ -2621,6 +2686,7 @@ async fn proxy_to_backend(
                         ),
                         headers: HashMap::new(),
                         connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
                     };
                 }
 
@@ -2633,6 +2699,7 @@ async fn proxy_to_backend(
                         body: ResponseBody::Streaming(response),
                         headers: resp_headers,
                         connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
                     };
                 }
 
@@ -2644,12 +2711,14 @@ async fn proxy_to_backend(
                         body: ResponseBody::Buffered(resp_body),
                         headers: resp_headers,
                         connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
                     },
                     Err(err_body) => retry::BackendResponse {
                         status_code: 502,
                         body: ResponseBody::Buffered(err_body),
                         headers: HashMap::new(),
                         connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
                     },
                 }
             } else if stream_response {
@@ -2659,6 +2728,7 @@ async fn proxy_to_backend(
                     body: ResponseBody::Streaming(response),
                     headers: resp_headers,
                     connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
@@ -2667,6 +2737,7 @@ async fn proxy_to_backend(
                     body: ResponseBody::Buffered(body),
                     headers: resp_headers,
                     connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
                 }
             }
         }
@@ -2694,6 +2765,7 @@ async fn proxy_to_backend(
                 ),
                 headers: HashMap::new(),
                 connection_error: is_connect || is_timeout,
+                backend_resolved_ip: resolved_ip.clone(),
             }
         }
     }

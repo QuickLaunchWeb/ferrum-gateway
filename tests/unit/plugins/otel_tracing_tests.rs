@@ -36,6 +36,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         matched_proxy_id: None,
         matched_proxy_name: None,
         backend_target_url: None,
+        backend_resolved_ip: None,
         response_status_code: 200,
         latency_total_ms: 15.0,
         latency_gateway_processing_ms: 3.0,

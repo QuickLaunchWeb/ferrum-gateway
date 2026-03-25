@@ -24,6 +24,7 @@ fn make_summary(
         matched_proxy_id: Some(proxy_id.to_string()),
         matched_proxy_name: Some("Test".to_string()),
         backend_target_url: Some("http://localhost:3000".to_string()),
+        backend_resolved_ip: None,
         response_status_code: status,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: 5.0,

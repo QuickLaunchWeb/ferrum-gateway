@@ -29,6 +29,10 @@ pub struct BackendResponse {
     /// DNS resolution failure, TLS handshake error, connect timeout, etc.
     /// False when we got an actual HTTP response (even if it's a 502).
     pub connection_error: bool,
+    /// The DNS-resolved IP address of the backend that was connected to.
+    /// Populated from the DNS cache before the request is sent. `None` when
+    /// DNS resolution fails or the request never reaches the backend.
+    pub backend_resolved_ip: Option<String>,
 }
 
 impl BackendResponse {

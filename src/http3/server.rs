@@ -510,6 +510,18 @@ async fn handle_h3_request(
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let gateway_processing_ms = total_ms - backend_total_ms;
 
+    // Resolve backend IP from DNS cache for HTTP/3 tx log
+    let h3_resolved_ip = state
+        .dns_cache
+        .resolve(
+            &proxy.backend_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .ok()
+        .map(|ip| ip.to_string());
+
     // Build transaction summary for logging
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -520,6 +532,7 @@ async fn handle_h3_request(
         matched_proxy_id: Some(proxy.id.clone()),
         matched_proxy_name: proxy.name.clone(),
         backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+        backend_resolved_ip: h3_resolved_ip,
         response_status_code: response_status,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: gateway_processing_ms,

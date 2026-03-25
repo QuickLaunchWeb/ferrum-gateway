@@ -87,6 +87,9 @@ pub struct TransactionSummary {
     pub matched_proxy_id: Option<String>,
     pub matched_proxy_name: Option<String>,
     pub backend_target_url: Option<String>,
+    /// The DNS-resolved IP address of the backend that was connected to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_resolved_ip: Option<String>,
     pub response_status_code: u16,
     pub latency_total_ms: f64,
     pub latency_gateway_processing_ms: f64,
