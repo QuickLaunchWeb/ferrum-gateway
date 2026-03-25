@@ -804,6 +804,10 @@ async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
 fn generate_test_dtls_cert(temp_dir: &TempDir) -> (String, String) {
     use rcgen::{CertificateParams, KeyPair};
 
+    // Ensure rustls crypto provider is installed (needed by rcgen)
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .expect("Failed to generate ECDSA P-256 key pair");
 

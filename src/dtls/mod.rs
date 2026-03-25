@@ -91,8 +91,14 @@ fn load_dtls_certificate(
     let cert_pem = std::fs::read_to_string(cert_path)
         .map_err(|e| anyhow::anyhow!("Failed to read DTLS cert {}: {}", cert_path, e))?;
 
-    // dtls crate expects PEM in format: PRIVATE_KEY block first, then CERTIFICATE blocks
-    let combined_pem = format!("{}\n{}", key_pem.trim(), cert_pem.trim());
+    // The webrtc-dtls crate's from_pem() expects non-standard PEM tags with underscores
+    // (e.g. "PRIVATE_KEY" instead of the standard "PRIVATE KEY"). Normalize the tag so
+    // that standard PKCS#8 PEM files ("BEGIN PRIVATE KEY") work correctly.
+    let normalized_key = key_pem
+        .replace("BEGIN PRIVATE KEY", "BEGIN PRIVATE_KEY")
+        .replace("END PRIVATE KEY", "END PRIVATE_KEY");
+
+    let combined_pem = format!("{}\n{}", normalized_key.trim(), cert_pem.trim());
     DtlsCertificate::from_pem(&combined_pem).map_err(|e| {
         anyhow::anyhow!(
             "Failed to parse DTLS certificate (note: only ECDSA P-256 and Ed25519 keys \
