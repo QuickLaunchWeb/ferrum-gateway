@@ -182,6 +182,10 @@ pub struct StreamTransactionSummary {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub connection_error: Option<String>,
+    /// Human-friendly classification of the connection error, if any.
+    /// Mirrors the `ErrorClass` used for HTTP/gRPC transactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<crate::retry::ErrorClass>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
 }

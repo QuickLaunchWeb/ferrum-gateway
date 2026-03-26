@@ -92,10 +92,48 @@ For a successful request, `error_class` is omitted entirely:
 }
 ```
 
+## Protocol Coverage
+
+Error classification is wired into all proxy protocols:
+
+| Protocol | Summary Type | Error Classification | Classifier |
+|---|---|---|---|
+| HTTP/1.1 | `TransactionSummary` | Full (13 error classes) | `classify_reqwest_error()` |
+| HTTP/2 | `TransactionSummary` | Full (13 error classes) | `classify_reqwest_error()` |
+| HTTP/3 (QUIC) | `TransactionSummary` | Full (13 error classes) | `classify_reqwest_error()` |
+| gRPC / gRPCs | `TransactionSummary` | Full (via gRPC error mapping) | `classify_grpc_proxy_error()` |
+| TCP / TCP+TLS | `StreamTransactionSummary` | Field available (`error_class`) | Classified from `anyhow::Error` context |
+| UDP / DTLS | `StreamTransactionSummary` | Field available (`error_class`) | Classified from `anyhow::Error` context |
+
+### Per-Error-Class Protocol Applicability
+
+Not all error classes apply to all protocols equally:
+
+| Error Class | HTTP | gRPC | HTTP/3 | TCP/UDP |
+|---|:---:|:---:|:---:|:---:|
+| `ConnectionTimeout` | Yes | Yes | Yes | Yes |
+| `ConnectionRefused` | Yes | Yes | Yes | Yes |
+| `ConnectionReset` | Yes | — | Yes | Yes |
+| `ConnectionClosed` | Yes | — | Yes | Yes |
+| `DnsLookupError` | Yes | Yes | Yes | Yes |
+| `TlsError` | Yes | Yes | Yes | Yes |
+| `ReadWriteTimeout` | Yes | Yes | Yes | — |
+| `ClientDisconnect` | Yes | — | — | — |
+| `ProtocolError` | Yes | Yes | Yes | — |
+| `ResponseBodyTooLarge` | Yes | — | Yes | — |
+| `RequestBodyTooLarge` | Yes | — | — | — |
+| `ConnectionPoolError` | Yes | — | — | — |
+| `RequestError` | Yes | Yes | Yes | — |
+
+**Notes:**
+- gRPC uses hyper's HTTP/2 client (not reqwest), so its error classification maps from `GrpcProxyError` variants which carry enough context to distinguish timeout, TLS, refused, and protocol errors.
+- TCP/UDP streams don't have request/response semantics, so body size limits and client disconnect don't apply. Their primary error classes are connection-level: timeout, refused, reset, DNS, and TLS.
+
 ## Implementation Details
 
 Error classification is implemented in `src/retry.rs`:
 
 - `ErrorClass` enum — 13 variants covering the full spectrum of gateway-level failures.
-- `classify_reqwest_error()` — inspects the `reqwest::Error` chain (connect errors, timeout, TLS, DNS, reset, etc.) and returns the appropriate `ErrorClass`.
-- The classification function is only called when the backend request fails, keeping the hot path allocation-free.
+- `classify_reqwest_error()` — inspects the `reqwest::Error` chain (connect errors, timeout, TLS, DNS, reset, etc.) and returns the appropriate `ErrorClass`. Used by HTTP/1.1, HTTP/2, and HTTP/3 paths.
+- `classify_grpc_proxy_error()` — maps `GrpcProxyError` variants (timeout, unavailable, internal) into `ErrorClass`. Inspects the error message to further distinguish TLS, connection refused, protocol, and DNS errors.
+- All classification functions are only called when the backend request fails, keeping the hot path allocation-free.

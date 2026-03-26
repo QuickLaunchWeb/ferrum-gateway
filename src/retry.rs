@@ -70,6 +70,40 @@ impl std::fmt::Display for ErrorClass {
     }
 }
 
+/// Classify a gRPC proxy error into an `ErrorClass`.
+///
+/// Maps `GrpcProxyError` variants (which carry message strings describing
+/// the failure) into the appropriate `ErrorClass`. Called on the error path only.
+pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -> ErrorClass {
+    use crate::proxy::grpc_proxy::GrpcProxyError;
+    match e {
+        GrpcProxyError::BackendTimeout(msg) => {
+            if msg.contains("Connect timeout") {
+                ErrorClass::ConnectionTimeout
+            } else {
+                ErrorClass::ReadWriteTimeout
+            }
+        }
+        GrpcProxyError::BackendUnavailable(msg) => {
+            if msg.contains("TLS handshake failed")
+                || msg.contains("h2 handshake failed")
+                || msg.contains("certificate")
+            {
+                ErrorClass::TlsError
+            } else if msg.contains("Connection refused") {
+                ErrorClass::ConnectionRefused
+            } else if msg.contains("h2c handshake failed") {
+                ErrorClass::ProtocolError
+            } else if msg.contains("Invalid server name") {
+                ErrorClass::DnsLookupError
+            } else {
+                ErrorClass::ConnectionRefused
+            }
+        }
+        GrpcProxyError::Internal(_) => ErrorClass::RequestError,
+    }
+}
+
 /// Classify a `reqwest::Error` into an `ErrorClass` by inspecting its
 /// error chain and message. This is called on the error path only (not hot path).
 pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {

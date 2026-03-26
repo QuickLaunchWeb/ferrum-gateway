@@ -1890,6 +1890,7 @@ pub async fn handle_proxy_request(
                     }));
             }
             Err(e) => {
+                let grpc_error_class = retry::classify_grpc_proxy_error(&e);
                 let (grpc_code, msg) = match &e {
                     GrpcProxyError::BackendUnavailable(m) => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
@@ -1901,7 +1902,55 @@ pub async fn handle_proxy_request(
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
                 };
-                log_rejected_request(&plugins, &ctx, 200, start_time, "grpc_backend_error").await;
+
+                // Log with error_class for gRPC backend failures
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                if !plugins.is_empty() {
+                    let logging_plugins: Vec<&Arc<dyn Plugin>> = plugins
+                        .iter()
+                        .filter(|p| p.priority() >= plugin_priority::STDOUT_LOGGING)
+                        .collect();
+
+                    if !logging_plugins.is_empty() {
+                        let proxy_ref = ctx.matched_proxy.as_ref();
+                        let mut metadata = ctx.metadata.clone();
+                        metadata.insert(
+                            "rejection_phase".to_string(),
+                            "grpc_backend_error".to_string(),
+                        );
+                        let summary = TransactionSummary {
+                            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                            client_ip: ctx.client_ip.clone(),
+                            consumer_username: ctx
+                                .identified_consumer
+                                .as_ref()
+                                .map(|c| c.username.clone()),
+                            http_method: ctx.method.clone(),
+                            request_path: ctx.path.clone(),
+                            matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
+                            matched_proxy_name: proxy_ref.and_then(|p| p.name.clone()),
+                            backend_target_url: proxy_ref.map(|p| {
+                                let url = build_backend_url(p, &ctx.path, "");
+                                strip_query_params(&url).to_string()
+                            }),
+                            backend_resolved_ip: None,
+                            response_status_code: 200, // gRPC errors use HTTP 200
+                            latency_total_ms: total_ms,
+                            latency_gateway_processing_ms: total_ms - backend_total_ms,
+                            latency_backend_ttfb_ms: backend_total_ms,
+                            latency_backend_total_ms: backend_total_ms,
+                            request_user_agent: ctx.headers.get("user-agent").cloned(),
+                            response_streamed: false,
+                            client_disconnected: false,
+                            error_class: Some(grpc_error_class),
+                            metadata,
+                        };
+                        for plugin in &logging_plugins {
+                            plugin.log(&summary).await;
+                        }
+                    }
+                }
+
                 record_request(&state, 200); // gRPC errors use HTTP 200
                 return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
             }

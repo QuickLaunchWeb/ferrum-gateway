@@ -486,16 +486,17 @@ async fn handle_h3_request(
     let backend_url = crate::proxy::build_backend_url(&proxy, &path, &query_string);
     let backend_start = std::time::Instant::now();
 
-    let (response_status, response_body, mut response_headers) = proxy_to_backend_h3(
-        &state,
-        &proxy,
-        &backend_url,
-        &method,
-        &proxy_headers,
-        body_data,
-        &ctx.client_ip,
-    )
-    .await;
+    let (response_status, response_body, mut response_headers, h3_error_class) =
+        proxy_to_backend_h3(
+            &state,
+            &proxy,
+            &backend_url,
+            &method,
+            &proxy_headers,
+            body_data,
+            &ctx.client_ip,
+        )
+        .await;
 
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -541,7 +542,7 @@ async fn handle_h3_request(
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
-        error_class: None,
+        error_class: h3_error_class,
         metadata: ctx.metadata.clone(),
     };
 
@@ -584,7 +585,12 @@ async fn proxy_to_backend_h3(
     headers: &std::collections::HashMap<String, String>,
     body_bytes: Vec<u8>,
     client_ip: &str,
-) -> (u16, Vec<u8>, std::collections::HashMap<String, String>) {
+) -> (
+    u16,
+    Vec<u8>,
+    std::collections::HashMap<String, String>,
+    Option<crate::retry::ErrorClass>,
+) {
     // Get client from connection pool (uses DnsCacheResolver for DNS lookups)
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
@@ -619,6 +625,7 @@ async fn proxy_to_backend_h3(
                     405,
                     r#"{"error":"Method not allowed"}"#.as_bytes().to_vec(),
                     HashMap::new(),
+                    None,
                 );
             }
         },
@@ -691,18 +698,24 @@ async fn proxy_to_backend_h3(
                             .as_bytes()
                             .to_vec(),
                         std::collections::HashMap::new(),
+                        Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
                     );
                 }
 
                 // Stream-collect with size limit
                 let max_size = state.max_response_body_size_bytes;
                 match collect_response_with_limit_h3(response, max_size).await {
-                    Ok((resp_body, _)) => (status, resp_body, resp_headers),
-                    Err(err_body) => (502, err_body, std::collections::HashMap::new()),
+                    Ok((resp_body, _)) => (status, resp_body, resp_headers, None),
+                    Err(err_body) => (
+                        502,
+                        err_body,
+                        std::collections::HashMap::new(),
+                        Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+                    ),
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
-                (status, body, resp_headers)
+                (status, body, resp_headers, None)
             }
         }
         Err(e) => {
@@ -710,11 +723,13 @@ async fn proxy_to_backend_h3(
                 "Backend request failed (HTTP/3 frontend): connection error details: {}",
                 e
             );
+            let h3_error_class = crate::retry::classify_reqwest_error(&e);
             let error_msg = serde_json::json!({"error": "Backend unavailable"});
             (
                 502,
                 error_msg.to_string().into_bytes(),
                 std::collections::HashMap::new(),
+                Some(h3_error_class),
             )
         }
     }
