@@ -371,8 +371,8 @@ println!("✓ Test description");
 - [ ] Add concurrent request testing
 - [ ] Add large payload testing
 - [ ] Add WebSocket proxy testing
-- [ ] Add plugin execution verification
-- [ ] Add consumer authentication testing
+- [x] Add plugin execution verification — see [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
+- [x] Add consumer authentication testing — see [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
 - [ ] Add rate limiting verification
 - [ ] Add performance benchmarking
 

@@ -708,7 +708,7 @@ async fn handle_connection(
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
-        async move { handle_proxy_request(req, state, addr, false).await }
+        async move { handle_proxy_request(req, state, addr, false, None).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         let err_string = e.to_string();
@@ -786,7 +786,15 @@ async fn handle_websocket_request_authenticated(
     };
 
     // Collect client headers to forward to backend
-    let client_headers = collect_forwardable_headers(&parts.headers);
+    let mut client_headers = collect_forwardable_headers(&parts.headers);
+
+    // Inject consumer identity headers for WebSocket connections
+    if let Some(ref consumer) = ctx.identified_consumer {
+        client_headers.push(("x-consumer-username".to_string(), consumer.username.clone()));
+        if let Some(ref custom_id) = consumer.custom_id {
+            client_headers.push(("x-consumer-custom-id".to_string(), custom_id.clone()));
+        }
+    }
 
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
@@ -795,15 +803,64 @@ async fn handle_websocket_request_authenticated(
         match connect_websocket_backend(&backend_url, &proxy, &env_config, &client_headers).await {
             Ok(stream) => stream,
             Err(e) => {
+                let ws_error_class = retry::classify_boxed_error(e.as_ref());
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
                     error_kind = "connect_failure",
+                    error_class = %ws_error_class,
                     error = %e,
                     "WebSocket backend connection failed"
                 );
                 state.request_count.fetch_add(1, Ordering::Relaxed);
                 record_status(&state, 502);
+
+                // Log with error_class for WebSocket backend failures
+                if !plugins.is_empty() {
+                    let logging_plugins: Vec<&Arc<dyn Plugin>> = plugins
+                        .iter()
+                        .filter(|p| p.priority() >= plugin_priority::STDOUT_LOGGING)
+                        .collect();
+
+                    if !logging_plugins.is_empty() {
+                        let ws_total_ms = (chrono::Utc::now() - ctx.timestamp_received)
+                            .num_milliseconds()
+                            .max(0) as f64;
+                        let mut metadata = ctx.metadata.clone();
+                        metadata.insert(
+                            "rejection_phase".to_string(),
+                            "websocket_backend_error".to_string(),
+                        );
+                        let summary = TransactionSummary {
+                            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                            client_ip: ctx.client_ip.clone(),
+                            consumer_username: ctx
+                                .identified_consumer
+                                .as_ref()
+                                .map(|c| c.username.clone()),
+                            http_method: "GET".to_string(),
+                            request_path: ctx.path.clone(),
+                            matched_proxy_id: Some(proxy.id.clone()),
+                            matched_proxy_name: proxy.name.clone(),
+                            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+                            backend_resolved_ip: None,
+                            response_status_code: 502,
+                            latency_total_ms: ws_total_ms,
+                            latency_gateway_processing_ms: ws_total_ms,
+                            latency_backend_ttfb_ms: -1.0,
+                            latency_backend_total_ms: -1.0,
+                            request_user_agent: ctx.headers.get("user-agent").cloned(),
+                            response_streamed: false,
+                            client_disconnected: false,
+                            error_class: Some(ws_error_class),
+                            metadata,
+                        };
+                        for plugin in &logging_plugins {
+                            plugin.log(&summary).await;
+                        }
+                    }
+                }
+
                 return Ok(build_response(
                     StatusCode::BAD_GATEWAY,
                     r#"{"error":"Backend WebSocket connection failed"}"#,
@@ -850,6 +907,7 @@ async fn handle_websocket_request_authenticated(
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata: ctx.metadata.clone(),
     };
 
@@ -1389,6 +1447,17 @@ async fn handle_tls_connection(
         }
     };
 
+    // Extract peer certificate (first in chain) before wrapping the stream.
+    // This is the only point where the ServerConnection is accessible — once
+    // wrapped in TokioIo, the TLS metadata is encapsulated and inaccessible.
+    // Arc-shared so HTTP/2 multiplexed requests avoid per-request cert cloning.
+    let client_cert_der: Option<Arc<Vec<u8>>> = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| Arc::new(cert.to_vec()));
+
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
@@ -1406,7 +1475,8 @@ async fn handle_tls_connection(
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
-        async move { handle_proxy_request(req, state, addr, true).await }
+        let cert = client_cert_der.clone();
+        async move { handle_proxy_request(req, state, addr, true, cert).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         let err_string = e.to_string();
@@ -1478,6 +1548,7 @@ pub async fn log_rejected_request(
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata,
     };
 
@@ -1492,6 +1563,7 @@ pub async fn handle_proxy_request(
     state: ProxyState,
     remote_addr: SocketAddr,
     is_tls: bool,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
@@ -1505,6 +1577,7 @@ pub async fn handle_proxy_request(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.tls_client_cert_der = tls_client_cert_der;
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;
@@ -1792,6 +1865,14 @@ pub async fn handle_proxy_request(
         }
         ctx.headers = tmp_headers;
     }
+    // Inject X-Consumer-Username header when a consumer has been authenticated
+    if let Some(ref consumer) = ctx.identified_consumer {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        headers.insert("X-Consumer-Username".to_string(), consumer.username.clone());
+        if let Some(ref custom_id) = consumer.custom_id {
+            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.clone());
+        }
+    }
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
@@ -1897,6 +1978,7 @@ pub async fn handle_proxy_request(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         response_streamed: false,
                         client_disconnected: false,
+                        error_class: None,
                         metadata: ctx.metadata.clone(),
                     };
                     for plugin in plugins.iter() {
@@ -1923,6 +2005,7 @@ pub async fn handle_proxy_request(
                     }));
             }
             Err(e) => {
+                let grpc_error_class = retry::classify_grpc_proxy_error(&e);
                 let (grpc_code, msg) = match &e {
                     GrpcProxyError::BackendUnavailable(m) => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
@@ -1934,7 +2017,55 @@ pub async fn handle_proxy_request(
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
                 };
-                log_rejected_request(&plugins, &ctx, 200, start_time, "grpc_backend_error").await;
+
+                // Log with error_class for gRPC backend failures
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                if !plugins.is_empty() {
+                    let logging_plugins: Vec<&Arc<dyn Plugin>> = plugins
+                        .iter()
+                        .filter(|p| p.priority() >= plugin_priority::STDOUT_LOGGING)
+                        .collect();
+
+                    if !logging_plugins.is_empty() {
+                        let proxy_ref = ctx.matched_proxy.as_ref();
+                        let mut metadata = ctx.metadata.clone();
+                        metadata.insert(
+                            "rejection_phase".to_string(),
+                            "grpc_backend_error".to_string(),
+                        );
+                        let summary = TransactionSummary {
+                            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                            client_ip: ctx.client_ip.clone(),
+                            consumer_username: ctx
+                                .identified_consumer
+                                .as_ref()
+                                .map(|c| c.username.clone()),
+                            http_method: ctx.method.clone(),
+                            request_path: ctx.path.clone(),
+                            matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
+                            matched_proxy_name: proxy_ref.and_then(|p| p.name.clone()),
+                            backend_target_url: proxy_ref.map(|p| {
+                                let url = build_backend_url(p, &ctx.path, "");
+                                strip_query_params(&url).to_string()
+                            }),
+                            backend_resolved_ip: None,
+                            response_status_code: 200, // gRPC errors use HTTP 200
+                            latency_total_ms: total_ms,
+                            latency_gateway_processing_ms: total_ms - backend_total_ms,
+                            latency_backend_ttfb_ms: backend_total_ms,
+                            latency_backend_total_ms: backend_total_ms,
+                            request_user_agent: ctx.headers.get("user-agent").cloned(),
+                            response_streamed: false,
+                            client_disconnected: false,
+                            error_class: Some(grpc_error_class),
+                            metadata,
+                        };
+                        for plugin in &logging_plugins {
+                            plugin.log(&summary).await;
+                        }
+                    }
+                }
+
                 record_request(&state, 200); // gRPC errors use HTTP 200
                 return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
             }
@@ -2114,6 +2245,7 @@ pub async fn handle_proxy_request(
     let response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
+    let backend_error_class = backend_resp.error_class.clone();
 
     debug!(
         proxy_id = %proxy.id,
@@ -2208,6 +2340,7 @@ pub async fn handle_proxy_request(
             request_user_agent: ctx.headers.get("user-agent").cloned(),
             response_streamed: is_streaming_response,
             client_disconnected: false,
+            error_class: backend_error_class,
             metadata: ctx.metadata.clone(),
         };
 
@@ -2426,6 +2559,7 @@ async fn proxy_to_backend_retry(
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::ErrorClass::ConnectionPoolError),
             };
         }
     };
@@ -2450,6 +2584,7 @@ async fn proxy_to_backend_retry(
                     headers: HashMap::new(),
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 };
             }
         },
@@ -2507,6 +2642,7 @@ async fn proxy_to_backend_retry(
                     headers: resp_headers,
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
@@ -2516,6 +2652,7 @@ async fn proxy_to_backend_retry(
                     headers: resp_headers,
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 }
             }
         }
@@ -2544,6 +2681,7 @@ async fn proxy_to_backend_retry(
                 headers: HashMap::new(),
                 connection_error: is_connect || is_timeout,
                 backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::classify_reqwest_error(&e)),
             }
         }
     }
@@ -2604,6 +2742,7 @@ async fn proxy_to_backend(
             headers: hdrs,
             connection_error: false,
             backend_resolved_ip: resolved_ip.clone(),
+            error_class: None,
         };
     }
 
@@ -2671,6 +2810,7 @@ async fn proxy_to_backend(
                     headers: HashMap::new(),
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 };
             }
         },
@@ -2734,6 +2874,7 @@ async fn proxy_to_backend(
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
             };
         }
 
@@ -2761,6 +2902,7 @@ async fn proxy_to_backend(
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                     };
                 }
             }
@@ -2783,6 +2925,7 @@ async fn proxy_to_backend(
                         headers: HashMap::new(),
                         connection_error: true,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::ClientDisconnect),
                     };
                 }
             }
@@ -2826,6 +2969,7 @@ async fn proxy_to_backend(
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                     };
                 }
 
@@ -2839,6 +2983,7 @@ async fn proxy_to_backend(
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
                     };
                 }
 
@@ -2851,6 +2996,7 @@ async fn proxy_to_backend(
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
                     },
                     Err(err_body) => retry::BackendResponse {
                         status_code: 502,
@@ -2858,6 +3004,7 @@ async fn proxy_to_backend(
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                     },
                 }
             } else if stream_response {
@@ -2868,6 +3015,7 @@ async fn proxy_to_backend(
                     headers: resp_headers,
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
@@ -2877,6 +3025,7 @@ async fn proxy_to_backend(
                     headers: resp_headers,
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 }
             }
         }
@@ -2905,6 +3054,7 @@ async fn proxy_to_backend(
                 headers: HashMap::new(),
                 connection_error: is_connect || is_timeout,
                 backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::classify_reqwest_error(&e)),
             }
         }
     }
@@ -3068,6 +3218,7 @@ async fn proxy_to_backend_http2(
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionPoolError),
             };
         }
     };
@@ -3091,6 +3242,7 @@ async fn proxy_to_backend_http2(
                     headers: HashMap::new(),
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
                 };
             }
         };
@@ -3109,6 +3261,7 @@ async fn proxy_to_backend_http2(
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
+                error_class: None,
             };
         }
     };
@@ -3139,6 +3292,7 @@ async fn proxy_to_backend_http2(
                     headers: HashMap::new(),
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
+                    error_class: None,
                 };
             }
         },
@@ -3212,6 +3366,7 @@ async fn proxy_to_backend_http2(
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ProtocolError),
             };
         }
         Err(_) => {
@@ -3226,6 +3381,7 @@ async fn proxy_to_backend_http2(
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
             };
         }
     };
@@ -3246,6 +3402,7 @@ async fn proxy_to_backend_http2(
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
+            error_class: None,
         }
     } else {
         // Buffer the full response body
@@ -3261,6 +3418,7 @@ async fn proxy_to_backend_http2(
                     headers: HashMap::new(),
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ProtocolError),
                 };
             }
         };
@@ -3270,6 +3428,7 @@ async fn proxy_to_backend_http2(
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
+            error_class: None,
         }
     }
 }

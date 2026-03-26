@@ -95,6 +95,7 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         db_ssl_client_cert: None,
         db_ssl_client_key: None,
         file_config_path: Some("/tmp/test-grpc-config.json".into()),
+        db_config_backup_path: None,
         cp_grpc_listen_addr: None,
         cp_grpc_jwt_secret: None,
         dp_cp_grpc_url: None,
@@ -269,7 +270,8 @@ async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::Join
                     let state = state.clone();
                     let addr = remote_addr;
                     async move {
-                        ferrum_gateway::proxy::handle_proxy_request(req, state, addr, false).await
+                        ferrum_gateway::proxy::handle_proxy_request(req, state, addr, false, None)
+                            .await
                     }
                 });
                 let _ = builder.serve_connection_with_upgrades(io, svc).await;

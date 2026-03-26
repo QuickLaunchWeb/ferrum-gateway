@@ -1,3 +1,4 @@
+mod functional_auth_acl_test;
 mod functional_cp_dp_test;
 mod functional_database_test;
 mod functional_db_tls_test;
@@ -5,6 +6,7 @@ mod functional_db_upstream_test;
 mod functional_file_mode_test;
 mod functional_grpc_test;
 mod functional_load_balancer_test;
+mod functional_logging_test;
 mod functional_scale_perf_test;
 mod functional_tcp_proxy_test;
 mod functional_udp_proxy_test;

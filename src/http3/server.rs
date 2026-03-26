@@ -162,16 +162,30 @@ async fn handle_h3_connection(
     let remote_addr = connection.remote_address();
     debug!("HTTP/3 connection established from {}", remote_addr);
 
+    // Extract peer certificate from the QUIC connection (mTLS).
+    // Quinn returns peer_identity() as Box<dyn Any> containing Vec<rustls::pki_types::CertificateDer>.
+    // Arc-shared so multiplexed streams avoid per-request cert cloning.
+    let client_cert_der: Option<Arc<Vec<u8>>> = connection
+        .peer_identity()
+        .and_then(|identity| {
+            identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .and_then(|certs| certs.first().map(|cert| Arc::new(cert.to_vec())));
+
     let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
 
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
                 let state = state.clone();
+                let cert = client_cert_der.clone();
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) = handle_h3_request(req, stream, state, remote_addr).await
+                            if let Err(e) =
+                                handle_h3_request(req, stream, state, remote_addr, cert).await
                             {
                                 error!("HTTP/3 request error: {}", e);
                             }
@@ -202,6 +216,7 @@ async fn handle_h3_request(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: ProxyState,
     remote_addr: SocketAddr,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
 
@@ -213,6 +228,7 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.tls_client_cert_der = tls_client_cert_der;
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;
@@ -486,16 +502,17 @@ async fn handle_h3_request(
     let backend_url = crate::proxy::build_backend_url(&proxy, &path, &query_string);
     let backend_start = std::time::Instant::now();
 
-    let (response_status, response_body, mut response_headers) = proxy_to_backend_h3(
-        &state,
-        &proxy,
-        &backend_url,
-        &method,
-        &proxy_headers,
-        body_data,
-        &ctx.client_ip,
-    )
-    .await;
+    let (response_status, response_body, mut response_headers, h3_error_class) =
+        proxy_to_backend_h3(
+            &state,
+            &proxy,
+            &backend_url,
+            &method,
+            &proxy_headers,
+            body_data,
+            &ctx.client_ip,
+        )
+        .await;
 
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -541,6 +558,7 @@ async fn handle_h3_request(
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
+        error_class: h3_error_class,
         metadata: ctx.metadata.clone(),
     };
 
@@ -583,7 +601,12 @@ async fn proxy_to_backend_h3(
     headers: &std::collections::HashMap<String, String>,
     body_bytes: Vec<u8>,
     client_ip: &str,
-) -> (u16, Vec<u8>, std::collections::HashMap<String, String>) {
+) -> (
+    u16,
+    Vec<u8>,
+    std::collections::HashMap<String, String>,
+    Option<crate::retry::ErrorClass>,
+) {
     // Get client from connection pool (uses DnsCacheResolver for DNS lookups)
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
@@ -618,6 +641,7 @@ async fn proxy_to_backend_h3(
                     405,
                     r#"{"error":"Method not allowed"}"#.as_bytes().to_vec(),
                     HashMap::new(),
+                    None,
                 );
             }
         },
@@ -690,18 +714,24 @@ async fn proxy_to_backend_h3(
                             .as_bytes()
                             .to_vec(),
                         std::collections::HashMap::new(),
+                        Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
                     );
                 }
 
                 // Stream-collect with size limit
                 let max_size = state.max_response_body_size_bytes;
                 match collect_response_with_limit_h3(response, max_size).await {
-                    Ok((resp_body, _)) => (status, resp_body, resp_headers),
-                    Err(err_body) => (502, err_body, std::collections::HashMap::new()),
+                    Ok((resp_body, _)) => (status, resp_body, resp_headers, None),
+                    Err(err_body) => (
+                        502,
+                        err_body,
+                        std::collections::HashMap::new(),
+                        Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+                    ),
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
-                (status, body, resp_headers)
+                (status, body, resp_headers, None)
             }
         }
         Err(e) => {
@@ -709,11 +739,13 @@ async fn proxy_to_backend_h3(
                 "Backend request failed (HTTP/3 frontend): connection error details: {}",
                 e
             );
+            let h3_error_class = crate::retry::classify_reqwest_error(&e);
             let error_msg = serde_json::json!({"error": "Backend unavailable"});
             (
                 502,
                 error_msg.to_string().into_bytes(),
                 std::collections::HashMap::new(),
+                Some(h3_error_class),
             )
         }
     }
