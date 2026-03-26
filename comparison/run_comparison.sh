@@ -2,7 +2,7 @@
 
 # ===========================================================================
 # API Gateway Comparison Benchmark
-# Ferrum Gateway vs Pingora vs Kong vs Tyk
+# Ferrum Gateway vs Pingora vs Kong vs Tyk vs KrakenD vs Envoy
 #
 # Runs each gateway sequentially (one at a time) against the same backend
 # echo server, testing both HTTP and HTTPS (TLS termination), then generates
@@ -18,7 +18,8 @@
 #   KONG_VERSION=3.9        Kong Docker image tag
 #   TYK_VERSION=v5.7        Tyk Docker image tag
 #   KRAKEND_VERSION=2.13    KrakenD Docker image tag
-#   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,pingora,kong,tyk,krakend)
+#   ENVOY_VERSION=1.32-latest  Envoy Docker image tag
+#   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,pingora,kong,tyk,krakend,envoy)
 #   WARMUP_DURATION=5s      Warm-up duration before measured test
 # ===========================================================================
 
@@ -48,6 +49,7 @@ WARMUP_DURATION=${WARMUP_DURATION:-5s}
 KONG_VERSION=${KONG_VERSION:-3.9}
 TYK_VERSION=${TYK_VERSION:-v5.7}
 KRAKEND_VERSION=${KRAKEND_VERSION:-2.13}
+ENVOY_VERSION=${ENVOY_VERSION:-1.32-latest}
 SKIP_GATEWAYS=${SKIP_GATEWAYS:-}
 
 RESULTS_DIR="$COMP_DIR/results"
@@ -60,6 +62,7 @@ LUA_SCRIPT_KEY_AUTH="$COMP_DIR/lua/comparison_test_key_auth.lua"
 KONG_CONTAINER="ferrum-bench-kong"
 TYK_CONTAINER="ferrum-bench-tyk"
 KRAKEND_CONTAINER="ferrum-bench-krakend"
+ENVOY_CONTAINER="ferrum-bench-envoy"
 REDIS_CONTAINER="ferrum-bench-redis"
 
 # PIDs to track
@@ -166,6 +169,7 @@ cleanup() {
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
     docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
+    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
     docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
 
     # Clean up Docker network and temporary config files
@@ -178,6 +182,9 @@ cleanup() {
     rm -f "$COMP_DIR/configs/.krakend_runtime_http.json" 2>/dev/null || true
     rm -f "$COMP_DIR/configs/.krakend_runtime_https.json" 2>/dev/null || true
     rm -f "$COMP_DIR/configs/.krakend_runtime_e2e_tls.json" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.envoy_runtime_http.yaml" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.envoy_runtime_https.yaml" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml" 2>/dev/null || true
 
     kill_port "$BACKEND_PORT"
     kill_port "$BACKEND_HTTPS_PORT"
@@ -192,11 +199,14 @@ trap cleanup EXIT
 # ===========================================================================
 
 needs_docker() {
-    # Docker is needed for Tyk (always), KrakenD (always), and Kong (unless native)
+    # Docker is needed for Tyk (always), KrakenD (always), Envoy (always), and Kong (unless native)
     if ! should_skip "tyk"; then
         return 0
     fi
     if ! should_skip "krakend"; then
+        return 0
+    fi
+    if ! should_skip "envoy"; then
         return 0
     fi
     if ! should_skip "kong" && [[ "$KONG_NATIVE" != "true" ]]; then
@@ -274,6 +284,13 @@ pull_images() {
         log_info "Pulling krakend:${KRAKEND_VERSION}..."
         docker pull "krakend:${KRAKEND_VERSION}" --quiet || {
             log_warn "Failed to pull KrakenD image. Will try to use cached version."
+        }
+    fi
+
+    if ! should_skip "envoy"; then
+        log_info "Pulling envoyproxy/envoy:v${ENVOY_VERSION}..."
+        docker pull "envoyproxy/envoy:v${ENVOY_VERSION}" --quiet || {
+            log_warn "Failed to pull Envoy image. Will try to use cached version."
         }
     fi
 }
@@ -1113,6 +1130,117 @@ test_krakend() {
 }
 
 # ===========================================================================
+# Envoy Proxy
+# ===========================================================================
+
+prepare_envoy_config() {
+    # Replace BACKEND_HOST placeholder in Envoy config files
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/envoy/envoy_http.yaml" > "$COMP_DIR/configs/.envoy_runtime_http.yaml"
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/envoy/envoy_https.yaml" > "$COMP_DIR/configs/.envoy_runtime_https.yaml"
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/envoy/envoy_e2e_tls.yaml" > "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml"
+}
+
+start_envoy_http() {
+    log_info "Starting Envoy Proxy (HTTP) on port $GATEWAY_HTTP_PORT..."
+    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
+    fi
+
+    docker run -d --name "$ENVOY_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$COMP_DIR/configs/.envoy_runtime_http.yaml:/etc/envoy/envoy.yaml:ro" \
+        "envoyproxy/envoy:v${ENVOY_VERSION}" > /dev/null
+
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy (HTTP)" 20
+}
+
+start_envoy_https() {
+    log_info "Starting Envoy Proxy (HTTPS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
+    fi
+
+    docker run -d --name "$ENVOY_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$COMP_DIR/configs/.envoy_runtime_https.yaml:/etc/envoy/envoy.yaml:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/envoy/tls/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/envoy/tls/server.key:ro" \
+        "envoyproxy/envoy:v${ENVOY_VERSION}" > /dev/null
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy (HTTPS)" 20
+}
+
+start_envoy_e2e_tls() {
+    log_info "Starting Envoy Proxy (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
+    fi
+
+    docker run -d --name "$ENVOY_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml:/etc/envoy/envoy.yaml:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/envoy/tls/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/envoy/tls/server.key:ro" \
+        "envoyproxy/envoy:v${ENVOY_VERSION}" > /dev/null
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy (E2E TLS)" 20
+}
+
+stop_envoy() {
+    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+    sleep 1
+}
+
+test_envoy() {
+    log_header "Testing Envoy Proxy (${ENVOY_VERSION})"
+
+    prepare_envoy_config
+
+    # HTTP tests
+    start_envoy_http
+    run_wrk "envoy" "http" "/health" "$GATEWAY_HTTP_PORT"
+    run_wrk "envoy" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    stop_envoy
+
+    # HTTPS tests (TLS termination — plaintext backend)
+    start_envoy_https
+    run_wrk "envoy" "https" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "envoy" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_envoy
+
+    # E2E TLS tests (TLS on both sides)
+    start_envoy_e2e_tls
+    run_wrk "envoy" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "envoy" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_envoy
+}
+
+# ===========================================================================
 # Key-Auth Tests (HTTP only, Ferrum + Kong + Tyk)
 # Note: KrakenD key-auth requires Enterprise Edition, so it is excluded.
 # ===========================================================================
@@ -1349,6 +1477,7 @@ write_metadata() {
     "kong_version": "$kong_info",
     "tyk_version": "Docker ${TYK_VERSION}",
     "krakend_version": "Docker ${KRAKEND_VERSION}",
+    "envoy_version": "Docker ${ENVOY_VERSION}",
     "kong_native": $KONG_NATIVE,
     "os": "$(uname -s) $(uname -r) $(uname -m)",
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1369,16 +1498,16 @@ generate_report() {
 
 main() {
     echo -e "${BOLD}"
-    echo "  ╔══════════════════════════════════════════════════════════════╗"
-    echo "  ║          API Gateway Comparison Benchmark Suite            ║"
-    echo "  ║    Ferrum  vs  Pingora  vs  Kong  vs  Tyk  vs  KrakenD    ║"
-    echo "  ╚══════════════════════════════════════════════════════════════╝"
+    echo "  ╔══════════════════════════════════════════════════════════════════════╗"
+    echo "  ║              API Gateway Comparison Benchmark Suite              ║"
+    echo "  ║   Ferrum vs Pingora vs Kong vs Tyk vs KrakenD vs Envoy          ║"
+    echo "  ╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo "  Duration: ${WRK_DURATION}  Threads: ${WRK_THREADS}  Connections: ${WRK_CONNECTIONS}"
     if [[ "$KONG_NATIVE" == "true" ]]; then
-        echo "  Kong: native ($(kong version 2>/dev/null || echo '?'))  Tyk: Docker ${TYK_VERSION}  KrakenD: Docker ${KRAKEND_VERSION}"
+        echo "  Kong: native ($(kong version 2>/dev/null || echo '?'))  Tyk: Docker ${TYK_VERSION}  KrakenD: Docker ${KRAKEND_VERSION}  Envoy: Docker ${ENVOY_VERSION}"
     else
-        echo "  Kong: Docker ${KONG_VERSION}  Tyk: Docker ${TYK_VERSION}  KrakenD: Docker ${KRAKEND_VERSION}"
+        echo "  Kong: Docker ${KONG_VERSION}  Tyk: Docker ${TYK_VERSION}  KrakenD: Docker ${KRAKEND_VERSION}  Envoy: Docker ${ENVOY_VERSION}"
     fi
     if [[ -n "$SKIP_GATEWAYS" ]]; then
         echo -e "  ${YELLOW}Skipping: ${SKIP_GATEWAYS}${NC}"
@@ -1411,6 +1540,10 @@ main() {
 
     if ! should_skip "krakend"; then
         test_krakend
+    fi
+
+    if ! should_skip "envoy"; then
+        test_envoy
     fi
 
     # Key-Auth tests (HTTP only, Ferrum + Kong + Tyk; KrakenD key-auth requires Enterprise)
