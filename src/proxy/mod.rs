@@ -2318,6 +2318,19 @@ pub async fn handle_proxy_request(
         }
     }
 
+    // on_response_body hooks — only for buffered responses, only when plugins exist.
+    // This allows plugins (e.g., response_caching) to inspect and store the
+    // full response body after after_proxy headers are finalized.
+    if !plugins.is_empty()
+        && let ResponseBody::Buffered(ref data) = response_body
+    {
+        for plugin in plugins.iter() {
+            plugin
+                .on_response_body(&ctx, response_status, &response_headers, data)
+                .await;
+        }
+    }
+
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let gateway_processing_ms = total_ms - backend_total_ms;
 

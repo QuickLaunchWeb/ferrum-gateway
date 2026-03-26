@@ -17,6 +17,7 @@ pub mod prometheus_metrics;
 pub mod rate_limiting;
 pub mod request_termination;
 pub mod request_transformer;
+pub mod response_caching;
 pub mod response_transformer;
 pub mod stdout_logging;
 pub mod transaction_debugger;
@@ -207,7 +208,7 @@ pub struct StreamTransactionSummary {
 /// | Early   | 0–999       | Pre-processing: CORS preflight               | cors (100)                       |
 /// | AuthN   | 950–1999    | Authentication: identity verification         | mtls (950), oauth2 (1000), jwt (1100), key (1200), basic (1300) |
 /// | AuthZ   | 2000–2999   | Authorization & post-auth enforcement         | access_control (2000), rate_limiting (2900) |
-/// | Transform | 3000–3999 | Request transformation before backend         | request_transformer (3000)       |
+/// | Transform | 3000–3999 | Request transformation & caching              | request_transformer (3000), response_caching (3500) |
 /// | Response | 4000–4999  | Response transformation after backend         | response_transformer (4000)      |
 /// | Logging | 9000–9999   | Logging & observability (fire-and-forget)     | stdout (9000), http (9100), debugger (9200) |
 #[allow(dead_code)]
@@ -228,6 +229,7 @@ pub mod priority {
     pub const RATE_LIMITING: u16 = 2900;
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
+    pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const HTTP_LOGGING: u16 = 9100;
@@ -308,6 +310,24 @@ pub trait Plugin: Send + Sync {
     /// plugins that inspect or transform the response body.
     fn requires_response_body_buffering(&self) -> bool {
         false
+    }
+
+    /// Called after the full response body has been received from the backend.
+    ///
+    /// Only invoked when `requires_response_body_buffering()` returns `true` for
+    /// at least one active plugin on the proxy. Plugins that need to inspect or
+    /// cache the response body should override this method.
+    ///
+    /// The body bytes are the raw backend response body (before any response
+    /// transformation). The response_status and response_headers are the values
+    /// after the `after_proxy` phase.
+    async fn on_response_body(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
     }
 
     /// Called for transaction logging.
@@ -426,6 +446,9 @@ pub fn create_plugin_with_http_client(
         "request_termination" => Ok(Some(Arc::new(
             request_termination::RequestTermination::new(config),
         ))),
+        "response_caching" => Ok(Some(Arc::new(response_caching::ResponseCaching::new(
+            config,
+        )))),
         "prometheus_metrics" => Ok(Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(
             config,
         )))),
@@ -483,6 +506,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "rate_limiting",
         "body_validator",
         "request_termination",
+        "response_caching",
         "prometheus_metrics",
         "otel_tracing",
     ];
