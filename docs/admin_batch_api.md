@@ -179,6 +179,206 @@ Create consumers, proxies, and plugin configs in a single request:
 }
 ```
 
+## Usage Examples
+
+### curl: Create consumers with API keys
+
+```bash
+curl -X POST http://localhost:9000/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consumers": [
+      {"username": "alice", "credentials": {"keyauth": "alice-api-key-2024"}},
+      {"username": "bob", "credentials": {"keyauth": "bob-api-key-2024"}},
+      {"username": "charlie", "credentials": {"keyauth": "charlie-api-key-2024"}}
+    ]
+  }'
+```
+
+**Response:**
+```json
+{"created":{"proxies":0,"consumers":3,"plugin_configs":0,"upstreams":0}}
+```
+
+### curl: Provision a complete service with auth in one call
+
+This creates a consumer, a proxy route, and attaches key_auth + access_control plugins -- all in a single request:
+
+```bash
+curl -X POST http://localhost:9000/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consumers": [
+      {
+        "username": "mobile-app",
+        "custom_id": "mobile-team",
+        "credentials": {"keyauth": "mobile-secret-key"}
+      }
+    ],
+    "proxies": [
+      {
+        "id": "payments-proxy",
+        "name": "payments-api",
+        "listen_path": "/api/payments",
+        "backend_protocol": "http",
+        "backend_host": "payments-service.internal",
+        "backend_port": 8080
+      }
+    ],
+    "plugin_configs": [
+      {
+        "name": "key_auth",
+        "enabled": true,
+        "proxy_id": "payments-proxy",
+        "config": {}
+      },
+      {
+        "name": "access_control",
+        "enabled": true,
+        "proxy_id": "payments-proxy",
+        "config": {"allow": ["mobile-app"]}
+      },
+      {
+        "name": "rate_limiting",
+        "enabled": true,
+        "proxy_id": "payments-proxy",
+        "config": {"requests_per_second": 100}
+      }
+    ]
+  }'
+```
+
+Once the DB poller picks up the new config (default 30s, or set `FERRUM_DB_POLL_INTERVAL_SECONDS=5` for faster feedback), the route is live:
+
+```bash
+curl http://localhost:8000/api/payments/checkout \
+  -H "X-API-Key: mobile-secret-key"
+```
+
+### curl: Create a load-balanced upstream with proxies
+
+```bash
+curl -X POST http://localhost:9000/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "upstreams": [
+      {
+        "id": "user-svc-upstream",
+        "name": "user-service-pool",
+        "algorithm": "round_robin",
+        "targets": [
+          {"host": "10.0.1.10", "port": 3000, "weight": 100},
+          {"host": "10.0.1.11", "port": 3000, "weight": 100},
+          {"host": "10.0.1.12", "port": 3000, "weight": 50}
+        ],
+        "health_checks": {
+          "active": {
+            "http_path": "/health",
+            "interval": 10,
+            "healthy_threshold": 2,
+            "unhealthy_threshold": 3
+          }
+        }
+      }
+    ],
+    "proxies": [
+      {
+        "name": "user-service",
+        "listen_path": "/api/users",
+        "backend_protocol": "http",
+        "upstream_id": "user-svc-upstream"
+      }
+    ]
+  }'
+```
+
+### Python: Bulk-provision tenants from a CSV
+
+```python
+import csv
+import json
+import requests
+
+ADMIN_URL = "http://localhost:9000"
+TOKEN = "your-jwt-token"
+CHUNK_SIZE = 100
+
+headers = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json",
+}
+
+# Read tenants from CSV (columns: tenant_name, api_key, backend_host, backend_port)
+with open("tenants.csv") as f:
+    tenants = list(csv.DictReader(f))
+
+# Process in chunks of 100
+for i in range(0, len(tenants), CHUNK_SIZE):
+    chunk = tenants[i : i + CHUNK_SIZE]
+
+    consumers = []
+    proxies = []
+    plugin_configs = []
+
+    for t in chunk:
+        consumer_name = t["tenant_name"]
+        proxy_id = f"proxy-{consumer_name}"
+
+        consumers.append({
+            "username": consumer_name,
+            "credentials": {"keyauth": t["api_key"]},
+        })
+        proxies.append({
+            "id": proxy_id,
+            "name": consumer_name,
+            "listen_path": f"/tenant/{consumer_name}",
+            "backend_protocol": "http",
+            "backend_host": t["backend_host"],
+            "backend_port": int(t["backend_port"]),
+        })
+        plugin_configs.append({
+            "name": "key_auth",
+            "enabled": True,
+            "proxy_id": proxy_id,
+            "config": {},
+        })
+        plugin_configs.append({
+            "name": "access_control",
+            "enabled": True,
+            "proxy_id": proxy_id,
+            "config": {"allow": [consumer_name]},
+        })
+
+    resp = requests.post(
+        f"{ADMIN_URL}/batch",
+        headers=headers,
+        json={
+            "consumers": consumers,
+            "proxies": proxies,
+            "plugin_configs": plugin_configs,
+        },
+    )
+    result = resp.json()
+    print(f"Chunk {i // CHUNK_SIZE + 1}: {result['created']}")
+```
+
+### Verifying batch results
+
+After creating resources, list them with pagination to confirm:
+
+```bash
+# Check total consumer count
+curl -s "http://localhost:9000/consumers?limit=1" \
+  -H "Authorization: Bearer $TOKEN" | jq '.pagination.total'
+
+# List first 10 proxies
+curl -s "http://localhost:9000/proxies?limit=10" \
+  -H "Authorization: Bearer $TOKEN" | jq '.data[].listen_path'
+```
+
 ## Response
 
 ### Success (201 Created)
