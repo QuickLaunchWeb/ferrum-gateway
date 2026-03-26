@@ -1,7 +1,11 @@
 //! Tests for retry logic module
 
 use ferrum_gateway::config::types::{BackoffStrategy, RetryConfig};
-use ferrum_gateway::retry::{BackendResponse, ResponseBody, retry_delay, should_retry};
+use ferrum_gateway::proxy::grpc_proxy::GrpcProxyError;
+use ferrum_gateway::retry::{
+    BackendResponse, ErrorClass, ResponseBody, classify_boxed_error, classify_grpc_proxy_error,
+    retry_delay, should_retry,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -16,6 +20,7 @@ fn http_response(status_code: u16) -> BackendResponse {
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: None,
+        error_class: None,
     }
 }
 
@@ -26,6 +31,7 @@ fn connection_failure() -> BackendResponse {
         headers: HashMap::new(),
         connection_error: true,
         backend_resolved_ip: None,
+        error_class: Some(ferrum_gateway::retry::ErrorClass::ConnectionRefused),
     }
 }
 
@@ -171,4 +177,155 @@ fn test_connection_failure_still_respects_max_retries() {
     };
     assert!(should_retry(&config, "GET", &connection_failure(), 0));
     assert!(!should_retry(&config, "GET", &connection_failure(), 1));
+}
+
+// --- classify_grpc_proxy_error tests ---
+
+#[test]
+fn test_grpc_connect_timeout_classified() {
+    let err =
+        GrpcProxyError::BackendTimeout("Connect timeout after 5000ms to 10.0.0.1:50051".into());
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ConnectionTimeout
+    );
+}
+
+#[test]
+fn test_grpc_read_timeout_classified() {
+    let err = GrpcProxyError::BackendTimeout("Read timeout after 30000ms".into());
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ReadWriteTimeout
+    );
+}
+
+#[test]
+fn test_grpc_body_read_timeout_classified() {
+    let err = GrpcProxyError::BackendTimeout("Body read timeout after 30000ms".into());
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ReadWriteTimeout
+    );
+}
+
+#[test]
+fn test_grpc_tls_handshake_failure_classified() {
+    let err = GrpcProxyError::BackendUnavailable(
+        "TLS handshake failed: certificate verify failed".into(),
+    );
+    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_grpc_h2_handshake_failure_classified() {
+    let err = GrpcProxyError::BackendUnavailable("h2 handshake failed: protocol error".into());
+    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_grpc_connection_refused_classified() {
+    let err = GrpcProxyError::BackendUnavailable("Connection refused: connection refused".into());
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ConnectionRefused
+    );
+}
+
+#[test]
+fn test_grpc_h2c_handshake_failure_classified() {
+    let err = GrpcProxyError::BackendUnavailable("h2c handshake failed: connection reset".into());
+    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::ProtocolError);
+}
+
+#[test]
+fn test_grpc_invalid_server_name_classified() {
+    let err = GrpcProxyError::BackendUnavailable("Invalid server name: invalid dnsname".into());
+    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::DnsLookupError);
+}
+
+#[test]
+fn test_grpc_generic_unavailable_classified() {
+    let err = GrpcProxyError::BackendUnavailable("Backend error: something went wrong".into());
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ConnectionRefused
+    );
+}
+
+#[test]
+fn test_grpc_internal_error_classified() {
+    let err = GrpcProxyError::Internal("Failed to read client cert from /path: not found".into());
+    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::RequestError);
+}
+
+// --- classify_boxed_error tests (WebSocket / generic errors) ---
+
+#[test]
+fn test_boxed_error_connect_timeout() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "WebSocket backend connect timeout (5000ms) for proxy ws-1".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionTimeout
+    );
+}
+
+#[test]
+fn test_boxed_error_timed_out() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "operation timed out".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionTimeout
+    );
+}
+
+#[test]
+fn test_boxed_error_connection_refused() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "Connection refused (os error 111)".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionRefused
+    );
+}
+
+#[test]
+fn test_boxed_error_tls() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "TLS handshake failed: certificate verify failed".into();
+    assert_eq!(classify_boxed_error(err.as_ref()), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_boxed_error_dns() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "failed to lookup address information: Name or service not known".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::DnsLookupError
+    );
+}
+
+#[test]
+fn test_boxed_error_connection_reset() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "connection reset by peer".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionReset
+    );
+}
+
+#[test]
+fn test_boxed_error_broken_pipe() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "broken pipe".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionClosed
+    );
+}
+
+#[test]
+fn test_boxed_error_unknown_fallback() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "some unknown error".into();
+    assert_eq!(classify_boxed_error(err.as_ref()), ErrorClass::RequestError);
 }
