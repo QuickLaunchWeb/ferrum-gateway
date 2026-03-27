@@ -13,6 +13,7 @@ use crate::config::types::{GatewayConfig, SdProvider, ServiceDiscoveryConfig, Up
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::load_balancer::LoadBalancerCache;
+use crate::plugins::PluginHttpClient;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -37,6 +38,10 @@ pub struct ServiceDiscoveryManager {
     load_balancer_cache: Arc<LoadBalancerCache>,
     dns_cache: DnsCache,
     health_checker: Arc<HealthChecker>,
+    /// Shared HTTP client for Kubernetes and Consul discovery calls.
+    /// Inherits the gateway's pool config, DNS cache, trust store, and
+    /// `FERRUM_BACKEND_TLS_NO_VERIFY` setting.
+    http_client: PluginHttpClient,
 }
 
 impl ServiceDiscoveryManager {
@@ -44,12 +49,14 @@ impl ServiceDiscoveryManager {
         load_balancer_cache: Arc<LoadBalancerCache>,
         dns_cache: DnsCache,
         health_checker: Arc<HealthChecker>,
+        http_client: PluginHttpClient,
     ) -> Self {
         Self {
             tasks: DashMap::new(),
             load_balancer_cache,
             dns_cache,
             health_checker,
+            http_client,
         }
     }
 
@@ -159,6 +166,7 @@ impl ServiceDiscoveryManager {
             SdProvider::Kubernetes => {
                 if let Some(k8s_config) = &sd_config.kubernetes {
                     Box::new(kubernetes::KubernetesDiscoverer::new(
+                        self.http_client.get().clone(),
                         k8s_config.namespace.clone(),
                         k8s_config.service_name.clone(),
                         k8s_config.port_name.clone(),
@@ -176,6 +184,7 @@ impl ServiceDiscoveryManager {
             SdProvider::Consul => {
                 if let Some(consul_config) = &sd_config.consul {
                     Box::new(consul::ConsulDiscoverer::new(
+                        self.http_client.get().clone(),
                         consul_config.address.clone(),
                         consul_config.service_name.clone(),
                         consul_config.datacenter.clone(),

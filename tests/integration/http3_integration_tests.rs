@@ -364,6 +364,7 @@ async fn test_http3_proxy_state_creation() {
                     lb_cache,
                     dns_cache_for_sd,
                     hc,
+                    ferrum_gateway::plugins::PluginHttpClient::default(),
                 ),
             )
         },
@@ -523,6 +524,7 @@ async fn test_http3_full_integration() {
                     lb_cache,
                     dns_cache_for_sd,
                     hc,
+                    ferrum_gateway::plugins::PluginHttpClient::default(),
                 ),
             )
         },

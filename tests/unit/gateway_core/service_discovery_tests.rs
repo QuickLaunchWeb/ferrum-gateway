@@ -375,6 +375,7 @@ async fn test_manager_start_with_no_sd_upstreams() {
         cache,
         dns_cache,
         Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
+        ferrum_gateway::plugins::PluginHttpClient::default(),
     );
 
     // No SD config → no tasks started
@@ -392,6 +393,7 @@ async fn test_manager_stop_is_idempotent() {
         cache,
         dns_cache,
         Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
+        ferrum_gateway::plugins::PluginHttpClient::default(),
     );
 
     manager.stop();
@@ -403,6 +405,7 @@ async fn test_manager_stop_is_idempotent() {
 #[test]
 fn test_consul_discoverer_provider_name() {
     let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
         "http://consul:8500".to_string(),
         "my-service".to_string(),
         None,
@@ -419,6 +422,7 @@ fn test_consul_discoverer_provider_name() {
 #[test]
 fn test_kubernetes_discoverer_provider_name() {
     let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
         "default".to_string(),
         "my-service".to_string(),
         None,
@@ -476,6 +480,7 @@ async fn test_consul_discover_parses_response() {
         .await;
 
     let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
         mock_server.uri(),
         "my-api".to_string(),
         None,
@@ -516,6 +521,7 @@ async fn test_consul_discover_with_token() {
         .await;
 
     let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
         mock_server.uri(),
         "secure-api".to_string(),
         None,
@@ -543,6 +549,7 @@ async fn test_consul_discover_error_response() {
         .await;
 
     let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
         mock_server.uri(),
         "bad-api".to_string(),
         None,
@@ -593,6 +600,7 @@ async fn test_kubernetes_discover_parses_endpointslice() {
         .await;
 
     let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
         "default".to_string(),
         "my-service".to_string(),
         Some("http".to_string()), // select by port name

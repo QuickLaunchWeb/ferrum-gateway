@@ -152,9 +152,10 @@ impl ProxyState {
             &global_pool_config,
             dns_cache.clone(),
             env_config_arc.plugin_http_slow_threshold_ms,
+            env_config_arc.backend_tls_no_verify,
         );
         let plugin_cache = Arc::new(
-            PluginCache::with_http_client(&config, plugin_http_client)
+            PluginCache::with_http_client(&config, plugin_http_client.clone())
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
         // Build credential-indexed consumer lookup for O(1) auth
@@ -174,6 +175,7 @@ impl ProxyState {
             load_balancer_cache.clone(),
             dns_cache.clone(),
             health_checker.clone(),
+            plugin_http_client,
         ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));

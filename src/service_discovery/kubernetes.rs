@@ -3,9 +3,10 @@
 //! Polls the Kubernetes API server for EndpointSlice resources matching a
 //! service name and converts ready endpoints into upstream targets.
 //!
-//! Supports both in-cluster (service account token) and out-of-cluster
-//! (kubeconfig) authentication automatically via `KUBECONFIG` env var
-//! or the standard in-cluster service account path.
+//! Uses the gateway's shared `PluginHttpClient` (via its underlying
+//! `reqwest::Client`) so that Kubernetes API calls inherit the gateway's
+//! connection pool settings, DNS cache, trust store, and
+//! `FERRUM_BACKEND_TLS_NO_VERIFY` setting.
 
 use crate::config::types::UpstreamTarget;
 use std::collections::HashMap;
@@ -14,9 +15,9 @@ use tracing::debug;
 /// Kubernetes service discoverer.
 ///
 /// Polls EndpointSlice resources for the configured service and converts
-/// ready endpoints into `UpstreamTarget` entries. The HTTP client is built
-/// once at construction and reused across polls to avoid repeated TLS
-/// handshakes and connection setup.
+/// ready endpoints into `UpstreamTarget` entries. Uses a shared
+/// `reqwest::Client` from the gateway's `PluginHttpClient` for connection
+/// reuse and consistent TLS configuration.
 pub struct KubernetesDiscoverer {
     client: reqwest::Client,
     namespace: String,
@@ -29,13 +30,13 @@ pub struct KubernetesDiscoverer {
 
 impl KubernetesDiscoverer {
     pub fn new(
+        client: reqwest::Client,
         namespace: String,
         service_name: String,
         port_name: Option<String>,
         label_selector: Option<String>,
         default_weight: u32,
     ) -> Self {
-        let client = Self::build_client();
         Self {
             client,
             namespace,
@@ -52,20 +53,6 @@ impl KubernetesDiscoverer {
     pub fn with_api_url(mut self, url: String) -> Self {
         self.api_url_override = Some(url);
         self
-    }
-
-    /// Build the HTTP client once with in-cluster CA cert if available.
-    fn build_client() -> reqwest::Client {
-        let mut builder = reqwest::Client::builder();
-
-        if let Some(ca_path) = Self::ca_cert_path()
-            && let Ok(ca_cert) = std::fs::read(&ca_path)
-            && let Ok(cert) = reqwest::Certificate::from_pem(&ca_cert)
-        {
-            builder = builder.add_root_certificate(cert);
-        }
-
-        builder.build().unwrap_or_else(|_| reqwest::Client::new())
     }
 
     /// Build the Kubernetes API URL for listing EndpointSlices.
@@ -113,16 +100,6 @@ impl KubernetesDiscoverer {
         std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token").ok()
     }
 
-    /// Read the CA cert path for TLS verification against the API server.
-    fn ca_cert_path() -> Option<String> {
-        let path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
-        if std::path::Path::new(path).exists() {
-            Some(path.to_string())
-        } else {
-            None
-        }
-    }
-
     /// Extract the matching port from an EndpointSlice item.
     fn extract_port(&self, item: &serde_json::Value) -> Option<u16> {
         let ports = item.get("ports").and_then(|v| v.as_array())?;
@@ -154,7 +131,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
 
         let mut request = self.client.get(&url);
 
-        // Add bearer token auth
+        // Add bearer token auth (re-read each poll — tokens can rotate)
         if let Some(token) = Self::read_sa_token() {
             request = request.bearer_auth(token);
         } else if let Ok(kubeconfig_token) = std::env::var("KUBE_TOKEN") {

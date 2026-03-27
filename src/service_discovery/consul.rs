@@ -3,6 +3,11 @@
 //! Polls Consul's health API endpoint to discover healthy service instances
 //! and converts them into upstream targets. Supports blocking queries for
 //! efficient change detection.
+//!
+//! Uses the gateway's shared `PluginHttpClient` (via its underlying
+//! `reqwest::Client`) so that Consul API calls inherit the gateway's
+//! connection pool settings, DNS cache, trust store, and
+//! `FERRUM_BACKEND_TLS_NO_VERIFY` setting.
 
 use crate::config::types::UpstreamTarget;
 use std::collections::HashMap;
@@ -27,7 +32,9 @@ pub struct ConsulDiscoverer {
 }
 
 impl ConsulDiscoverer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        client: reqwest::Client,
         address: String,
         service_name: String,
         datacenter: Option<String>,
@@ -37,7 +44,7 @@ impl ConsulDiscoverer {
         default_weight: u32,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             address: address.trim_end_matches('/').to_string(),
             service_name,
             datacenter,

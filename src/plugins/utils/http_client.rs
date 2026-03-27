@@ -75,7 +75,12 @@ impl PluginHttpClient {
     /// - HTTP/2 keep-alive from PoolConfig (multiplexed stream health)
     /// - Gateway DNS cache (shared TTL, stale-while-revalidate, background refresh)
     /// - 30s connect timeout, 60s request timeout (generous for log sinks)
-    pub fn new(pool_config: &PoolConfig, dns_cache: DnsCache, slow_threshold_ms: u64) -> Self {
+    pub fn new(
+        pool_config: &PoolConfig,
+        dns_cache: DnsCache,
+        slow_threshold_ms: u64,
+        tls_no_verify: bool,
+    ) -> Self {
         let resolver = DnsCacheResolver::new(dns_cache);
 
         let mut builder = reqwest::Client::builder()
@@ -83,6 +88,7 @@ impl PluginHttpClient {
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60))
+            .danger_accept_invalid_certs(tls_no_verify)
             .dns_resolver(Arc::new(resolver));
 
         if pool_config.enable_http_keep_alive {
