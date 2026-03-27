@@ -67,6 +67,7 @@ pub async fn run(
         proxy_state: None,
         mode: "cp".into(),
         read_only: env_config.admin_read_only,
+        admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -95,6 +96,7 @@ pub async fn run(
             proxy_state: None,
             mode: "cp".into(),
             read_only: env_config.admin_read_only,
+            admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
