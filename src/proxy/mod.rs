@@ -1583,7 +1583,7 @@ pub async fn log_rejected_request(
         matched_proxy_id: proxy.map(|p| p.id.clone()),
         matched_proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target_url: proxy.map(|p| {
-            let url = build_backend_url(p, &ctx.path, "");
+            let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
             strip_query_params(&url).to_string()
         }),
         backend_resolved_ip: None,
@@ -1720,12 +1720,21 @@ pub async fn handle_proxy_request(
         });
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let matched_proxy = state
+    let route_match = state
         .router_cache
         .find_proxy(request_host.as_deref(), &path);
 
-    let proxy = match matched_proxy {
-        Some(p) => p,
+    let (proxy, strip_len) = match route_match {
+        Some(rm) => {
+            // Inject regex path parameters into context metadata and headers
+            for (name, value) in &rm.path_params {
+                ctx.metadata
+                    .insert(format!("path_param.{}", name), value.clone());
+                ctx.headers
+                    .insert(format!("x-path-param-{}", name), value.clone());
+            }
+            (rm.proxy, rm.matched_prefix_len)
+        }
         None => {
             debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
             state.request_count.fetch_add(1, Ordering::Relaxed);
@@ -1964,7 +1973,7 @@ pub async fn handle_proxy_request(
             BackendProtocol::Grpc | BackendProtocol::Grpcs
         )
     {
-        let backend_url = build_backend_url(&proxy, &path, &query_string);
+        let backend_url = build_backend_url(&proxy, &path, &query_string, strip_len);
         let backend_start = Instant::now();
 
         let grpc_result = grpc_proxy::proxy_grpc_request(
@@ -2107,7 +2116,7 @@ pub async fn handle_proxy_request(
                             matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
                             matched_proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target_url: proxy_ref.map(|p| {
-                                let url = build_backend_url(p, &ctx.path, "");
+                                let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
                                 strip_query_params(&url).to_string()
                             }),
                             backend_resolved_ip: None,
@@ -2199,8 +2208,14 @@ pub async fn handle_proxy_request(
         (proxy.backend_host.as_str(), proxy.backend_port)
     };
 
-    let backend_url =
-        build_backend_url_with_target(&proxy, &path, &query_string, effective_host, effective_port);
+    let backend_url = build_backend_url_with_target(
+        &proxy,
+        &path,
+        &query_string,
+        effective_host,
+        effective_port,
+        strip_len,
+    );
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing
@@ -2233,6 +2248,7 @@ pub async fn handle_proxy_request(
             proxy_headers,
             req,
             upstream_target.as_ref(),
+            &plugins,
             should_stream,
             &ctx.client_ip,
             is_tls,
@@ -2259,6 +2275,7 @@ pub async fn handle_proxy_request(
                     &query_string,
                     &next.host,
                     next.port,
+                    strip_len,
                 );
                 current_target = Some(next);
             }
@@ -2297,14 +2314,15 @@ pub async fn handle_proxy_request(
             proxy_headers,
             req,
             upstream_target.as_ref(),
+            &plugins,
             should_stream,
             &ctx.client_ip,
             is_tls,
         )
         .await
     };
-    let response_status = backend_resp.status_code;
-    let response_body = backend_resp.body;
+    let mut response_status = backend_resp.status_code;
+    let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class.clone();
@@ -2380,15 +2398,57 @@ pub async fn handle_proxy_request(
     }
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
-    // This allows plugins (e.g., response_caching) to inspect and store the
-    // full response body after after_proxy headers are finalized.
+    // This allows plugins (e.g., response_caching, body_validator) to inspect,
+    // validate, or store the full response body after after_proxy headers are
+    // finalized. A Reject result replaces the response before it reaches the client.
     if !plugins.is_empty()
         && let ResponseBody::Buffered(ref data) = response_body
     {
         for plugin in plugins.iter() {
-            plugin
+            let result = plugin
                 .on_response_body(&ctx, response_status, &response_headers, data)
                 .await;
+            match result {
+                PluginResult::Continue => {}
+                PluginResult::Reject {
+                    status_code,
+                    body: reject_body,
+                    headers: reject_headers,
+                } => {
+                    debug!(
+                        plugin = plugin.name(),
+                        status_code, "Plugin rejected response body"
+                    );
+                    response_status = status_code;
+                    response_headers.clear();
+                    response_headers
+                        .insert("content-type".to_string(), "application/json".to_string());
+                    for (k, v) in reject_headers {
+                        response_headers.insert(k, v);
+                    }
+                    response_body = ResponseBody::Buffered(reject_body.into_bytes());
+                    break;
+                }
+            }
+        }
+    }
+
+    // transform_response_body hooks — only for buffered responses.
+    // Allows plugins (e.g., response_transformer with body rules) to rewrite
+    // JSON fields in the response body before it is sent to the client.
+    if !plugins.is_empty()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        // Clone content-type to avoid borrowing response_headers across the loop.
+        let content_type = response_headers.get("content-type").cloned();
+        let ct_ref = content_type.as_deref();
+        for plugin in plugins.iter() {
+            if let Some(transformed) = plugin.transform_response_body(data, ct_ref).await {
+                // Update Content-Length to reflect the new body size
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                *data = transformed;
+            }
         }
     }
 
@@ -2512,17 +2572,28 @@ pub async fn handle_proxy_request(
 }
 
 /// Build the backend URL based on proxy config and path forwarding logic.
-pub fn build_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
+pub fn build_backend_url(
+    proxy: &Proxy,
+    incoming_path: &str,
+    query_string: &str,
+    strip_len: usize,
+) -> String {
     build_backend_url_with_target(
         proxy,
         incoming_path,
         query_string,
         &proxy.backend_host,
         proxy.backend_port,
+        strip_len,
     )
 }
 
 /// Build backend URL using a specific host and port (for load-balanced targets).
+///
+/// `strip_len` is the number of bytes to strip from the start of `incoming_path`
+/// when `proxy.strip_listen_path` is true. For prefix routes this equals
+/// `proxy.listen_path.len()`; for regex routes it is the regex match length
+/// (from `RouteMatch::matched_prefix_len`).
 ///
 /// Uses a single `String` buffer to avoid intermediate allocations from
 /// multiple `format!` calls.
@@ -2532,6 +2603,7 @@ pub fn build_backend_url_with_target(
     query_string: &str,
     host: &str,
     port: u16,
+    strip_len: usize,
 ) -> String {
     use std::fmt::Write;
 
@@ -2547,7 +2619,7 @@ pub fn build_backend_url_with_target(
     };
 
     let remaining_path = if proxy.strip_listen_path {
-        incoming_path.strip_prefix(&proxy.listen_path).unwrap_or("")
+        &incoming_path[strip_len.min(incoming_path.len())..]
     } else {
         incoming_path
     };
@@ -2772,6 +2844,7 @@ async fn proxy_to_backend(
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
     upstream_target: Option<&UpstreamTarget>,
+    #[allow(unused_variables)] plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_response: bool,
     client_ip: &str,
     is_tls: bool,
@@ -3007,6 +3080,24 @@ async fn proxy_to_backend(
                 }
             }
         };
+
+        // Transform request body via plugins (JSON field rename, add, remove, etc.)
+        let body_bytes =
+            if !body_bytes.is_empty() && plugins.iter().any(|p| p.modifies_request_body()) {
+                let content_type = headers.get("content-type").map(|s| s.as_str());
+                let mut current = body_bytes;
+                for plugin in plugins {
+                    if plugin.modifies_request_body()
+                        && let Some(transformed) =
+                            plugin.transform_request_body(&current, content_type).await
+                    {
+                        current = transformed;
+                    }
+                }
+                current
+            } else {
+                body_bytes
+            };
 
         if !body_bytes.is_empty() {
             req_builder = req_builder.body(body_bytes);
