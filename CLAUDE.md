@@ -288,7 +288,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | (none) | Path to externally provided JSON config backup for startup failover when DB is unreachable |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | `0.0.0.0:50051` | CP gRPC server listen address |
 | `FERRUM_DP_CP_GRPC_URL` | (required for dp mode) | CP gRPC URL for DP to connect to |
-| `FERRUM_BACKEND_TLS_NO_VERIFY` | `false` | Skip backend TLS verification (testing only) |
+| `FERRUM_TLS_NO_VERIFY` | `false` | Skip outbound TLS verification for all connections (testing only) |
+| `FERRUM_TLS_CA_BUNDLE_PATH` | (none) | Path to PEM CA bundle for outbound TLS verification (internal CAs) |
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | (none) | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt) |
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |

@@ -355,9 +355,7 @@ impl EnvConfig {
                 .and_then(|v| v.parse().ok()),
 
             // Global TLS trust store and mTLS
-            tls_ca_bundle_path: env::var("FERRUM_TLS_CA_BUNDLE_PATH")
-                .or_else(|_| env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH"))
-                .ok(),
+            tls_ca_bundle_path: env::var("FERRUM_TLS_CA_BUNDLE_PATH").ok(),
             backend_tls_client_cert_path: env::var("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH").ok(),
             backend_tls_client_key_path: env::var("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH").ok(),
 
@@ -370,10 +368,7 @@ impl EnvConfig {
             // Admin API TLS enhancements
             admin_tls_client_ca_bundle_path: env::var("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH")
                 .ok(),
-            tls_no_verify: env::var("FERRUM_TLS_NO_VERIFY")
-                .or_else(|_| env::var("FERRUM_BACKEND_TLS_NO_VERIFY"))
-                .unwrap_or_default()
-                == "true",
+            tls_no_verify: env::var("FERRUM_TLS_NO_VERIFY").unwrap_or_default() == "true",
             admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default()
                 == "true",
             admin_read_only: env::var("FERRUM_ADMIN_READ_ONLY").unwrap_or_default() == "true",

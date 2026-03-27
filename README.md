@@ -357,7 +357,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh |
 | `FERRUM_DNS_ERROR_TTL` | No | `1` | TTL (seconds) for errors/empty responses |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
-| `FERRUM_BACKEND_TLS_CA_BUNDLE_PATH` | No | — | Path to CA bundle for backend TLS verification |
+| `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification (proxy, service discovery, plugins) |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
 | `FERRUM_PROXY_TLS_CERT_PATH` | No | — | Path to server TLS certificate for HTTPS |
@@ -367,7 +367,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ADMIN_TLS_KEY_PATH` | No | — | Path to admin TLS private key for HTTPS |
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to admin client CA bundle for mTLS verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Disable admin TLS certificate verification (testing only) |
-| `FERRUM_BACKEND_TLS_NO_VERIFY` | No | `false` | Disable backend TLS certificate verification (testing only) |
+| `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_MIN_VERSION` | No | `1.2` | Minimum TLS protocol version (`1.2` or `1.3`) |
 | `FERRUM_TLS_MAX_VERSION` | No | `1.3` | Maximum TLS protocol version (`1.2` or `1.3`) |
 | `FERRUM_TLS_CIPHER_SUITES` | No | *(secure defaults)* | Comma-separated cipher suites (see [TLS Policy Hardening](docs/frontend_tls.md#tls-policy-hardening)) |
