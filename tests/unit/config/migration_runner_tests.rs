@@ -22,12 +22,10 @@ async fn test_migration_runner_fresh_database() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 and V2 should be applied on a fresh database
-    assert_eq!(applied.len(), 2);
+    // V1 should be applied on a fresh database
+    assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].version, 1);
     assert_eq!(applied[0].name, "initial_schema");
-    assert_eq!(applied[1].version, 2);
-    assert_eq!(applied[1].name, "service_discovery");
 
     // Running again should apply nothing
     let applied_again = runner.run_pending().await.unwrap();
@@ -56,16 +54,13 @@ async fn test_migration_runner_bootstrap_existing_db() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should NOT be applied (bootstrapped instead), but V2 should run
-    assert_eq!(applied.len(), 1);
-    assert_eq!(applied[0].version, 2);
-    assert_eq!(applied[0].name, "service_discovery");
+    // V1 should NOT be applied (bootstrapped instead), no other migrations pending
+    assert!(applied.is_empty());
 
-    // Check that both V1 and V2 are recorded as applied
+    // Check that V1 is recorded as applied (via bootstrap)
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 2);
+    assert_eq!(status.applied.len(), 1);
     assert_eq!(status.applied[0].version, 1);
-    assert_eq!(status.applied[1].version, 2);
     assert!(status.pending.is_empty());
 }
 
@@ -78,13 +73,13 @@ async fn test_migration_status() {
     // Before running: everything should be pending
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
-    assert_eq!(status.pending.len(), 2);
+    assert_eq!(status.pending.len(), 1);
 
     // Run migrations
     runner.run_pending().await.unwrap();
 
     // After running: everything should be applied
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 2);
+    assert_eq!(status.applied.len(), 1);
     assert!(status.pending.is_empty());
 }

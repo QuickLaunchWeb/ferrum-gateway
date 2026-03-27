@@ -357,12 +357,16 @@ async fn test_http3_proxy_state_creation() {
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
-        service_discovery_manager: Arc::new(
-            ferrum_gateway::service_discovery::ServiceDiscoveryManager::new(
-                lb_cache,
-                dns_cache_for_sd,
-            ),
-        ),
+        service_discovery_manager: {
+            let hc = Arc::new(ferrum_gateway::health_check::HealthChecker::new());
+            Arc::new(
+                ferrum_gateway::service_discovery::ServiceDiscoveryManager::new(
+                    lb_cache,
+                    dns_cache_for_sd,
+                    hc,
+                ),
+            )
+        },
         alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
@@ -512,12 +516,16 @@ async fn test_http3_full_integration() {
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
-        service_discovery_manager: Arc::new(
-            ferrum_gateway::service_discovery::ServiceDiscoveryManager::new(
-                lb_cache,
-                dns_cache_for_sd,
-            ),
-        ),
+        service_discovery_manager: {
+            let hc = Arc::new(ferrum_gateway::health_check::HealthChecker::new());
+            Arc::new(
+                ferrum_gateway::service_discovery::ServiceDiscoveryManager::new(
+                    lb_cache,
+                    dns_cache_for_sd,
+                    hc,
+                ),
+            )
+        },
         alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,

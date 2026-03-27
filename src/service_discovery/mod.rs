@@ -11,6 +11,7 @@ pub mod kubernetes;
 
 use crate::config::types::{GatewayConfig, SdProvider, ServiceDiscoveryConfig, UpstreamTarget};
 use crate::dns::DnsCache;
+use crate::health_check::HealthChecker;
 use crate::load_balancer::LoadBalancerCache;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -35,14 +36,20 @@ pub struct ServiceDiscoveryManager {
     tasks: DashMap<String, JoinHandle<()>>,
     load_balancer_cache: Arc<LoadBalancerCache>,
     dns_cache: DnsCache,
+    health_checker: Arc<HealthChecker>,
 }
 
 impl ServiceDiscoveryManager {
-    pub fn new(load_balancer_cache: Arc<LoadBalancerCache>, dns_cache: DnsCache) -> Self {
+    pub fn new(
+        load_balancer_cache: Arc<LoadBalancerCache>,
+        dns_cache: DnsCache,
+        health_checker: Arc<HealthChecker>,
+    ) -> Self {
         Self {
             tasks: DashMap::new(),
             load_balancer_cache,
             dns_cache,
+            health_checker,
         }
     }
 
@@ -206,6 +213,7 @@ impl ServiceDiscoveryManager {
         let lb_cache = self.load_balancer_cache.clone();
         let static_targets = static_targets.to_vec();
         let dns_cache = self.dns_cache.clone();
+        let health_checker = self.health_checker.clone();
 
         let handle = tokio::spawn(async move {
             run_discovery_loop(
@@ -218,6 +226,7 @@ impl ServiceDiscoveryManager {
                 poll_interval,
                 shutdown_rx,
                 &dns_cache,
+                &health_checker,
             )
             .await;
         });
@@ -269,6 +278,7 @@ async fn run_discovery_loop(
     poll_interval_seconds: u64,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     dns_cache: &DnsCache,
+    health_checker: &HealthChecker,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_interval_seconds));
     let mut last_discovered: Vec<UpstreamTarget> = Vec::new();
@@ -313,7 +323,15 @@ async fn run_discovery_loop(
                     }
 
                     // Update the load balancer cache atomically
-                    lb_cache.update_targets(upstream_id, merged, algorithm, hash_on.clone());
+                    lb_cache.update_targets(
+                        upstream_id,
+                        merged.clone(),
+                        algorithm,
+                        hash_on.clone(),
+                    );
+
+                    // Clean up stale health state for targets that were removed
+                    health_checker.remove_stale_targets(&merged);
 
                     last_discovered = discovered;
                 }

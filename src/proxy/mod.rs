@@ -173,6 +173,7 @@ impl ProxyState {
         let service_discovery_manager = Arc::new(ServiceDiscoveryManager::new(
             load_balancer_cache.clone(),
             dns_cache.clone(),
+            health_checker.clone(),
         ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));

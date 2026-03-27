@@ -371,7 +371,11 @@ async fn test_manager_start_with_no_sd_upstreams() {
 
     let cache = Arc::new(LoadBalancerCache::new(&config));
     let dns_cache = ferrum_gateway::dns::DnsCache::new(Default::default());
-    let manager = ServiceDiscoveryManager::new(cache, dns_cache);
+    let manager = ServiceDiscoveryManager::new(
+        cache,
+        dns_cache,
+        Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
+    );
 
     // No SD config → no tasks started
     manager.start(&config, None);
@@ -384,7 +388,11 @@ async fn test_manager_stop_is_idempotent() {
     let config = make_config_with_upstreams(vec![]);
     let cache = Arc::new(LoadBalancerCache::new(&config));
     let dns_cache = ferrum_gateway::dns::DnsCache::new(Default::default());
-    let manager = ServiceDiscoveryManager::new(cache, dns_cache);
+    let manager = ServiceDiscoveryManager::new(
+        cache,
+        dns_cache,
+        Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
+    );
 
     manager.stop();
     manager.stop(); // Should not panic
