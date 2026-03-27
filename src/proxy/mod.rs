@@ -45,6 +45,7 @@ use crate::plugins::{
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
+use crate::service_discovery::ServiceDiscoveryManager;
 
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
@@ -89,6 +90,8 @@ pub struct ProxyState {
     pub health_checker: Arc<HealthChecker>,
     /// Circuit breaker cache for proxy-level circuit breaking.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    /// Service discovery manager for dynamic upstream target resolution.
+    pub service_discovery_manager: Arc<ServiceDiscoveryManager>,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement.
     /// `None` when HTTP/3 is disabled; avoids a `format!()` allocation per response.
     pub alt_svc_header: Option<String>,
@@ -149,9 +152,11 @@ impl ProxyState {
             &global_pool_config,
             dns_cache.clone(),
             env_config_arc.plugin_http_slow_threshold_ms,
+            env_config_arc.tls_no_verify,
+            env_config_arc.tls_ca_bundle_path.as_deref(),
         );
         let plugin_cache = Arc::new(
-            PluginCache::with_http_client(&config, plugin_http_client)
+            PluginCache::with_http_client(&config, plugin_http_client.clone())
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
         // Build credential-indexed consumer lookup for O(1) auth
@@ -166,6 +171,13 @@ impl ProxyState {
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::new());
+        // Service discovery manager (tasks started later via start_service_discovery)
+        let service_discovery_manager = Arc::new(ServiceDiscoveryManager::new(
+            load_balancer_cache.clone(),
+            dns_cache.clone(),
+            health_checker.clone(),
+            plugin_http_client,
+        ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
 
@@ -181,7 +193,7 @@ impl ProxyState {
             dns_cache.clone(),
             load_balancer_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
-            env_config_arc.backend_tls_no_verify,
+            env_config_arc.tls_no_verify,
         ));
 
         // Reconcile stream proxy listeners (TCP/UDP) at startup so that any
@@ -202,6 +214,7 @@ impl ProxyState {
             load_balancer_cache,
             health_checker,
             circuit_breaker_cache,
+            service_discovery_manager,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
             grpc_pool,
@@ -288,6 +301,10 @@ impl ProxyState {
             tokio::spawn(async move {
                 slm.reconcile().await;
             });
+
+            // Reconcile service discovery tasks
+            let new_cfg = self.config.load_full();
+            self.service_discovery_manager.reconcile(&new_cfg, None);
 
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
@@ -428,7 +445,26 @@ impl ProxyState {
             delta.modified_upstreams.len(),
             proxy_ids_to_rebuild.len(),
         );
+
+        // Reconcile service discovery tasks for changed upstreams
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.service_discovery_manager.reconcile(&new_cfg, None);
+        }
+
         true
+    }
+
+    /// Start service discovery background tasks for all upstreams in the config.
+    ///
+    /// Should be called once after `ProxyState::new()` in each mode's startup,
+    /// similar to `health_checker.start()`.
+    pub fn start_service_discovery(&self, shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>) {
+        let config = self.config.load_full();
+        self.service_discovery_manager.start(&config, shutdown_rx);
     }
 
     /// Apply an incremental config update from the database polling loop.
@@ -671,6 +707,16 @@ impl ProxyState {
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
         );
+
+        // Reconcile service discovery tasks for changed upstreams
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.service_discovery_manager.reconcile(&new_cfg, None);
+        }
+
         true
     }
 
@@ -1045,7 +1091,7 @@ fn build_websocket_tls_connector(
     }
 
     // Determine if we should skip server cert verification
-    let skip_verify = env_config.backend_tls_no_verify || !proxy.backend_tls_verify_server_cert;
+    let skip_verify = env_config.tls_no_verify || !proxy.backend_tls_verify_server_cert;
 
     // Build root certificate store
     let mut root_store =
@@ -1055,7 +1101,7 @@ fn build_websocket_tls_connector(
     let ca_path = proxy
         .backend_tls_server_ca_cert_path
         .as_ref()
-        .or(env_config.backend_tls_ca_bundle_path.as_ref());
+        .or(env_config.tls_ca_bundle_path.as_ref());
     if let Some(ca_path) = ca_path {
         match std::fs::read(ca_path) {
             Ok(ca_pem) => {
@@ -2887,7 +2933,7 @@ async fn proxy_to_backend(
                     proxy.backend_read_timeout_ms,
                 ))
                 .danger_accept_invalid_certs(
-                    !proxy.backend_tls_verify_server_cert || state.env_config.backend_tls_no_verify,
+                    !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())

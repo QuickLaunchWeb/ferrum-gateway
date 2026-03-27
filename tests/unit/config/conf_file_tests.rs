@@ -103,7 +103,7 @@ fn test_conf_file_bool_values() {
 FERRUM_MODE = file
 FERRUM_FILE_CONFIG_PATH = /path
 FERRUM_ENABLE_HTTP3 = true
-FERRUM_BACKEND_TLS_NO_VERIFY = 1
+FERRUM_TLS_NO_VERIFY = 1
 FERRUM_ADMIN_READ_ONLY = false
 ";
     let conf = ConfFile::parse(conf_contents).unwrap();
@@ -113,7 +113,7 @@ FERRUM_ADMIN_READ_ONLY = false
         || {
             let config = EnvConfig::from_env_with_conf(&conf).unwrap();
             assert!(config.enable_http3);
-            assert!(config.backend_tls_no_verify);
+            assert!(config.tls_no_verify);
             assert!(!config.admin_read_only);
         },
     );

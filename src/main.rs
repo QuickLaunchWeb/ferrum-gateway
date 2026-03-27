@@ -18,6 +18,7 @@ mod plugins;
 mod proxy;
 mod retry;
 mod router_cache;
+mod service_discovery;
 mod tls;
 
 use config::{EnvConfig, OperatingMode};
