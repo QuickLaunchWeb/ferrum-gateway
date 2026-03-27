@@ -34,6 +34,7 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendProtocol, Proxy};
 use crate::dns::DnsCache;
+use crate::tls::NoVerifier;
 
 /// Pool entry tracking a sender handle and its last-used timestamp.
 struct GrpcPoolEntry {
@@ -238,7 +239,7 @@ impl GrpcConnectionPool {
         }
     }
 
-    /// Build an HTTP/2 client builder with keepalive settings from pool config.
+    /// Build an HTTP/2 client builder with keepalive and flow-control settings.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
 
@@ -253,9 +254,19 @@ impl GrpcConnectionPool {
                 .keep_alive_timeout(Duration::from_secs(
                     pool_config.http2_keep_alive_timeout_seconds,
                 ))
-                .initial_stream_window_size(Some(1_048_576))
-                .initial_connection_window_size(Some(16_777_216))
                 .max_concurrent_reset_streams(4096);
+        }
+
+        // Flow-control tuning — larger windows dramatically improve throughput
+        // by allowing more data in flight before waiting for WINDOW_UPDATEs.
+        builder
+            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
+            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
+            .adaptive_window(pool_config.http2_adaptive_window)
+            .max_frame_size(pool_config.http2_max_frame_size);
+
+        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+            builder.max_concurrent_streams(max_streams);
         }
 
         builder
@@ -400,7 +411,7 @@ impl GrpcConnectionPool {
         if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify {
             tls_config
                 .dangerous()
-                .set_certificate_verifier(Arc::new(NoCertificateVerification));
+                .set_certificate_verifier(Arc::new(NoVerifier));
         }
 
         let connector = TlsConnector::from(Arc::new(tls_config));
@@ -470,47 +481,6 @@ impl GrpcConnectionPool {
     }
 }
 
-/// Dangerous: skip TLS certificate verification (for testing or self-signed certs).
-#[derive(Debug)]
-struct NoCertificateVerification;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 /// Errors specific to gRPC proxying.
 #[derive(Debug)]
 pub enum GrpcProxyError {
@@ -561,14 +531,8 @@ pub async fn proxy_grpc_request(
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
 ) -> Result<GrpcResponse, GrpcProxyError> {
-    // Get or create HTTP/2 connection to backend
+    // Get or create HTTP/2 connection to backend (round-robins across pool)
     let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
-
-    // If the cached sender is closed, remove and reconnect
-    if sender.is_closed() {
-        sender = grpc_pool.get_sender(proxy, dns_cache).await?;
-    }
-
     // Parse the backend URL to extract path and authority
     let uri: hyper::Uri = backend_url
         .parse()

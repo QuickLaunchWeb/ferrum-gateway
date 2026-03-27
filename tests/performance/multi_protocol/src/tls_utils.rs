@@ -105,21 +105,24 @@ pub fn make_h3_server_config(
         .context("h3 server TLS config")?;
 
     tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
-
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
             .context("quinn crypto config")?,
     ));
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(1024u32.into());
-    transport.stream_receive_window((2 * 1024 * 1024u32).into());
-    transport.receive_window((16 * 1024 * 1024u32).into());
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
+    transport.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
     transport.send_window(16 * 1024 * 1024);
     server_cfg.transport_config(Arc::new(transport));
     Ok(server_cfg)
 }
 
 /// Create a `quinn::ClientConfig` that skips server certificate verification.
+///
+/// Applies optimized QUIC transport settings (8 MiB stream window, 32 MiB
+/// connection window, 8 MiB send window) to match the gateway's tuned defaults
+/// and ensure the bench client is not the bottleneck.
 pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
     let mut tls_cfg = rustls::ClientConfig::builder()
         .dangerous()
@@ -132,9 +135,9 @@ pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("quic client config");
     let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(1024u32.into());
-    transport.stream_receive_window((2 * 1024 * 1024u32).into());
-    transport.receive_window((16 * 1024 * 1024u32).into());
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
+    transport.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
     transport.send_window(16 * 1024 * 1024);
     client_cfg.transport_config(Arc::new(transport));
     client_cfg
