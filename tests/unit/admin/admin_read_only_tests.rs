@@ -47,6 +47,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         proxy_state: None,
         mode: "test".to_string(),
         read_only,
+        admin_restore_max_body_size_mib: 100,
     }
 }
 
@@ -161,6 +162,7 @@ async fn test_admin_state_mode_field() {
         proxy_state: None,
         mode: "production".to_string(),
         read_only: false,
+        admin_restore_max_body_size_mib: 100,
     };
     assert_eq!(admin_state_prod.mode, "production");
 }

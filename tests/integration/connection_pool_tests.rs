@@ -117,6 +117,9 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         dtls_key_path: None,
         dtls_client_ca_cert_path: None,
         plugin_http_slow_threshold_ms: 1000,
+        admin_restore_max_body_size_mib: 100,
+        migrate_action: "up".into(),
+        migrate_dry_run: false,
     }
 }
 

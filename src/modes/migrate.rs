@@ -1,4 +1,3 @@
-use std::env;
 use tracing::{error, info};
 
 use crate::config::EnvConfig;
@@ -10,14 +9,8 @@ pub async fn run(
     env_config: EnvConfig,
     _shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
-    let action = env::var("FERRUM_MIGRATE_ACTION")
-        .unwrap_or_else(|_| "up".into())
-        .to_lowercase();
-
-    let dry_run = env::var("FERRUM_MIGRATE_DRY_RUN")
-        .unwrap_or_default()
-        .to_lowercase()
-        == "true";
+    let action = &env_config.migrate_action;
+    let dry_run = env_config.migrate_dry_run;
 
     match action.as_str() {
         "up" => run_db_migrations(&env_config, dry_run).await,

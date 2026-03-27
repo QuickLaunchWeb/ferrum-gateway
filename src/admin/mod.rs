@@ -42,6 +42,8 @@ pub struct AdminState {
     pub cached_config: Option<Arc<ArcSwap<GatewayConfig>>>,
     pub mode: String,
     pub read_only: bool,
+    /// Max request body size in MiB for POST /restore.
+    pub admin_restore_max_body_size_mib: usize,
 }
 
 impl AdminState {
@@ -343,10 +345,7 @@ pub async fn handle_admin_request(
     // backups (30K+ proxies / 90K+ plugins can reach ~80 MB);
     // all other endpoints use the standard 1 MiB limit.
     let restore_max_mib: usize = if path == "/restore" {
-        std::env::var("FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100)
+        state.admin_restore_max_body_size_mib
     } else {
         1
     };

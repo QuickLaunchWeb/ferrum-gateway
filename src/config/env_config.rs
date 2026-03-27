@@ -222,6 +222,18 @@ pub struct EnvConfig {
     /// JWKS fetch, OTLP export) exceeds this duration, a warning is logged.
     /// Default: 1000 (1 second).
     pub plugin_http_slow_threshold_ms: u64,
+
+    /// Max request body size in MiB for POST /restore (large config backups).
+    /// Default: 100 MiB.
+    pub admin_restore_max_body_size_mib: usize,
+
+    /// Migration action: up, status, config (migrate mode only).
+    /// Default: "up".
+    pub migrate_action: String,
+
+    /// When true, migration commands preview changes without applying.
+    /// Default: false.
+    pub migrate_dry_run: bool,
 }
 
 impl Default for EnvConfig {
@@ -294,6 +306,9 @@ impl Default for EnvConfig {
             trusted_proxies: String::new(),
             real_ip_header: None,
             plugin_http_slow_threshold_ms: 1000,
+            admin_restore_max_body_size_mib: 100,
+            migrate_action: "up".into(),
+            migrate_dry_run: false,
         }
     }
 }
@@ -441,6 +456,14 @@ impl EnvConfig {
                 "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS",
                 1000,
             ),
+
+            admin_restore_max_body_size_mib: resolve_usize(
+                conf,
+                "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB",
+                100,
+            ),
+            migrate_action: resolve_var_or(conf, "FERRUM_MIGRATE_ACTION", "up").to_lowercase(),
+            migrate_dry_run: resolve_bool(conf, "FERRUM_MIGRATE_DRY_RUN", false),
         };
 
         config.validate()?;
@@ -552,10 +575,7 @@ impl EnvConfig {
                 // Migrate mode: validation depends on FERRUM_MIGRATE_ACTION.
                 // For "config", FERRUM_FILE_CONFIG_PATH is required.
                 // For "up" and "status", FERRUM_DB_TYPE and FERRUM_DB_URL are required.
-                let action = env::var("FERRUM_MIGRATE_ACTION")
-                    .unwrap_or_else(|_| "up".into())
-                    .to_lowercase();
-                match action.as_str() {
+                match self.migrate_action.as_str() {
                     "config" => {
                         if self.file_config_path.is_none() {
                             return Err(
