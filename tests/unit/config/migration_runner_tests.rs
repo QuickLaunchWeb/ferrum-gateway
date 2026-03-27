@@ -22,10 +22,12 @@ async fn test_migration_runner_fresh_database() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should be applied on a fresh database
-    assert_eq!(applied.len(), 1);
+    // V1 and V2 should be applied on a fresh database
+    assert_eq!(applied.len(), 2);
     assert_eq!(applied[0].version, 1);
     assert_eq!(applied[0].name, "initial_schema");
+    assert_eq!(applied[1].version, 2);
+    assert_eq!(applied[1].name, "service_discovery");
 
     // Running again should apply nothing
     let applied_again = runner.run_pending().await.unwrap();
@@ -36,9 +38,16 @@ async fn test_migration_runner_fresh_database() {
 async fn test_migration_runner_bootstrap_existing_db() {
     let pool = test_pool().await;
 
-    // Simulate a pre-migration database by creating the proxies table directly
+    // Simulate a pre-migration database by creating the core tables directly
+    // (as V1 would have created them, so V2+ migrations can alter them)
     sqlx::query(
         "CREATE TABLE proxies (id TEXT PRIMARY KEY, name TEXT, listen_path TEXT NOT NULL UNIQUE, backend_protocol TEXT NOT NULL DEFAULT 'http', backend_host TEXT NOT NULL, backend_port INTEGER NOT NULL DEFAULT 80, backend_path TEXT, strip_listen_path INTEGER NOT NULL DEFAULT 1, preserve_host_header INTEGER NOT NULL DEFAULT 0, backend_connect_timeout_ms INTEGER NOT NULL DEFAULT 5000, backend_read_timeout_ms INTEGER NOT NULL DEFAULT 30000, backend_write_timeout_ms INTEGER NOT NULL DEFAULT 30000, backend_tls_client_cert_path TEXT, backend_tls_client_key_path TEXT, backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1, backend_tls_server_ca_cert_path TEXT, dns_override TEXT, dns_cache_ttl_seconds INTEGER, auth_mode TEXT NOT NULL DEFAULT 'single', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE upstreams (id TEXT PRIMARY KEY, name TEXT, targets TEXT NOT NULL DEFAULT '[]', algorithm TEXT NOT NULL DEFAULT 'round_robin', hash_on TEXT, health_checks TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
     .execute(&pool)
     .await
@@ -47,13 +56,16 @@ async fn test_migration_runner_bootstrap_existing_db() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should NOT be applied (bootstrapped instead), so nothing new
-    assert!(applied.is_empty());
+    // V1 should NOT be applied (bootstrapped instead), but V2 should run
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].version, 2);
+    assert_eq!(applied[0].name, "service_discovery");
 
-    // Check that V1 is recorded as applied via bootstrapping
+    // Check that both V1 and V2 are recorded as applied
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 1);
+    assert_eq!(status.applied.len(), 2);
     assert_eq!(status.applied[0].version, 1);
+    assert_eq!(status.applied[1].version, 2);
     assert!(status.pending.is_empty());
 }
 
@@ -66,13 +78,13 @@ async fn test_migration_status() {
     // Before running: everything should be pending
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
-    assert_eq!(status.pending.len(), 1);
+    assert_eq!(status.pending.len(), 2);
 
     // Run migrations
     runner.run_pending().await.unwrap();
 
     // After running: everything should be applied
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 1);
+    assert_eq!(status.applied.len(), 2);
     assert!(status.pending.is_empty());
 }

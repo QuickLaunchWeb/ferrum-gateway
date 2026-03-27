@@ -126,6 +126,9 @@ pub async fn run(
 
     // Start background TTL refresh to keep cache warm (with shutdown)
     dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
+
+    // Start service discovery background tasks
+    proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
     let db = Arc::new(db);
 
     // Build TLS hardening policy from environment

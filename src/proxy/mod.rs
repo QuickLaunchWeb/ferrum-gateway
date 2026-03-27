@@ -45,6 +45,7 @@ use crate::plugins::{
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
+use crate::service_discovery::ServiceDiscoveryManager;
 
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
@@ -89,6 +90,8 @@ pub struct ProxyState {
     pub health_checker: Arc<HealthChecker>,
     /// Circuit breaker cache for proxy-level circuit breaking.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    /// Service discovery manager for dynamic upstream target resolution.
+    pub service_discovery_manager: Arc<ServiceDiscoveryManager>,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement.
     /// `None` when HTTP/3 is disabled; avoids a `format!()` allocation per response.
     pub alt_svc_header: Option<String>,
@@ -166,6 +169,11 @@ impl ProxyState {
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::new());
+        // Service discovery manager (tasks started later via start_service_discovery)
+        let service_discovery_manager = Arc::new(ServiceDiscoveryManager::new(
+            load_balancer_cache.clone(),
+            dns_cache.clone(),
+        ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
 
@@ -202,6 +210,7 @@ impl ProxyState {
             load_balancer_cache,
             health_checker,
             circuit_breaker_cache,
+            service_discovery_manager,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
             grpc_pool,
@@ -288,6 +297,10 @@ impl ProxyState {
             tokio::spawn(async move {
                 slm.reconcile().await;
             });
+
+            // Reconcile service discovery tasks
+            let new_cfg = self.config.load_full();
+            self.service_discovery_manager.reconcile(&new_cfg, None);
 
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
@@ -428,7 +441,26 @@ impl ProxyState {
             delta.modified_upstreams.len(),
             proxy_ids_to_rebuild.len(),
         );
+
+        // Reconcile service discovery tasks for changed upstreams
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.service_discovery_manager.reconcile(&new_cfg, None);
+        }
+
         true
+    }
+
+    /// Start service discovery background tasks for all upstreams in the config.
+    ///
+    /// Should be called once after `ProxyState::new()` in each mode's startup,
+    /// similar to `health_checker.start()`.
+    pub fn start_service_discovery(&self, shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>) {
+        let config = self.config.load_full();
+        self.service_discovery_manager.start(&config, shutdown_rx);
     }
 
     /// Apply an incremental config update from the database polling loop.
@@ -671,6 +703,16 @@ impl ProxyState {
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
         );
+
+        // Reconcile service discovery tasks for changed upstreams
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.service_discovery_manager.reconcile(&new_cfg, None);
+        }
+
         true
     }
 

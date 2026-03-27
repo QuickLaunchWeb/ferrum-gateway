@@ -34,6 +34,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Health Checking**: Active probes (HTTP, TCP SYN, UDP) and passive status monitoring with configurable thresholds
 - **Circuit Breaker**: Three-state pattern (Closed/Open/Half-Open) preventing cascading failures
 - **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies
+- **Service Discovery**: Dynamic upstream target resolution via DNS-SD, Kubernetes, and Consul providers with background polling and static+dynamic target merging
 - **Advanced TLS Hardening**: Configurable cipher suites, key exchange groups, and protocol versions
 
 ## Operating Modes
@@ -465,6 +466,59 @@ proxies:
 ```
 
 See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for full documentation.
+
+#### Service Discovery
+
+Upstreams can discover targets dynamically using a `service_discovery` block. Three providers are supported:
+
+**DNS-SD** (DNS Service Discovery):
+```yaml
+upstreams:
+  - id: "my-upstream"
+    targets: []
+    algorithm: round_robin
+    service_discovery:
+      provider: dns_sd
+      dns_sd:
+        service_name: "_http._tcp.my-service.local"
+        poll_interval_seconds: 30
+```
+
+**Kubernetes**:
+```yaml
+upstreams:
+  - id: "k8s-upstream"
+    targets: []
+    algorithm: least_connections
+    service_discovery:
+      provider: kubernetes
+      kubernetes:
+        namespace: "default"
+        service_name: "my-service"
+        port_name: "http"
+        poll_interval_seconds: 15
+```
+
+**Consul**:
+```yaml
+upstreams:
+  - id: "consul-upstream"
+    targets:
+      - host: "fallback.example.com"
+        port: 8080
+        weight: 1
+    algorithm: round_robin
+    service_discovery:
+      provider: consul
+      consul:
+        address: "http://consul.internal:8500"
+        service_name: "my-service"
+        datacenter: "dc1"
+        poll_interval_seconds: 10
+        token: "consul-acl-token"
+```
+
+Discovered targets are merged with any statically defined `targets`. If the provider is unreachable, the upstream keeps its last-known targets to maintain availability.
 
 ## Connection Pooling
 

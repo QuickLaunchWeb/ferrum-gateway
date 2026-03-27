@@ -129,6 +129,7 @@ src/
 ├── config_delta.rs            # Incremental config updates for CP/DP
 ├── dtls/                      # DTLS support (frontend termination, backend origination, cert helpers)
 ├── dns/                       # DNS resolution with caching
+├── service_discovery/         # Dynamic upstream discovery (DNS-SD, Kubernetes, Consul)
 ├── tls/                       # TLS/mTLS listener configuration
 ├── http3/                     # HTTP/3 (QUIC) support
 └── custom_plugins/            # Custom/external plugin loading
@@ -143,6 +144,7 @@ src/
 | `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), tags |
 | `Upstream` | A load-balanced target group | targets (host/port/weight), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |
+| `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
 
 ### Plugin System
 
