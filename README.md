@@ -314,7 +314,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (values override env vars). See [Configuration File](#configuration-file-ferrumconf). |
+| `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (provides defaults; env vars override). See [Configuration File](#configuration-file-ferrumconf). |
 | `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
 | `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
@@ -396,7 +396,7 @@ See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the securit
 
 ### Configuration File (`ferrum.conf`)
 
-As an alternative to environment variables, the gateway supports a `ferrum.conf` configuration file. Values set in the conf file **take precedence** over environment variables, providing a single-file approach for operators who prefer file-based configuration over environment variables.
+As an alternative to environment variables, the gateway supports a `ferrum.conf` configuration file for setting reasonable defaults. Environment variables **take precedence** over values in the conf file, allowing operators to define baseline configuration in the file and override specific values per deployment via env vars.
 
 **File location:**
 - Default: `./ferrum.conf` (current working directory)
@@ -429,7 +429,7 @@ FERRUM_PROXY_TLS_CERT_PATH = "/path/with spaces/cert.pem"
 
 A reference `ferrum.conf` with all available fields and descriptions is included in the repository root.
 
-**Precedence order:** `ferrum.conf` > environment variables > built-in defaults
+**Precedence order:** environment variables > `ferrum.conf` > built-in defaults
 
 ### Configuration File Format (File Mode)
 

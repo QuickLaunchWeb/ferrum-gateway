@@ -24,7 +24,7 @@ fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
 }
 
 #[test]
-fn test_conf_file_overrides_env_vars() {
+fn test_env_vars_override_conf_file() {
     let conf_contents = "\
 FERRUM_MODE = file
 FERRUM_FILE_CONFIG_PATH = /from/conf
@@ -33,7 +33,7 @@ FERRUM_PROXY_HTTP_PORT = 9999
 ";
     let conf = ConfFile::parse(conf_contents).unwrap();
 
-    // Set env vars that should be overridden by conf file
+    // Env vars take precedence over conf file values
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
@@ -43,37 +43,38 @@ FERRUM_PROXY_HTTP_PORT = 9999
         ],
         || {
             let config = EnvConfig::from_env_with_conf(&conf).unwrap();
-            // Conf file values take precedence
-            assert_eq!(config.file_config_path.as_deref(), Some("/from/conf"));
-            assert_eq!(config.log_level, "debug");
-            assert_eq!(config.proxy_http_port, 9999);
+            // Env var values take precedence
+            assert_eq!(config.file_config_path.as_deref(), Some("/from/env"));
+            assert_eq!(config.log_level, "error");
+            assert_eq!(config.proxy_http_port, 1111);
         },
     );
 }
 
 #[test]
-fn test_conf_file_falls_back_to_env_when_not_set() {
-    // Conf file only sets mode and file path, everything else from env
+fn test_conf_file_provides_defaults_when_env_not_set() {
+    // Conf file sets defaults; env vars override where present
     let conf_contents = "\
 FERRUM_MODE = file
-FERRUM_FILE_CONFIG_PATH = /some/path
+FERRUM_FILE_CONFIG_PATH = /from/conf
+FERRUM_LOG_LEVEL = debug
+FERRUM_PROXY_HTTP_PORT = 9999
 ";
     let conf = ConfFile::parse(conf_contents).unwrap();
 
+    // Only set mode and file_config_path as env vars, leave others to conf defaults
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
-            ("FERRUM_FILE_CONFIG_PATH", "/env/path"),
-            ("FERRUM_LOG_LEVEL", "warn"),
-            ("FERRUM_PROXY_HTTP_PORT", "7777"),
+            ("FERRUM_FILE_CONFIG_PATH", "/from/env"),
         ],
         || {
             let config = EnvConfig::from_env_with_conf(&conf).unwrap();
-            // Conf file overrides these
-            assert_eq!(config.file_config_path.as_deref(), Some("/some/path"));
-            // Env var used for fields not in conf file
-            assert_eq!(config.log_level, "warn");
-            assert_eq!(config.proxy_http_port, 7777);
+            // Env var overrides conf file
+            assert_eq!(config.file_config_path.as_deref(), Some("/from/env"));
+            // Conf file provides defaults for fields not set via env
+            assert_eq!(config.log_level, "debug");
+            assert_eq!(config.proxy_http_port, 9999);
         },
     );
 }
