@@ -1273,10 +1273,15 @@ components:
           enum: [stream, buffer]
           default: stream
           description: |
-            Response body handling mode. `stream` passes response bytes through as
-            they arrive (lower latency, lower memory). `buffer` collects the full
-            response body before running after-proxy plugins (required when a plugin
-            needs to inspect or transform the response body).
+            Response body handling mode.
+
+            - `stream` (default): Passes response bytes through as they arrive for
+              lower latency and memory usage. If any plugin attached to this proxy
+              requires response body buffering (e.g., response_transformer), the
+              gateway automatically buffers regardless of this setting.
+            - `buffer`: Always buffers the full response body before running
+              after-proxy plugins, even if no plugin requires it. Use this when you
+              need to guarantee the complete body is available for inspection.
         created_at:
           type: [string, "null"]
           format: date-time
