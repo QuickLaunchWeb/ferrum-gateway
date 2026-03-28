@@ -349,6 +349,65 @@ fn test_unique_consumer_credentials_no_keyauth_ok() {
     assert!(config.validate_unique_consumer_credentials().is_ok());
 }
 
+// ---- Consumer identity uniqueness tests ----
+
+#[test]
+fn test_unique_consumer_identities_valid() {
+    let c1 = make_consumer("c1", "alice");
+    let c2 = make_consumer("c2", "bob");
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    assert!(config.validate_unique_consumer_identities().is_ok());
+}
+
+#[test]
+fn test_unique_consumer_identities_duplicate_username() {
+    let c1 = make_consumer("c1", "alice");
+    let c2 = make_consumer("c2", "alice");
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_identities().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate consumer username"));
+}
+
+#[test]
+fn test_unique_consumer_identities_duplicate_custom_id() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.custom_id = Some("shared-id".into());
+    let mut c2 = make_consumer("c2", "bob");
+    c2.custom_id = Some("shared-id".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_identities().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate consumer custom_id"));
+}
+
+#[test]
+fn test_unique_consumer_identities_cross_namespace_collision() {
+    // Consumer c2's custom_id collides with consumer c1's username
+    let c1 = make_consumer("c1", "alice");
+    let mut c2 = make_consumer("c2", "bob");
+    c2.custom_id = Some("alice".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_identities().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("collides with username"));
+    assert!(err[0].contains("incorrect JWT/OAuth2"));
+}
+
+#[test]
+fn test_unique_consumer_identities_own_custom_id_matches_own_username() {
+    // A consumer whose custom_id matches its own username should NOT be flagged
+    let mut c1 = make_consumer("c1", "alice");
+    c1.custom_id = Some("alice".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1];
+    assert!(config.validate_unique_consumer_identities().is_ok());
+}
+
 // ---- Upstream name uniqueness tests ----
 
 #[test]

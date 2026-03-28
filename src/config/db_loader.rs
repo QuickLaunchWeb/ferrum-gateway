@@ -927,7 +927,13 @@ impl DatabaseStore {
             let existing_hosts: Vec<String> = row
                 .try_get::<String, _>("hosts")
                 .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
+                .and_then(|s| match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("Failed to parse hosts JSON during uniqueness check: {}", e);
+                        None
+                    }
+                })
                 .unwrap_or_default();
 
             if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
@@ -1131,19 +1137,27 @@ impl DatabaseStore {
 
             let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 100 {
                 // Too many IDs for an IN clause — fetch all and filter in memory
-                let all_rows: Vec<AnyRow> =
-                    sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                        .fetch_all(&self.pool)
-                        .await
-                        .unwrap_or_default();
-                all_rows
-                    .into_iter()
-                    .filter(|r| {
-                        r.try_get::<String, _>("proxy_id")
-                            .map(|id| changed_ids.contains(&id))
-                            .unwrap_or(false)
-                    })
-                    .collect()
+                match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
+                    .fetch_all(&self.pool)
+                    .await
+                {
+                    Ok(all_rows) => all_rows
+                        .into_iter()
+                        .filter(|r| {
+                            r.try_get::<String, _>("proxy_id")
+                                .map(|id| changed_ids.contains(&id))
+                                .unwrap_or(false)
+                        })
+                        .collect(),
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch proxy_plugins for incremental update: {}. \
+                             Plugin associations may be stale until next full reload.",
+                            e
+                        );
+                        Vec::new()
+                    }
+                }
             } else {
                 // Build parameterized IN clause for targeted fetch
                 let placeholders: String = changed_id_list
@@ -1159,7 +1173,17 @@ impl DatabaseStore {
                 for id in &changed_id_list {
                     query = query.bind(*id);
                 }
-                query.fetch_all(&self.pool).await.unwrap_or_default()
+                match query.fetch_all(&self.pool).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch proxy_plugins for incremental update: {}. \
+                             Plugin associations may be stale until next full reload.",
+                            e
+                        );
+                        Vec::new()
+                    }
+                }
             };
 
             for r in &assoc_rows {
@@ -1638,7 +1662,13 @@ fn row_to_proxy(
     let hosts: Vec<String> = row
         .try_get::<String, _>("hosts")
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Proxy {}: failed to parse hosts JSON '{}': {}", pid, s, e);
+                None
+            }
+        })
         .unwrap_or_default();
 
     Ok(Proxy {
@@ -1849,7 +1879,13 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         "round_robin".into()
     });
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str)).unwrap_or_default();
+        serde_json::from_value(serde_json::Value::String(algo_str.clone())).unwrap_or_else(|e| {
+            warn!(
+                "Failed to parse upstream algorithm '{}', defaulting to round_robin: {}",
+                algo_str, e
+            );
+            LoadBalancerAlgorithm::default()
+        });
 
     let health_checks: Option<HealthCheckConfig> = row
         .try_get::<String, _>("health_checks")

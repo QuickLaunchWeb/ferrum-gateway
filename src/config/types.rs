@@ -839,6 +839,22 @@ impl GatewayConfig {
             }
         }
 
+        // Cross-namespace collision: a custom_id that matches another consumer's
+        // username or ID would silently overwrite in the identity index, causing
+        // incorrect JWT/OAuth2 authentication.
+        for consumer in &self.consumers {
+            if let Some(ref custom_id) = consumer.custom_id
+                && let Some(&owner_id) = seen_usernames.get(custom_id.as_str())
+                && owner_id != consumer.id
+            {
+                duplicates.push(format!(
+                    "Consumer '{}' custom_id '{}' collides with username of consumer '{}' \
+                     — this will cause incorrect JWT/OAuth2 authentication",
+                    consumer.id, custom_id, owner_id
+                ));
+            }
+        }
+
         if duplicates.is_empty() {
             Ok(())
         } else {

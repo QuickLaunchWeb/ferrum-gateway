@@ -2774,7 +2774,13 @@ async fn proxy_to_backend_retry(
                     error_class: None,
                 }
             } else {
-                let body = response.bytes().await.unwrap_or_default().to_vec();
+                let body = match response.bytes().await {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => {
+                        warn!("Failed to read backend response body: {}", e);
+                        Vec::new()
+                    }
+                };
                 retry::BackendResponse {
                     status_code: status,
                     body: ResponseBody::Buffered(body),
@@ -3168,7 +3174,13 @@ async fn proxy_to_backend(
                     error_class: None,
                 }
             } else {
-                let body = response.bytes().await.unwrap_or_default().to_vec();
+                let body = match response.bytes().await {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => {
+                        warn!("Failed to read backend response body: {}", e);
+                        Vec::new()
+                    }
+                };
                 retry::BackendResponse {
                     status_code: status,
                     body: ResponseBody::Buffered(body),
