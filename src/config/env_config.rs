@@ -34,15 +34,15 @@ impl OperatingMode {
     }
 }
 
-/// Resolve a configuration value: conf file takes precedence over env var.
+/// Resolve a configuration value: env var takes precedence over conf file.
 fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
-    if let Some(conf_val) = conf.get(key) {
-        if env::var(key).is_ok_and(|env_val| env_val != conf_val) {
-            tracing::warn!("{key}: ferrum.conf value overrides environment variable");
+    if let Ok(env_val) = env::var(key) {
+        if conf.get(key).is_some_and(|conf_val| conf_val != env_val) {
+            tracing::info!("{key}: environment variable overrides ferrum.conf default");
         }
-        return Some(conf_val.to_string());
+        return Some(env_val);
     }
-    env::var(key).ok()
+    conf.get(key).map(|v| v.to_string())
 }
 
 /// Resolve a configuration value with a default fallback.

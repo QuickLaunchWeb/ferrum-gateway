@@ -379,7 +379,7 @@ Using `--test-threads=1` prevents port conflicts when multiple functional tests 
 
 - **Admin API JWT in file mode**: When `FERRUM_ADMIN_JWT_SECRET` is not configured, the admin API uses a randomly generated secret per process start. This means the admin API is effectively inaccessible (no one can forge valid tokens), but it is still recommended to either set an explicit JWT secret or restrict network access to the admin port.
 
-- **ferrum.conf precedence**: Values in `ferrum.conf` take precedence over environment variables. If both are set for the same key with different values, a warning is logged. Be aware that a stale `ferrum.conf` in the working directory can silently override explicit env vars.
+- **ferrum.conf precedence**: Environment variables take precedence over values in `ferrum.conf`. The conf file provides defaults; if both are set for the same key with different values, an info-level message is logged. A stale `ferrum.conf` in the working directory will not override explicit env vars.
 
 ## Future Improvements
 

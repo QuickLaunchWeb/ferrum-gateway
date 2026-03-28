@@ -9,7 +9,8 @@ pub const DEFAULT_CONF_PATH: &str = "./ferrum.conf";
 pub const CONF_PATH_ENV_VAR: &str = "FERRUM_CONF_PATH";
 
 /// Parsed configuration file values. Keys are the same `FERRUM_*` names used
-/// by environment variables. Values set here take precedence over env vars.
+/// by environment variables. Values here provide defaults that can be
+/// overridden by environment variables.
 #[derive(Debug, Default)]
 pub struct ConfFile {
     values: HashMap<String, String>,
