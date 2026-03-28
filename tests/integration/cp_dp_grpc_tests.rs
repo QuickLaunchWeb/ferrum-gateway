@@ -1079,3 +1079,198 @@ async fn test_dp_ignores_malformed_delta() {
 
     client_handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_incremental_result_serde_roundtrip() {
+    // Verify IncrementalResult survives JSON serialization/deserialization
+    // (this is the wire format for DELTA updates).
+    let original = IncrementalResult {
+        added_or_modified_proxies: vec![
+            create_test_proxy("proxy-a", "/api-a"),
+            create_test_proxy("proxy-b", "/api-b"),
+        ],
+        removed_proxy_ids: vec!["proxy-old".to_string()],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec!["consumer-gone".to_string()],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec!["upstream-x".to_string()],
+        poll_timestamp: Utc::now(),
+    };
+
+    let json = serde_json::to_string(&original).expect("Failed to serialize IncrementalResult");
+    let deserialized: IncrementalResult =
+        serde_json::from_str(&json).expect("Failed to deserialize IncrementalResult");
+
+    assert_eq!(deserialized.added_or_modified_proxies.len(), 2);
+    assert_eq!(deserialized.added_or_modified_proxies[0].id, "proxy-a");
+    assert_eq!(deserialized.added_or_modified_proxies[1].id, "proxy-b");
+    assert_eq!(deserialized.removed_proxy_ids, vec!["proxy-old"]);
+    assert_eq!(deserialized.removed_consumer_ids, vec!["consumer-gone"]);
+    assert_eq!(deserialized.removed_upstream_ids, vec!["upstream-x"]);
+    assert!(deserialized.added_or_modified_consumers.is_empty());
+    assert!(deserialized.added_or_modified_plugin_configs.is_empty());
+    assert!(deserialized.added_or_modified_upstreams.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_modifying_proxy() {
+    // Verify that a delta with a modified proxy (same ID, different fields)
+    // correctly updates the existing proxy in-place.
+    let cp_config = create_test_config(2);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "delta-mod-node", &ps, None).await
+    });
+
+    // Wait for initial snapshot (2 proxies)
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received.is_ok());
+
+    // Verify initial backend port
+    assert_eq!(proxy_state.config.load().proxies[0].backend_port, 3000);
+
+    // Send delta that modifies proxy-0 (change backend_port)
+    let mut modified_proxy = create_test_proxy("proxy-0", "/api-0");
+    modified_proxy.backend_port = 9999;
+    modified_proxy.updated_at = Utc::now(); // newer timestamp
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![modified_proxy],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+
+    // Wait for delta — proxy count stays 2 but backend_port changes
+    let received_delta = timeout(Duration::from_secs(5), async {
+        loop {
+            let config = proxy_state.config.load();
+            if let Some(p) = config.proxies.iter().find(|p| p.id == "proxy-0")
+                && p.backend_port == 9999
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_delta.is_ok(),
+        "DP should have applied delta modifying proxy-0 backend_port to 9999"
+    );
+
+    // Verify total proxy count unchanged
+    let config = proxy_state.config.load();
+    assert_eq!(config.proxies.len(), 2);
+    // Verify the modification stuck
+    let proxy_0 = config.proxies.iter().find(|p| p.id == "proxy-0").unwrap();
+    assert_eq!(proxy_0.backend_port, 9999);
+    // Verify proxy-1 is untouched
+    let proxy_1 = config.proxies.iter().find(|p| p.id == "proxy-1").unwrap();
+    assert_eq!(proxy_1.backend_port, 3000);
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_with_mixed_operations() {
+    // A single delta that simultaneously adds, modifies, and removes proxies.
+    let cp_config = create_test_config(3); // proxy-0, proxy-1, proxy-2
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "delta-mixed-node", &ps, None).await
+    });
+
+    // Wait for initial snapshot (3 proxies)
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received.is_ok());
+
+    // Send a single delta that:
+    // - Removes proxy-1
+    // - Modifies proxy-0 (change backend_port)
+    // - Adds proxy-new
+    let mut modified = create_test_proxy("proxy-0", "/api-0");
+    modified.backend_port = 5555;
+    modified.updated_at = Utc::now();
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![modified, create_test_proxy("proxy-new", "/api-new")],
+        removed_proxy_ids: vec!["proxy-1".to_string()],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+
+    // Wait for delta — should go from 3 to 3 (remove 1, add 1, modify 1)
+    let received_delta = timeout(Duration::from_secs(5), async {
+        loop {
+            let config = proxy_state.config.load();
+            let ids: Vec<&str> = config.proxies.iter().map(|p| p.id.as_str()).collect();
+            if ids.contains(&"proxy-new") && !ids.contains(&"proxy-1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_delta.is_ok(),
+        "DP should have applied mixed delta (add + modify + remove)"
+    );
+
+    let config = proxy_state.config.load();
+    assert_eq!(config.proxies.len(), 3); // -1 removed, +1 added = net 3
+
+    let ids: Vec<&str> = config.proxies.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&"proxy-0"));
+    assert!(!ids.contains(&"proxy-1")); // removed
+    assert!(ids.contains(&"proxy-2"));
+    assert!(ids.contains(&"proxy-new")); // added
+
+    // Verify modification
+    let proxy_0 = config.proxies.iter().find(|p| p.id == "proxy-0").unwrap();
+    assert_eq!(proxy_0.backend_port, 5555);
+
+    client_handle.abort();
+}
