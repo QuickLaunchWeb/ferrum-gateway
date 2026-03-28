@@ -47,6 +47,63 @@ pub async fn run(
         .dp_grpc_auth_token
         .clone()
         .ok_or_else(|| anyhow::anyhow!("FERRUM_DP_GRPC_AUTH_TOKEN is required in dp mode"))?;
+
+    // Build DP gRPC TLS config if any TLS settings are provided
+    let dp_grpc_tls = {
+        let has_tls = env_config.dp_grpc_tls_ca_cert_path.is_some()
+            || env_config.dp_grpc_tls_client_cert_path.is_some()
+            || env_config.dp_grpc_tls_no_verify
+            || cp_url.starts_with("https://");
+
+        if has_tls {
+            let ca_cert_pem = if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
+                Some(std::fs::read(path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read DP gRPC TLS CA cert {}: {}", path, e)
+                })?)
+            } else {
+                None
+            };
+
+            let (client_cert_pem, client_key_pem) = if let (Some(cert_path), Some(key_path)) = (
+                &env_config.dp_grpc_tls_client_cert_path,
+                &env_config.dp_grpc_tls_client_key_path,
+            ) {
+                let cert = std::fs::read(cert_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read DP gRPC TLS client cert {}: {}",
+                        cert_path,
+                        e
+                    )
+                })?;
+                let key = std::fs::read(key_path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read DP gRPC TLS client key {}: {}", key_path, e)
+                })?;
+                (Some(cert), Some(key))
+            } else {
+                (None, None)
+            };
+
+            if ca_cert_pem.is_some() && client_cert_pem.is_some() {
+                info!("DP gRPC TLS configured with mTLS (CA cert + client cert)");
+            } else if ca_cert_pem.is_some() {
+                info!("DP gRPC TLS configured with server verification (CA cert)");
+            } else if env_config.dp_grpc_tls_no_verify {
+                warn!("DP gRPC TLS configured with server verification DISABLED (testing mode)");
+            } else {
+                info!("DP gRPC TLS configured (https URL, system roots)");
+            }
+
+            Some(crate::grpc::dp_client::DpGrpcTlsConfig {
+                ca_cert_pem,
+                client_cert_pem,
+                client_key_pem,
+                no_verify: env_config.dp_grpc_tls_no_verify,
+            })
+        } else {
+            None
+        }
+    };
+
     let dp_proxy_state = proxy_state.clone();
     let dp_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -55,6 +112,7 @@ pub async fn run(
             auth_token,
             dp_proxy_state,
             Some(dp_shutdown),
+            dp_grpc_tls,
         )
         .await;
     });

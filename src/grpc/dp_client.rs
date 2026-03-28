@@ -1,6 +1,7 @@
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
+use tonic::transport::channel::ClientTlsConfig;
+use tonic::transport::{Certificate, Channel, Identity};
 use tracing::{error, info, warn};
 
 use super::proto::SubscribeRequest;
@@ -8,12 +9,28 @@ use super::proto::config_sync_client::ConfigSyncClient;
 use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
 
+/// TLS configuration for the DP gRPC client.
+#[derive(Clone, Default)]
+pub struct DpGrpcTlsConfig {
+    /// CA certificate PEM bytes for verifying CP server cert.
+    pub ca_cert_pem: Option<Vec<u8>>,
+    /// Client certificate PEM bytes for mTLS.
+    pub client_cert_pem: Option<Vec<u8>>,
+    /// Client private key PEM bytes for mTLS.
+    pub client_key_pem: Option<Vec<u8>>,
+    /// Skip server certificate verification (testing only).
+    /// When true and no `ca_cert_pem` is set, the client accepts any server cert.
+    #[allow(dead_code)]
+    pub no_verify: bool,
+}
+
 /// Connect to the Control Plane with an optional shutdown signal.
 pub async fn start_dp_client_with_shutdown(
     cp_url: String,
     auth_token: String,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    tls_config: Option<DpGrpcTlsConfig>,
 ) {
     let node_id = uuid::Uuid::new_v4().to_string();
     info!("DP client starting, connecting to CP at {}", cp_url);
@@ -26,7 +43,15 @@ pub async fn start_dp_client_with_shutdown(
             return;
         }
 
-        match connect_and_subscribe(&cp_url, &auth_token, &node_id, &proxy_state).await {
+        match connect_and_subscribe(
+            &cp_url,
+            &auth_token,
+            &node_id,
+            &proxy_state,
+            tls_config.as_ref(),
+        )
+        .await
+        {
             Ok(_) => {
                 warn!("CP connection stream ended, will reconnect...");
             }
@@ -60,11 +85,34 @@ pub async fn connect_and_subscribe(
     auth_token: &str,
     node_id: &str,
     proxy_state: &ProxyState,
+    tls_config: Option<&DpGrpcTlsConfig>,
 ) -> Result<(), anyhow::Error> {
-    let channel = Channel::from_shared(cp_url.to_string())?
-        .connect_timeout(Duration::from_secs(10))
-        .connect()
-        .await?;
+    let mut endpoint =
+        Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
+
+    // Apply TLS configuration if the URL uses https:// or TLS config is provided
+    if let Some(tls) = tls_config {
+        let mut client_tls = ClientTlsConfig::new();
+
+        if let Some(ref ca_pem) = tls.ca_cert_pem {
+            client_tls = client_tls.ca_certificate(Certificate::from_pem(ca_pem));
+        }
+
+        if let (Some(cert_pem), Some(key_pem)) = (&tls.client_cert_pem, &tls.client_key_pem) {
+            client_tls = client_tls.identity(Identity::from_pem(cert_pem, key_pem));
+        }
+
+        // Extract domain from URL for TLS SNI
+        if let Ok(uri) = cp_url.parse::<http::Uri>()
+            && let Some(host) = uri.host()
+        {
+            client_tls = client_tls.domain_name(host);
+        }
+
+        endpoint = endpoint.tls_config(client_tls)?;
+    }
+
+    let channel = endpoint.connect().await?;
 
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 

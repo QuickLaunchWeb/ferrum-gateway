@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::Server;
+use tonic::transport::server::ServerTlsConfig;
+use tonic::transport::{Certificate, Identity};
 use tracing::{error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -149,16 +151,63 @@ pub async fn run(
         None
     };
 
-    // gRPC listener
+    // gRPC listener (with optional TLS/mTLS)
     let grpc_addr: SocketAddr = env_config
         .cp_grpc_listen_addr
         .as_deref()
         .unwrap_or("0.0.0.0:50051")
         .parse()?;
 
+    let grpc_tls_config = if let (Some(cert_path), Some(key_path)) = (
+        &env_config.cp_grpc_tls_cert_path,
+        &env_config.cp_grpc_tls_key_path,
+    ) {
+        let cert_pem = std::fs::read(cert_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read CP gRPC TLS cert {}: {}", cert_path, e))?;
+        let key_pem = std::fs::read(key_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read CP gRPC TLS key {}: {}", key_path, e))?;
+
+        let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert_pem, &key_pem));
+
+        if let Some(client_ca_path) = &env_config.cp_grpc_tls_client_ca_path {
+            let ca_pem = std::fs::read(client_ca_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read CP gRPC client CA {}: {}", client_ca_path, e)
+            })?;
+            tls = tls.client_ca_root(Certificate::from_pem(&ca_pem));
+            info!(
+                "CP gRPC TLS configured with mTLS (server cert: {}, client CA: {})",
+                cert_path, client_ca_path
+            );
+        } else {
+            info!(
+                "CP gRPC TLS configured (server cert: {}, no client verification)",
+                cert_path
+            );
+        }
+        Some(tls)
+    } else {
+        if env_config.cp_grpc_tls_client_ca_path.is_some() {
+            warn!(
+                "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH is set but cert/key are missing — ignoring client CA"
+            );
+        }
+        info!("CP gRPC server running in plaintext mode (no TLS configured)");
+        None
+    };
+
     info!("CP gRPC server listening on {}", grpc_addr);
     let grpc_handle = tokio::spawn(async move {
-        if let Err(e) = Server::builder()
+        let mut builder = Server::builder();
+        if let Some(tls) = grpc_tls_config {
+            builder = match builder.tls_config(tls) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Failed to configure gRPC TLS: {}", e);
+                    return;
+                }
+            };
+        }
+        if let Err(e) = builder
             .add_service(grpc_server.into_service())
             .serve(grpc_addr)
             .await

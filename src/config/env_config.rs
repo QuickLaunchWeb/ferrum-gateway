@@ -115,6 +115,27 @@ pub struct EnvConfig {
     pub dp_cp_grpc_url: Option<String>,
     pub dp_grpc_auth_token: Option<String>,
 
+    // CP gRPC TLS (server-side)
+    /// Path to PEM certificate for the CP gRPC server. When set (with key),
+    /// the gRPC listener uses TLS instead of plaintext.
+    pub cp_grpc_tls_cert_path: Option<String>,
+    /// Path to PEM private key for the CP gRPC server.
+    pub cp_grpc_tls_key_path: Option<String>,
+    /// Path to PEM CA bundle for verifying DP client certificates (mTLS).
+    /// When set, the CP requires and verifies client certificates from DPs.
+    pub cp_grpc_tls_client_ca_path: Option<String>,
+
+    // DP gRPC TLS (client-side)
+    /// Path to PEM CA certificate for verifying the CP server certificate.
+    /// When set, the DP verifies the CP server's identity.
+    pub dp_grpc_tls_ca_cert_path: Option<String>,
+    /// Path to PEM client certificate for DP-to-CP mTLS authentication.
+    pub dp_grpc_tls_client_cert_path: Option<String>,
+    /// Path to PEM client private key for DP-to-CP mTLS authentication.
+    pub dp_grpc_tls_client_key_path: Option<String>,
+    /// Skip TLS certificate verification for the DP gRPC client (testing only).
+    pub dp_grpc_tls_no_verify: bool,
+
     // Request/Response limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
@@ -297,6 +318,13 @@ impl Default for EnvConfig {
             cp_grpc_jwt_secret: None,
             dp_cp_grpc_url: None,
             dp_grpc_auth_token: None,
+            cp_grpc_tls_cert_path: None,
+            cp_grpc_tls_key_path: None,
+            cp_grpc_tls_client_ca_path: None,
+            dp_grpc_tls_ca_cert_path: None,
+            dp_grpc_tls_client_cert_path: None,
+            dp_grpc_tls_client_key_path: None,
+            dp_grpc_tls_no_verify: false,
             max_header_size_bytes: 32_768,
             max_single_header_size_bytes: 16_384,
             max_body_size_bytes: 10_485_760,
@@ -410,6 +438,17 @@ impl EnvConfig {
             cp_grpc_jwt_secret: resolve_var(conf, "FERRUM_CP_GRPC_JWT_SECRET"),
             dp_cp_grpc_url: resolve_var(conf, "FERRUM_DP_CP_GRPC_URL"),
             dp_grpc_auth_token: resolve_var(conf, "FERRUM_DP_GRPC_AUTH_TOKEN"),
+
+            // CP gRPC TLS
+            cp_grpc_tls_cert_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CERT_PATH"),
+            cp_grpc_tls_key_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_KEY_PATH"),
+            cp_grpc_tls_client_ca_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH"),
+
+            // DP gRPC TLS
+            dp_grpc_tls_ca_cert_path: resolve_var(conf, "FERRUM_DP_GRPC_TLS_CA_CERT_PATH"),
+            dp_grpc_tls_client_cert_path: resolve_var(conf, "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH"),
+            dp_grpc_tls_client_key_path: resolve_var(conf, "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH"),
+            dp_grpc_tls_no_verify: resolve_bool(conf, "FERRUM_DP_GRPC_TLS_NO_VERIFY", false),
 
             max_header_size_bytes: resolve_usize(conf, "FERRUM_MAX_HEADER_SIZE_BYTES", 32_768),
             max_single_header_size_bytes: resolve_usize(

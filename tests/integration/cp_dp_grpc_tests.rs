@@ -13,12 +13,13 @@ use chrono::Utc;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 use tokio::time::timeout;
-use tonic::transport::Server;
+use tonic::transport::server::ServerTlsConfig;
+use tonic::transport::{Certificate, Identity, Server};
 
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 use ferrum_gateway::dns::{DnsCache, DnsConfig};
 use ferrum_gateway::grpc::cp_server::CpGrpcServer;
-use ferrum_gateway::grpc::dp_client;
+use ferrum_gateway::grpc::dp_client::{self, DpGrpcTlsConfig};
 use ferrum_gateway::proxy::ProxyState;
 
 const TEST_JWT_SECRET: &str = "test-grpc-secret-key";
@@ -134,6 +135,13 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         cp_grpc_jwt_secret: None,
         dp_cp_grpc_url: None,
         dp_grpc_auth_token: None,
+        cp_grpc_tls_cert_path: None,
+        cp_grpc_tls_key_path: None,
+        cp_grpc_tls_client_ca_path: None,
+        dp_grpc_tls_ca_cert_path: None,
+        dp_grpc_tls_client_cert_path: None,
+        dp_grpc_tls_client_key_path: None,
+        dp_grpc_tls_no_verify: false,
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
         max_body_size_bytes: 10_485_760,
@@ -250,7 +258,7 @@ async fn test_dp_receives_initial_config_from_cp() {
 
     let result = timeout(
         Duration::from_secs(5),
-        dp_client::connect_and_subscribe(&cp_url, &token, node_id, &proxy_state),
+        dp_client::connect_and_subscribe(&cp_url, &token, node_id, &proxy_state, None),
     )
     .await;
 
@@ -293,7 +301,7 @@ async fn test_dp_receives_config_updates() {
     let token = create_test_token();
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "test-node-2", &ps).await
+        dp_client::connect_and_subscribe(&cp_url, &token, "test-node-2", &ps, None).await
     });
 
     // Wait for initial config to arrive
@@ -357,7 +365,7 @@ async fn test_dp_rejects_invalid_token() {
 
     let result = timeout(
         Duration::from_secs(5),
-        dp_client::connect_and_subscribe(&cp_url, &wrong_token, "bad-node", &proxy_state),
+        dp_client::connect_and_subscribe(&cp_url, &wrong_token, "bad-node", &proxy_state, None),
     )
     .await;
 
@@ -398,7 +406,7 @@ async fn test_dp_handles_malformed_config() {
     // Spawn DP client
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "test-node-malformed", &ps).await
+        dp_client::connect_and_subscribe(&cp_url, &token, "test-node-malformed", &ps, None).await
     });
 
     // Wait for initial config
@@ -472,7 +480,7 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
     let url_clone = cp_url.clone();
     let token_clone = token.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::start_dp_client_with_shutdown(url_clone, token_clone, ps, None).await;
+        dp_client::start_dp_client_with_shutdown(url_clone, token_clone, ps, None, None).await;
     });
 
     // Wait for initial config
@@ -510,4 +518,268 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
     );
 
     client_handle.abort();
+}
+
+// ── TLS / mTLS tests ─────────────────────────────────────────────────────────
+
+/// Generate a self-signed CA + leaf certificate for testing.
+/// Returns (ca_cert_pem, server_cert_pem, server_key_pem).
+fn generate_test_ca_and_server_cert() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Generate CA key pair and self-signed CA cert
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(vec!["Ferrum Test CA".to_string()]).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    // Generate server key pair and cert signed by the CA
+    let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        )));
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    (
+        ca_cert.pem().into_bytes(),
+        server_cert.pem().into_bytes(),
+        server_key.serialize_pem().into_bytes(),
+    )
+}
+
+/// Start a CP gRPC server with TLS on a random port.
+async fn start_test_cp_server_with_tls(
+    config: GatewayConfig,
+    server_cert_pem: &[u8],
+    server_key_pem: &[u8],
+    client_ca_pem: Option<&[u8]>,
+) -> (
+    SocketAddr,
+    tokio::sync::broadcast::Sender<ferrum_gateway::grpc::proto::ConfigUpdate>,
+    tokio::task::JoinHandle<()>,
+) {
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let (server, update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mut tls_config =
+        ServerTlsConfig::new().identity(Identity::from_pem(server_cert_pem, server_key_pem));
+    if let Some(ca_pem) = client_ca_pem {
+        tls_config = tls_config.client_ca_root(Certificate::from_pem(ca_pem));
+    }
+
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .tls_config(tls_config)
+            .expect("Failed to configure TLS")
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("gRPC TLS server failed");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, update_tx, handle)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_connects_to_cp_with_tls() {
+    // Generate CA + server cert
+    let (ca_pem, server_cert_pem, server_key_pem) = generate_test_ca_and_server_cert();
+
+    // Start CP server with TLS
+    let cp_config = create_test_config(2);
+    let (addr, _update_tx, _server_handle) =
+        start_test_cp_server_with_tls(cp_config.clone(), &server_cert_pem, &server_key_pem, None)
+            .await;
+
+    // Create DP with TLS config (CA cert to verify server)
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("https://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let tls_config = DpGrpcTlsConfig {
+        ca_cert_pem: Some(ca_pem),
+        client_cert_pem: None,
+        client_key_pem: None,
+        no_verify: false,
+    };
+
+    let result = timeout(
+        Duration::from_secs(5),
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &token,
+            "tls-node-1",
+            &proxy_state,
+            Some(&tls_config),
+        ),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let current_config = proxy_state.config.load();
+    assert_eq!(
+        current_config.proxies.len(),
+        2,
+        "DP should have received 2 proxies from CP over TLS"
+    );
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("TLS connect_and_subscribe failed: {}", e),
+        Err(_) => {} // Timeout acceptable after receiving config
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_connects_to_cp_with_mtls() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Generate CA for both server and client certs
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(vec!["Ferrum Test CA".to_string()]).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_cert.pem().into_bytes();
+
+    // Generate server cert signed by CA
+    let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        )));
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+    let server_cert_pem = server_cert.pem().into_bytes();
+    let server_key_pem = server_key.serialize_pem().into_bytes();
+
+    // Generate client cert signed by the same CA
+    let client_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let client_params = rcgen::CertificateParams::new(vec!["dp-client".to_string()]).unwrap();
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .unwrap();
+    let client_cert_pem = client_cert.pem().into_bytes();
+    let client_key_pem = client_key.serialize_pem().into_bytes();
+
+    // Start CP with mTLS (requires client certs verified against the CA)
+    let cp_config = create_test_config(3);
+    let (addr, _update_tx, _server_handle) = start_test_cp_server_with_tls(
+        cp_config.clone(),
+        &server_cert_pem,
+        &server_key_pem,
+        Some(&ca_pem),
+    )
+    .await;
+
+    // Create DP with mTLS config (CA cert + client cert/key)
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("https://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let tls_config = DpGrpcTlsConfig {
+        ca_cert_pem: Some(ca_pem),
+        client_cert_pem: Some(client_cert_pem),
+        client_key_pem: Some(client_key_pem),
+        no_verify: false,
+    };
+
+    let result = timeout(
+        Duration::from_secs(5),
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &token,
+            "mtls-node-1",
+            &proxy_state,
+            Some(&tls_config),
+        ),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let current_config = proxy_state.config.load();
+    assert_eq!(
+        current_config.proxies.len(),
+        3,
+        "DP should have received 3 proxies from CP over mTLS"
+    );
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("mTLS connect_and_subscribe failed: {}", e),
+        Err(_) => {}
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_rejects_untrusted_cp_server_cert() {
+    // Generate one CA for the server and a DIFFERENT CA for the client trust store
+    let (_, server_cert_pem, server_key_pem) = generate_test_ca_and_server_cert();
+
+    // Generate a different CA that the DP will trust (server cert NOT signed by this)
+    let different_ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut different_ca_params =
+        rcgen::CertificateParams::new(vec!["Different CA".to_string()]).unwrap();
+    different_ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let different_ca_cert = different_ca_params.self_signed(&different_ca_key).unwrap();
+    let different_ca_pem = different_ca_cert.pem().into_bytes();
+
+    // Start CP server with its own cert
+    let cp_config = create_test_config(1);
+    let (addr, _update_tx, _server_handle) =
+        start_test_cp_server_with_tls(cp_config, &server_cert_pem, &server_key_pem, None).await;
+
+    // DP trusts the WRONG CA — should fail to connect
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("https://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let tls_config = DpGrpcTlsConfig {
+        ca_cert_pem: Some(different_ca_pem),
+        client_cert_pem: None,
+        client_key_pem: None,
+        no_verify: false,
+    };
+
+    let result = timeout(
+        Duration::from_secs(5),
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &token,
+            "untrusted-node",
+            &proxy_state,
+            Some(&tls_config),
+        ),
+    )
+    .await;
+
+    // Connection should fail due to certificate verification
+    match result {
+        Ok(Err(_)) => {} // Expected: TLS handshake failure
+        Ok(Ok(())) => panic!("Should have failed with untrusted CA"),
+        Err(_) => panic!("Should have failed fast, not timed out"),
+    }
+
+    // Config should remain empty
+    assert_eq!(
+        proxy_state.config.load().proxies.len(),
+        0,
+        "Config should remain empty when TLS verification fails"
+    );
 }
