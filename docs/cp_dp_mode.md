@@ -55,13 +55,39 @@ All gRPC calls are authenticated with JWT HS256 tokens:
 - The DP sends its auth token in the gRPC metadata on every request
 - Both CP and DP use the same shared secret for JWT signing/verification
 
+### Transport Security (TLS/mTLS)
+
+The gRPC channel between CP and DP supports three security modes:
+
+| Mode | CP Configuration | DP Configuration | Use Case |
+|------|-----------------|-----------------|----------|
+| **Plaintext** | No TLS env vars | `http://` URL | Development, trusted networks |
+| **One-way TLS** | `FERRUM_CP_GRPC_TLS_CERT_PATH` + `_KEY_PATH` | `https://` URL + `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | DP verifies CP identity |
+| **Mutual TLS (mTLS)** | Above + `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | Above + `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` + `_KEY_PATH` | Both sides verify identity |
+
+**One-way TLS**: The CP presents a server certificate; the DP verifies it against a trusted CA. This encrypts the channel and prevents MITM attacks on the JWT token and config data.
+
+**Mutual TLS**: In addition to server verification, the CP requires a client certificate from the DP, verified against a trusted CA. This provides certificate-based DP identity in addition to JWT authentication.
+
 ### Config Sync Flow
 
 1. DP connects to CP's gRPC endpoint with JWT authentication
 2. CP sends an immediate `ConfigUpdate` with the full current config (type=FULL_SNAPSHOT)
-3. CP polls the database at `FERRUM_DB_POLL_INTERVAL` seconds
-4. When config changes are detected, CP broadcasts a `ConfigUpdate` to all subscribed DPs
-5. DPs atomically update their cached config (router cache, plugin cache, consumer index)
+3. CP polls the database incrementally at `FERRUM_DB_POLL_INTERVAL` seconds using indexed `updated_at` queries
+4. When changes are detected, CP broadcasts a `ConfigUpdate` with type=DELTA containing only the added/modified/removed resources
+5. DPs apply the delta surgically — only affected caches (router, plugin, consumer, load balancer) are updated
+6. If the incremental poll fails, CP falls back to a full database reload and broadcasts a FULL_SNAPSHOT
+
+### Update Types
+
+The `ConfigUpdate` proto message carries an `UpdateType` discriminator:
+
+| Type | Value | When | Content |
+|------|-------|------|---------|
+| `FULL_SNAPSHOT` | 0 | Initial subscription, fallback | Entire `GatewayConfig` as JSON |
+| `DELTA` | 1 | Incremental database changes | `IncrementalResult` with only changed resources |
+
+DPs handle both types transparently: full snapshots replace the entire config; deltas are applied via `ProxyState::apply_incremental()` which patches the in-memory config and performs surgical cache updates.
 
 ### Resilience
 
@@ -83,6 +109,9 @@ The CP/DP architecture is designed so that data source outages are invisible to 
 | `FERRUM_MODE` | Yes | Set to `cp` |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | Yes | gRPC listen address (e.g., `0.0.0.0:50051`) |
 | `FERRUM_CP_GRPC_JWT_SECRET` | Yes | Shared secret for JWT authentication |
+| `FERRUM_CP_GRPC_TLS_CERT_PATH` | No | PEM certificate for gRPC TLS |
+| `FERRUM_CP_GRPC_TLS_KEY_PATH` | No | PEM private key for gRPC TLS |
+| `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | PEM CA for verifying DP client certs (mTLS) |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the Admin API |
 | `FERRUM_DB_TYPE` | Yes | Database type (`sqlite` or `postgres`) |
 | `FERRUM_DB_URL` | Yes | Database connection URL |
@@ -93,8 +122,12 @@ The CP/DP architecture is designed so that data source outages are invisible to 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `FERRUM_MODE` | Yes | Set to `dp` |
-| `FERRUM_DP_CP_GRPC_URL` | Yes | CP gRPC endpoint URL (e.g., `http://cp-host:50051`) |
+| `FERRUM_DP_CP_GRPC_URL` | Yes | CP gRPC endpoint URL (`http://` or `https://`) |
 | `FERRUM_DP_GRPC_AUTH_TOKEN` | Yes | JWT token for authenticating with CP |
+| `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | PEM CA cert for verifying CP server cert |
+| `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | PEM client cert for mTLS |
+| `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | PEM client key for mTLS |
+| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | Skip TLS verification (testing only) |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the read-only Admin API |
 | `FERRUM_PROXY_HTTP_PORT` | No | HTTP proxy port (default: 8000) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | HTTPS proxy port (default: 8443) |
@@ -112,7 +145,7 @@ The DP auth token must be a valid JWT signed with the CP's `FERRUM_CP_GRPC_JWT_S
 # Secret: <same as FERRUM_CP_GRPC_JWT_SECRET>
 ```
 
-### Control Plane
+### Control Plane (Plaintext)
 
 ```bash
 FERRUM_MODE=cp \
@@ -125,7 +158,7 @@ FERRUM_DB_POLL_INTERVAL=10 \
 ./ferrum-gateway
 ```
 
-### Data Plane
+### Data Plane (Plaintext)
 
 ```bash
 FERRUM_MODE=dp \
@@ -134,6 +167,34 @@ FERRUM_DP_GRPC_AUTH_TOKEN=<jwt-token-signed-with-grpc-shared-secret> \
 FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
 FERRUM_PROXY_HTTP_PORT=8000 \
 FERRUM_PROXY_HTTPS_PORT=8443 \
+./ferrum-gateway
+```
+
+### Control Plane (mTLS)
+
+```bash
+FERRUM_MODE=cp \
+FERRUM_DB_TYPE=postgres \
+FERRUM_DB_URL=postgres://user:pass@db:5432/ferrum \
+FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
+FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051 \
+FERRUM_CP_GRPC_JWT_SECRET=grpc-shared-secret \
+FERRUM_CP_GRPC_TLS_CERT_PATH=/certs/server.pem \
+FERRUM_CP_GRPC_TLS_KEY_PATH=/certs/server-key.pem \
+FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH=/certs/ca.pem \
+./ferrum-gateway
+```
+
+### Data Plane (mTLS)
+
+```bash
+FERRUM_MODE=dp \
+FERRUM_DP_CP_GRPC_URL=https://cp-host:50051 \
+FERRUM_DP_GRPC_AUTH_TOKEN=<jwt-token> \
+FERRUM_DP_GRPC_TLS_CA_CERT_PATH=/certs/ca.pem \
+FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH=/certs/dp-client.pem \
+FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH=/certs/dp-client-key.pem \
+FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
 ./ferrum-gateway
 ```
 

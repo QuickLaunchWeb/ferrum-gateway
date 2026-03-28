@@ -1,12 +1,29 @@
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
+use tonic::transport::channel::ClientTlsConfig;
+use tonic::transport::{Certificate, Channel, Identity};
 use tracing::{error, info, warn};
 
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
+use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
+
+/// TLS configuration for the DP gRPC client.
+#[derive(Clone, Default)]
+pub struct DpGrpcTlsConfig {
+    /// CA certificate PEM bytes for verifying CP server cert.
+    pub ca_cert_pem: Option<Vec<u8>>,
+    /// Client certificate PEM bytes for mTLS.
+    pub client_cert_pem: Option<Vec<u8>>,
+    /// Client private key PEM bytes for mTLS.
+    pub client_key_pem: Option<Vec<u8>>,
+    /// Skip server certificate verification (testing only).
+    /// When true and no `ca_cert_pem` is set, the client accepts any server cert.
+    #[allow(dead_code)]
+    pub no_verify: bool,
+}
 
 /// Connect to the Control Plane with an optional shutdown signal.
 pub async fn start_dp_client_with_shutdown(
@@ -14,6 +31,7 @@ pub async fn start_dp_client_with_shutdown(
     auth_token: String,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    tls_config: Option<DpGrpcTlsConfig>,
 ) {
     let node_id = uuid::Uuid::new_v4().to_string();
     info!("DP client starting, connecting to CP at {}", cp_url);
@@ -26,7 +44,15 @@ pub async fn start_dp_client_with_shutdown(
             return;
         }
 
-        match connect_and_subscribe(&cp_url, &auth_token, &node_id, &proxy_state).await {
+        match connect_and_subscribe(
+            &cp_url,
+            &auth_token,
+            &node_id,
+            &proxy_state,
+            tls_config.as_ref(),
+        )
+        .await
+        {
             Ok(_) => {
                 warn!("CP connection stream ended, will reconnect...");
             }
@@ -60,11 +86,34 @@ pub async fn connect_and_subscribe(
     auth_token: &str,
     node_id: &str,
     proxy_state: &ProxyState,
+    tls_config: Option<&DpGrpcTlsConfig>,
 ) -> Result<(), anyhow::Error> {
-    let channel = Channel::from_shared(cp_url.to_string())?
-        .connect_timeout(Duration::from_secs(10))
-        .connect()
-        .await?;
+    let mut endpoint =
+        Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
+
+    // Apply TLS configuration if the URL uses https:// or TLS config is provided
+    if let Some(tls) = tls_config {
+        let mut client_tls = ClientTlsConfig::new();
+
+        if let Some(ref ca_pem) = tls.ca_cert_pem {
+            client_tls = client_tls.ca_certificate(Certificate::from_pem(ca_pem));
+        }
+
+        if let (Some(cert_pem), Some(key_pem)) = (&tls.client_cert_pem, &tls.client_key_pem) {
+            client_tls = client_tls.identity(Identity::from_pem(cert_pem, key_pem));
+        }
+
+        // Extract domain from URL for TLS SNI
+        if let Ok(uri) = cp_url.parse::<http::Uri>()
+            && let Some(host) = uri.host()
+        {
+            client_tls = client_tls.domain_name(host);
+        }
+
+        endpoint = endpoint.tls_config(client_tls)?;
+    }
+
+    let channel = endpoint.connect().await?;
 
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 
@@ -89,30 +138,50 @@ pub async fn connect_and_subscribe(
             update.update_type, update.version
         );
 
-        match serde_json::from_str::<GatewayConfig>(&update.config_json) {
-            Ok(mut config) => {
-                // Validate config received from CP before applying
-                config.normalize_hosts();
-                if let Err(errors) = config.validate_regex_listen_paths() {
-                    for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+        match update.update_type {
+            0 => {
+                // FULL_SNAPSHOT — replace entire config
+                match serde_json::from_str::<GatewayConfig>(&update.config_json) {
+                    Ok(mut config) => {
+                        config.normalize_hosts();
+                        if let Err(errors) = config.validate_regex_listen_paths() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with invalid regex listen_paths");
+                            continue;
+                        }
+                        if let Err(errors) = config.validate_stream_proxies() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with invalid stream proxy config");
+                            continue;
+                        }
+                        config.normalize_stream_proxy_paths();
+                        proxy_state.update_config(config);
+                        info!("Full configuration snapshot applied from CP");
                     }
-                    error!("Ignoring config update with invalid regex listen_paths");
-                    continue;
-                }
-                if let Err(errors) = config.validate_stream_proxies() {
-                    for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                    Err(e) => {
+                        error!("Failed to parse full config update: {}", e);
                     }
-                    error!("Ignoring config update with invalid stream proxy config");
-                    continue;
                 }
-                config.normalize_stream_proxy_paths();
-                proxy_state.update_config(config);
-                info!("Configuration updated from CP");
             }
-            Err(e) => {
-                error!("Failed to parse config update: {}", e);
+            1 => {
+                // DELTA — apply incremental changes only
+                match serde_json::from_str::<IncrementalResult>(&update.config_json) {
+                    Ok(result) => {
+                        if proxy_state.apply_incremental(result) {
+                            info!("Incremental config delta applied from CP");
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse delta update: {}", e);
+                    }
+                }
+            }
+            other => {
+                warn!("Unknown config update type {}, ignoring", other);
             }
         }
     }

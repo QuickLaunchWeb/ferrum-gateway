@@ -102,6 +102,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Frontend TLS termination on proxy and admin listeners
 - Frontend mTLS with client certificate verification
 - Backend mTLS with per-proxy certificate configuration
+- CP/DP gRPC channel TLS and mTLS (one-way TLS or mutual certificate verification)
 - DTLS frontend termination and backend origination (ECDSA P-256 / Ed25519)
 - Configurable cipher suites, key exchange groups, and protocol versions
 - Database TLS/SSL with PostgreSQL and MySQL support

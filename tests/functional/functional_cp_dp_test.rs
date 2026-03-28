@@ -67,6 +67,13 @@ fn create_test_env_config() -> EnvConfig {
         cp_grpc_jwt_secret: Some(GRPC_JWT_SECRET.into()),
         dp_cp_grpc_url: None,
         dp_grpc_auth_token: None,
+        cp_grpc_tls_cert_path: None,
+        cp_grpc_tls_key_path: None,
+        cp_grpc_tls_client_ca_path: None,
+        dp_grpc_tls_ca_cert_path: None,
+        dp_grpc_tls_client_cert_path: None,
+        dp_grpc_tls_client_key_path: None,
+        dp_grpc_tls_no_verify: false,
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
         max_body_size_bytes: 10_485_760,
@@ -260,7 +267,8 @@ async fn test_cp_dp_grpc_config_sync() {
 
     let client_handle = tokio::spawn(async move {
         let _ =
-            dp_client::connect_and_subscribe(&url_clone, &token_clone, "test-dp-node", &ps).await;
+            dp_client::connect_and_subscribe(&url_clone, &token_clone, "test-dp-node", &ps, None)
+                .await;
     });
 
     // Wait for initial config to be received by DP

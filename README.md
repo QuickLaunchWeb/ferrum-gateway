@@ -213,7 +213,7 @@ cargo run --release
 
 ### Control Plane + Data Plane
 
-**Control Plane:**
+**Control Plane (plaintext):**
 ```bash
 FERRUM_MODE=cp \
 FERRUM_DB_TYPE=sqlite \
@@ -224,13 +224,15 @@ FERRUM_CP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release
 ```
 
-**Data Plane:**
+**Data Plane (plaintext):**
 ```bash
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
 FERRUM_DP_GRPC_AUTH_TOKEN="<HS256-JWT-signed-with-grpc-secret>" \
 cargo run --release
 ```
+
+For production deployments, enable TLS or mTLS on the CP/DP gRPC channel. See [CP/DP Mode docs](docs/cp_dp_mode.md#transport-security-tlsmtls) for `FERRUM_CP_GRPC_TLS_*` and `FERRUM_DP_GRPC_TLS_*` environment variables.
 
 ## Docker Deployment
 
