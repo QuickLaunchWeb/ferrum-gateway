@@ -1096,13 +1096,18 @@ components:
           $ref: "#/components/schemas/BackendProtocol"
         backend_host:
           type: [string, "null"]
-          description: Backend server hostname or IP (must be non-empty)
-          minLength: 1
+          description: >-
+            Backend server hostname or IP. Required when `upstream_id` is not set.
+            When `upstream_id` is set, this field is ignored (upstream targets
+            provide the backend address).
         backend_port:
           type: integer
           format: uint16
-          minimum: 1
-          description: Backend server port (must be >= 1)
+          default: 0
+          description: >-
+            Backend server port. Required (>= 1) when `upstream_id` is not set.
+            When `upstream_id` is set, this field is ignored (upstream targets
+            provide the backend port).
         backend_path:
           type: [string, "null"]
 

@@ -530,17 +530,21 @@ async fn handle_create_proxy(
             &json!({"error": "listen_path must start with '/' or '~' (regex)"}),
         ));
     }
-    if proxy.backend_host.is_empty() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "backend_host must be non-empty"}),
-        ));
-    }
-    if proxy.backend_port == 0 {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "backend_port must be greater than 0"}),
-        ));
+    // backend_host and backend_port are required unless upstream_id is set
+    // (upstream targets override these fields at request time)
+    if proxy.upstream_id.is_none() {
+        if proxy.backend_host.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "backend_host must be non-empty (or set upstream_id)"}),
+            ));
+        }
+        if proxy.backend_port == 0 {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "backend_port must be greater than 0 (or set upstream_id)"}),
+            ));
+        }
     }
 
     if proxy.id.is_empty() {
@@ -787,17 +791,21 @@ async fn handle_update_proxy(
             &json!({"error": "listen_path must start with '/' or '~' (regex)"}),
         ));
     }
-    if proxy.backend_host.is_empty() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "backend_host must be non-empty"}),
-        ));
-    }
-    if proxy.backend_port == 0 {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "backend_port must be greater than 0"}),
-        ));
+    // backend_host and backend_port are required unless upstream_id is set
+    // (upstream targets override these fields at request time)
+    if proxy.upstream_id.is_none() {
+        if proxy.backend_host.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "backend_host must be non-empty (or set upstream_id)"}),
+            ));
+        }
+        if proxy.backend_port == 0 {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "backend_port must be greater than 0 (or set upstream_id)"}),
+            ));
+        }
     }
 
     proxy.id = id.to_string();
