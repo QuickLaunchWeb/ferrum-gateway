@@ -101,20 +101,18 @@ def run_stage(
         work / f"{stage}.stderr.txt"
     ).open("wb") as stderr:
         try:
-            options = dict(env=env, stdout=stdout, stderr=stderr,
-                           check=False, timeout=timeout)
             # Literal shell programs with quoted environment data follow the
             # existing hosted harness pattern. No variable selects a program.
             if stage == "manifest":
                 result = subprocess.run([
                     "bash", "-euo", "pipefail", "-c",
                     'exec docker buildx imagetools inspect "$image_ref" --format "{{json .Manifest}}"',
-                ], **options)
+                ], env=env, stdout=stdout, stderr=stderr, check=False, timeout=timeout)
             elif stage == "manifest-validation":
                 result = subprocess.run([
                     "bash", "-euo", "pipefail", "-c",
                     'exec jq -e -f "$work/require_manifest.jq" "$work/manifest.stdout.txt"',
-                ], **options)
+                ], env=env, stdout=stdout, stderr=stderr, check=False, timeout=timeout)
             elif stage == "syft-scan":
                 result = subprocess.run([
                     "bash", "-euo", "pipefail", "-c",
@@ -126,17 +124,17 @@ def run_stage(
                     'anchore/syft@sha256:9a9f85314017f1ea798fb012edfa7fe9259923910f82c8d4bc983ab5c765e60b '
                     'scan "registry:${image_ref}" --platform "$platform" '
                     '-o "spdx-json=/out/${family}_${registry}-${arch}.spdx.json"',
-                ], **options)
+                ], env=env, stdout=stdout, stderr=stderr, check=False, timeout=timeout)
             elif stage == "spdx-validation":
                 result = subprocess.run([
                     "bash", "-euo", "pipefail", "-c",
                     'exec jq -e -f "$work/require_sbom.jq" "$work/${family}_${registry}-${arch}.spdx.json"',
-                ], **options)
+                ], env=env, stdout=stdout, stderr=stderr, check=False, timeout=timeout)
             else:
                 result = subprocess.run([
                     "bash", "-euo", "pipefail", "-c",
                     'exec jq -e -f "$work/historical_require_sbom.jq" "$work/${family}_${registry}-${arch}.spdx.json"',
-                ], **options)
+                ], env=env, stdout=stdout, stderr=stderr, check=False, timeout=timeout)
             results[stage] = {"exit_code": result.returncode}
         except subprocess.TimeoutExpired:
             results[stage] = {"status": "timeout", "timeout_seconds": timeout}
