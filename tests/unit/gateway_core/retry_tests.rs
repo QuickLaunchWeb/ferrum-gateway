@@ -1442,8 +1442,7 @@ fn test_classify_boxed_error_post_connect_rustls_is_post_wire() {
     // class so request_reached_wire returns true and
     // `retry_on_connect_failure` does NOT replay non-idempotent
     // requests whose bytes may already have crossed the encrypted
-    // channel. Handshake-class rustls (CertificateRequired, etc.) is
-    // a different case — see the tests below.
+    // channel. Peer-provided alert descriptions are equally ambiguous.
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(rustls::Error::DecryptError);
     let class = classify_boxed_error(&*err);
     assert_eq!(
@@ -1460,31 +1459,187 @@ fn test_classify_boxed_error_post_connect_rustls_is_post_wire() {
 }
 
 #[test]
-fn test_classify_boxed_error_post_connect_handshake_alert_is_tls_error() {
-    // Issue #4406: reqwest reports backend mTLS handshake failures with
-    // `is_connect() = false` (TCP already succeeded). A typed handshake
-    // alert must still be TlsError so retry_on_connect_failure can replay
-    // and operators grepping tls_error see the misconfig.
+fn test_classify_boxed_error_post_connect_handshake_alert_is_post_wire() {
+    // A peer may send CertificateRequired after processing application data.
+    // Without independent handshake-phase evidence the alert is post-wire so
+    // retry_on_connect_failure cannot replay a non-idempotent request.
     let alert = rustls::AlertDescription::CertificateRequired;
     let err: Box<dyn std::error::Error + Send + Sync> =
         Box::new(rustls::Error::AlertReceived(alert));
     let class = classify_boxed_error(&*err);
-    assert_eq!(class, ErrorClass::TlsError);
+    assert_eq!(class, ErrorClass::ConnectionReset);
     assert!(
-        !ferrum_edge::retry::request_reached_wire(class),
-        "handshake-class rustls must stay pre-wire so retry_on_connect_failure \
-         can replay; nothing reached the origin application layer"
+        ferrum_edge::retry::request_reached_wire(class),
+        "an attacker-controlled alert must not authorize a pre-wire retry"
     );
 }
 
+// ── Issue #4536: a peer-supplied alert kind never proves the phase ──────
+
+/// The exact shape from issue #4536: a TLS 1.3 origin that requests a client
+/// certificate AFTER reading the request line and the whole POST body (RFC
+/// 8446 §4.6.2 post-handshake authentication). rustls has no PHA support, so
+/// it raises `InappropriateHandshakeMessage`; an origin that instead sends a
+/// fatal alert raises `AlertReceived(_)`. Both are reported with no
+/// setup-phase context, and both MUST be post-wire so `should_retry` consults
+/// `retryable_methods` (which excludes POST by default) instead of replaying
+/// on `retry_on_connect_failure`.
 #[test]
-fn test_classify_boxed_error_handshake_failure_alert_is_tls_error() {
+fn post_handshake_rustls_alerts_are_post_wire_and_do_not_replay_a_post() {
+    let post_handshake_shapes: Vec<rustls::Error> = vec![
+        rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
+        rustls::Error::AlertReceived(rustls::AlertDescription::CertificateRequired),
+        rustls::Error::AlertReceived(rustls::AlertDescription::AccessDenied),
+        // What rustls returns from `ExpectTraffic::handle` when a TLS 1.3
+        // origin sends `CertificateRequest` post-handshake (rustls has no PHA
+        // support): only `NewSessionTicket` / `KeyUpdate` are expected there.
+        rustls::Error::InappropriateHandshakeMessage {
+            expect_types: vec![
+                rustls::HandshakeType::NewSessionTicket,
+                rustls::HandshakeType::KeyUpdate,
+            ],
+            got_type: rustls::HandshakeType::CertificateRequest,
+        },
+    ];
+
+    let config = RetryConfig {
+        max_retries: 3,
+        retry_on_connect_failure: true,
+        ..default_config()
+    };
+
+    for shape in post_handshake_shapes {
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(shape.clone());
+        let class = classify_boxed_error(&*boxed);
+        assert_eq!(
+            class,
+            ErrorClass::ConnectionReset,
+            "{shape:?} carries no phase evidence and must be post-wire"
+        );
+        assert!(
+            ferrum_edge::retry::request_reached_wire(class),
+            "{shape:?} must not arm the connect-failure replay"
+        );
+
+        // Same error reached through the io wrapper reqwest/tokio-rustls use.
+        let io_wrapped: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            shape.clone(),
+        ));
+        assert_eq!(
+            classify_boxed_error(&*io_wrapped),
+            ErrorClass::ConnectionReset,
+            "{shape:?} in io::Error::get_ref() must not become pre-wire either"
+        );
+
+        // The dispatch paths set `connection_error == !request_reached_wire`,
+        // and `should_retry` short-circuits `retryable_methods` on that flag.
+        let response = BackendResponse {
+            status_code: 502,
+            body: ResponseBody::buffered(Vec::new()),
+            headers: HashMap::new(),
+            connection_error: !ferrum_edge::retry::request_reached_wire(class),
+            backend_resolved_ip: None,
+            error_class: Some(class),
+        };
+        assert!(
+            !should_retry(&config, "POST", &response, 0),
+            "{shape:?} must not replay a fully transmitted POST past \
+             retryable_methods (issue #4536)"
+        );
+
+        // The SAME error during a known setup phase is still pre-wire, so the
+        // #4406 / #4476 mTLS-misconfiguration signal survives by context — and
+        // a connect-phase failure is still replayable regardless of method.
+        let setup_class = classify_boxed_setup_error(&shape);
+        assert_eq!(
+            setup_class,
+            ErrorClass::TlsError,
+            "{shape:?} during setup keeps the tls_error operator signal"
+        );
+        assert!(!ferrum_edge::retry::request_reached_wire(setup_class));
+        let setup_response = BackendResponse {
+            status_code: 502,
+            body: ResponseBody::buffered(Vec::new()),
+            headers: HashMap::new(),
+            connection_error: true,
+            backend_resolved_ip: None,
+            error_class: Some(setup_class),
+        };
+        assert!(
+            should_retry(&config, "POST", &setup_response, 0),
+            "{shape:?} during setup keeps the #4406 connect-failure replay"
+        );
+    }
+}
+
+/// Issue #4536, residual site 1: `io::ErrorKind::ConnectionRefused` used to
+/// return the pre-wire `ConnectionRefused` with no phase gate, unlike its
+/// `TimedOut` / `ConnectionReset` neighbours.
+#[test]
+fn post_connect_econnrefused_is_post_wire_but_setup_phase_is_not() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+
+    let post = classify_boxed_error(&*err);
+    assert_eq!(post, ErrorClass::ConnectionReset);
+    assert!(
+        ferrum_edge::retry::request_reached_wire(post),
+        "ECONNREFUSED outside a known dial must not arm the connect-failure replay"
+    );
+
+    let setup = classify_boxed_setup_error(&*err);
+    assert_eq!(setup, ErrorClass::ConnectionRefused);
+    assert!(!ferrum_edge::retry::request_reached_wire(setup));
+}
+
+/// Issue #4536, residual site 2: `EADDRNOTAVAIL` is a DIAL signal, and
+/// `PortExhaustion` is pre-wire. The typed walk only claims it inside a known
+/// connect phase now.
+#[test]
+fn post_connect_eaddrnotavail_is_not_pre_wire_port_exhaustion() {
+    for raw in [99, 49, 10049] {
+        // Wrapped so the Display wording ("Cannot assign requested address")
+        // cannot reach the shared substring fallback — this pins the TYPED
+        // walk, which is the path reqwest's post-connect branch uses.
+        #[derive(Debug)]
+        struct Opaque(std::io::Error);
+        impl std::fmt::Display for Opaque {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "backend dispatch failed")
+            }
+        }
+        impl std::error::Error for Opaque {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let setup = classify_boxed_setup_error(&Opaque(std::io::Error::from_raw_os_error(raw)));
+        assert_eq!(
+            setup,
+            ErrorClass::PortExhaustion,
+            "raw_os_error({raw}) during a dial is still port exhaustion"
+        );
+        assert!(!ferrum_edge::retry::request_reached_wire(setup));
+
+        let post = classify_boxed_error(&Opaque(std::io::Error::from_raw_os_error(raw)));
+        assert!(
+            ferrum_edge::retry::request_reached_wire(post),
+            "raw_os_error({raw}) with no dial context must not be pre-wire \
+             (got {post:?})"
+        );
+    }
+}
+
+#[test]
+fn test_classify_boxed_error_handshake_failure_alert_is_post_wire() {
     let alert = rustls::AlertDescription::HandshakeFailure;
     let err: Box<dyn std::error::Error + Send + Sync> =
         Box::new(rustls::Error::AlertReceived(alert));
     let class = classify_boxed_error(&*err);
-    assert_eq!(class, ErrorClass::TlsError);
-    assert!(!ferrum_edge::retry::request_reached_wire(class));
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
 }
 
 #[test]
@@ -1523,8 +1678,15 @@ fn test_classify_boxed_error_close_notify_alert_is_connection_closed() {
 
 #[test]
 fn test_classify_boxed_error_post_connect_rustls_buried_in_chain() {
-    // HandshakeNotComplete is handshake-class even through a wrapper —
-    // the chain walker reaches rustls and maps it to TlsError.
+    // Issue #4536: the chain walker still REACHES the buried rustls error —
+    // that part is unchanged — but the rustls VARIANT is no longer taken as
+    // proof of phase. `classify_boxed_error` carries no setup context, so a
+    // handshake-named rustls error is post-wire and `retry_on_connect_failure`
+    // cannot replay a non-idempotent request past `retryable_methods`.
+    // The setup-phase counterpart
+    // (`test_classify_boxed_setup_error_keeps_rustls_as_tls_error_pre_wire`)
+    // pins that the same error is still `TlsError` when the caller knows it is
+    // connecting.
     #[derive(Debug)]
     struct Wrapper(rustls::Error);
     impl std::fmt::Display for Wrapper {
@@ -1539,8 +1701,15 @@ fn test_classify_boxed_error_post_connect_rustls_buried_in_chain() {
     }
     let wrapped = Wrapper(rustls::Error::HandshakeNotComplete);
     let class = classify_boxed_error(&wrapped);
-    assert_eq!(class, ErrorClass::TlsError);
-    assert!(!ferrum_edge::retry::request_reached_wire(class));
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
+    let setup_class = classify_boxed_setup_error(&wrapped);
+    assert_eq!(
+        setup_class,
+        ErrorClass::TlsError,
+        "the identical buried rustls error stays pre-wire when the CALLER \
+         knows it is still setting the connection up"
+    );
 }
 
 #[test]
@@ -1647,19 +1816,17 @@ fn test_post_connect_io_reset_without_rustls_is_connection_reset() {
 }
 
 #[test]
-fn test_post_connect_io_reset_wrapping_handshake_rustls_is_tls_error() {
-    // tokio-rustls / reqwest wrap a missing-client-cert alert as
-    // io::ErrorKind::ConnectionReset with rustls in get_ref(), and
-    // reqwest's is_connect() is already false (issue #4406). Must not
-    // stay ConnectionReset.
+fn test_post_connect_io_reset_wrapping_handshake_rustls_is_post_wire() {
+    // Once the phase is ambiguous, rustls in get_ref() does not make a
+    // peer-controlled alert safe to retry regardless of method.
     let io_err = std::io::Error::new(
         std::io::ErrorKind::ConnectionReset,
         rustls::Error::AlertReceived(rustls::AlertDescription::CertificateRequired),
     );
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
     let class = classify_boxed_error(&*err);
-    assert_eq!(class, ErrorClass::TlsError);
-    assert!(!ferrum_edge::retry::request_reached_wire(class));
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
 }
 
 #[test]
@@ -1756,7 +1923,15 @@ fn test_classify_boxed_error_typed_io_error_takes_precedence_over_substrings() {
         // Adversarial wording — would substring-match TLS via "tls handshake".
         "tls handshake didn't make it past the kernel",
     ));
-    assert_eq!(classify_boxed_error(&*err), ErrorClass::ConnectionRefused);
+    // Post-connect (issue #4536): still typed, still not the TLS substring —
+    // but ECONNREFUSED outside a known dial is post-wire.
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::ConnectionReset);
+    // Setup phase: the typed kind wins over the adversarial "tls handshake"
+    // wording and stays the pre-wire connect class.
+    assert_eq!(
+        classify_boxed_setup_error(&*err),
+        ErrorClass::ConnectionRefused
+    );
 }
 
 #[test]

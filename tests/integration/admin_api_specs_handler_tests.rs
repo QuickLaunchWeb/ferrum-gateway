@@ -499,9 +499,18 @@ async fn attach_manual_proxy_plugin(store: &DatabaseStore, proxy_id: &str, plugi
         .await
         .expect("get proxy for manual association")
         .expect("proxy must exist for manual association");
-    proxy.plugins.push(PluginAssociation {
-        plugin_config_id: plugin.id.clone(),
-    });
+    // A proxy-scoped create already wrote its own association (issue #4611);
+    // only a group-scoped (or otherwise unattached) plugin still needs the
+    // manual attach this helper models.
+    if !proxy
+        .plugins
+        .iter()
+        .any(|association| association.plugin_config_id == plugin.id)
+    {
+        proxy.plugins.push(PluginAssociation {
+            plugin_config_id: plugin.id.clone(),
+        });
+    }
     assert!(
         store
             .update_proxy(&proxy)
@@ -2024,6 +2033,15 @@ async fn api_spec_delete_accepts_unattached_proxy_scoped_cascade_plugin() {
         ))
         .await
         .expect("create unattached proxy-scoped plugin");
+    // Since issue #4611 the store attaches a proxy-scoped create itself, so an
+    // unattached proxy-scoped row is legacy data. Recreate that shape directly
+    // in the junction: the cascade must still cope with rows written before
+    // the attach-on-create contract.
+    sqlx::query("DELETE FROM proxy_plugins WHERE plugin_config_id = ?")
+        .bind(&plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("detach the legacy proxy-scoped plugin");
 
     let proxy = store
         .get_proxy("ferrum", &proxy_id)
@@ -2090,6 +2108,15 @@ async fn api_spec_delete_rejects_cascade_plugins_that_atomic_restore_cannot_recr
             .execute(&store.pool())
             .await
             .expect("inject malformed cascade scope");
+        // The malformed shape under test is a non-proxy-scoped row that still
+        // carries `proxy_id`, NOT a proxy referencing it: since issue #4611 the
+        // proxy-scoped create above also wrote the association, so drop it
+        // here or the proxy read itself fails closed before the cascade runs.
+        sqlx::query("DELETE FROM proxy_plugins WHERE plugin_config_id = ?")
+            .bind(&plugin_id)
+            .execute(&store.pool())
+            .await
+            .expect("detach the malformed cascade plugin");
 
         let (delete_status, delete_body) =
             client.delete_json(&format!("/api-specs/{spec_id}")).await;
@@ -2268,12 +2295,15 @@ async fn api_spec_delete_rejects_cascade_plugin_referenced_by_another_proxy() {
         ))
         .await
         .expect("create foreign referrer proxy");
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind(&other_proxy_id)
-        .bind(&plugin_id)
-        .execute(&store.pool())
-        .await
-        .expect("inject cross-proxy plugin association");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
+    )
+    .bind("ferrum")
+    .bind(&other_proxy_id)
+    .bind(&plugin_id)
+    .execute(&store.pool())
+    .await
+    .expect("inject cross-proxy plugin association");
 
     let (delete_status, delete_body) = client.delete_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(

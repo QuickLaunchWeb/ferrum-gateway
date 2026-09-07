@@ -35,9 +35,12 @@
 //! form one validated SNI/L4 listener group on a port. Non-unique secondary
 //! indexes cover both candidate scans under the namespace admission lease.
 //! MySQL uses a
-//! 255-character `listen_path` prefix because InnoDB appends the `VARCHAR(255)`
-//! primary key to secondary-index records; full namespace + path + primary-key
-//! columns can exceed its 3072-byte key limit. The query retains its full
+//! 255-character `listen_path` prefix because InnoDB appends the primary key to
+//! secondary-index records; full namespace + path + primary-key columns can
+//! exceed its 3072-byte key limit. The composite `PRIMARY KEY (namespace, id)`
+//! does not change that budget: InnoDB only appends the clustered-index columns
+//! a secondary index does not already carry, and every index whose length is
+//! near the limit already leads with `namespace`. The query retains its full
 //! `listen_path = ?` predicate, so prefix collisions are filtered correctly.
 //!
 //! ## Foreign key constraints
@@ -50,19 +53,42 @@
 //! the referenced tables, columns, ON DELETE actions, and nullability match
 //! exactly:
 //!
-//! | Table                     | Column(s)                | References                | ON DELETE |
-//! |---------------------------|--------------------------|---------------------------|-----------|
-//! | proxies                   | upstream_id              | upstreams(id)             | RESTRICT  |
-//! | plugin_configs            | proxy_id                 | proxies(id)               | CASCADE   |
-//! | proxy_plugins             | proxy_id                 | proxies(id)               | CASCADE   |
-//! | proxy_plugins             | plugin_config_id         | plugin_configs(id)        | CASCADE   |
-//! | consumer_credential_index | (namespace, consumer_id) | consumers(namespace, id)  | CASCADE   |
-//! | consumer_identity_index   | (namespace, consumer_id) | consumers(namespace, id)  | CASCADE   |
+//! | Table                     | Column(s)                     | References                     | ON DELETE |
+//! |---------------------------|-------------------------------|--------------------------------|-----------|
+//! | proxies                   | (namespace, upstream_id)      | upstreams(namespace, id)       | RESTRICT  |
+//! | plugin_configs            | (namespace, proxy_id)         | proxies(namespace, id)         | CASCADE   |
+//! | proxy_plugins             | (namespace, proxy_id)         | proxies(namespace, id)         | CASCADE   |
+//! | proxy_plugins             | (namespace, plugin_config_id) | plugin_configs(namespace, id)  | CASCADE   |
+//! | api_specs                 | (namespace, proxy_id)         | proxies(namespace, id)         | CASCADE   |
+//! | consumer_credential_index | (namespace, consumer_id)      | consumers(namespace, id)       | CASCADE   |
+//! | consumer_identity_index   | (namespace, consumer_id)      | consumers(namespace, id)       | CASCADE   |
 //!
-//! `consumers` uses a composite `PRIMARY KEY (namespace, id)` (issue #2121):
-//! consumer ids are unique per namespace, so the same id may exist in two
-//! namespaces. Both consumer index tables therefore reference the composite
-//! key.
+//! ## Namespace-scoped resource identity
+//!
+//! `proxies`, `upstreams`, `plugin_configs`, `api_specs`, and `consumers` all
+//! use a composite `PRIMARY KEY (namespace, id)`. `consumers` got there first
+//! (issue #2121); the other four followed in issue #4627 so durable identity
+//! matches `GatewayConfig::validate_unique_resource_ids`, which has always
+//! permitted the same resource id in two tenants. Every relationship above is
+//! therefore namespace-qualified: an association can never bind across
+//! tenants, and one tenant cannot squat a bare id another tenant needs.
+//!
+//! `proxy_plugins` carries its own `namespace` column and a
+//! `PRIMARY KEY (namespace, proxy_id, plugin_config_id)`. Both of its foreign
+//! keys reuse that single column, so a junction row is structurally incapable
+//! of joining a proxy in one namespace to a plugin config in another.
+//!
+//! Nullable child columns (`proxies.upstream_id`, `plugin_configs.proxy_id`)
+//! keep the SQL default MATCH SIMPLE semantics: when any column of the child
+//! key is NULL the constraint is not checked, which is exactly the
+//! "unattached resource" case these columns model.
+//!
+//! Because `namespace` participates in every one of these keys, an in-place
+//! `UPDATE <table> SET namespace = ?` can no longer be used to rename a
+//! namespace — there is no ordering of such updates that keeps every
+//! constraint satisfied. `DatabaseStore::rename_namespace_in_tx` copies the
+//! rows parent-first under the new name and then deletes the old ones, the
+//! same shape `consumers` and `gateway_trust_bundles` already used.
 //!
 //! Named constraints on MySQL (e.g. `fk_proxies_upstream`) are cosmetic; they
 //! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
@@ -299,9 +325,17 @@ impl V001SqlBuilder {
 
     async fn create_indexes(&self, connection: &mut AnyConnection) -> Result<(), anyhow::Error> {
         let indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_proxies_upstream_id ON proxies (upstream_id)",
-            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_proxy_id ON plugin_configs (proxy_id)",
-            "CREATE INDEX IF NOT EXISTS idx_proxy_plugins_plugin_config_id ON proxy_plugins (plugin_config_id)",
+            // Relationship indexes lead with `namespace` because every
+            // relationship key is `(namespace, id)` (issue #4627): they serve
+            // the namespace-scoped reference scans AND satisfy MySQL's
+            // requirement that a foreign key's referencing columns have an
+            // index whose leftmost prefix is the FK column list.
+            "CREATE INDEX IF NOT EXISTS idx_proxies_ns_upstream_id ON proxies (namespace, upstream_id)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_proxy_id ON plugin_configs (namespace, proxy_id)",
+            // `proxy_plugins` PRIMARY KEY (namespace, proxy_id, plugin_config_id)
+            // already covers the (namespace, proxy_id) foreign key; this index
+            // covers the (namespace, plugin_config_id) one.
+            "CREATE INDEX IF NOT EXISTS idx_proxy_plugins_ns_plugin_config_id ON proxy_plugins (namespace, plugin_config_id)",
             "CREATE INDEX IF NOT EXISTS idx_proxies_updated_at ON proxies (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumers_updated_at ON consumers (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_updated_at ON plugin_configs (updated_at)",
@@ -318,7 +352,12 @@ impl V001SqlBuilder {
             // Full config loads use keyset pagination with
             // `WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?`. The
             // `(namespace, updated_at)` compounds do not cover that access
-            // pattern, so keep dedicated `(namespace, id)` indexes.
+            // pattern. Since issue #4627 the four resource tables carry a
+            // composite `PRIMARY KEY (namespace, id)` that already covers it,
+            // but these explicit indexes are kept — matching the `consumers`
+            // precedent from issue #2121 — so a database that recorded V001
+            // before the composite keys were folded in still gets them from
+            // the compatibility pass in `create_full_load_indexes`.
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_id ON proxies (namespace, id)",
             // Non-unique: host-overlap uniqueness stays application-enforced
             // under the route-bucket lock. This secondary index covers
@@ -336,11 +375,13 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_scope_id ON plugin_configs (scope, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
-            // Cold-path index for cross-namespace mesh_route_dispatch lookups in
-            // `mesh_route_dispatch_plugin_configs_tx`. Upstream IDs are globally
-            // unique PKs, so the cleanup helpers intentionally scan across
-            // namespaces (a cross-namespace reference is real and must be
-            // caught). MongoDB has a matching `{plugin_name, enabled}` partial
+            // Cold-path index for the `mesh_route_dispatch` upstream-reference
+            // lookups in `mesh_route_dispatch_plugin_configs_tx` and
+            // `ensure_no_external_spec_upstream_refs_tx`. Since issue #4627 an
+            // upstream id is only unique within its namespace, so those helpers
+            // add a `namespace = ?` predicate on top of this index rather than
+            // scanning every tenant. MongoDB has a matching
+            // `{plugin_name, enabled}` partial
             // index with `partialFilterExpression: {enabled: true}`; the
             // SQL helper applies the same `WHERE enabled = 1` filter on
             // Postgres/SQLite (MySQL has no partial-index equivalent).
@@ -355,12 +396,12 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_operation_count ON api_specs (namespace, operation_count)",
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_created_at ON api_specs (namespace, created_at)",
             // Back-link indexes: replace_api_spec_bundle and delete_api_spec
-            // run WHERE api_spec_id = ? against these tables. Without indexes,
-            // those queries are full-table scans that grow with overall config
-            // volume, not spec count.
-            "CREATE INDEX IF NOT EXISTS idx_proxies_api_spec_id ON proxies (api_spec_id)",
-            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
-            "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
+            // run WHERE namespace = ? AND api_spec_id = ? against these tables.
+            // Without indexes, those queries are full-table scans that grow
+            // with overall config volume, not spec count.
+            "CREATE INDEX IF NOT EXISTS idx_proxies_ns_api_spec_id ON proxies (namespace, api_spec_id)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_api_spec_id ON plugin_configs (namespace, api_spec_id)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_api_spec_id ON upstreams (namespace, api_spec_id)",
         ];
 
         for idx_sql in indexes {
@@ -568,7 +609,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
-                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 targets MEDIUMTEXT NOT NULL,
@@ -586,13 +627,14 @@ impl V001SqlBuilder {
                 backend_tls_san_allow_list MEDIUMTEXT,
                 api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL
+                updated_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY (namespace, id)
             )
             "#
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 name TEXT,
                 targets TEXT NOT NULL DEFAULT '[]',
@@ -610,7 +652,8 @@ impl V001SqlBuilder {
                 backend_tls_san_allow_list TEXT,
                 api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, id)
             )
             "#
         }
@@ -1376,7 +1419,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS proxies (
-                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 hosts TEXT NOT NULL,
@@ -1431,7 +1474,8 @@ impl V001SqlBuilder {
                 api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
-                CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT,
+                PRIMARY KEY (namespace, id),
+                CONSTRAINT fk_proxies_upstream FOREIGN KEY (namespace, upstream_id) REFERENCES upstreams(namespace, id) ON DELETE RESTRICT,
                 CONSTRAINT chk_proxies_backend_port CHECK (backend_port >= 0 AND backend_port <= 65535),
                 CONSTRAINT chk_proxies_listen_port CHECK (listen_port IS NULL OR (listen_port >= 1 AND listen_port <= 65535)),
                 CONSTRAINT chk_proxies_connect_timeout CHECK (backend_connect_timeout_ms > 0),
@@ -1442,7 +1486,7 @@ impl V001SqlBuilder {
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS proxies (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 name TEXT,
                 hosts TEXT NOT NULL DEFAULT '[]',
@@ -1463,7 +1507,7 @@ impl V001SqlBuilder {
                 dns_override TEXT,
                 dns_cache_ttl_seconds INTEGER,
                 auth_mode TEXT NOT NULL DEFAULT 'single',
-                upstream_id TEXT REFERENCES upstreams(id) ON DELETE RESTRICT,
+                upstream_id TEXT,
                 upstream_subset TEXT,
                 circuit_breaker TEXT,
                 retry TEXT,
@@ -1497,6 +1541,8 @@ impl V001SqlBuilder {
                 api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, id),
+                FOREIGN KEY (namespace, upstream_id) REFERENCES upstreams(namespace, id) ON DELETE RESTRICT,
                 CHECK (backend_port >= 0 AND backend_port <= 65535),
                 CHECK (listen_port IS NULL OR (listen_port >= 1 AND listen_port <= 65535)),
                 CHECK (backend_connect_timeout_ms > 0),
@@ -1511,7 +1557,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
-                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 plugin_name VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 config MEDIUMTEXT NOT NULL,
@@ -1523,24 +1569,27 @@ impl V001SqlBuilder {
                 api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
-                CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
+                PRIMARY KEY (namespace, id),
+                CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (namespace, proxy_id) REFERENCES proxies(namespace, id) ON DELETE CASCADE
             )
             "#
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 plugin_name TEXT NOT NULL,
                 config TEXT NOT NULL DEFAULT '{}',
                 scope TEXT NOT NULL DEFAULT 'global',
-                proxy_id TEXT REFERENCES proxies(id) ON DELETE CASCADE,
+                proxy_id TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
                 trigger_json TEXT DEFAULT NULL,
                 api_spec_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, id),
+                FOREIGN KEY (namespace, proxy_id) REFERENCES proxies(namespace, id) ON DELETE CASCADE
             )
             "#
         }
@@ -1604,19 +1653,23 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS proxy_plugins (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 proxy_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 plugin_config_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
-                PRIMARY KEY (proxy_id, plugin_config_id),
-                CONSTRAINT fk_proxy_plugins_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE,
-                CONSTRAINT fk_proxy_plugins_plugin FOREIGN KEY (plugin_config_id) REFERENCES plugin_configs(id) ON DELETE CASCADE
+                PRIMARY KEY (namespace, proxy_id, plugin_config_id),
+                CONSTRAINT fk_proxy_plugins_proxy FOREIGN KEY (namespace, proxy_id) REFERENCES proxies(namespace, id) ON DELETE CASCADE,
+                CONSTRAINT fk_proxy_plugins_plugin FOREIGN KEY (namespace, plugin_config_id) REFERENCES plugin_configs(namespace, id) ON DELETE CASCADE
             )
             "#
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS proxy_plugins (
-                proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
-                plugin_config_id TEXT NOT NULL REFERENCES plugin_configs(id) ON DELETE CASCADE,
-                PRIMARY KEY (proxy_id, plugin_config_id)
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                proxy_id TEXT NOT NULL,
+                plugin_config_id TEXT NOT NULL,
+                PRIMARY KEY (namespace, proxy_id, plugin_config_id),
+                FOREIGN KEY (namespace, proxy_id) REFERENCES proxies(namespace, id) ON DELETE CASCADE,
+                FOREIGN KEY (namespace, plugin_config_id) REFERENCES plugin_configs(namespace, id) ON DELETE CASCADE
             )
             "#
         }
@@ -1724,8 +1777,10 @@ impl V001SqlBuilder {
         // this table; it is excluded from db_loader.rs, GatewayConfig, and
         // all gRPC/CP distribution paths.
         //
-        // FK: proxy_id → proxies(id) ON DELETE CASCADE so deleting the proxy
-        //     (e.g., when a spec is purged) automatically removes the spec row.
+        // FK: (namespace, proxy_id) → proxies(namespace, id) ON DELETE CASCADE
+        //     so deleting the proxy (e.g., when a spec is purged) automatically
+        //     removes the spec row, and a spec can only ever describe a proxy in
+        //     its own tenant (issue #4627).
         //
         // The api_spec_id columns on proxies, upstreams, and plugin_configs are
         // deliberately UNCONSTRAINED (no FK, no ON DELETE SET NULL).  Application
@@ -1736,11 +1791,12 @@ impl V001SqlBuilder {
         //   2. Avoid cross-table creation-ordering complexity on MySQL (which would
         //      require api_specs to exist before inserting proxies that reference it).
         // Manual DB operations that delete from api_specs directly must also clean
-        // dependent rows by hand (WHERE api_spec_id = '<deleted-spec-id>').
+        // dependent rows by hand
+        // (WHERE namespace = '<ns>' AND api_spec_id = '<deleted-spec-id>').
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS api_specs (
-                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 proxy_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 spec_version VARCHAR(50) COLLATE utf8mb4_0900_bin NOT NULL,
@@ -1764,15 +1820,16 @@ impl V001SqlBuilder {
                 external_ref_digest VARCHAR(64) COLLATE utf8mb4_0900_bin NULL,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
-                CONSTRAINT fk_api_specs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
+                PRIMARY KEY (namespace, id),
+                CONSTRAINT fk_api_specs_proxy FOREIGN KEY (namespace, proxy_id) REFERENCES proxies(namespace, id) ON DELETE CASCADE
             )
             "#
         } else if self.is_sqlite() {
             r#"
             CREATE TABLE IF NOT EXISTS api_specs (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
-                proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+                proxy_id TEXT NOT NULL,
                 spec_version TEXT NOT NULL,
                 spec_format TEXT NOT NULL,
                 spec_content BLOB NOT NULL,
@@ -1793,16 +1850,18 @@ impl V001SqlBuilder {
                 external_ref_snapshot BLOB NULL,
                 external_ref_digest TEXT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, id),
+                FOREIGN KEY (namespace, proxy_id) REFERENCES proxies(namespace, id) ON DELETE CASCADE
             )
             "#
         } else {
             // PostgreSQL: BYTEA for binary data (BLOB is not a native PG type).
             r#"
             CREATE TABLE IF NOT EXISTS api_specs (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
-                proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+                proxy_id TEXT NOT NULL,
                 spec_version TEXT NOT NULL,
                 spec_format TEXT NOT NULL,
                 spec_content BYTEA NOT NULL,
@@ -1823,7 +1882,9 @@ impl V001SqlBuilder {
                 external_ref_snapshot BYTEA NULL,
                 external_ref_digest TEXT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, id),
+                FOREIGN KEY (namespace, proxy_id) REFERENCES proxies(namespace, id) ON DELETE CASCADE
             )
             "#
         }
@@ -1899,7 +1960,7 @@ mod tests {
         assert!(
             builder
                 .create_upstreams_sql()
-                .contains("id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY")
+                .contains("id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL")
         );
     }
 
@@ -2462,7 +2523,11 @@ mod tests {
     fn test_mysql_proxy_plugins_collation_on_fk_columns() {
         let builder = V001SqlBuilder::new("mysql");
         let sql = builder.create_proxy_plugins_sql();
-        assert_columns_have_collation(sql, "proxy_plugins", &["proxy_id", "plugin_config_id"]);
+        assert_columns_have_collation(
+            sql,
+            "proxy_plugins",
+            &["namespace", "proxy_id", "plugin_config_id"],
+        );
     }
 
     #[test]
@@ -2587,7 +2652,7 @@ mod tests {
         for dialect in ["postgres", "mysql", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
             let sql = builder.create_proxies_sql();
-            assert_fk_present(sql, "upstreams", "id", "RESTRICT");
+            assert_fk_present(sql, "upstreams", "namespace, id", "RESTRICT");
         }
     }
 
@@ -2596,7 +2661,7 @@ mod tests {
         for dialect in ["postgres", "mysql", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
             let sql = builder.create_plugin_configs_sql();
-            assert_fk_present(sql, "proxies", "id", "CASCADE");
+            assert_fk_present(sql, "proxies", "namespace, id", "CASCADE");
         }
     }
 
@@ -2605,9 +2670,10 @@ mod tests {
         for dialect in ["postgres", "mysql", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
             let sql = builder.create_proxy_plugins_sql();
-            // Both FKs in the junction table must be CASCADE
-            assert_fk_present(sql, "proxies", "id", "CASCADE");
-            assert_fk_present(sql, "plugin_configs", "id", "CASCADE");
+            // Both FKs in the junction table must be namespace-qualified and
+            // CASCADE, so a junction row cannot bind across tenants.
+            assert_fk_present(sql, "proxies", "namespace, id", "CASCADE");
+            assert_fk_present(sql, "plugin_configs", "namespace, id", "CASCADE");
         }
     }
 
@@ -2634,9 +2700,10 @@ mod tests {
 
     #[test]
     fn test_fk_count_matches_across_dialects() {
-        // Every dialect must define exactly 6 FK references (counted by
+        // Every dialect must define exactly 7 FK references (counted by
         // occurrences of "REFERENCES" in the combined CREATE TABLE SQL):
-        // the 4 proxy/plugin FKs plus the two composite consumer-index FKs.
+        // the 4 proxy/plugin FKs, the api_specs → proxies FK, and the two
+        // composite consumer-index FKs.
         for dialect in ["postgres", "mysql", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
             let all_sql = [
@@ -2647,13 +2714,50 @@ mod tests {
                 builder.create_proxies_sql(),
                 builder.create_plugin_configs_sql(),
                 builder.create_proxy_plugins_sql(),
+                builder.create_api_specs_sql(),
             ]
             .join("\n");
 
             let count = all_sql.matches("REFERENCES").count();
             assert_eq!(
-                count, 6,
-                "{dialect} dialect has {count} FK REFERENCES clauses, expected 6"
+                count, 7,
+                "{dialect} dialect has {count} FK REFERENCES clauses, expected 7"
+            );
+        }
+    }
+
+    /// Issue #4627: every namespaced resource table must key on
+    /// `(namespace, id)` so the same bare id can exist in two tenants, and the
+    /// junction table must carry the namespace in its own key.
+    #[test]
+    fn test_namespaced_resource_tables_use_composite_primary_keys() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            for (table, sql) in [
+                ("proxies", builder.create_proxies_sql()),
+                ("upstreams", builder.create_upstreams_sql()),
+                ("plugin_configs", builder.create_plugin_configs_sql()),
+                ("api_specs", builder.create_api_specs_sql()),
+            ] {
+                assert!(
+                    sql.contains("PRIMARY KEY (namespace, id)"),
+                    "{dialect} {table} must declare a composite PRIMARY KEY (namespace, id)"
+                );
+                assert!(
+                    !sql.contains("id TEXT PRIMARY KEY")
+                        && !sql.contains("COLLATE utf8mb4_0900_bin PRIMARY KEY"),
+                    "{dialect} {table} must not keep a single-column id PRIMARY KEY"
+                );
+            }
+
+            let junction = builder.create_proxy_plugins_sql();
+            assert!(
+                junction.contains("PRIMARY KEY (namespace, proxy_id, plugin_config_id)"),
+                "{dialect} proxy_plugins must key on (namespace, proxy_id, plugin_config_id)"
+            );
+            assert!(
+                junction.contains("namespace"),
+                "{dialect} proxy_plugins must carry a namespace column"
             );
         }
     }

@@ -17,7 +17,7 @@ use crate::scaffolding::backends::{
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::{reserve_port, unbound_port};
+use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
 use crate::scaffolding::{
     file_mode_yaml_for_backend, file_mode_yaml_for_backend_with, to_file_mode_yaml,
 };
@@ -89,86 +89,49 @@ fn ws_proxy_url(harness: &GatewayHarness, path: &str) -> String {
 // Test 1 — backend port with nothing listening → 502 + ConnectionRefused class.
 // ────────────────────────────────────────────────────────────────────────────
 //
-// Fixture: `unbound_port()` reserves a port then drops the listener, so the
-// gateway's connect() returns a real `ECONNREFUSED` from the kernel
-// (distinct from `ScriptedTcpBackend::RefuseNextConnect`, which accepts and
-// drops — that path emits FIN/RST, not a connect-time refusal, and so does
-// not exercise the gateway's `ConnectionRefused` classifier).
-//
-// CLAUDE.md warns about the bind-drop-rebind race: under parallel test load
-// another process can bind the port in the gap between our drop and the
-// gateway's connect, which turns the gateway's 502 into some other status
-// and makes the test flaky. Retry the full setup (fresh port + fresh
-// harness) when the expected 502 + refused-class signal doesn't land.
+// Hold a bound-but-not-listening socket throughout the request. The kernel
+// returns ECONNREFUSED and a parallel fixture cannot reuse the endpoint.
+// This differs from accepting and dropping, which produces FIN/RST.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn backend_refuses_connect_maps_to_502_with_connection_refused() {
-    const MAX_ATTEMPTS: u32 = 5;
-    let mut last_failure: Option<String> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        // Real ECONNREFUSED: no listener on this port.
-        let backend_port = unbound_port().await.expect("unbound port");
-        let yaml = file_mode_yaml_for_backend(backend_port);
-        let harness = GatewayHarness::builder()
-            .file_config(yaml)
-            .log_level("info")
-            .capture_output()
-            .spawn()
-            .await
-            .expect("spawn gateway");
+    let unavailable = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let yaml = file_mode_yaml_for_backend(unavailable.port);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
 
-        let client = harness.http_client().expect("client");
-        let resp = client
-            .get(&harness.proxy_url("/api/anything"))
-            .await
-            .expect("gateway returns a response");
-        if resp.status != StatusCode::BAD_GATEWAY {
-            last_failure = Some(format!(
-                "attempt {attempt}/{MAX_ATTEMPTS}: expected 502, got {} (port may have been rebound)",
-                resp.status
-            ));
-            continue;
-        }
-        let gateway_error = resp
-            .headers
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/anything"))
+        .await
+        .expect("gateway returns a response");
+    assert_eq!(resp.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        resp.headers
             .get("x-gateway-error")
-            .and_then(|v| v.to_str().ok());
-        if gateway_error != Some("connection_failure") {
-            last_failure = Some(format!(
-                "attempt {attempt}/{MAX_ATTEMPTS}: expected X-Gateway-Error=connection_failure, got {gateway_error:?}"
-            ));
-            continue;
-        }
-        if resp.body_text() != r#"{"error":"Backend unavailable"}"# {
-            last_failure = Some(format!(
-                "attempt {attempt}/{MAX_ATTEMPTS}: expected Backend unavailable body, got {}",
-                resp.body_text()
-            ));
-            continue;
-        }
+            .and_then(|v| v.to_str().ok()),
+        Some("connection_failure")
+    );
+    assert_eq!(resp.body_text(), r#"{"error":"Backend unavailable"}"#);
 
-        let logs = require_logs(&harness);
-        // `connect_failure` is the gateway's `error_kind` for reqwest
-        // errors where `is_connect() == true` — exactly the ECONNREFUSED
-        // case. Distinct from `request_error` (RST after accept),
-        // `read_timeout`, and body-error classes, so asserting on it
-        // proves the gateway took the connect-failure path rather than
-        // some other fallback. `ConnectionRefused`/"Connection refused"
-        // are belt-and-suspenders for future log-surface changes.
-        let has_refused_class = logs.contains("connect_failure")
+    // Wait for the existing non-blocking log writer to flush this one
+    // request; do not retry the request or the scenario to obtain a pass.
+    let refused_class = |logs: &str| {
+        logs.contains("connect_failure")
             || logs.contains("ConnectionRefused")
-            || logs.contains("Connection refused");
-        if !has_refused_class {
-            last_failure = Some(format!(
-                "attempt {attempt}/{MAX_ATTEMPTS}: expected refused-class signal in logs:\n{logs}"
-            ));
-            continue;
-        }
-        return; // pass
-    }
-    panic!(
-        "backend_refuses_connect test failed across {MAX_ATTEMPTS} attempts; last failure: {}",
-        last_failure.unwrap_or_else(|| "unknown".into())
+            || logs.contains("Connection refused")
+    };
+    let logs = harness
+        .wait_for_log_contains(refused_class, Duration::from_secs(3))
+        .await;
+    assert!(
+        refused_class(&logs),
+        "expected refused-class signal in logs:\n{logs}"
     );
 }
 
@@ -1853,6 +1816,80 @@ async fn h1_backend_write_timeout_maps_to_504_backend_timeout() {
         status,
         StatusCode::GATEWAY_TIMEOUT,
         "expected 504 for a live backend write timeout, got {status} body={body}"
+    );
+    assert_eq!(
+        gateway_error.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    );
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+
+    let logs = collect_read_write_timeout_logs(&harness).await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "write timeout must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// #4411: the issue's own reproduction, on the bundled HTTP client's HTTP/1.1
+// backend path. 2 MiB with no receive-window pin fits inside the loopback send
+// buffer plus the never-reading peer's initial receive window, so the upload
+// pump reaches a clean EOS with no bridge backpressure and the pre-EOS idle arm
+// can never fire. Only the post-EOS send-queue drain bound produces the 504,
+// and on this path only because vendored reqwest patch 004 reports the dialed
+// socket (`docs/upstream-reqwest-patches/004-connection-established-fd/`).
+const KERNEL_ABSORB_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h1_kernel_absorb_write_timeout_maps_to_504_backend_timeout() {
+    if !ferrum_edge::_test_support::send_queue_probe_supported() {
+        // No send-queue query on this target; `backend_read_timeout_ms` is the
+        // only bound, as documented next to `backend_write_timeout_ms`.
+        return;
+    }
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = file_mode_yaml_with_timeouts_and_access_log(backend_port, 8_000, write_timeout_ms);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(harness.proxy_url("/api/twrite"))
+        .header("content-type", "application/octet-stream")
+        .header("expect", "")
+        .body(vec![b'x'; KERNEL_ABSORB_UPLOAD_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "kernel-absorbed never-read POST must be 504, got {status} body={body}"
     );
     assert_eq!(
         gateway_error.as_deref(),

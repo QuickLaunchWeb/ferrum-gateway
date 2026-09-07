@@ -770,6 +770,7 @@ struct H3StreamingTrailerPolicy<'a> {
     pre_policy: &'a PrePolicyResponseHeaders,
     /// Config-time declarations plus the fail-closed unbounded arm.
     governance: ResponseTrailerGovernance<'a>,
+    gateway_owned: GatewayOwnedResponseHeaders,
     /// Plain response trailers, or a native gRPC terminal section. Selected by
     /// the relay from the dispatch it committed to, never from a trailer name.
     section: TrailerSectionKind,
@@ -909,7 +910,7 @@ where
                 trailer_policy.final_headers,
                 trailer_policy.pre_policy,
                 trailer_policy.governance,
-                GatewayOwnedResponseHeaders::default(),
+                trailer_policy.gateway_owned,
                 trailer_policy.section,
             );
             if removed > 0 {
@@ -2427,11 +2428,13 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Global request admission control (HTTP/3). Single atomic load (~1ns).
+    // Global request admission control (HTTP/3). Match H1/H2: acquire pairs
+    // with begin_drain's release store when rejecting new streams on
+    // already-established connections.
     if state
         .overload
         .reject_new_requests
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
     {
         record_h3_flavor_aware_reject(&state, http_flavor, 503);
         if grpc_web_response_content_type.is_some() {
@@ -4547,6 +4550,93 @@ async fn handle_h3_request(
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647): the same
+    // single hop-budget decision the H1/H2 ladder takes in
+    // `src/proxy/mod.rs::handle_proxy_request_inner`, at the same point —
+    // after every request-phase plugin and before the outbound map is owned
+    // and handed to the native H3 client or the cross-protocol bridge. A
+    // decremented budget lands in the map every H3 dispatch and retry reads.
+    // Keep both call sites in sync.
+    match crate::proxy::max_forwards::apply_options_max_forwards(
+        &method,
+        &mut owned_proxy_headers,
+        &mut ctx.headers,
+    ) {
+        crate::proxy::max_forwards::MaxForwardsDecision::Forward
+        | crate::proxy::max_forwards::MaxForwardsDecision::Decremented => {}
+        crate::proxy::max_forwards::MaxForwardsDecision::Terminal(terminal) => {
+            // Heap-pinned like the `boxed_*` reject helpers on the H1/H2
+            // ladder: this handler's state machine is already close to the
+            // worker stack budget of a debug build, and inlining one more
+            // full reject path overflowed it on the H3-plain mesh functional
+            // tests. The branch runs only on a terminal Max-Forwards.
+            Box::pin(async {
+                let hook_start = std::time::Instant::now();
+                let mut headers = crate::proxy::max_forwards::max_forwards_response_headers(
+                    terminal,
+                    proxy.allowed_methods.as_deref(),
+                );
+                let mut reject_status = terminal.status().as_u16();
+                let mut reject_body = terminal.body();
+                // Same reject-path shaping as a `before_proxy` rejection so the
+                // `cors` plugin and other response-header hooks decorate the
+                // local answer exactly as they would on H1/H2.
+                apply_reject_after_proxy_and_synthetic_body_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut reject_status,
+                    &mut headers,
+                    &mut reject_body,
+                    matches!(http_flavor, HttpFlavor::Grpc),
+                    false,
+                )
+                .await;
+                plugin_execution_ns += hook_start.elapsed().as_nanos() as u64;
+                let http_status = StatusCode::from_u16(reject_status).unwrap_or(terminal.status());
+                run_h3_reject_response_committed_hooks(
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    http_status,
+                    reject_body.clone(),
+                    &headers,
+                )
+                .await;
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                );
+                record_request(&state, log_status_code);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    crate::proxy::max_forwards::MAX_FORWARDS_REJECTION_PHASE,
+                    plugin_execution_ns,
+                )
+                .await;
+                send_h3_plugin_reject_flavor_aware(
+                    &mut stream,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    http_status,
+                    reject_body,
+                    &headers,
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+            return Ok(());
+        }
+    }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing
     // ctx.headers while ctx is passed as &mut to proxy functions downstream.
     //
@@ -5956,6 +6046,7 @@ async fn handle_h3_request(
     );
     let backend_start = std::time::Instant::now();
     let sticky_cookie_needed = selection.sticky_cookie_needed;
+    ctx.h3_response_upstream_is_fallback = selection.is_fallback;
 
     // Resolve backend IP once from DNS cache (O(1) cached lookup) before dispatch.
     // Shared across all ordinary H3 response paths for TransactionSummary logging.
@@ -7078,7 +7169,11 @@ async fn handle_h3_request(
         let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
             &response_headers,
             response_trailer_governance,
-            !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
+            !plugins.is_empty()
+                || sticky_cookie_needed
+                || gateway_synthesizes_content_type
+                || ctx.h3_response_upstream_is_fallback
+                || state.via_header_http3.is_some(),
         );
 
         // after_proxy hooks run before streaming begins so headers can be
@@ -7265,6 +7360,11 @@ async fn handle_h3_request(
         // wire contradicting a header the gateway itself synthesized. The
         // lookup stays case-sensitive on the already-lowercased H3 header map,
         // exactly as the previous builder-side check was.
+        let gateway_owned_headers = finalize_h3_response_routing_headers(
+            ctx.h3_response_upstream_is_fallback,
+            state.via_header_http3.as_deref(),
+            &mut response_headers,
+        );
         response_headers
             .entry("content-type".to_string())
             .or_insert_with(|| "application/json".to_string());
@@ -7715,6 +7815,7 @@ async fn handle_h3_request(
                         &mut h3_resp.recv_stream,
                         backend_read_timeout_ms,
                         H3StreamingTrailerPolicy {
+                            gateway_owned: gateway_owned_headers,
                             final_headers: &response_headers,
                             pre_policy: &pre_policy_response_headers,
                             governance: response_trailer_governance,
@@ -9393,7 +9494,11 @@ async fn handle_h3_request(
         // boundary as H1/H2's response builder. Classification is the original
         // typed `h3_request_on_wire` signal; status is the client-visible one
         // after after_proxy, body, final-client-visible, and committed hooks.
-        let mut gateway_owned_headers = GatewayOwnedResponseHeaders::default();
+        let mut gateway_owned_headers = finalize_h3_response_routing_headers(
+            ctx.h3_response_upstream_is_fallback,
+            state.via_header_http3.as_deref(),
+            &mut response_headers,
+        );
         if crate::proxy::apply_authoritative_backend_gateway_error_header(
             &mut response_headers,
             !h3_request_on_wire,
@@ -10162,6 +10267,46 @@ fn build_h3_backend_headers(
     }
 
     h3_headers
+}
+
+/// Seal the gateway's routing headers after response hooks, before commitment.
+/// Return ownership for trailer reconciliation, including idempotent writes.
+/// Existing Via hops are retained before the gateway's configured hop.
+pub(crate) fn finalize_h3_response_routing_headers(
+    is_fallback: bool,
+    via: Option<&str>,
+    headers: &mut HashMap<String, String>,
+) -> GatewayOwnedResponseHeaders {
+    let mut owned = GatewayOwnedResponseHeaders::default();
+    if is_fallback {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("x-gateway-upstream-status"));
+        headers.insert("x-gateway-upstream-status".into(), "degraded".into());
+        owned.insert(GatewayOwnedResponseHeader::GatewayUpstreamStatus);
+    }
+    if let Some(via) = via {
+        let mut prior = Vec::new();
+        headers.retain(|name, value| {
+            if name.eq_ignore_ascii_case("via") {
+                prior.push((name.clone(), value.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        prior.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut value = prior
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !value.is_empty() {
+            value.push_str(", ");
+        }
+        value.push_str(via);
+        headers.insert("via".into(), value);
+        owned.insert(GatewayOwnedResponseHeader::Via);
+    }
+    owned
 }
 
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
@@ -11027,7 +11172,11 @@ async fn stream_h3_open_response_to_client(
     let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
         &response_headers,
         trailer_governance,
-        !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
+        !plugins.is_empty()
+            || sticky_cookie_needed
+            || gateway_synthesizes_content_type
+            || ctx.h3_response_upstream_is_fallback
+            || state.via_header_http3.is_some(),
     );
 
     if let Some(reject) = run_h3_streaming_after_proxy_hooks(
@@ -11098,6 +11247,11 @@ async fn stream_h3_open_response_to_client(
     // Default `content-type` goes into the header MAP, not just the builder, so
     // the map handed to the trailer boundary below is the field set the client
     // actually received. See the matching note in the inline native-H3 relay.
+    let gateway_owned_headers = finalize_h3_response_routing_headers(
+        ctx.h3_response_upstream_is_fallback,
+        state.via_header_http3.as_deref(),
+        &mut response_headers,
+    );
     response_headers
         .entry("content-type".to_string())
         .or_insert_with(|| "application/json".to_string());
@@ -11427,6 +11581,7 @@ async fn stream_h3_open_response_to_client(
                 &mut recv_stream,
                 backend_read_timeout_ms,
                 H3StreamingTrailerPolicy {
+                    gateway_owned: gateway_owned_headers,
                     final_headers: &response_headers,
                     pre_policy: &pre_policy_response_headers,
                     governance: trailer_governance,
@@ -12819,13 +12974,21 @@ async fn dispatch_grpc_native_h3(
                     method,
                     backend_url,
                     &h3_headers,
+                    grpc_deadline_at,
                     tls_config_fn,
                 )
                 .await
         } else {
             state
                 .h3_pool
-                .open_bidi_backend_stream(proxy, method, backend_url, &h3_headers, tls_config_fn)
+                .open_bidi_backend_stream(
+                    proxy,
+                    method,
+                    backend_url,
+                    &h3_headers,
+                    grpc_deadline_at,
+                    tls_config_fn,
+                )
                 .await
         }
     };
@@ -13086,6 +13249,8 @@ async fn dispatch_grpc_native_h3(
         response_trailer_governance,
         !plugins.is_empty()
             || sticky_cookie_needed
+            || ctx.h3_response_upstream_is_fallback
+            || state.via_header_http3.is_some()
             || response_headers.contains_key("content-length"),
     );
 
@@ -13522,6 +13687,12 @@ async fn dispatch_grpc_native_h3(
         );
         h3_grpc_authorization_precommit_terminal!(termination, true);
     }
+
+    let gateway_owned_headers = finalize_h3_response_routing_headers(
+        ctx.h3_response_upstream_is_fallback,
+        state.via_header_http3.as_deref(),
+        &mut response_headers,
+    );
 
     // Send response headers. gRPC carries its own `content-type`
     // (`application/grpc`); never override it with the plain JSON default.
@@ -14493,7 +14664,7 @@ async fn dispatch_grpc_native_h3(
                         &response_headers,
                         &grpc_pre_policy_response_headers,
                         response_trailer_governance,
-                        GatewayOwnedResponseHeaders::default(),
+                        gateway_owned_headers,
                         TrailerSectionKind::NativeGrpcTerminal,
                     );
                     if removed > 0 {
@@ -15075,7 +15246,11 @@ async fn proxy_to_backend_h3_streaming(
     let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
         &response_headers,
         trailer_governance,
-        !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
+        !plugins.is_empty()
+            || sticky_cookie_needed
+            || gateway_synthesizes_content_type
+            || ctx.h3_response_upstream_is_fallback
+            || state.via_header_http3.is_some(),
     );
 
     // after_proxy hooks run before streaming begins so headers can be modified
@@ -15159,6 +15334,11 @@ async fn proxy_to_backend_h3_streaming(
     // the header MAP, not just the builder, so the map handed to the trailer
     // boundary below is the field set the client actually received. See the
     // matching note in the inline native-H3 relay.
+    let gateway_owned_headers = finalize_h3_response_routing_headers(
+        ctx.h3_response_upstream_is_fallback,
+        state.via_header_http3.as_deref(),
+        &mut response_headers,
+    );
     response_headers
         .entry("content-type".to_string())
         .or_insert_with(|| "application/json".to_string());
@@ -15507,6 +15687,7 @@ async fn proxy_to_backend_h3_streaming(
                 &mut h3_resp.recv_stream,
                 backend_read_timeout_ms,
                 H3StreamingTrailerPolicy {
+                    gateway_owned: gateway_owned_headers,
                     final_headers: &response_headers,
                     pre_policy: &pre_policy_response_headers,
                     governance: trailer_governance,
@@ -18877,6 +19058,7 @@ mod build_h3_backend_headers_tests {
     fn minimal_proxy_state() -> ProxyState {
         let dns_cache = DnsCache::new(DnsConfig::default());
         let config = GatewayConfig {
+            quarantined_plugin_configs: Vec::new(),
             version: "1".to_string(),
             proxies: vec![],
             consumers: vec![],
@@ -19779,5 +19961,54 @@ mod h3_ocsp_staple_tests {
             observed_staple(Arc::new(convert(&frontend)), b"h3").is_empty(),
             "an unstapled certificate must not acquire a staple through the H3 conversion"
         );
+    }
+}
+
+#[cfg(test)]
+mod response_routing_header_tests {
+    use super::finalize_h3_response_routing_headers;
+    use std::collections::HashMap;
+
+    #[test]
+    fn fallback_and_via_are_independent_and_preserve_existing_hops() {
+        for is_fallback in [false, true] {
+            for via in [
+                None,
+                Some("1.1 gateway"),
+                Some("2.0 gateway"),
+                Some("3.0 gateway"),
+            ] {
+                let mut headers = HashMap::from([("via".into(), "1.1 upstream".into())]);
+                let owned = finalize_h3_response_routing_headers(is_fallback, via, &mut headers);
+                assert_eq!(
+                    headers.get("x-gateway-upstream-status").map(String::as_str),
+                    is_fallback.then_some("degraded")
+                );
+                assert_eq!(owned.owns("x-gateway-upstream-status"), is_fallback);
+                assert_eq!(owned.owns("via"), via.is_some());
+                let expected = via.map_or_else(
+                    || "1.1 upstream".to_string(),
+                    |via| format!("1.1 upstream, {via}"),
+                );
+                assert_eq!(headers.get("via"), Some(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_headers_leave_an_ordinary_response_unchanged() {
+        let mut headers = HashMap::from([("content-type".into(), "text/plain".into())]);
+        let original = headers.clone();
+        finalize_h3_response_routing_headers(false, None, &mut headers);
+        assert_eq!(headers, original);
+    }
+
+    #[test]
+    fn fallback_ownership_is_retained_when_the_value_already_matches() {
+        let mut headers = HashMap::from([("x-gateway-upstream-status".into(), "degraded".into())]);
+        let owned = finalize_h3_response_routing_headers(true, Some("3.0 gateway"), &mut headers);
+        assert!(owned.owns("x-gateway-upstream-status"));
+        assert!(owned.owns("via"));
+        assert_eq!(headers.get("via").map(String::as_str), Some("3.0 gateway"));
     }
 }

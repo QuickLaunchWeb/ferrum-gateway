@@ -164,8 +164,7 @@ fn one_source_cannot_consume_the_global_budget() {
     }
     let reason = limiter
         .try_acquire(ipv4(0xc000_0201))
-        .err()
-        .expect("attacker beyond its per-IP share");
+        .expect_err("attacker beyond its per-IP share");
     assert_eq!(reason, ConnRejectReason::MaxConnectionsPerIp);
 
     // 12 global slots remain for everyone else.

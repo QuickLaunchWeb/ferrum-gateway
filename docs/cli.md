@@ -165,6 +165,10 @@ The report withholds externally sourced values, not just the ones that appear in
    - Does **not** bind sockets, spawn servers, mutate stores, mint random JWT secrets, or connect to a database/CP
 4. **Mesh runtime** (mesh mode) — the same `MeshRuntimeConfig` admission `run` uses (protocol, stock xDS transport posture, topology). When the protocol is `file`, or is inferred from a localized `{version?, mesh}` document, Ferrum CP URLs and CP/DP JWT credentials are **not** required. `-c/--spec` supplies the local policy document for `file` and `stock_xds` validation and does not require a duplicate `FERRUM_MESH_FILE_CONFIG_PATH`; stock xDS uses its stricter policy-only loader and rejects documents that declare control-plane-owned services or workloads. Inference is shape-aware only: a document whose top-level keys are an optional `version` plus a `mesh` mapping may select file validation; a gateway resources document does not. Format is still extension-based (no content sniffing), and the document is loaded through the same bounded file reader and `deny_unknown_fields` parser as startup. Explicit `native`/`xds` plus a localized slice spec, or distinct `--spec` and `FERRUM_MESH_FILE_CONFIG_PATH` values, fail closed with a fixed diagnostic. Identity/CA environment is still required — this does not weaken workload identity or production guardrails.
 
+5. **Injector runtime** — the same runtime parser and serving TLS loader as `run`: TLS cert/key pairing and material, plaintext opt-in, trust domain, capture settings, CIDRs, JWT secret references, and container resource quantities. No webhook listener is bound.
+6. **Node-agent runtime** — the same `NodeAgentConfig` parser as `run`, including the required node name and capture/fallback contract. No kernel probe, eBPF load, capture installation, or node-agent listener is started.
+7. **Config migration input** (`migrate` mode with `FERRUM_MIGRATE_ACTION=config`) — the same bounded file reader, syntax parser, and required version detection as startup. Validation does not migrate the file or create a backup. Database migration actions (`up`/`status`) validate settings only; they do not connect to a database or inspect/apply its schema.
+
 ### Examples
 
 ```bash
@@ -264,6 +268,7 @@ ferrum-edge health [OPTIONS]
 
 | Flag | Short | Description |
 |------|-------|-------------|
+| `--settings <PATH>` | `-s` | Operational settings file for inferred ports (same path discovery as `run`) |
 | `--port <PORT>` | `-p` | Admin API port (defaults to `FERRUM_ADMIN_HTTP_PORT` / 9000, or `FERRUM_ADMIN_HTTPS_PORT` / 9443 when TLS is used) |
 | `--host <HOST>` | | Admin API host (default: `127.0.0.1`) |
 | `--tls` | | Connect via HTTPS instead of HTTP |
@@ -272,7 +277,15 @@ ferrum-edge health [OPTIONS]
 
 ### Auto-Detection
 
-When `FERRUM_ADMIN_HTTP_PORT=0` (plaintext admin disabled), the health command automatically switches to TLS mode and uses port 9443 (or the value of `FERRUM_ADMIN_HTTPS_PORT`). No `--tls` flag is needed in this case.
+Health resolves admin ports from environment variables, then the selected
+`ferrum.conf`, then 9000/9443 defaults. Use `--settings` for the same custom
+settings path passed to `run`, or `FERRUM_CONF_PATH`; otherwise normal settings
+path discovery applies. An invalid settings file or port fails the probe.
+An explicit `--port` bypasses settings inference and uses plaintext unless
+`--tls` is also given. The one-shot probe does not run startup secret-source
+materialization; pass resolved paths/ports when startup uses external sources.
+
+When `FERRUM_ADMIN_HTTP_PORT=0` in either environment or settings (plaintext admin disabled), the health command automatically switches to TLS mode and uses port 9443 (or the value of `FERRUM_ADMIN_HTTPS_PORT`). No `--tls` flag is needed in this case.
 
 ### Examples
 

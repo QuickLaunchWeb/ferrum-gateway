@@ -124,13 +124,29 @@ reconciliations. They are **historical evidence**, not the live launch verdict.
   serve without revocation enforcement for that issuer, i.e. fail-open, and a
   "refuse just that issuer" variant is the same outage with more machinery.
   The mitigation is lead time, not softening: `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS`
-  (default 30) warns at load, the `ferrum_tls_revocation_expiry_seconds` gauge
+  (default 30) warns at load and again on every hourly staple re-check, the
+  `ferrum_tls_revocation_expiry_seconds` gauge
   and the chart's `FerrumGatewayRevocationMaterialExpiringSoon` alert make it
   recurring, and live reload
   (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` / `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`)
   adopts a refreshed copy without a restart. Documented in
   docs/frontend_tls.md and docs/backend_mtls.md; pinned by
   `tests/unit/tls/crl_policy_tests.rs` (issue #4505).
+- **A served OCSP staple is dropped, not kept, once it reaches `nextUpdate`**:
+  `tls::ocsp_recheck` re-evaluates every served staple hourly (a constant, not
+  an env var) and retires one that has reached its `nextUpdate` on the exact
+  certificate resolver the listener serves — so it reaches HTTP/1.1, HTTP/2,
+  HTTP/3, TCP+TLS and admin HTTPS at once, with live reload on **or off**. This
+  is the opposite trade-off from the startup refusal above and deliberately so:
+  a stale staple is a hard handshake failure for any client that checks it,
+  while no staple falls back to that client's own revocation behaviour, so
+  "keep serving what we have" is the strictly worse of the two. It does not
+  make the gateway fail open — nothing about certificate or CRL admission
+  changes — and it does not fetch anything, because Ferrum still has no OCSP
+  responder client; re-attaching a fresh response remains the operator's fetch
+  loop plus live reload (or a restart). Documented in docs/frontend_tls.md;
+  pinned by `tests/unit/tls/ocsp_validation_tests.rs` and
+  `tests/integration/frontend_tls_live_reload_tests.rs` (issue #4505).
 - **Fail-fast panics in shipping profiles**: `[profile.release]`,
   `[profile.ci-release]` (inherits `release`), and `[profile.max-perf]` set
   `panic = "abort"` (issue #4166). A panic anywhere in the process —

@@ -2122,6 +2122,59 @@ async fn h2_tls_backend_fixture_can_complete_handshake() {
     assert_eq!(backend.handshakes_completed(), 1);
 }
 
+// This test permits only the two explicit startup-probe close events. An
+// invalid HTTP/2 preface is a protocol defect, even if another connection later
+// delivers the governed response successfully (#4720).
+fn is_bodyless_h2_startup_probe_close(error: &str) -> bool {
+    matches!(
+        error,
+        "h2 handshake failed: connection closed before reading preface"
+            | "ExpectHeaders: connection closed before any stream arrived"
+    )
+}
+
+#[tokio::test]
+async fn bodyless_h2_probe_filter_distinguishes_eof_from_invalid_preface() {
+    use tokio::io::AsyncWriteExt;
+
+    async fn handshake_error(prefix: &[u8]) -> String {
+        let (server, mut peer) = tokio::io::duplex(128);
+        peer.write_all(prefix)
+            .await
+            .expect("write preface fragment");
+        peer.shutdown().await.expect("close peer write half");
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            h2::server::Builder::new().handshake::<_, Bytes>(server),
+        )
+        .await
+        .expect("bounded fixture handshake")
+        .expect_err("an incomplete or invalid preface must fail");
+        format!("h2 handshake failed: {error}")
+    }
+
+    for prefix in [b"".as_slice(), b"PRI * HT".as_slice()] {
+        let eof = handshake_error(prefix).await;
+        assert_eq!(
+            eof,
+            "h2 handshake failed: connection closed before reading preface"
+        );
+        assert!(is_bodyless_h2_startup_probe_close(&eof));
+    }
+    let invalid = handshake_error(b"GET /health HTTP/1.1\r\n\r\n").await;
+    assert!(invalid.contains("unspecific protocol error detected"));
+    assert!(!is_bodyless_h2_startup_probe_close(&invalid));
+    assert!(!is_bodyless_h2_startup_probe_close(&format!(
+        "{invalid}; preface_kind=http1-method-prefix observed_bytes=24"
+    )));
+    assert!(is_bodyless_h2_startup_probe_close(
+        "ExpectHeaders: connection closed before any stream arrived"
+    ));
+    assert!(!is_bodyless_h2_startup_probe_close(
+        "ExpectHeaders: connection closed before any stream arrived; unrelated failure"
+    ));
+}
+
 // A bodyless request has no request-body marker for the governor's reqwest
 // preference. The response must still be governed when capability warmup sends
 // it through the direct-H2 `StreamingH2` arm.
@@ -2251,18 +2304,10 @@ async fn bodyless_direct_h2_sse_response_is_governed() {
     let step_errors = backend.step_errors().await;
     let unexpected_step_errors: Vec<_> = step_errors
         .iter()
-        // Capability/pool warmup may open a speculative H2 connection and drop
-        // it before sending the client preface. A binary spawn attempt can also
-        // finish the H2 handshake before losing a late listener-bind race; its
-        // shutdown then closes the warmup connection while ExpectHeaders waits,
-        // and the harness retries with fresh listener ports. The governed
-        // response and received GET above prove the real direct-H2 connection
-        // completed, so neither independent startup disconnect is a script
-        // failure for this assertion.
-        .filter(|error| {
-            !error.starts_with("h2 handshake failed: connection error detected: unspecific protocol error detected")
-                && error.as_str() != "ExpectHeaders: connection closed before any stream arrived"
-        })
+        // A speculative warmup can close before its preface, or after a
+        // completed handshake while ExpectHeaders awaits the first stream.
+        // Neither exact close event hides an invalid-preface protocol error.
+        .filter(|error| !is_bodyless_h2_startup_probe_close(error))
         .collect();
     assert!(
         unexpected_step_errors.is_empty(),
@@ -3573,6 +3618,76 @@ async fn h2_reqwest_backend_write_timeout_maps_to_504() {
         status,
         StatusCode::GATEWAY_TIMEOUT,
         "H2/reqwest write timeout must be 504, got {status} body={body}"
+    );
+    assert_eq!(gateway_error.as_deref(), Some("backend_timeout"));
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+
+    let logs = harness
+        .wait_for_log_contains(&has_read_write_timeout_class, Duration::from_secs(5))
+        .await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "write timeout must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// #4411: h2c frontend → the bundled HTTP client's HTTP/1.1 backend. 2 MiB with
+// no receive-window pin, so the upload pump reaches a clean EOS and only the
+// post-EOS send-queue drain bound can produce the 504. That bound reaches this
+// path only through vendored reqwest patch 004
+// (`docs/upstream-reqwest-patches/004-connection-established-fd/`).
+const H2_KERNEL_ABSORB_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_reqwest_kernel_absorb_write_timeout_maps_to_504() {
+    if !ferrum_edge::_test_support::send_queue_probe_supported() {
+        // No send-queue query on this target; `backend_read_timeout_ms` is the
+        // only bound, as documented next to `backend_write_timeout_ms`.
+        return;
+    }
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = http_timeout_access_log_yaml(backend_port, 8_000, write_timeout_ms, Value::Null);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(format!("{}/api/twrite", harness.proxy_base_url()))
+        .header("content-type", "application/octet-stream")
+        .header("expect", "")
+        .body(vec![b'x'; H2_KERNEL_ABSORB_UPLOAD_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "h2c kernel-absorbed never-read POST must be 504, got {status} body={body}"
     );
     assert_eq!(gateway_error.as_deref(), Some("backend_timeout"));
     assert_eq!(body, r#"{"error":"Backend timeout"}"#);

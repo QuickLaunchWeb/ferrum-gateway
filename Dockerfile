@@ -41,7 +41,7 @@ ARG BPF_LINKER_ARM64_SHA256=d09ddd83303e9ab1443f51e0e284680154009646a3ce141c63d8
 # is honored (and install rust-src on that pinned toolchain). core-only
 # build-std matches the crate's `#![no_std]` + `panic = "abort"`.
 # Digest resolved 2026-08-31; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:271849e998ffce5776454bbf98c5dc21baafc854ff8e566197908d3aca9a81e8 AS ebpf-builder
+FROM rust:latest@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 AS ebpf-builder
 ARG TARGETARCH
 ARG BPF_LINKER_VERSION
 ARG BPF_LINKER_AMD64_SHA256
@@ -91,7 +91,7 @@ RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 # Digest resolved 2026-08-31; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:271849e998ffce5776454bbf98c5dc21baafc854ff8e566197908d3aca9a81e8 AS builder
+FROM rust:latest@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959 AS builder
 
 # Install build dependencies
 # clang/libclang-dev: required by bindgen (used by zstd-sys)
@@ -129,6 +129,7 @@ COPY ebpf ./ebpf
 # `cloud-secrets` image and the `cloud-secrets,ebpf` image reuse that work.
 ARG FEATURES
 ARG TARGETARCH
+ARG CARGO_PROFILE=release
 
 # Issue #4602: the release profile is fat LTO with a single codegen unit, and
 # the final `ferrum-edge` bin-crate compile under that profile exhausts the
@@ -143,14 +144,18 @@ ENV FERRUM_ARM64_RELEASE_PROFILE_ENV="CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFI
 RUN mkdir src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs && \
     if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
-    cargo build --features "${FEATURES}" --release 2>/dev/null || true && \
+    cargo build --features "${FEATURES}" --profile "${CARGO_PROFILE}" 2>/dev/null || true && \
     rm -rf src
 
 # ── Build the real binary ───────────────────────────────────────────────
 COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
 RUN if [ "${TARGETARCH}" = "arm64" ]; then export ${FERRUM_ARM64_RELEASE_PROFILE_ENV}; fi && \
-    touch src/main.rs && cargo build --features "${FEATURES}" --release
+    touch src/main.rs && cargo build --features "${FEATURES}" --profile "${CARGO_PROFILE}" && \
+    install -m 0755 "target/${CARGO_PROFILE}/ferrum-edge" "target/${CARGO_PROFILE}/ferrum-cni" /build/
+
+# Distroless has no shell; stage the empty SQLite volume directory here.
+RUN mkdir -m 0755 /data
 
 # Stage 2: common distroless runtime. It intentionally has no shell, package
 # manager, eBPF ELF, or `ip` executable.
@@ -159,8 +164,9 @@ FROM runtime-base AS runtime-common
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-edge /app/ferrum-edge
-COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-cni /app/ferrum-cni
+COPY --from=builder --chown=65532:65532 /build/ferrum-edge /app/ferrum-edge
+COPY --from=builder --chown=65532:65532 /build/ferrum-cni /app/ferrum-cni
+COPY --from=builder --chown=65532:65532 /data/ /data/
 
 # Set environment variables. `FERRUM_LOG_LEVEL` defaults to `warn` so the startup
 # operability warnings stay visible; every published runtime stage must agree with
@@ -259,8 +265,8 @@ FROM capture-tools-base AS runtime-ebpf-tools
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/ferrum-edge /app/ferrum-edge
-COPY --from=builder /build/target/release/ferrum-cni /app/ferrum-cni
+COPY --from=builder /build/ferrum-edge /app/ferrum-edge
+COPY --from=builder /build/ferrum-cni /app/ferrum-cni
 COPY --from=ebpf-builder \
     /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
 

@@ -11933,6 +11933,7 @@ mod tests {
                 exclude_ports: vec![15020],
                 exclude_ports_explicit: true,
                 exclude_inbound_ports: Vec::new(),
+                exclude_inbound_tcp_ports: Vec::new(),
                 ip6tables_mode: Ip6TablesMode::Auto,
                 udp_capture_enabled: false,
                 udp_outbound_port: crate::capture::DEFAULT_UDP_OUTBOUND_PORT,

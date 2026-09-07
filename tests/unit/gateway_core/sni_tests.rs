@@ -2055,7 +2055,7 @@ async fn extractor_stays_a_projection_of_the_typed_peek() {
 // ── StreamTransactionSummary taxonomy for SNI admission (issue #4407) ─────
 
 use ferrum_edge::_test_support::{
-    apply_circuit_breaker_outcome_for_test, classify_stream_error,
+    apply_circuit_breaker_outcome_for_test, classify_stream_error, classify_stream_setup_error,
     no_matching_sni_route_error_for_test, pre_copy_disconnect_cause_for_test,
     pre_copy_disconnect_direction_for_test, sni_admission_refused_error_for_test,
 };
@@ -2069,7 +2069,10 @@ use std::collections::HashMap;
 /// refusal: no backend was selected, so `backend_target` stays empty and
 /// cause/direction come from the typed `StreamSetupError`.
 fn sni_admission_summary(error: &anyhow::Error) -> StreamTransactionSummary {
-    let error_class = classify_stream_error(error);
+    // The accept loop classifies pre-copy failures with the SETUP-phase
+    // classifier (issue #4536); the typed SNI kinds resolve identically under
+    // either phase, and mirroring the production call keeps it that way.
+    let error_class = classify_stream_setup_error(error);
     let disconnect_cause = pre_copy_disconnect_cause_for_test(error, &error_class);
     let disconnect_direction = pre_copy_disconnect_direction_for_test(error, &error_class);
     StreamTransactionSummary {

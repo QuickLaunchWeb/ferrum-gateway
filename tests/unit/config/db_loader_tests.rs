@@ -18,7 +18,7 @@ use ferrum_edge::config::db_loader::{
     sqlstate_is_retryable_transaction_conflict,
 };
 use ferrum_edge::config::namespace_registry::{
-    NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
+    NAMESPACE_RENAME_COPY_TABLES, NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
 };
 use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
@@ -3576,20 +3576,81 @@ fn sql_namespace_rename_rewrites_historical_audit_events() {
         .expect("rename_namespace_in_tx body");
     assert!(
         body.contains("NAMESPACE_RENAME_SIMPLE_TABLES"),
-        "in-place SQL rename must still walk the live resource table plan:\n{body}"
+        "the in-place rewrite plan must still be walked for audit_events:\n{body}"
     );
-    assert!(
-        NAMESPACE_RENAME_SIMPLE_TABLES.contains(&"audit_events"),
-        "historical audit_events must follow the renamed tenant:\n{body}"
+    assert_eq!(
+        NAMESPACE_RENAME_SIMPLE_TABLES,
+        &["audit_events"],
+        "historical audit_events must follow the renamed tenant"
     );
     assert!(
         !body.contains("namespace_at_event"),
         "namespace_at_event is immutable evidence and must not be rewritten on rename:\n{body}"
     );
+    // Issue #4627: the namespace-keyed resource tables are copied under the new
+    // name and then deleted under the old one, parent-first, because `namespace`
+    // is part of every one of their primary and foreign keys.
+    assert!(
+        body.contains("NAMESPACE_RENAME_COPY_TABLES"),
+        "rename must walk the copy plan for the namespace-keyed resource tables:\n{body}"
+    );
+    assert!(
+        body.contains("copy_namespace_pk_rows_tx"),
+        "rename must copy rather than update the namespace-keyed resource tables:\n{body}"
+    );
     for table in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
         assert!(
-            body.contains("NAMESPACE_RENAME_SIMPLE_TABLES") || body.contains(table),
-            "rename must still cover live resource table {table}:\n{body}"
+            NAMESPACE_RENAME_COPY_TABLES
+                .iter()
+                .any(|(name, _)| *name == table),
+            "rename must still cover live resource table {table}"
+        );
+        assert!(
+            !body.contains(&format!("UPDATE {table} SET namespace")),
+            "{table} must not be renamed with an in-place namespace UPDATE:\n{body}"
+        );
+    }
+}
+
+/// Issue #4627 drift catcher: the rename copy plan must project EVERY column
+/// of each namespace-keyed resource table. A column added to the baseline
+/// schema without being added here would be silently dropped by a rename.
+#[test]
+fn sql_namespace_rename_copy_plan_matches_baseline_schema() {
+    let schema = include_str!("../../../src/config/migrations/sql_dialect.rs");
+    for (table, columns) in NAMESPACE_RENAME_COPY_TABLES {
+        let expected: Vec<&str> = columns.to_vec();
+        let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
+        let mut rest = schema;
+        let mut branches = 0usize;
+        while let Some(idx) = rest.find(&marker) {
+            let body_start = idx + marker.len();
+            let body_end = body_start
+                + rest[body_start..]
+                    .find("\n            )")
+                    .unwrap_or_else(|| panic!("{table} CREATE TABLE body must terminate"));
+            let declared: Vec<&str> = rest[body_start..body_end]
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|first| {
+                    !matches!(
+                        first.to_ascii_uppercase().as_str(),
+                        "PRIMARY" | "FOREIGN" | "CONSTRAINT" | "CHECK" | "UNIQUE"
+                    )
+                })
+                .collect();
+            assert_eq!(
+                declared, expected,
+                "{table} rename copy plan is out of sync with the baseline schema"
+            );
+            branches += 1;
+            rest = &rest[body_end..];
+        }
+        assert!(
+            branches >= 2,
+            "{table} must declare at least a MySQL and a non-MySQL branch, found {branches}"
         );
     }
 }

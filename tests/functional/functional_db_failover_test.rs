@@ -615,6 +615,248 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
 }
 
 // ============================================================================
+// Test 2b-ns: Multi-namespace backup is projected onto FERRUM_NAMESPACE
+// ============================================================================
+
+/// An externally provisioned startup backup may be an all-namespace export.
+/// The gateway must serve ONLY the namespace it is configured for.
+///
+/// Success criteria:
+/// 1. The gateway starts at all — the file holds two proxies on the same
+///    `listen_path` in different namespaces, which the cross-resource
+///    validators would reject if they ran over the unfiltered file.
+/// 2. The active namespace's route serves, authenticated by the active
+///    namespace's consumer credential.
+/// 3. The other namespace's credential does NOT authenticate on that route.
+/// 4. A route that exists only in the other namespace 404s — its listener and
+///    route were never installed.
+/// 5. The startup log names no foreign resource and carries no credential.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
+    println!("\n=== DB Config Backup: multi-namespace export, one served namespace ===\n");
+    ensure_built().expect("Failed to build gateway binary");
+
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let backup_path: PathBuf = temp_dir.path().join("backup-multi-namespace.json");
+        let log_path: PathBuf = temp_dir.path().join("gateway.stderr");
+
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        // Held atomically from allocation through server startup.
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        let _backend = start_static_backend(backend_listener, "tenant-a-backend");
+
+        // A two-namespace export. `tenant-a` and `tenant-b` deliberately share
+        // `/shared`: that collision is legal because listen paths are
+        // `(namespace, value)`-scoped, and it is exactly what an unfiltered
+        // backup load would reject.
+        let backup_json = json!({
+            "version": "1",
+            "known_namespaces": ["tenant-a", "tenant-b"],
+            "proxies": [
+                {
+                    "id": "a-shared",
+                    "namespace": "tenant-a",
+                    "listen_path": "/shared",
+                    "backend_scheme": "http",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "plugins": [{"plugin_config_id": "a-key-auth"}],
+                },
+                {
+                    "id": "b-shared",
+                    "namespace": "tenant-b",
+                    "listen_path": "/shared",
+                    "backend_scheme": "http",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": 9,
+                    "strip_listen_path": true,
+                },
+                {
+                    "id": "b-only",
+                    "namespace": "tenant-b",
+                    "listen_path": "/tenant-b-only",
+                    "backend_scheme": "http",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": 9,
+                    "strip_listen_path": true,
+                }
+            ],
+            "consumers": [
+                {
+                    "id": "alice",
+                    "username": "alice",
+                    "namespace": "tenant-a",
+                    "credentials": {"keyauth": [{"key": "tenant-a-api-key"}]},
+                },
+                {
+                    "id": "bob",
+                    "username": "bob",
+                    "namespace": "tenant-b",
+                    "credentials": {"keyauth": [{"key": "tenant-b-api-key"}]},
+                }
+            ],
+            "upstreams": [],
+            "plugin_configs": [
+                {
+                    "id": "a-key-auth",
+                    "namespace": "tenant-a",
+                    "plugin_name": "key_auth",
+                    "scope": "proxy",
+                    "proxy_id": "a-shared",
+                    "enabled": true,
+                    "config": {"key_location": "header:X-API-Key"},
+                },
+                {
+                    "id": "b-key-auth",
+                    "namespace": "tenant-b",
+                    "plugin_name": "key_auth",
+                    "scope": "proxy",
+                    "proxy_id": "b-only",
+                    "enabled": true,
+                    "config": {"key_location": "header:X-API-Key"},
+                }
+            ],
+        });
+        std::fs::write(&backup_path, backup_json.to_string()).expect("write backup");
+
+        let bogus_primary = "sqlite:/nonexistent/bootstrap/bogus-multi-namespace.db?mode=ro";
+        let identity = mint_failover_identity("db-failover-backup-namespace");
+
+        let log_file = std::fs::File::create(&log_path).expect("create stderr log");
+        let mut cmd = Command::new(binary_path());
+        cmd.env("FERRUM_MODE", "database")
+            .env("FERRUM_DB_TYPE", "sqlite")
+            .env("FERRUM_DB_URL", bogus_primary)
+            .env("FERRUM_NAMESPACE", "tenant-a")
+            .env(
+                "FERRUM_DB_CONFIG_BACKUP_PATH",
+                backup_path.to_string_lossy().to_string(),
+            )
+            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
+            .env("FERRUM_DB_POLL_INTERVAL", "2")
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+            .env("FERRUM_LOG_LEVEL", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log_file));
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn gateway");
+
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
+            last_err = format!(
+                "attempt {}: health check did not pass (a multi-namespace backup must \
+                 still bootstrap the configured namespace)",
+                attempt
+            );
+            eprintln!("  {}", last_err);
+            kill_child(child);
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            continue;
+        }
+        println!("  Gateway healthy from a two-namespace backup export");
+
+        let client = reqwest::Client::new();
+
+        // 1. The active namespace's route serves, with its own credential.
+        let ok = client
+            .get(format!("http://127.0.0.1:{}/shared/hello", proxy_port))
+            .header("X-API-Key", "tenant-a-api-key")
+            .send()
+            .await
+            .expect("tenant-a proxy request");
+        assert_eq!(
+            ok.status(),
+            200,
+            "the configured namespace's route must serve from the backup"
+        );
+        assert_eq!(
+            ok.text().await.unwrap_or_default(),
+            "tenant-a-backend",
+            "the configured namespace's proxy must reach its own backend"
+        );
+
+        // 2. The other namespace's consumer credential must not authenticate.
+        let foreign = client
+            .get(format!("http://127.0.0.1:{}/shared/hello", proxy_port))
+            .header("X-API-Key", "tenant-b-api-key")
+            .send()
+            .await
+            .expect("tenant-b credential request");
+        assert_eq!(
+            foreign.status(),
+            401,
+            "a consumer from another namespace must not authenticate"
+        );
+
+        // 3. A route that exists only in the other namespace was never installed.
+        let foreign_route = client
+            .get(format!(
+                "http://127.0.0.1:{}/tenant-b-only/hello",
+                proxy_port
+            ))
+            .send()
+            .await
+            .expect("tenant-b-only route request");
+        assert_eq!(
+            foreign_route.status(),
+            404,
+            "another namespace's route must not be routable"
+        );
+        println!("  tenant-b route 404s and tenant-b credential is rejected");
+
+        kill_child(child);
+
+        // 4. The startup log must not disclose the other tenant or any secret.
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        for forbidden in [
+            "tenant-a-api-key",
+            "tenant-b-api-key",
+            "tenant-b",
+            "b-only",
+            "b-shared",
+            "b-key-auth",
+            // Short tokens like the foreign username are deliberately omitted:
+            // the log embeds a randomly named temporary directory that a
+            // 3-character needle could match by chance.
+        ] {
+            assert!(
+                !log.contains(forbidden),
+                "startup output disclosed '{}':\n{}",
+                forbidden,
+                log
+            );
+        }
+        println!("  Startup output names no foreign resource and no credential");
+
+        println!("\n=== DB Config Backup Namespace Filter Test PASSED ===\n");
+        return;
+    }
+
+    panic!(
+        "Multi-namespace backup bootstrap did not serve the configured namespace \
+         after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
+// ============================================================================
 // Test 2b: Backup bootstrap recovers via failover URL (no primary ever up)
 // ============================================================================
 

@@ -14,6 +14,7 @@ import shlex
 import sys
 import tomllib
 from collections.abc import Callable, Iterable
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
 
@@ -85,8 +86,8 @@ EXPECTED_CARGO_TARGETS = {
 WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
-        "build-arm64-cross",
-        "b0ffbe05ef3d7682291e1118ca8d024112fdb46297ad0932ff4b1b2cb5c520a5",
+        "main-linux-image",
+        "ad65ce950b2aa86b2a8c36ac6875ef3bccaaa73e38032f340746b98ec05813aa",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -866,7 +867,9 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           (.spdxVersion | type == "string" and startswith("SPDX-")) and
           (.documentNamespace | type == "string" and length > 0) and
           (.packages | type == "array" and length > 0) and
-          (.documentDescribes | type == "array" and length > 0)
+          ((.documentDescribes | type == "array" and length > 0) or
+            ([.relationships[]? | select(.spdxElementId == "SPDXRef-DOCUMENT"
+              and .relationshipType == "DESCRIBES")] | length > 0))
           JQ
 
           generate_sboms() {
@@ -1724,41 +1727,7 @@ RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS = (
     "steps",
 )
 
-# The hosted half of the main-branch publication gate is a release-integrity
-# boundary too. Freeze its complete job rather than selected fields so an
-# ordinary pull request cannot weaken or replace the proof while preserving a
-# partial structural contract.
-GATEWAY_PUBLICATION_WORKFLOW_FILENAME = "gateway-api-conformance.yml"
-GATEWAY_PUBLICATION_WORKFLOW_SOURCE = (
-    ".github/workflows/gateway-api-conformance.yml"
-)
-GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB = r"""  main-publication-required-checks:
-    name: Main Publication Required Checks
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    # The gate stops at its own deadline below, so this ceiling is only a
-    # backstop against a wedged runner.
-    timeout-minutes: 110
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-
-      - name: Prove every publish-blocking required check passed for this SHA
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}
-          PUBLICATION_GATE_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          # The commit and repository travel in the environment so this argv
-          # stays fully literal: a trusted-policy scan can read exactly what
-          # this step executes without resolving a shell expansion.
-          python3 .github/scripts/verify_publication_gate.py --self-test
-          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000
-"""
+GATEWAY_WORKFLOW_FILENAME = "gateway-api-conformance.yml"
 
 # The main-branch publication gate inside `ci.yml` is itself a
 # release-integrity boundary. Its complete job is frozen for the same reason.
@@ -1904,11 +1873,6 @@ CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
 PUBLISH_EXACT_JOB_CONTRACTS = {
     "CI workflow": {
         "main-publish-gate": CI_MAIN_PUBLISH_GATE_JOB,
-    },
-    GATEWAY_PUBLICATION_WORKFLOW_SOURCE: {
-        "main-publication-required-checks": (
-            GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB
-        ),
     },
     "release workflow": {
         "attest-release-images": RELEASE_ATTEST_RELEASE_IMAGES_JOB,
@@ -2655,6 +2619,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           file: Dockerfile
           target: runtime-ebpf-tools
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge-ebpf-tools:ci
@@ -2701,6 +2666,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
           file: Dockerfile
           target: runtime-ebpf
           build-args: |
+            CARGO_PROFILE=pr-build
             FEATURES=cloud-secrets,ebpf
           load: true
           tags: ferrum-edge-ebpf:ci
@@ -2735,6 +2701,307 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
             fi
           done
 """
+# Issue #4643: admit an exact registry-cache generation after this policy
+# reaches main. Stage one leaves the current workflow unchanged. Stage two
+# replaces only its image recipe with these complete reader/writer/aggregate
+# jobs. The required outer gate and live-kernel job remain unchanged.
+AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
+    name: Ambient production image (registry reader)
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true' && !(github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      # Registry cache leaves the Actions cache allowance for compiler data.
+      # Each target has its own cache graph. Missing cache still builds cold.
+      #
+      # Cheap, deterministic half: the tool-provisioning stage the production
+      # runtime is built FROM. This alone would not prove the shipped image, so
+      # the full target is smoked below; running it first surfaces a broken tool
+      # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
+      - name: Build the capture tool base stage
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: capture-tools-base
+          load: true
+          tags: ferrum-edge-capture-tools-base:ci
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-capture-tools-base
+          provenance: false
+
+      # The exact target the mesh chart's `-ebpf-tools` tag publishes.
+      - name: Build the production Ambient UDP lifecycle runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf-tools
+          build-args: |
+            CARGO_PROFILE=pr-build
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge-ebpf-tools:ci
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-runtime-ebpf-tools
+          provenance: false
+
+      - name: Prove the published runtime can execute the production tool set
+        run: |
+          set -euo pipefail
+
+          # Every tool the generated host/pod-netns UDP setup and teardown
+          # scripts invoke. `preflight_capture_tools` refuses startup without
+          # them, so an image failing here crash-loops the Ambient UDP producer.
+          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c '
+            set -eu
+            for tool in ip iptables ip6tables iptables-save ip6tables-save; do
+              command -v "$tool" >/dev/null 2>&1 || {
+                echo "missing required tool: $tool" >&2
+                exit 1
+              }
+            done
+            ip -V >/dev/null
+            iptables --version >/dev/null
+            ip6tables --version >/dev/null
+            iptables-save --version >/dev/null
+            ip6tables-save --version >/dev/null
+          '
+
+          # The image must still be a working Ferrum runtime, and must carry the
+          # eBPF ELF that makes it a strict superset of the `-ebpf` variant.
+          docker run --rm ferrum-edge-ebpf-tools:ci version >/dev/null
+          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c \
+            'test -s /app/bpf/ferrum-ebpf'
+
+      # The complementary half of the contract: the ordinary `-ebpf` image the
+      # chart still selects for eBPF capture / NodeWaypoint must REMAIN
+      # distroless. Proving the tools image alone would let a later change
+      # "fix" this finding by quietly adding a shell to `-ebpf` instead.
+      - name: Build the distroless eBPF runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            CARGO_PROFILE=pr-build
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge-ebpf:ci
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-runtime-ebpf
+          provenance: false
+
+      - name: Prove the `-ebpf` image keeps its distroless contract
+        run: |
+          set -euo pipefail
+          container="$(docker create ferrum-edge-ebpf:ci)"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          listing="$RUNNER_TEMP/ebpf-image-files.txt"
+          # Normalize exactly like the production Dockerfile smoke so the
+          # exact-path assertions below cannot be defeated by a `./` prefix.
+          docker export "$container" | tar -tf - \
+            | sed -e 's#^\./##' -e 's#^/##' > "$listing"
+
+          # Positive control: prove the exact-path assertion is live before
+          # asserting absences against the same inventory.
+          grep -Fxq app/ferrum-edge "$listing"
+          # `ip` IS expected: NodeWaypoint owns an exact policy rule/route.
+          grep -Fxq usr/sbin/ip "$listing"
+
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/busybox usr/bin/busybox usr/bin/apt usr/bin/apt-get \
+            usr/bin/dpkg usr/sbin/iptables usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" "$listing"; then
+              echo "::error::the distroless -ebpf image must not ship /$forbidden" >&2
+              exit 1
+            fi
+          done
+"""
+
+AMBIENT_REGISTRY_IMAGE_WRITE_JOB = r"""  ambient-host-udp-image-write:
+    name: Ambient production image (registry writer)
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true' && (github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Log in to cache registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      # Registry cache leaves the Actions cache allowance for compiler data.
+      # Each target has its own cache graph. Missing cache still builds cold.
+      #
+      # Cheap, deterministic half: the tool-provisioning stage the production
+      # runtime is built FROM. This alone would not prove the shipped image, so
+      # the full target is smoked below; running it first surfaces a broken tool
+      # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
+      - name: Build the capture tool base stage
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: capture-tools-base
+          load: true
+          tags: ferrum-edge-capture-tools-base:ci
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-capture-tools-base
+          cache-to: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-capture-tools-base,mode=max,image-manifest=true,oci-mediatypes=true
+          provenance: false
+
+      # The exact target the mesh chart's `-ebpf-tools` tag publishes.
+      - name: Build the production Ambient UDP lifecycle runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf-tools
+          build-args: |
+            CARGO_PROFILE=pr-build
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge-ebpf-tools:ci
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-runtime-ebpf-tools
+          cache-to: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-runtime-ebpf-tools,mode=max,image-manifest=true,oci-mediatypes=true
+          provenance: false
+
+      - name: Prove the published runtime can execute the production tool set
+        run: |
+          set -euo pipefail
+
+          # Every tool the generated host/pod-netns UDP setup and teardown
+          # scripts invoke. `preflight_capture_tools` refuses startup without
+          # them, so an image failing here crash-loops the Ambient UDP producer.
+          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c '
+            set -eu
+            for tool in ip iptables ip6tables iptables-save ip6tables-save; do
+              command -v "$tool" >/dev/null 2>&1 || {
+                echo "missing required tool: $tool" >&2
+                exit 1
+              }
+            done
+            ip -V >/dev/null
+            iptables --version >/dev/null
+            ip6tables --version >/dev/null
+            iptables-save --version >/dev/null
+            ip6tables-save --version >/dev/null
+          '
+
+          # The image must still be a working Ferrum runtime, and must carry the
+          # eBPF ELF that makes it a strict superset of the `-ebpf` variant.
+          docker run --rm ferrum-edge-ebpf-tools:ci version >/dev/null
+          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c \
+            'test -s /app/bpf/ferrum-ebpf'
+
+      # The complementary half of the contract: the ordinary `-ebpf` image the
+      # chart still selects for eBPF capture / NodeWaypoint must REMAIN
+      # distroless. Proving the tools image alone would let a later change
+      # "fix" this finding by quietly adding a shell to `-ebpf` instead.
+      - name: Build the distroless eBPF runtime
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            CARGO_PROFILE=pr-build
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge-ebpf:ci
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-runtime-ebpf
+          cache-to: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-runtime-ebpf,mode=max,image-manifest=true,oci-mediatypes=true
+          provenance: false
+
+      - name: Prove the `-ebpf` image keeps its distroless contract
+        run: |
+          set -euo pipefail
+          container="$(docker create ferrum-edge-ebpf:ci)"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          listing="$RUNNER_TEMP/ebpf-image-files.txt"
+          # Normalize exactly like the production Dockerfile smoke so the
+          # exact-path assertions below cannot be defeated by a `./` prefix.
+          docker export "$container" | tar -tf - \
+            | sed -e 's#^\./##' -e 's#^/##' > "$listing"
+
+          # Positive control: prove the exact-path assertion is live before
+          # asserting absences against the same inventory.
+          grep -Fxq app/ferrum-edge "$listing"
+          # `ip` IS expected: NodeWaypoint owns an exact policy rule/route.
+          grep -Fxq usr/sbin/ip "$listing"
+
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/busybox usr/bin/busybox usr/bin/apt usr/bin/apt-get \
+            usr/bin/dpkg usr/sbin/iptables usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" "$listing"; then
+              echo "::error::the distroless -ebpf image must not ship /$forbidden" >&2
+              exit 1
+            fi
+          done
+"""
+
+AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB = r"""  ambient-host-udp-image:
+    name: Ambient host-UDP production image contract
+    needs:
+      - changes
+      - ambient-host-udp-image-read
+      - ambient-host-udp-image-write
+    if: always()
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify selected production image contract
+        env:
+          RELEVANCE_RESULT: ${{ needs.changes.result }}
+          RELEVANT: ${{ needs.changes.outputs.relevant }}
+          WRITER_SELECTED: ${{ github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+          READER_RESULT: ${{ needs.ambient-host-udp-image-read.result }}
+          WRITER_RESULT: ${{ needs.ambient-host-udp-image-write.result }}
+        run: |
+          set -euo pipefail
+          [ "$RELEVANCE_RESULT" = success ] || exit 1
+          case "$RELEVANT" in
+            false)
+              [ "$READER_RESULT" = skipped ] && [ "$WRITER_RESULT" = skipped ]
+              exit $?
+              ;;
+            true) ;;
+            *) exit 1 ;;
+          esac
+          case "$WRITER_SELECTED" in
+            true) [ "$WRITER_RESULT" = success ] && [ "$READER_RESULT" = skipped ] ;;
+            false) [ "$READER_RESULT" = success ] && [ "$WRITER_RESULT" = skipped ] ;;
+            *) exit 1 ;;
+          esac
+"""
+
 AMBIENT_HOST_UDP_GATE_JOB = r"""  gate:
     name: Ambient Host UDP Live
     needs:
@@ -3200,13 +3467,13 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
     "node-waypoint-ebpf-live": {
         "needs": "    needs: production-dockerfile-plan\n",
         # Fail-closed on purpose: only an exact `false` from the trusted-base
-        # planner skips the live datapath. `always() &&` keeps the live job
+        # planner skips the live datapath. `!cancelled() &&` keeps the live job
         # reachable when the planner itself failed, so the aggregate reports a
-        # failure rather than an absence.
+        # failure rather than an absence, while superseded runs can stop.
         "if": (
-            "    if: always() && "
+            "    if: ${{ !cancelled() && "
             "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
-            " != 'false'\n"
+            " != 'false' }}\n"
         ),
     },
     "production-dockerfile-smoke-default": {
@@ -3472,7 +3739,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
     # The repository-root Cargo config also selects the mold linker through
@@ -4111,6 +4378,8 @@ APPROVED_AUTOMATION_ROOTS = (
 PROTECTED_PUBLICATION_GATE_FILES = (
     ".github/required-publication-checks.json",
     ".github/scripts/verify_publication_gate.py",
+    ".github/workflows/release-dispatch.yml",
+    ".github/scripts/validate_release_request.py",
 )
 # A repository program whose stdout becomes shell source is still executed in
 # its own language, but every edit can change the generated program. Carry this
@@ -6526,7 +6795,34 @@ def closed_job_field_errors(
     return errors
 
 
+def nonpublishing_ci_errors(contents: str, source: str) -> list[str]:
+    """CI can build and upload test artifacts, but cannot publish releases."""
+    errors: list[str] = []
+    permission, failures = extract_top_level_block(contents, source, "permissions")
+    errors.extend(failures)
+    if permission != "permissions:\n  contents: read\n":
+        errors.append(f"{source} must default to contents: read only")
+    active = "\n".join(line for line in contents.splitlines() if not line.lstrip().startswith("#"))
+    if re.search(r"\b(?:actions|contents|packages|id-token):\s*write\b|\bwrite-all\b", active):
+        errors.append(f"{source} must not grant publication write permissions")
+    for job in ("latest-release", "docker", "docker-manifest", "build-arm64-cross",
+                "main-publish-gate", "verify-pr-linux-gnu-abi",
+                "verify-latest-linux-gnu-abi-aarch64", "linux-gnu-abi-latest-gate"):
+        block, failures = extract_job_block(contents, source, job, required=False)
+        errors.extend(failures)
+        if block is not None:
+            errors.append(f"{source} production job {job!r} belongs in release.yml")
+    if re.search(r"docker\s+(?:push\b|buildx\s+imagetools\s+create\b)|"
+                 r"gh\s+release\s+(?:create|upload|edit|delete)\b|"
+                 r"softprops/action-gh-release@|push-by-digest=true|"
+                 r"^\s+push:\s*true\s*$", active, re.MULTILINE):
+        errors.append(f"{source} must not contain registry or release publishing steps")
+    return list(dict.fromkeys(errors))
+
+
 def validate_publish_control_contract(contents: str, source: str) -> list[str]:
+    if source == "CI workflow":
+        return nonpublishing_ci_errors(contents, source)
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     exact_jobs = PUBLISH_EXACT_JOB_CONTRACTS.get(source, {})
     step_contracts = PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {})
@@ -7730,7 +8026,7 @@ def replace_command_substitutions(line: str, *, literal: bool) -> str:
     return "".join(parts)
 
 
-def shell_tokens(value: str) -> tuple[str, ...] | None:
+def _uncached_shell_tokens(value: str) -> tuple[str, ...] | None:
     """Tokenize one shell program without turning quoted prose into commands."""
 
     try:
@@ -7742,10 +8038,33 @@ def shell_tokens(value: str) -> tuple[str, ...] | None:
         return None
 
 
+# Only lexical results are reusable across scans: policy decisions also depend
+# on dynamic dispatch/opaque-stdin scopes. Bound both entry count and input
+# length so untrusted workflow text cannot retain arbitrarily large programs.
+SHELL_LEX_CACHE_SIZE = 2048
+SHELL_LEX_CACHE_MAX_CHARS = 4096
+_cached_shell_tokens = lru_cache(maxsize=SHELL_LEX_CACHE_SIZE)(_uncached_shell_tokens)
+
+
+def shell_tokens(value: str) -> tuple[str, ...] | None:
+    """Reuse immutable tokens for small, identical shell programs in this process."""
+
+    if len(value) > SHELL_LEX_CACHE_MAX_CHARS:
+        return _uncached_shell_tokens(value)
+    return _cached_shell_tokens(value)
+
+
+@lru_cache(maxsize=SHELL_LEX_CACHE_SIZE)
+def _cached_tool_name(value: str) -> str:
+    return PurePosixPath(value).name
+
+
 def tool_name(value: str) -> str:
     """Return the executable basename for a literal shell word."""
 
-    return PurePosixPath(value).name
+    if len(value) > SHELL_LEX_CACHE_MAX_CHARS:
+        return PurePosixPath(value).name
+    return _cached_tool_name(value)
 
 
 def dynamic_shell_word(value: str) -> bool:
@@ -11970,11 +12289,36 @@ def live_suite_relevance_errors(
                 )
 
         if name == "ambient-host-udp-live.yml":
+            image_job, _ = extract_job_contract_block(
+                contents, located, "ambient-host-udp-image", required=True
+            )
+            registry_generation = image_job == AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB
             protected_jobs = (
                 (live_job, AMBIENT_HOST_UDP_LIVE_JOB),
-                ("ambient-host-udp-image", AMBIENT_HOST_UDP_IMAGE_JOB),
+                (
+                    "ambient-host-udp-image",
+                    AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB
+                    if registry_generation else AMBIENT_HOST_UDP_IMAGE_JOB,
+                ),
                 ("gate", AMBIENT_HOST_UDP_GATE_JOB),
             )
+            registry_jobs = (
+                ("ambient-host-udp-image-read", AMBIENT_REGISTRY_IMAGE_READ_JOB),
+                ("ambient-host-udp-image-write", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
+            )
+            if registry_generation:
+                protected_jobs += registry_jobs
+            else:
+                for registry_job, _ in registry_jobs:
+                    extra, extra_failures = extract_job_contract_block(
+                        contents, located, registry_job, required=False
+                    )
+                    errors.extend(extra_failures)
+                    if extra is not None:
+                        errors.append(
+                            f"{located} has a partial registry-cache generation: "
+                            f"{registry_job} requires the registry image aggregate"
+                        )
             for protected_job, expected_job in protected_jobs:
                 actual_job, job_failures = extract_job_contract_block(
                     contents,
@@ -11993,6 +12337,7 @@ def live_suite_relevance_errors(
                     not job_failures
                     and actual_job is not None
                     and protected_job == "ambient-host-udp-image"
+                    and not registry_generation
                 ):
                     errors.extend(
                         ambient_host_udp_image_cache_budget_errors(
@@ -12506,22 +12851,30 @@ def scan_workflow_collection_cross_surfaces(
     return errors
 
 
-def publication_gate_workflow_contract_errors(
+def retired_main_publication_gate_errors(
     workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Hold the hosted publication gate to its complete trusted job body."""
+    """Conformance validation must not host the retired publication poller."""
 
-    contents = workflows.get(GATEWAY_PUBLICATION_WORKFLOW_FILENAME)
+    contents = workflows.get(GATEWAY_WORKFLOW_FILENAME)
     if contents is None:
-        return [
-            f"{source}/{GATEWAY_PUBLICATION_WORKFLOW_FILENAME} must contain "
-            "the protected main-publication-required-checks job"
-        ]
-    return validate_publish_control_contract(
-        contents,
-        GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
+        return []
+    located = f"{source}/{GATEWAY_WORKFLOW_FILENAME}"
+    normalized, _, errors = flow_normalized_workflow(contents, located)
+    # None means no flow syntax needed normalization. Scan the original
+    # canonical block form in that case.
+    block, failures = extract_job_block(
+        normalized if normalized is not None else contents,
+        located, "main-publication-required-checks", required=False,
     )
+    errors.extend(failures)
+    if block is not None:
+        errors.append(
+            f"{located} must not restore main-publication-required-checks; "
+            "publication proof belongs in the production release gates"
+        )
+    return errors
 
 
 def validate_workflow_collection(
@@ -12537,7 +12890,7 @@ def validate_workflow_collection(
     """
 
     return [
-        *publication_gate_workflow_contract_errors(workflows, source),
+        *retired_main_publication_gate_errors(workflows, source),
         *live_suite_relevance_errors(workflows, source),
         *node_waypoint_relevance_errors(workflows, source),
         *required_check_name_ownership_errors(workflows, source),
@@ -13112,23 +13465,10 @@ def compare_pr_workflow_collection(
     request, regardless of what the base happened to carry.
     """
 
-    baseline_publication_workflow = merge_base_workflows.get(
-        GATEWAY_PUBLICATION_WORKFLOW_FILENAME,
-        "",
-    )
-    proposed_publication_workflow = proposed_workflows.get(
-        GATEWAY_PUBLICATION_WORKFLOW_FILENAME,
-        "",
-    )
     return [
-        *publication_gate_workflow_contract_errors(
+        *retired_main_publication_gate_errors(
             proposed_workflows,
             f"proposed {source}",
-        ),
-        *compare_pr_publish_control_contract(
-            baseline_publication_workflow,
-            proposed_publication_workflow,
-            GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
         ),
         *live_suite_relevance_errors(proposed_workflows, f"proposed {source}"),
         *node_waypoint_relevance_errors(proposed_workflows, f"proposed {source}"),
@@ -17475,7 +17815,6 @@ LINUX_GNU_PUBLISHED_CNI = "release-assets/ferrum-cni-linux-x86_64"
 # may name it on an upload step, so the scanned bytes and the published bytes
 # cannot be made to differ by a second uploader.
 LINUX_GNU_X86_PRODUCERS = {
-    "CI workflow": ("build-binaries", "binary-x86_64-unknown-linux-gnu"),
     "release workflow": (
         "build-release-binaries",
         "release-binaries-x86_64-unknown-linux-gnu",
@@ -17939,6 +18278,10 @@ def compare_pr_workflow_job(
     errors: list[str] = []
     if source == "CI workflow":
         errors.extend(validate_ci_planner_isolation(proposed_contents, source))
+        if job_name == "main-linux-image":
+            # Enforce the nonpublishing contract on the proposal as well as
+            # the trusted checkout, before any new CI job can be admitted.
+            errors.extend(nonpublishing_ci_errors(proposed_contents, source))
     if baseline != proposed:
         errors.append(
             f"{source} protected job {job_name!r} cannot be changed by a pull request"
@@ -18121,6 +18464,56 @@ def compare_pr_workflow_job(
 
 def self_test() -> list[str]:
     failures: list[str] = []
+
+    # Repeated scans must retain quoting, malformed-input and content-change
+    # behavior. Cache only lexical data, never a decision from a scanner scope.
+    _cached_shell_tokens.cache_clear()
+    for program in (
+        "echo 'cross build' # inert prose",
+        "cross build --target aarch64-unknown-linux-gnu",
+        'run() { "$@"; }; run cross build',
+        "echo 'unterminated",
+        "",
+    ):
+        expected_tokens = _uncached_shell_tokens(program)
+        if (
+            shell_tokens(program) != expected_tokens
+            or shell_tokens(program) != expected_tokens
+        ):
+            failures.append("shell token cache changed lexical results")
+    if _cached_shell_tokens.cache_info().hits != 5:
+        failures.append("identical small shell programs did not reuse tokens")
+    before_large = _cached_shell_tokens.cache_info()
+    large_program = "echo " + "x" * SHELL_LEX_CACHE_MAX_CHARS
+    if shell_tokens(large_program) != _uncached_shell_tokens(large_program):
+        failures.append("uncached large shell program changed lexical results")
+    if _cached_shell_tokens.cache_info() != before_large:
+        failures.append("oversized shell program entered the token cache")
+    for index in range(SHELL_LEX_CACHE_SIZE + 1):
+        shell_tokens(f"echo cache-bound-{index}")
+    if _cached_shell_tokens.cache_info().currsize != SHELL_LEX_CACHE_SIZE:
+        failures.append("shell token cache exceeded its entry bound")
+    _cached_shell_tokens.cache_clear()
+
+    _cached_tool_name.cache_clear()
+    for word in ("", "/", "./cargo", "/usr/bin/cross", "a//b/../cross/", "a/."):
+        if (
+            tool_name(word) != PurePosixPath(word).name
+            or tool_name(word) != PurePosixPath(word).name
+        ):
+            failures.append("tool-name cache changed path semantics")
+    if _cached_tool_name.cache_info().hits != 6:
+        failures.append("identical tool names did not reuse lexical results")
+    before_large = _cached_tool_name.cache_info()
+    if tool_name(large_program) != PurePosixPath(large_program).name:
+        failures.append("uncached large tool name changed path semantics")
+    if _cached_tool_name.cache_info() != before_large:
+        failures.append("oversized tool name entered the lexical cache")
+    for index in range(SHELL_LEX_CACHE_SIZE + 1):
+        tool_name(f"cache-bound-{index}")
+    if _cached_tool_name.cache_info().currsize != SHELL_LEX_CACHE_SIZE:
+        failures.append("tool-name cache exceeded its entry bound")
+    _cached_tool_name.cache_clear()
 
     expected = list(EXPECTED_PRE_BUILD_COMMANDS)
     if validate_pre_build(expected):
@@ -21065,7 +21458,7 @@ pre_build = []
         "on:\n"
         "  pull_request:\n"
         "jobs:\n"
-        "  build-arm64-cross:\n"
+        "  main-linux-image:\n"
         "    runs-on: ubuntu-latest\n"
         "    steps:\n"
         "      - run: sh scripts/build_arm64.sh\n"
@@ -26227,42 +26620,28 @@ pre_build = []
     ):
         failures.append("opaque shell stdin program edit was not rejected")
 
-    gateway_publication_workflow = (
+    gateway_validation_workflow = (
         "name: Gateway API Conformance fixture\n"
         "on: [push]\n"
         "jobs:\n"
-        + GATEWAY_MAIN_PUBLICATION_REQUIRED_CHECKS_JOB
+        "  ordinary:\n"
+        "    runs-on: ubuntu-latest\n"
     )
-    if publication_gate_workflow_contract_errors(
-        {
-            GATEWAY_PUBLICATION_WORKFLOW_FILENAME: (
-                gateway_publication_workflow
-            )
-        },
+    if retired_main_publication_gate_errors(
+        {GATEWAY_WORKFLOW_FILENAME: gateway_validation_workflow},
         "self-test workflow directory",
     ):
-        failures.append("the hosted publication-gate job contract was rejected")
-
-    weakened_publication_job = gateway_publication_workflow.replace(
-        "    if: github.event_name == 'push' && "
-        "github.ref == 'refs/heads/main'\n",
-        "    if: always()\n",
-        1,
-    )
-    weakened_publication_errors = compare_pr_publish_control_contract(
-        gateway_publication_workflow,
-        weakened_publication_job,
-        GATEWAY_PUBLICATION_WORKFLOW_SOURCE,
-    )
-    if not weakened_publication_errors:
-        failures.append("a weakened hosted publication-gate job was not rejected")
-    elif not any(
-        "main-publication-required-checks" in error
-        for error in weakened_publication_errors
+        failures.append("ordinary Gateway validation without publication was rejected")
+    for retired_key in (
+        "main-publication-required-checks",
+        '\"main-publication-required-checks\"',
+        '\"main-publication-required-check\\u0073\"',
     ):
-        failures.append(
-            "the weakened hosted publication-gate refusal did not name the job"
-        )
+        resurrected = gateway_validation_workflow + f"  {retired_key}:\n    runs-on: ubuntu-latest\n"
+        if not retired_main_publication_gate_errors(
+            {GATEWAY_WORKFLOW_FILENAME: resurrected}, "self-test workflow directory",
+        ):
+            failures.append("the retired main publication poller was admitted")
 
     protected_publication_files = {
         ".github/scripts/verify_publication_gate.py": (
@@ -26301,338 +26680,19 @@ pre_build = []
                 f"{protected_name}"
             )
 
-    ci_exact_publish_jobs = PUBLISH_EXACT_JOB_CONTRACTS["CI workflow"]
-    ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
-    ci_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"]["docker"]
-    ci_manifest_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"][
-        "docker-manifest"
-    ]
-    publish_workflow = (
-        "name: Publish fixture\n"
-        "on: [push]\n"
-        "jobs:\n"
-        + ci_exact_publish_jobs["main-publish-gate"]
-        + "\n"
-        + "  latest-release:\n"
-        + ci_publish_contract["latest-release"]["needs"]
-        + ci_publish_contract["latest-release"]["if"]
-        + "    runs-on: ubuntu-latest\n"
-        + ci_publish_contract["latest-release"]["steps"]
-        + "\n"
-        + "  docker:\n"
-        + ci_publish_contract["docker"]["needs"]
-        + ci_publish_contract["docker"]["if"]
-        + "    runs-on: ubuntu-latest\n"
-        + ci_publish_contract["docker"]["strategy"]
-        + ci_publish_contract["docker"]["steps"]
-        + "\n"
-        + "  docker-manifest:\n"
-        + ci_publish_contract["docker-manifest"]["needs"]
-        + ci_publish_contract["docker-manifest"]["if"]
-        + "    runs-on: ubuntu-latest\n"
-        + ci_publish_contract["docker-manifest"]["steps"]
-        + "\n"
-        # A job with no publication contract at all, so the fixture can still
-        # show that unrelated implementation edits stay editable now that every
-        # wildcard-publishing job freezes its whole step list.
-        + "  unrelated:\n"
-        + "    runs-on: ubuntu-latest\n"
-        + "    steps:\n"
-        + "      - run: echo latest\n"
-    )
-    for manifest_step_name, manifest_step_body in ci_manifest_steps.items():
-        if manifest_step_body not in ci_publish_contract["docker-manifest"]["steps"]:
-            failures.append(
-                f"CI docker-manifest step {manifest_step_name!r} is not covered "
-                "by the frozen manifest step list"
-            )
-    if validate_publish_control_contract(publish_workflow, "CI workflow"):
-        failures.append("valid publication controls were rejected")
-
-    # The gate must be protected as one job, not as a selection of fields. A
-    # job-level escape hatch, widened permission, or weakened retry would alter
-    # publication semantics without necessarily touching `needs`, `if`, or the
-    # named step boundary.
-    exact_gate_edits = {
-        "publish gate permission widened": (
-            "      actions: read\n",
-            "      actions: write\n",
-        ),
-        "publish gate made non-blocking": (
-            "    runs-on: ubuntu-latest\n",
-            "    runs-on: ubuntu-latest\n    continue-on-error: true\n",
-        ),
-        "publish gate shell changed": (
-            "        shell: bash\n",
-            "        shell: python\n",
-        ),
-        "publish gate retry weakened": (
-            "              for attempt in 1 2 3; do\n",
-            "              for attempt in 1; do\n",
-        ),
-    }
-    for label, (original, replacement) in exact_gate_edits.items():
-        tampered = publish_workflow.replace(original, replacement, 1)
-        if tampered == publish_workflow:
-            failures.append(f"{label} fixture did not change the workflow")
-            continue
-        if not validate_publish_control_contract(tampered, "CI workflow"):
-            failures.append(f"{label} was not rejected")
-        if not compare_pr_publish_control_contract(
-            publish_workflow,
-            tampered,
-            "CI workflow",
-        ):
-            failures.append(f"{label} was allowed by the merge-base comparison")
-
-    inherited_run_defaults = publish_workflow.replace(
-        "jobs:\n",
-        "defaults:\n  run:\n    shell: python\njobs:\n",
-        1,
-    )
-    if not validate_publish_control_contract(
-        inherited_run_defaults,
-        "CI workflow",
+    no_publish = "name: CI\npermissions:\n  contents: read\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    if validate_publish_control_contract(no_publish, "CI workflow"):
+        failures.append("read-only nonpublishing CI was rejected")
+    for mutation in (
+        no_publish.replace("contents: read", "contents: write"),
+        no_publish.replace("    steps: []", "    permissions:\n      actions: write\n    steps: []"),
+        no_publish + "  docker:\n    steps: []\n",
+        no_publish.replace("steps: []", "steps:\n      - run: docker push evil/image:latest"),
+        no_publish.replace("steps: []", "steps:\n      - uses: softprops/action-gh-release@deadbeef"),
+        no_publish.replace("steps: []", "steps:\n      - run: docker buildx imagetools create evil/image:latest"),
     ):
-        failures.append("inherited publication run defaults were not rejected")
-    if not compare_pr_publish_control_contract(
-        publish_workflow,
-        inherited_run_defaults,
-        "CI workflow",
-    ):
-        failures.append(
-            "inherited publication run defaults were allowed by the comparison"
-        )
-
-    # The Docker jobs never name the ARM64 artifact literally, so repointing the
-    # `linux/arm64` matrix row or rewriting either consuming step would publish
-    # an ARM64 image built from the x86_64 binary.
-    artifact_selection_edits = {
-        "arm64 matrix row repointed at the x86_64 artifact": (
-            "            binary_target: aarch64-unknown-linux-gnu\n"
-            "            binary_asset: ferrum-edge-linux-aarch64\n",
-            "            binary_target: x86_64-unknown-linux-gnu\n"
-            "            binary_asset: ferrum-edge-linux-x86_64\n",
-        ),
-        "arm64 platform row bound to the x86_64 target": (
-            "          - platform: linux/arm64\n"
-            "            binary_target: aarch64-unknown-linux-gnu\n",
-            "          - platform: linux/arm64\n"
-            "            binary_target: x86_64-unknown-linux-gnu\n",
-        ),
-        "download step renamed to a fixed artifact": (
-            "          name: binary-${{ matrix.binary_target }}\n",
-            "          name: binary-x86_64-unknown-linux-gnu\n",
-        ),
-        "context step copies a fixed asset": (
-            "cp downloaded-artifacts/${{ matrix.binary_asset }} ",
-            "cp downloaded-artifacts/ferrum-edge-linux-x86_64 ",
-        ),
-    }
-    for label, (original, replacement) in artifact_selection_edits.items():
-        tampered = publish_workflow.replace(original, replacement, 1)
-        if tampered == publish_workflow:
-            failures.append(f"{label} fixture did not change the workflow")
-            continue
-        if not validate_publish_control_contract(tampered, "CI workflow"):
-            failures.append(f"{label} was not rejected")
-        if not compare_pr_publish_control_contract(
-            publish_workflow,
-            tampered,
-            "CI workflow",
-        ):
-            failures.append(f"{label} was allowed by the merge-base comparison")
-
-    # The manifest job assembles the published `latest` tag from a wildcard, so
-    # its dependency edges, its download pattern, and the commands that consume
-    # `/tmp/digests` are part of the publication contract too.
-    manifest_edits = {
-        "manifest needs widened to an added job": (
-            ci_publish_contract["docker-manifest"]["needs"],
-            "    needs: [docker, extra-digests]\n",
-        ),
-        "manifest download pattern widened": (
-            "          pattern: docker-digest-*\n",
-            "          pattern: docker-*\n",
-        ),
-        "manifest gate opened to pull requests": (
-            ci_publish_contract["docker-manifest"]["if"],
-            "    if: always()\n",
-        ),
-        "manifest tag repointed": (
-            "            -t ferrumedge/ferrum-edge:latest \\\n",
-            "            -t ferrumedge/ferrum-edge:latest -t evil/image:latest \\\n",
-        ),
-    }
-    for label, (original, replacement) in manifest_edits.items():
-        tampered = publish_workflow.replace(original, replacement, 1)
-        if tampered == publish_workflow:
-            failures.append(f"{label} fixture did not change the workflow")
-            continue
-        if not validate_publish_control_contract(tampered, "CI workflow"):
-            failures.append(f"{label} was not rejected")
-        if not compare_pr_publish_control_contract(
-            publish_workflow,
-            tampered,
-            "CI workflow",
-        ):
-            failures.append(f"{label} was allowed by the merge-base comparison")
-
-    # Artifacts are scoped to the workflow run rather than to `needs`, so an
-    # added job can put one more digest in front of the manifest wildcard
-    # without touching any frozen field. The name space is owned for that
-    # reason, not just the job graph frozen.
-    digest_namespace_workflow = publish_workflow + (
-        "\n"
-        "  extra-digests:\n"
-        "    runs-on: ubuntu-latest\n"
-        "    steps:\n"
-        "      - uses: actions/upload-artifact@" + ("0" * 40) + "\n"
-        "        with:\n"
-        "          name: docker-digest-evil\n"
-        "          path: /tmp/digests/*\n"
-    )
-    if not validate_publish_control_contract(
-        digest_namespace_workflow,
-        "CI workflow",
-    ):
-        failures.append("an added digest artifact producer was not rejected")
-    if not compare_pr_publish_control_contract(
-        publish_workflow,
-        digest_namespace_workflow,
-        "CI workflow",
-    ):
-        failures.append(
-            "an added digest artifact producer was allowed by the comparison"
-        )
-
-    # A name assembled by an expression is ruled out only when its literal
-    # prefix already disagrees with the wildcard.
-    dynamic_digest_workflow = digest_namespace_workflow.replace(
-        "          name: docker-digest-evil\n",
-        "          name: docker-digest-${{ github.actor }}\n",
-        1,
-    )
-    if not validate_publish_control_contract(dynamic_digest_workflow, "CI workflow"):
-        failures.append("a dynamically named digest artifact was not rejected")
-
-    # An unrelated artifact from an unrelated job stays editable.
-    for label, artifact_name in (
-        ("unrelated artifact upload", "coverage-report"),
-        ("unrelated dynamic artifact upload", "binary-${{ matrix.target }}"),
-    ):
-        unrelated_workflow = digest_namespace_workflow.replace(
-            "          name: docker-digest-evil\n",
-            f"          name: {artifact_name}\n",
-            1,
-        )
-        if validate_publish_control_contract(unrelated_workflow, "CI workflow"):
-            failures.append(f"{label} was rejected")
-
-    # Freezing the artifact-selection steps alone leaves the rest of the job
-    # able to rewrite the context they prepared. Every one of these keeps the
-    # matrix and both frozen steps byte-for-byte identical and still publishes
-    # an ARM64 image built from something other than the ARM64 artifact.
-    buildx_step = "      - name: Set up Docker Buildx\n"
-    context_mutations = {
-        "second download of the x86_64 artifact": (
-            buildx_step,
-            "      - name: Download other binary\n"
-            "        uses: actions/download-artifact"
-            "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
-            "        with:\n"
-            "          name: binary-x86_64-unknown-linux-gnu\n"
-            "          path: other-artifacts\n"
-            "\n" + buildx_step,
-        ),
-        "later step overwrites the prepared arm64 binary": (
-            buildx_step,
-            "      - name: Patch context\n"
-            "        run: cp other/ferrum-edge "
-            "docker-context/bin/arm64/ferrum-edge\n"
-            "\n" + buildx_step,
-        ),
-        "context rewritten through a shell-assembled path": (
-            buildx_step,
-            "      - name: Patch context\n"
-            "        run: |\n"
-            "          prefix=docker-\n"
-            '          cp other/ferrum-edge "${prefix}context/bin/arm64/ferrum-edge"\n'
-            "\n" + buildx_step,
-        ),
-        "build repointed away from the prepared context": (
-            "          context: docker-context\n",
-            "          context: attacker-context\n",
-        ),
-    }
-    for label, (original, replacement) in context_mutations.items():
-        tampered = publish_workflow.replace(original, replacement, 1)
-        if tampered == publish_workflow:
-            failures.append(f"{label} fixture did not change the workflow")
-            continue
-        if not validate_publish_control_contract(tampered, "CI workflow"):
-            failures.append(f"{label} was not rejected")
-        if not compare_pr_publish_control_contract(
-            publish_workflow,
-            tampered,
-            "CI workflow",
-        ):
-            failures.append(f"{label} was allowed by the merge-base comparison")
-
-    duplicate_publish_step = publish_workflow.replace(
-        ci_publish_steps["Prepare Docker context"],
-        ci_publish_steps["Prepare Docker context"]
-        + "\n"
-        + ci_publish_steps["Prepare Docker context"],
-        1,
-    )
-    if not validate_publish_control_contract(duplicate_publish_step, "CI workflow"):
-        failures.append("duplicate artifact-selection step was not rejected")
-
-    release_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["release workflow"][
-        "docker"
-    ]
-    if (
-        release_publish_steps["Download Linux binary"]
-        == ci_publish_steps["Download Linux binary"]
-    ):
-        failures.append(
-            "release and CI artifact-selection contracts must name distinct "
-            "artifacts"
-        )
-
-    benign_publish_edit = publish_workflow.replace("echo latest", "echo updated")
-    if compare_pr_publish_control_contract(
-        publish_workflow,
-        benign_publish_edit,
-        "CI workflow",
-    ):
-        failures.append("benign publishing job implementation edit was rejected")
-
-    changed_publish_needs = publish_workflow.replace(
-        ci_publish_contract["latest-release"]["needs"],
-        "    needs: [test, build-binaries]\n",
-        1,
-    )
-    if not validate_publish_control_contract(changed_publish_needs, "CI workflow"):
-        failures.append("removed ARM64 publication dependency was not rejected")
-    if not compare_pr_publish_control_contract(
-        publish_workflow,
-        changed_publish_needs,
-        "CI workflow",
-    ):
-        failures.append(
-            "merge-base comparison allowed an ARM64 publication dependency edit"
-        )
-
-    duplicate_publish_needs = publish_workflow.replace(
-        ci_publish_contract["latest-release"]["needs"],
-        ci_publish_contract["latest-release"]["needs"]
-        + "    needs: [test, build-binaries]\n",
-        1,
-    )
-    if not validate_publish_control_contract(duplicate_publish_needs, "CI workflow"):
-        failures.append("duplicate publication needs field was not rejected")
+        if not validate_publish_control_contract(mutation, "CI workflow"):
+            failures.append("publishing CI regression was not rejected")
 
     # An exact generated-output path is exempt from the scanned automation
     # roots only because a build produces it and no commit supplies it. The
@@ -28301,6 +28361,33 @@ pre_build = []
     if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
         failures.append("the trusted-base relevance contract was rejected")
 
+    registry_workflows = dict(relevance_workflows)
+    ambient_name = "ambient-host-udp-live.yml"
+    registry_workflows[ambient_name] = registry_workflows[ambient_name].replace(
+        AMBIENT_HOST_UDP_IMAGE_JOB,
+        AMBIENT_REGISTRY_IMAGE_READ_JOB + "\n"
+        + AMBIENT_REGISTRY_IMAGE_WRITE_JOB + "\n"
+        + AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
+        1,
+    )
+    if live_suite_relevance_errors(registry_workflows, "registry-cache fixture"):
+        failures.append("the complete Ambient registry-cache generation was rejected")
+    # Whole-job equality keeps target execution, token scope and success
+    # aggregation coupled; each incomplete generation must remain rejected.
+    for label, old_text, new_text in (
+        ("missing reader", AMBIENT_REGISTRY_IMAGE_READ_JOB, ""),
+        ("missing writer", AMBIENT_REGISTRY_IMAGE_WRITE_JOB, ""),
+        ("missing image aggregate", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB, ""),
+        ("mixed generations", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB, AMBIENT_HOST_UDP_IMAGE_JOB),
+        ("missing cache export", "mode=max,image-manifest=true,oci-mediatypes=true", "mode=min"),
+    ):
+        mutated = dict(registry_workflows)
+        mutated[ambient_name] = mutated[ambient_name].replace(old_text, new_text, 1)
+        if mutated == registry_workflows:
+            failures.append(f"registry-cache fixture did not change: {label}")
+        elif not live_suite_relevance_errors(mutated, f"registry-cache {label}"):
+            failures.append(f"incomplete registry-cache generation accepted: {label}")
+
     image_cache_budget = ambient_host_udp_image_cache_budget_errors(
         AMBIENT_HOST_UDP_IMAGE_JOB, "self-test-ambient-image-cache"
     )
@@ -28553,13 +28640,11 @@ pre_build = []
         # Item A of issue #3908: the binding a pull request could previously
         # rewrite at will, because nothing in trusted policy pinned it.
         "severed live binding": (
-            "    if: always() && needs.production-dockerfile-plan.outputs."
-            "node_waypoint_relevant != 'false'\n",
+            NODE_WAYPOINT_RELEVANCE_CONTRACT["node-waypoint-ebpf-live"]["if"],
             "    if: false\n",
         ),
         "inverted live binding": (
-            "    if: always() && needs.production-dockerfile-plan.outputs."
-            "node_waypoint_relevant != 'false'\n",
+            NODE_WAYPOINT_RELEVANCE_CONTRACT["node-waypoint-ebpf-live"]["if"],
             "    if: needs.production-dockerfile-plan.outputs."
             "node_waypoint_relevant == 'true'\n",
         ),
@@ -28663,7 +28748,7 @@ pre_build = []
         **relevance_workflows,
         **node_waypoint_fixture,
         **isolated_fixture,
-        GATEWAY_PUBLICATION_WORKFLOW_FILENAME: gateway_publication_workflow,
+        GATEWAY_WORKFLOW_FILENAME: gateway_validation_workflow,
     }
     ownership_prose_collection = {
         **complete_collection,
@@ -29315,8 +29400,15 @@ pre_build = []
                     f"{newer_generation} to {older_generation} was not rejected"
                 )
 
-    fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
-        "altered outer deadline": ("timeout-minutes: 60", "timeout-minutes: 30"),
+    # An entry's original may be a tuple of alternatives when the admitted
+    # generations legitimately differ at that point (the outer deadline moved
+    # from 60 to 120 minutes for #4650); the first alternative present in a
+    # generation is the one mutated.
+    fuzz_smoke_tampering: dict[str, tuple[str | tuple[str, ...], str]] = {
+        "altered outer deadline": (
+            ("timeout-minutes: 120", "timeout-minutes: 60"),
+            "timeout-minutes: 30",
+        ),
         "reduced compilation parallelism": ("--codegen-units 16", "--codegen-units 1"),
         "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
         "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
@@ -29361,7 +29453,13 @@ pre_build = []
     }
     # Every generation is admitted, so every generation has to be tamper-proof.
     for generation, generation_workflow in enumerate(fuzz_generation_workflows):
-        for tamper_name, (original, replacement) in fuzz_smoke_tampering.items():
+        for tamper_name, (originals, replacement) in fuzz_smoke_tampering.items():
+            if isinstance(originals, str):
+                originals = (originals,)
+            original = next(
+                (candidate for candidate in originals if candidate in generation_workflow),
+                originals[0],
+            )
             tampered = generation_workflow.replace(original, replacement)
             if tampered == generation_workflow:
                 failures.append(

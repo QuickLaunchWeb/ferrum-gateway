@@ -245,8 +245,8 @@ x-ferrum-external-refs:
 
 | Field | Type | Description |
 |---|---|---|
-| `id` | UUID string | Auto-generated |
-| `proxy_id` | string | Links to `proxies(id)`; `ON DELETE CASCADE` |
+| `id` | UUID string | Auto-generated; unique within the namespace (`PRIMARY KEY (namespace, id)`) |
+| `proxy_id` | string | Links to `proxies(namespace, id)` via `(namespace, proxy_id)`; `ON DELETE CASCADE` |
 | `namespace` | string | From `X-Ferrum-Namespace` header |
 | `spec_version` | string | Detected version (`"2.0"`, `"3.1.0"`, etc.) |
 | `spec_format` | enum | `json` or `yaml` |
@@ -270,7 +270,7 @@ x-ferrum-external-refs:
 | `created_at` | timestamp | Set on POST; preserved on PUT |
 | `updated_at` | timestamp | Set on POST and PUT |
 
-**Uniqueness**: a `UNIQUE(namespace, proxy_id)` constraint ensures at most one spec per proxy per namespace.
+**Uniqueness**: a `UNIQUE(namespace, proxy_id)` constraint ensures at most one spec per proxy per namespace. Spec identity itself is `(namespace, id)`: the SQL primary key is composite and the MongoDB durable key is `_id = "{namespace}:{id}"`, so two tenants may hold specs with the same bare id and the foreign key can only ever reach a proxy in the spec's own namespace (issue #4627).
 
 **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). Returns 413 when exceeded.
 
@@ -320,12 +320,25 @@ If a non-RS deployment experiences a partial failure, the following queries iden
 **Specs pointing to non-existent proxies** (the spec row survived but the proxy was never created or was already deleted):
 
 ```js
+// `_id` is the composite "{namespace}:{id}" (issue #4627), so the join is on the
+// plain `id` field plus the namespace.
 db.api_specs.aggregate([
-  { $lookup: { from: "proxies", localField: "proxy_id", foreignField: "_id", as: "p" } },
+  { $lookup: {
+      from: "proxies",
+      let: { ns: "$namespace", pid: "$proxy_id" },
+      pipeline: [
+        { $match: { $expr: { $and: [
+          { $eq: ["$namespace", "$$ns"] },
+          { $eq: ["$id", "$$pid"] }
+        ] } } },
+        { $project: { _id: 1 } }
+      ],
+      as: "p"
+  } },
   { $match: { p: { $size: 0 } } },
-  { $project: { _id: 1, namespace: 1, proxy_id: 1 } }
+  { $project: { _id: 1, id: 1, namespace: 1, proxy_id: 1 } }
 ])
-// To delete: db.api_specs.deleteMany({ _id: { $in: [<ids from above>] } })
+// To delete: db.api_specs.deleteMany({ _id: { $in: [<composite _ids from above>] } })
 ```
 
 **Resources tagged with a non-existent spec** (the resource was created but the spec row was lost):
@@ -334,9 +347,20 @@ db.api_specs.aggregate([
 // Proxies
 db.proxies.aggregate([
   { $match: { api_spec_id: { $ne: null } } },
-  { $lookup: { from: "api_specs", localField: "api_spec_id", foreignField: "_id", as: "s" } },
+  { $lookup: {
+      from: "api_specs",
+      let: { ns: "$namespace", sid: "$api_spec_id" },
+      pipeline: [
+        { $match: { $expr: { $and: [
+          { $eq: ["$namespace", "$$ns"] },
+          { $eq: ["$id", "$$sid"] }
+        ] } } },
+        { $project: { _id: 1 } }
+      ],
+      as: "s"
+  } },
   { $match: { s: { $size: 0 } } },
-  { $project: { _id: 1, namespace: 1, api_spec_id: 1 } }
+  { $project: { _id: 1, id: 1, namespace: 1, api_spec_id: 1 } }
 ])
 
 // Same pattern for plugin_configs and upstreams — replace the collection name.
@@ -346,7 +370,7 @@ Orphaned resources with dangling `api_spec_id` tags are inert — they function 
 
 ```js
 db.proxies.updateMany(
-  { api_spec_id: "<orphaned-spec-id>" },
+  { namespace: "<namespace>", api_spec_id: "<orphaned-spec-id>" },
   { $unset: { api_spec_id: "" } }
 )
 ```

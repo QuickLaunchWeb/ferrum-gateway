@@ -642,8 +642,33 @@ on a native-gRPC request.
 - Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, `src/plugins/builtin_parity.rs` (`BUILTIN_PLUGIN_PARITY_META`), and `openapi.yaml`. CI enforces registry/order-table/protocol-matrix set parity via `tests/unit/plugins/plugin_doc_parity_tests.rs`.
 - All `new()` constructors return `Result<Self, String>`. Return `Err` for no-op config, invalid regex/enum/ranges, or impossible behavior.
 - Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`stdout_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
-- Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup. DB mode warns for existing bad data.
+- Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup.
 - Shared entrypoint is `plugins::validate_plugin_config(name, config)`.
+- CP admission runs the SAME construction gate over every enabled plugin config
+  before a snapshot or delta can be accepted and broadcast
+  (`collect_rejecting_plugin_config_errors` in
+  `src/config/validation_pipeline.rs`, called from
+  `collect_rejecting_runtime_config_errors`). It mirrors
+  `plugin_cache::try_create_plugin` exactly: `OptionalFailOpen` failures are
+  skipped, and `FailClosed` / `KeepLastKnownGood` / unknown names reject. Do NOT
+  narrow it back to a per-plugin allowlist — a row no data plane can construct
+  used to pass CP admission and freeze the whole fleet on last-known-good, with
+  no ConfigSync acknowledgement to show it (issue #4526). Node-local resources
+  are already routed to shape-only entry points inside
+  `validate_plugin_config_with_http_client`, and the gate deliberately screens
+  schema/construction only — backend egress policy is node-local env config the
+  admitting CP does not own.
+- DB mode QUARANTINES existing bad data rather than warning-then-dying: a
+  serving-mode (`FullConfigLoadPurpose::Runtime`) full load drops every enabled
+  plugin config the construction gate refuses
+  (`quarantine_unconstructible_plugin_configs`), records them on
+  `GatewayConfig::quarantined_plugin_configs` (`#[serde(skip)]`, never
+  persisted, never on the wire), logs one `error!` per row naming the plugin,
+  its config id, and the constructor error, and raises `config_rejected`. The
+  process therefore reaches its admin listener and the offending row stays
+  readable and deletable in-band (issue #4526, extending the #2158 contract).
+  `config_rejected` is NOT cleared by an accepted reload that still had to
+  quarantine. CP loads never quarantine.
 
 ## File Dependencies And Custom Plugins
 

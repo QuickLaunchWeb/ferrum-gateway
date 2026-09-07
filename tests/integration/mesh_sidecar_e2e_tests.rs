@@ -619,3 +619,278 @@ fn sidecar_allow_any_leaves_the_capture_path_ungated() {
         "and no HTTP-family gate is installed"
     );
 }
+
+// ── Rewritten kubelet application probes (issue #4533) ───────────────────
+//
+// The injector points every application `httpGet` / `tcpSocket` / `grpc`
+// probe at the sidecar's own probe port and records the ORIGINAL handler in
+// `FERRUM_MESH_APP_PROBES`. These tests run the real server against real
+// loopback applications — an HTTP server, a bare TCP listener, and a tonic
+// `grpc.health.v1` server — and assert the 200/503 mapping per probe type,
+// plus that `timeoutSeconds` actually bounds a hung application.
+mod app_probe_rewrite {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use ferrum_edge::health_check::grpc_health_v1::{
+        HealthCheckRequest, HealthCheckResponse,
+        health_check_response::ServingStatus,
+        health_server::{Health, HealthServer},
+    };
+    use ferrum_edge::modes::mesh::app_probe::{
+        AppProbeGrpc, AppProbeHttpGet, AppProbeScheme, AppProbeServer, AppProbeSpec,
+        AppProbeTcpSocket, app_probe_key, app_probe_path, run_app_probe_server,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    /// Minimal loopback HTTP application that answers every request with a
+    /// fixed status line, like a real `httpGet`-probed container would.
+    async fn start_http_app(status_line: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind app");
+        let port = listener.local_addr().expect("app addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        port
+    }
+
+    /// A listener that accepts and then never answers: the probe can connect
+    /// but the HTTP exchange never completes, which is what `timeoutSeconds`
+    /// exists to bound.
+    async fn start_black_hole_app() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind hole");
+        let port = listener.local_addr().expect("hole addr").port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    /// A bound-and-accepting TCP port, which is all a `tcpSocket` probe needs.
+    async fn start_tcp_app() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
+        let port = listener.local_addr().expect("tcp addr").port();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        port
+    }
+
+    /// A closed port: nothing is listening, so connect fails immediately.
+    async fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind closed");
+        let port = listener.local_addr().expect("closed addr").port();
+        drop(listener);
+        port
+    }
+
+    struct StubHealth;
+
+    #[tonic::async_trait]
+    impl Health for StubHealth {
+        async fn check(
+            &self,
+            request: tonic::Request<HealthCheckRequest>,
+        ) -> Result<tonic::Response<HealthCheckResponse>, tonic::Status> {
+            let status = match request.into_inner().service.as_str() {
+                "down" => ServingStatus::NotServing,
+                "unknown" => return Err(tonic::Status::not_found("no such service")),
+                _ => ServingStatus::Serving,
+            };
+            Ok(tonic::Response::new(HealthCheckResponse {
+                status: status as i32,
+            }))
+        }
+    }
+
+    async fn start_grpc_health_app() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
+        let port = listener.local_addr().expect("grpc addr").port();
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(HealthServer::new(StubHealth))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        port
+    }
+
+    /// Start the real probe server on an ephemeral loopback port.
+    async fn start_probe_server(targets: BTreeMap<String, AppProbeSpec>) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind probe");
+        let addr = listener.local_addr().expect("probe addr");
+        let server = Arc::new(AppProbeServer::new(targets));
+        let (shutdown_tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            // Hold the sender inside the task so the accept loop never sees a
+            // closed channel and shuts down mid-assertion.
+            let _shutdown_tx = shutdown_tx;
+            run_app_probe_server(listener, server, rx).await;
+        });
+        addr
+    }
+
+    async fn probe_status(addr: std::net::SocketAddr, path: &str) -> u16 {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let request = format!("GET {path} HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write probe request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read probe response");
+        let head = String::from_utf8_lossy(&response);
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .expect("status code in response");
+        status.parse::<u16>().expect("numeric status")
+    }
+
+    fn http_target(port: u16, path: &str, timeout_seconds: u64) -> AppProbeSpec {
+        AppProbeSpec::from_http_get(
+            AppProbeHttpGet {
+                path: path.to_string(),
+                port,
+                scheme: AppProbeScheme::Http,
+                host: None,
+                http_headers: Vec::new(),
+            },
+            timeout_seconds,
+        )
+    }
+
+    #[tokio::test]
+    async fn every_rewritten_probe_type_maps_to_200_or_503() {
+        let healthy_http = start_http_app("200 OK").await;
+        let redirecting_http = start_http_app("301 Moved Permanently").await;
+        let unhealthy_http = start_http_app("503 Service Unavailable").await;
+        let tcp_up = start_tcp_app().await;
+        let tcp_down = closed_port().await;
+        let grpc = start_grpc_health_app().await;
+
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            app_probe_key("app", "livenessProbe"),
+            http_target(healthy_http, "/livez", 5),
+        );
+        targets.insert(
+            app_probe_key("app", "readinessProbe"),
+            http_target(redirecting_http, "/readyz", 5),
+        );
+        targets.insert(
+            app_probe_key("app", "startupProbe"),
+            http_target(unhealthy_http, "/startz", 5),
+        );
+        targets.insert(
+            app_probe_key("tcpapp", "readinessProbe"),
+            AppProbeSpec::from_tcp_socket(AppProbeTcpSocket { port: tcp_up }, 5),
+        );
+        targets.insert(
+            app_probe_key("tcpapp", "livenessProbe"),
+            AppProbeSpec::from_tcp_socket(AppProbeTcpSocket { port: tcp_down }, 5),
+        );
+        targets.insert(
+            app_probe_key("grpcapp", "readinessProbe"),
+            AppProbeSpec::from_grpc(
+                AppProbeGrpc {
+                    port: grpc,
+                    service: None,
+                },
+                5,
+            ),
+        );
+        targets.insert(
+            app_probe_key("grpcapp", "livenessProbe"),
+            AppProbeSpec::from_grpc(
+                AppProbeGrpc {
+                    port: grpc,
+                    service: Some("down".to_string()),
+                },
+                5,
+            ),
+        );
+        targets.insert(
+            app_probe_key("grpcapp", "startupProbe"),
+            AppProbeSpec::from_grpc(
+                AppProbeGrpc {
+                    port: closed_port().await,
+                    service: None,
+                },
+                5,
+            ),
+        );
+
+        let addr = start_probe_server(targets).await;
+
+        for (container, probe, expected) in [
+            // kubelet treats any 2xx/3xx as success.
+            ("app", "livenessProbe", 200),
+            ("app", "readinessProbe", 200),
+            ("app", "startupProbe", 503),
+            // `tcpSocket` success is a completed connect.
+            ("tcpapp", "readinessProbe", 200),
+            ("tcpapp", "livenessProbe", 503),
+            // gRPC health: only SERVING is success.
+            ("grpcapp", "readinessProbe", 200),
+            ("grpcapp", "livenessProbe", 503),
+            ("grpcapp", "startupProbe", 503),
+        ] {
+            let path = app_probe_path(container, probe);
+            assert_eq!(
+                probe_status(addr, &path).await,
+                expected,
+                "{container}/{probe} must map to {expected}"
+            );
+        }
+
+        // Nothing outside the recorded target set is reachable through this
+        // listener — it is not a proxy.
+        assert_eq!(probe_status(addr, "/app-probe/app/unknownProbe").await, 404);
+        assert_eq!(probe_status(addr, "/livez").await, 404);
+    }
+
+    #[tokio::test]
+    async fn a_hung_application_is_bounded_by_the_recorded_timeout_seconds() {
+        let black_hole = start_black_hole_app().await;
+        let mut targets = BTreeMap::new();
+        targets.insert(
+            app_probe_key("app", "livenessProbe"),
+            http_target(black_hole, "/livez", 1),
+        );
+        let addr = start_probe_server(targets).await;
+
+        let started = Instant::now();
+        let status = probe_status(addr, &app_probe_path("app", "livenessProbe")).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(status, 503, "a hung application must not report ready");
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the probe must actually wait out timeoutSeconds, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the probe must not outlive timeoutSeconds by an order of magnitude, took {elapsed:?}"
+        );
+    }
+}

@@ -43,10 +43,14 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
+use super::utils::synthetic_response::{
+    request_method_omits_response_body, synthetic_response_omits_body,
+};
 use super::utils::validation_diagnostics::{
     MAX_DIAGNOSTIC_CHARS, SafeFieldNames, bound_detail, safe_keyword, safe_location,
     schema_violation_detail, xml_error_category,
 };
+use super::utils::xml_bounds::xml_nesting_depth_within_limit;
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -1345,6 +1349,7 @@ impl Plugin for OpenapiValidator {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
+            && !request_method_omits_response_body(&ctx.method)
             && self.bypass_reason(ctx).is_none()
             && self.operation_for_context(ctx).is_some_and(|operation| {
                 operation.has_response_schema() || self.fail_on_missing_response_schema
@@ -1356,7 +1361,7 @@ impl Plugin for OpenapiValidator {
         ctx: &RequestContext,
         response_status: u16,
     ) -> bool {
-        !response_has_no_body_semantics(&ctx.method, response_status)
+        !synthetic_response_omits_body(&ctx.method, response_status)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -1366,41 +1371,45 @@ impl Plugin for OpenapiValidator {
     fn should_release_response_body_under_retries(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && (synthetic_response_omits_body(&ctx.method, response_status)
+                || original_response_is_event_stream(ctx, response_headers))
     }
 
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
-        _response_status: u16,
+        response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && !content_type.is_some_and(is_text_event_stream_media_type)
     }
 
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if self.should_buffer_response_body(ctx)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
             && original_response_is_event_stream(ctx, response_headers)
         {
             let operation_label = self
@@ -1443,7 +1452,7 @@ impl Plugin for OpenapiValidator {
         // apply. Every other status reaches media selection even with an empty
         // body, so an empty payload under a schema-bearing content type is
         // parsed and rejected rather than silently continuing.
-        if response_has_no_body_semantics(&ctx.method, response_status) {
+        if synthetic_response_omits_body(&ctx.method, response_status) {
             self.mark_skip(ctx, "no_body_expected");
             return PluginResult::Continue;
         }
@@ -1538,18 +1547,6 @@ impl Plugin for OpenapiValidator {
 /// finding #89.
 fn anchor_path_regex(raw: &str) -> String {
     format!("^(?:{raw})$")
-}
-
-/// Statuses and methods for which HTTP defines no response body.
-///
-/// A HEAD response, an informational status, `204 No Content`, `205 Reset
-/// Content`, and `304 Not Modified` carry no representation, so response schema
-/// selection is skipped instead of treating an absent body as a contract
-/// violation.
-fn response_has_no_body_semantics(method: &str, status: u16) -> bool {
-    method.eq_ignore_ascii_case("HEAD")
-        || (100..200).contains(&status)
-        || matches!(status, 204 | 205 | 304)
 }
 
 fn parse_operation(
@@ -2580,118 +2577,6 @@ fn body_to_schema_instance(
         return scalar_to_schema_value(body, schema, conversion).map(SchemaInstance::Value);
     }
     binary_body_to_schema_instance(decoded.as_ref(), schema)
-}
-
-/// Single pass over the raw document bytes rejecting element nesting deeper
-/// than `max_depth`, run *before* the document reaches `roxmltree`, whose
-/// tokenizer recurses once per nesting level. Every delimiter inspected is
-/// ASCII, so byte indexing cannot split a UTF-8 sequence. Constructs that may
-/// legally contain a bare `<` or `>` (comments, CDATA, processing
-/// instructions, DOCTYPE, quoted attribute values) are skipped rather than
-/// counted, so a legitimate document is never rejected. An unterminated
-/// construct simply ends the scan; `roxmltree` rejects such a document itself.
-fn xml_nesting_depth_within_limit(body: &str, max_depth: usize) -> bool {
-    let bytes = body.as_bytes();
-    let mut index = 0usize;
-    let mut depth = 0usize;
-    while index < bytes.len() {
-        if bytes[index] != b'<' {
-            index += 1;
-            continue;
-        }
-        let rest = &bytes[index..];
-        if rest.starts_with(b"<!--") {
-            match find_subslice(&bytes[index + 4..], b"-->") {
-                Some(offset) => index += 4 + offset + 3,
-                None => return true,
-            }
-            continue;
-        }
-        if rest.starts_with(b"<![CDATA[") {
-            match find_subslice(&bytes[index + 9..], b"]]>") {
-                Some(offset) => index += 9 + offset + 3,
-                None => return true,
-            }
-            continue;
-        }
-        if rest.starts_with(b"<?") {
-            match find_subslice(&bytes[index + 2..], b"?>") {
-                Some(offset) => index += 2 + offset + 2,
-                None => return true,
-            }
-            continue;
-        }
-        if rest.starts_with(b"<!") {
-            // DOCTYPE and friends. `allow_dtd` is false, so `roxmltree` rejects
-            // the document regardless; skipping conservatively cannot make the
-            // screen unsound.
-            match bytes[index + 2..].iter().position(|byte| *byte == b'>') {
-                Some(offset) => index += 2 + offset + 1,
-                None => return true,
-            }
-            continue;
-        }
-        if rest.starts_with(b"</") {
-            depth = depth.saturating_sub(1);
-            match bytes[index + 2..].iter().position(|byte| *byte == b'>') {
-                Some(offset) => index += 2 + offset + 1,
-                None => return true,
-            }
-            continue;
-        }
-        depth += 1;
-        if depth > max_depth {
-            return false;
-        }
-        // Advance to the tag's closing `>`, quote-aware: a `>` inside a quoted
-        // attribute value does not terminate the tag.
-        let mut cursor = index + 1;
-        let mut quote: Option<u8> = None;
-        let mut last_significant: Option<u8> = None;
-        let mut terminated = false;
-        while cursor < bytes.len() {
-            let byte = bytes[cursor];
-            match quote {
-                Some(open) => {
-                    if byte == open {
-                        quote = None;
-                    }
-                    last_significant = Some(byte);
-                }
-                None => {
-                    if byte == b'"' || byte == b'\'' {
-                        quote = Some(byte);
-                        last_significant = Some(byte);
-                    } else if byte == b'>' {
-                        terminated = true;
-                        break;
-                    } else if !byte.is_ascii_whitespace() {
-                        last_significant = Some(byte);
-                    }
-                }
-            }
-            cursor += 1;
-        }
-        if !terminated {
-            return true;
-        }
-        if last_significant == Some(b'/') {
-            // Self-closing element: it opened and closed in one tag.
-            depth = depth.saturating_sub(1);
-        }
-        index = cursor + 1;
-    }
-    true
-}
-
-/// First index of `needle` within `haystack`, or `None`.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn xml_body_to_value(

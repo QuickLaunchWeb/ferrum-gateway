@@ -834,6 +834,9 @@ pub struct CaptureConfig {
     /// listed port emits a `RETURN` rule placed BEFORE the inbound REDIRECT,
     /// so traffic to the port bypasses the mesh sidecar entirely.
     pub exclude_inbound_ports: Vec<u16>,
+    /// Additional TCP-only destination ports excluded from inbound capture.
+    /// These are not mirrored into the UDP TPROXY chain.
+    pub exclude_inbound_tcp_ports: Vec<u16>,
     pub ip6tables_mode: Ip6TablesMode,
     /// Whether UDP TPROXY capture rules are emitted (F3 §3.3 Stage 2). Default
     /// `false`: UDP cannot use the TCP REDIRECT model (REDIRECT rewrites the
@@ -922,6 +925,7 @@ impl CaptureConfig {
             exclude_ports: Vec::new(),
             exclude_ports_explicit: false,
             exclude_inbound_ports: Vec::new(),
+            exclude_inbound_tcp_ports: Vec::new(),
             ip6tables_mode: Ip6TablesMode::Auto,
             udp_capture_enabled: false,
             udp_outbound_port: DEFAULT_UDP_OUTBOUND_PORT,
@@ -986,6 +990,7 @@ impl CaptureConfig {
             exclude_ports,
             exclude_ports_explicit,
             exclude_inbound_ports,
+            exclude_inbound_tcp_ports: Vec::new(),
             ip6tables_mode,
             udp_capture_enabled,
             udp_outbound_port,
@@ -2221,6 +2226,14 @@ fn commands_for_family(
     // below — once REDIRECT fires the chain returns, so any RETURN rule placed
     // after it would be silently bypassed.
     for port in &config.exclude_inbound_ports {
+        commands.push(idempotent_append(
+            binary,
+            "nat",
+            "FERRUM_MESH_INBOUND",
+            &format!("-p tcp --dport {port} -j RETURN"),
+        ));
+    }
+    for port in &config.exclude_inbound_tcp_ports {
         commands.push(idempotent_append(
             binary,
             "nat",

@@ -3,6 +3,7 @@
 //! The serving path is a narrow AdmissionReview webhook. It only produces JSON
 //! patches; all mesh runtime work remains in `FERRUM_MODE=mesh`.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,6 +34,11 @@ use crate::capture::{
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::identity::spiffe::TrustDomain;
+use crate::modes::mesh::app_probe::{
+    APP_PROBE_PORT_ENV, APP_PROBES_ENV, AppProbeGrpc, AppProbeHeader, AppProbeHttpGet,
+    AppProbeScheme, AppProbeSpec, AppProbeTcpSocket, DEFAULT_APP_PROBE_PORT,
+    DEFAULT_PROBE_TIMEOUT_SECONDS, app_probe_key, app_probe_path, validate_probe_container_name,
+};
 use crate::tls::{self, TlsPolicy};
 use crate::util::body_limit::is_length_limit_error;
 use crate::util::mesh_enrollment::{
@@ -84,11 +90,17 @@ const SIDECAR_STARTUP_PROBE_FAILURE_THRESHOLD: u64 = 150;
 const SIDECAR_READINESS_PROBE_PERIOD_SECONDS: u64 = 5;
 const SIDECAR_READINESS_PROBE_FAILURE_THRESHOLD: u64 = 3;
 const CONTAINER_PROBE_FIELDS: [&str; 3] = ["startupProbe", "readinessProbe", "livenessProbe"];
-const POD_CONTAINER_LIST_POINTERS: [&str; 3] = [
-    "/spec/containers",
-    "/spec/initContainers",
-    "/spec/ephemeralContainers",
-];
+/// Container lists whose probes are rewritten (issue #4533).
+///
+/// `spec.ephemeralContainers` is deliberately absent: the Kubernetes API
+/// forbids probes on an ephemeral container, so there is nothing there to
+/// rewrite, and an ephemeral container is added through a subresource the
+/// injector's `CREATE` webhook never sees.
+const APP_PROBE_CONTAINER_LIST_POINTERS: [&str; 2] = ["/spec/containers", "/spec/initContainers"];
+/// Ferrum-native opt-out from the kubelet application-probe rewrite.
+const FERRUM_REWRITE_APP_PROBES_ANNOTATION: &str = "ferrum.io/rewriteAppProbes";
+/// Istio-compatible spelling of the same opt-out.
+const ISTIO_REWRITE_APP_PROBES_ANNOTATION: &str = "sidecar.istio.io/rewriteAppHTTPProbers";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretKeyRef {
@@ -624,13 +636,22 @@ fn classify_pod_kind(request: &AdmissionRequest) -> PodKindCheck {
     PodKindCheck::NotPod("no kind or resource metadata".to_string())
 }
 
+/// Parse runtime settings and load serving material without binding a listener.
+/// Shared by `run` and the CLI's pre-deploy validation gate.
+pub(crate) fn load_startup_config(
+    env_config: &EnvConfig,
+) -> Result<(InjectorConfig, Option<TlsAcceptor>), anyhow::Error> {
+    let config = InjectorConfig::from_env_config(env_config)
+        .map_err(|e| anyhow::anyhow!("invalid injector configuration: {e}"))?;
+    let tls_acceptor = build_tls_acceptor(env_config, &config)?;
+    Ok((config, tls_acceptor))
+}
+
 pub async fn run(
     env_config: EnvConfig,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
-    let config = InjectorConfig::from_env_config(&env_config)
-        .map_err(|e| anyhow::anyhow!("invalid injector configuration: {e}"))?;
-    let tls_acceptor = build_tls_acceptor(&env_config, &config)?;
+    let (config, tls_acceptor) = load_startup_config(&env_config)?;
     let max_connections = env_config.max_connections;
     let shutdown_drain_seconds = env_config.shutdown_drain_seconds;
     let config = Arc::new(config);
@@ -1012,6 +1033,12 @@ fn build_sidecar_patch_for_namespace(
         path: "/metadata/annotations/ferrum.io~1injected".to_string(),
         value: Some(Value::String("true".to_string())),
     });
+    // Kubelet application-probe rewrite (issue #4533). These `replace` ops MUST
+    // precede the sidecar / init-container inserts below: a JSON patch applies
+    // in order, and their `/spec/initContainers/<index>` paths are addressed
+    // against the pod as the apiserver sent it.
+    let app_probe_rewrite = app_probe_rewrite_for_pod(pod)?;
+    patch.extend(app_probe_rewrite.patches.iter().cloned());
     // Native sidecar (Kubernetes 1.29+): insert Ferrum first in
     // initContainers with restartPolicy Always so later init containers
     // (including iptables capture) and application containers wait for
@@ -1020,7 +1047,12 @@ fn build_sidecar_patch_for_namespace(
     patch.push(JsonPatchOperation {
         op: "add",
         path: NATIVE_SIDECAR_PATCH_PATH.to_string(),
-        value: Some(sidecar_container(config, pod, &pod_namespace)),
+        value: Some(sidecar_container(
+            config,
+            pod,
+            &pod_namespace,
+            &app_probe_rewrite.probes,
+        )),
     });
 
     if config.capture_mode == CaptureMode::Ebpf {
@@ -1051,7 +1083,12 @@ fn injected_shape_matches(
         return Ok(false);
     };
     let namespace = pod_namespace(pod, admission_namespace, config);
-    if sidecar != &sidecar_container(config, pod, namespace.as_str()) {
+    // Recompute the probe rewrite from the pod as submitted. For an already
+    // injected pod every application probe is already in the rewritten shape,
+    // so the originals come back out of this sidecar's own
+    // `FERRUM_MESH_APP_PROBES` and the recomputed container is byte-identical.
+    let app_probes = app_probe_rewrite_for_pod(pod)?.probes;
+    if sidecar != &sidecar_container(config, pod, namespace.as_str(), &app_probes) {
         return Ok(false);
     }
 
@@ -1393,7 +1430,12 @@ fn sidecar_capture_ipv6_active(config: &InjectorConfig, pod: &Value) -> bool {
             .unwrap_or(false)
 }
 
-fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Value> {
+fn sidecar_env(
+    config: &InjectorConfig,
+    pod: &Value,
+    namespace: &str,
+    app_probes: &BTreeMap<String, AppProbeSpec>,
+) -> Vec<Value> {
     let mut env = vec![
         json!({"name": "FERRUM_MODE", "value": "mesh"}),
         json!({"name": "FERRUM_NAMESPACE", "value": namespace}),
@@ -1429,6 +1471,22 @@ fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Val
     if sidecar_capture_ipv6_active(config, pod) {
         env.push(json!({"name": "FERRUM_MESH_CAPTURE_IPV6_ENABLED", "value": "true"}));
     }
+    // Rewritten kubelet application probes (issue #4533). Emitted ONLY when
+    // the pod actually has rewritten probes, so an unprobed workload does not
+    // open the probe listener at all. `BTreeMap` ordering makes the serialized
+    // value stable, which is what lets reinvocation recompute a byte-identical
+    // sidecar container.
+    if !app_probes.is_empty() {
+        env.push(json!({
+            "name": APP_PROBE_PORT_ENV,
+            "value": DEFAULT_APP_PROBE_PORT.to_string()
+        }));
+        // Serialization of a `BTreeMap<String, AppProbeSpec>` cannot fail: the
+        // value is a plain object of owned strings and integers with no
+        // non-string map keys and no floats.
+        let encoded = serde_json::to_string(app_probes).unwrap_or_else(|_| "{}".to_string());
+        env.push(json!({"name": APP_PROBES_ENV, "value": encoded}));
+    }
     env.extend(
         config
             .sidecar_env
@@ -1449,7 +1507,12 @@ fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Val
     env
 }
 
-fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> Value {
+fn sidecar_container(
+    config: &InjectorConfig,
+    pod: &Value,
+    namespace: &str,
+    app_probes: &BTreeMap<String, AppProbeSpec>,
+) -> Value {
     // The sidecar normally drops ALL capabilities (it runs as PROXY_UID). UDP
     // TPROXY capture is the exception (the capture listener binds an
     // `IP_TRANSPARENT` UDP socket, which on Linux needs `NET_ADMIN`). Sidecar UDP
@@ -1500,7 +1563,7 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
             SIDECAR_READINESS_PROBE_PERIOD_SECONDS,
             SIDECAR_READINESS_PROBE_FAILURE_THRESHOLD,
         ),
-        "env": sidecar_env(config, pod, namespace)
+        "env": sidecar_env(config, pod, namespace, app_probes)
     })
 }
 
@@ -1583,6 +1646,19 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     capture.include_outbound_ports = include_outbound_ports.ports;
     capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
     capture.exclude_inbound_ports = exclude_inbound_ports_for_pod(config, pod)?;
+    // The sidecar's OWN probe port terminates in the sidecar, so a TCP RETURN
+    // for it lets nothing bypass the mesh (issue #4533) — but only when the
+    // sidecar will actually bind that listener, i.e. when the rewrite produced
+    // (or, on reinvocation, recovered) at least one probe registration. A probe
+    // that merely LOOKS rewritten with no recorded original is not served, so
+    // its port stays captured: an application could otherwise bind 15020 and
+    // sit outside mesh mTLS / `mesh_authz`. The exclusion is TCP-only; the
+    // probe server speaks no UDP.
+    if rewrite_app_probes_enabled(pod) && !app_probe_rewrite_for_pod(pod)?.probes.is_empty() {
+        capture
+            .exclude_inbound_tcp_ports
+            .push(DEFAULT_APP_PROBE_PORT);
+    }
     capture.ip6tables_mode = config.ip6tables_mode;
     // UDP TPROXY capture (F3 §3.3 Stage 2), flag-gated default-off. When off the
     // emitted plan contains no mangle/TPROXY rules at all. Sidecar UDP egress is
@@ -1708,43 +1784,280 @@ fn exclude_inbound_ports_for_pod(config: &InjectorConfig, pod: &Value) -> Result
         .map_err(|e| format!("invalid {key}: {e}"))?;
         ports.extend(annotation_ports);
     }
-    ports.extend(inbound_probe_ports_for_pod(pod)?);
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
 }
 
-/// HTTP `httpGet` and TCP `tcpSocket` probe ports on every container in the
-/// pod, resolved against that container's named `ports` when the probe uses
-/// a name. `exec` and `grpc` probes are skipped: they have no HTTP/TCP
-/// kubelet port to exclude. Unresolved or ambiguous names fail admission
-/// rather than leaving the probe captured by the inbound catch-all.
-fn inbound_probe_ports_for_pod(pod: &Value) -> Result<Vec<u16>, String> {
-    let mut ports = Vec::new();
-    for pointer in POD_CONTAINER_LIST_POINTERS {
+/// Whether kubelet application probes are rewritten for this pod.
+///
+/// Default ON. `ferrum.io/rewriteAppProbes: "false"` (or Istio's
+/// `sidecar.istio.io/rewriteAppHTTPProbers: "false"`) opts out, which leaves
+/// the probes pointing at the application ports AND leaves those ports
+/// captured — under `STRICT` PeerAuthentication such a probe fails, which is
+/// the documented cost of the opt-out.
+fn rewrite_app_probes_enabled(pod: &Value) -> bool {
+    let annotations = pod
+        .pointer("/metadata/annotations")
+        .and_then(Value::as_object);
+    for key in [
+        FERRUM_REWRITE_APP_PROBES_ANNOTATION,
+        ISTIO_REWRITE_APP_PROBES_ANNOTATION,
+    ] {
+        let raw = annotations
+            .and_then(|annotations| annotations.get(key))
+            .and_then(Value::as_str);
+        if let Some(raw) = raw
+            && raw.trim().eq_ignore_ascii_case("false")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// The result of walking a pod's application probes (issue #4533).
+#[derive(Debug, Default)]
+struct AppProbeRewrite {
+    /// One `replace` per rewritten probe, addressed against the INCOMING pod.
+    /// Emitted before the sidecar / init-container inserts so the
+    /// `spec.initContainers` indices these paths carry are still the ones the
+    /// apiserver sees.
+    patches: Vec<JsonPatchOperation>,
+    /// Original handlers keyed `<container>/<probeField>`, handed to the
+    /// sidecar as `FERRUM_MESH_APP_PROBES`.
+    probes: BTreeMap<String, AppProbeSpec>,
+}
+
+/// Rewrite every application `httpGet` / `tcpSocket` / `grpc` probe to target
+/// the sidecar's probe port, recording the original handler.
+///
+/// `exec` probes are untouched: they run inside the container and are never
+/// captured. The injected `ferrum-edge` / `ferrum-edge-init` containers are
+/// skipped — the sidecar keeps its own loopback `exec` health probes.
+///
+/// **Reinvocation.** A probe already carrying the rewritten shape has its
+/// original recovered from the already-injected sidecar's own
+/// `FERRUM_MESH_APP_PROBES`, so a second admission of an injected pod
+/// recomputes a byte-identical sidecar container and emits no patch.
+fn app_probe_rewrite_for_pod(pod: &Value) -> Result<AppProbeRewrite, String> {
+    let mut rewrite = AppProbeRewrite::default();
+    if !rewrite_app_probes_enabled(pod) {
+        return Ok(rewrite);
+    }
+    let already_recorded = recorded_app_probes(pod);
+    for pointer in APP_PROBE_CONTAINER_LIST_POINTERS {
         let Some(containers) = pod.pointer(pointer).and_then(Value::as_array) else {
             continue;
         };
-        for container in containers {
-            collect_container_probe_ports(container, &mut ports)?;
+        for (index, container) in containers.iter().enumerate() {
+            let container_name = container_display_name(container);
+            if container_name == SIDECAR_CONTAINER_NAME || container_name == INIT_CONTAINER_NAME {
+                continue;
+            }
+            for probe_field in CONTAINER_PROBE_FIELDS {
+                let Some(probe) = container.get(probe_field) else {
+                    continue;
+                };
+                if !probe.is_object() {
+                    continue;
+                }
+                let key = app_probe_key(container_name, probe_field);
+                if probe_is_already_rewritten(probe, container_name, probe_field) {
+                    if let Some(spec) = already_recorded.get(&key) {
+                        rewrite.probes.insert(key, spec.clone());
+                    } else {
+                        warn!(
+                            container = container_name,
+                            probe = probe_field,
+                            "Pod already carries a Ferrum-rewritten kubelet probe but the \
+                             injected sidecar records no original handler for it; leaving the \
+                             probe unchanged"
+                        );
+                    }
+                    continue;
+                }
+                let Some(spec) =
+                    app_probe_spec_for_probe(container, container_name, probe_field, probe)?
+                else {
+                    continue;
+                };
+                validate_probe_container_name(container_name)?;
+                rewrite.probes.insert(key, spec);
+                rewrite.patches.push(JsonPatchOperation {
+                    op: "replace",
+                    path: format!("{pointer}/{index}/{probe_field}"),
+                    value: Some(rewritten_probe_value(probe, container_name, probe_field)),
+                });
+            }
         }
     }
-    Ok(ports)
+    Ok(rewrite)
 }
 
-fn collect_container_probe_ports(container: &Value, ports: &mut Vec<u16>) -> Result<(), String> {
-    let container_name = container_display_name(container);
-    for probe_field in CONTAINER_PROBE_FIELDS {
-        let Some(probe) = container.get(probe_field) else {
+/// Originals recorded on an already-injected pod's sidecar. Best effort: an
+/// unparseable value yields an empty map, which leaves those probes untouched
+/// rather than silently pointing them somewhere else.
+fn recorded_app_probes(pod: &Value) -> BTreeMap<String, AppProbeSpec> {
+    let Some(sidecar) = named_container(pod, "/spec/initContainers", SIDECAR_CONTAINER_NAME) else {
+        return BTreeMap::new();
+    };
+    let Some(env) = sidecar.get("env").and_then(Value::as_array) else {
+        return BTreeMap::new();
+    };
+    for entry in env {
+        if entry.get("name").and_then(Value::as_str) != Some(APP_PROBES_ENV) {
             continue;
-        };
-        if let Some(port) =
-            inbound_exclusion_port_for_probe(container, container_name, probe_field, probe)?
-        {
-            ports.push(port);
         }
+        let Some(raw) = entry.get("value").and_then(Value::as_str) else {
+            return BTreeMap::new();
+        };
+        return crate::modes::mesh::app_probe::parse_app_probes(raw).unwrap_or_default();
     }
-    Ok(())
+    BTreeMap::new()
+}
+
+/// Whether this probe already carries the shape this webhook emits.
+fn probe_is_already_rewritten(probe: &Value, container_name: &str, probe_field: &str) -> bool {
+    let Some(http_get) = probe.get("httpGet") else {
+        return false;
+    };
+    let path_matches = http_get.get("path").and_then(Value::as_str)
+        == Some(app_probe_path(container_name, probe_field).as_str());
+    let port_matches = http_get
+        .get("port")
+        .and_then(json_value_port_number)
+        .is_some_and(|port| port == DEFAULT_APP_PROBE_PORT);
+    path_matches && port_matches
+}
+
+/// The probe Kubernetes sees after the rewrite: the original timing fields
+/// (`initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`,
+/// `failureThreshold`, `successThreshold`, and anything else the pod set)
+/// preserved verbatim, with the handler replaced.
+fn rewritten_probe_value(probe: &Value, container_name: &str, probe_field: &str) -> Value {
+    let mut rewritten = probe.clone();
+    if let Some(map) = rewritten.as_object_mut() {
+        map.remove("httpGet");
+        map.remove("tcpSocket");
+        map.remove("grpc");
+        map.insert(
+            "httpGet".to_string(),
+            json!({
+                "path": app_probe_path(container_name, probe_field),
+                "port": DEFAULT_APP_PROBE_PORT,
+                "scheme": "HTTP"
+            }),
+        );
+    }
+    rewritten
+}
+
+/// Project one probe handler into the recorded original, resolving named ports
+/// against that container's `ports`. `Ok(None)` means "not a rewritable
+/// handler" (`exec`, or a probe with no handler at all).
+fn app_probe_spec_for_probe(
+    container: &Value,
+    container_name: &str,
+    probe_field: &str,
+    probe: &Value,
+) -> Result<Option<AppProbeSpec>, String> {
+    let timeout_seconds = probe
+        .get("timeoutSeconds")
+        .and_then(json_value_positive_u64)
+        .unwrap_or(DEFAULT_PROBE_TIMEOUT_SECONDS);
+
+    if let Some(http_get) = probe.get("httpGet") {
+        let port = resolve_probe_handler_port(
+            container,
+            container_name,
+            probe_field,
+            "httpGet",
+            http_get,
+        )?;
+        let scheme = match http_get.get("scheme").and_then(Value::as_str) {
+            Some(raw) if raw.eq_ignore_ascii_case("HTTPS") => AppProbeScheme::Https,
+            _ => AppProbeScheme::Http,
+        };
+        let path = http_get
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .unwrap_or("/")
+            .to_string();
+        let host = http_get
+            .get("host")
+            .and_then(Value::as_str)
+            .filter(|host| !host.trim().is_empty())
+            .map(str::to_string);
+        let mut http_headers = Vec::new();
+        if let Some(headers) = http_get.get("httpHeaders").and_then(Value::as_array) {
+            for header in headers {
+                let Some(name) = header.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                http_headers.push(AppProbeHeader {
+                    name: name.to_string(),
+                    value: header
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+        }
+        return Ok(Some(AppProbeSpec::from_http_get(
+            AppProbeHttpGet {
+                path,
+                port,
+                scheme,
+                host,
+                http_headers,
+            },
+            timeout_seconds,
+        )));
+    }
+
+    if let Some(tcp_socket) = probe.get("tcpSocket") {
+        let port = resolve_probe_handler_port(
+            container,
+            container_name,
+            probe_field,
+            "tcpSocket",
+            tcp_socket,
+        )?;
+        return Ok(Some(AppProbeSpec::from_tcp_socket(
+            AppProbeTcpSocket { port },
+            timeout_seconds,
+        )));
+    }
+
+    // `GRPCAction.port` is a REQUIRED int32 and kubelet opens an ordinary TCP
+    // connection to `podIP:<port>` to speak grpc.health.v1 (issue #4533). It is
+    // rewritten like any other captured probe; the sidecar performs the health
+    // RPC over loopback instead.
+    if let Some(grpc) = probe.get("grpc") {
+        let port =
+            resolve_probe_handler_port(container, container_name, probe_field, "grpc", grpc)?;
+        let service = grpc
+            .get("service")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        return Ok(Some(AppProbeSpec::from_grpc(
+            AppProbeGrpc { port, service },
+            timeout_seconds,
+        )));
+    }
+
+    Ok(None)
+}
+
+fn json_value_positive_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64().filter(|seconds| *seconds > 0),
+        Value::String(raw) => raw.trim().parse::<u64>().ok().filter(|s| *s > 0),
+        _ => None,
+    }
 }
 
 fn container_display_name(container: &Value) -> &str {
@@ -1753,35 +2066,6 @@ fn container_display_name(container: &Value) -> &str {
         .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("<unnamed>")
-}
-
-fn inbound_exclusion_port_for_probe(
-    container: &Value,
-    container_name: &str,
-    probe_field: &str,
-    probe: &Value,
-) -> Result<Option<u16>, String> {
-    if let Some(http_get) = probe.get("httpGet") {
-        return resolve_probe_handler_port(
-            container,
-            container_name,
-            probe_field,
-            "httpGet",
-            http_get,
-        )
-        .map(Some);
-    }
-    if let Some(tcp_socket) = probe.get("tcpSocket") {
-        return resolve_probe_handler_port(
-            container,
-            container_name,
-            probe_field,
-            "tcpSocket",
-            tcp_socket,
-        )
-        .map(Some);
-    }
-    Ok(None)
 }
 
 fn resolve_probe_handler_port(
@@ -2122,7 +2406,7 @@ mod tests {
             }
         });
         let namespace = pod_namespace(&pod, None, &config);
-        let sidecar = sidecar_container(&config, &pod, &namespace);
+        let sidecar = sidecar_container(&config, &pod, &namespace, &BTreeMap::new());
         let init = init_container(&config, &pod).expect("init container");
         pod["spec"]["initContainers"]
             .as_array_mut()
@@ -2152,7 +2436,7 @@ mod tests {
             }
         });
         let namespace = pod_namespace(&pod, None, &config);
-        let mut sidecar = sidecar_container(&config, &pod, &namespace);
+        let mut sidecar = sidecar_container(&config, &pod, &namespace, &BTreeMap::new());
         sidecar["securityContext"]["privileged"] = Value::Bool(true);
         let init = init_container(&config, &pod).expect("init container");
         pod["spec"]["initContainers"]
@@ -3757,8 +4041,39 @@ mod tests {
         }
     }
 
+    /// The `FERRUM_MESH_APP_PROBES` value the injector recorded on the
+    /// sidecar, decoded back into the shared wire type.
+    fn recorded_app_probes_from_patch(
+        patch: &[JsonPatchOperation],
+    ) -> BTreeMap<String, AppProbeSpec> {
+        let sidecar = patch_named_container(patch, "ferrum-edge").expect("sidecar container");
+        let env = sidecar.get("env").and_then(Value::as_array).expect("env");
+        let raw = env
+            .iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some(APP_PROBES_ENV))
+            .and_then(|entry| entry.get("value"))
+            .and_then(Value::as_str)
+            .expect("FERRUM_MESH_APP_PROBES");
+        crate::modes::mesh::app_probe::parse_app_probes(raw).expect("recorded probes parse")
+    }
+
+    fn patch_value_at<'a>(patch: &'a [JsonPatchOperation], path: &str) -> Option<&'a Value> {
+        patch
+            .iter()
+            .find(|op| op.path == path)
+            .and_then(|op| op.value.as_ref())
+    }
+
+    fn init_iptables_script(patch: &[JsonPatchOperation]) -> &str {
+        patch_named_container(patch, "ferrum-edge-init")
+            .expect("init container")
+            .pointer("/args/0")
+            .and_then(Value::as_str)
+            .expect("iptables plan")
+    }
+
     #[test]
-    fn patch_excludes_numeric_http_and_tcp_probe_ports() {
+    fn patch_rewrites_http_tcp_and_grpc_probes_to_the_sidecar_probe_port() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
             "spec": {
@@ -3767,57 +4082,155 @@ mod tests {
                         "name": "app",
                         "image": "app:test",
                         "livenessProbe": {
-                            "httpGet": {"path": "/livez", "port": 8080}
-                        },
-                        "readinessProbe": {
-                            "httpGet": {"path": "/readyz", "port": 8081}
+                            "httpGet": {
+                                "path": "/livez",
+                                "port": 8080,
+                                "scheme": "HTTPS",
+                                "httpHeaders": [{"name": "X-Probe", "value": "yes"}]
+                            },
+                            "initialDelaySeconds": 7,
+                            "periodSeconds": 11,
+                            "timeoutSeconds": 3,
+                            "failureThreshold": 5,
+                            "successThreshold": 1
                         }
                     },
                     {
                         "name": "metrics",
                         "image": "metrics:test",
+                        "readinessProbe": {"tcpSocket": {"port": 9090}}
+                    },
+                    {
+                        "name": "grpcsvc",
+                        "image": "grpc:test",
                         "startupProbe": {
-                            "tcpSocket": {"port": 9090}
+                            "grpc": {"port": 50051, "service": "readiness"},
+                            "timeoutSeconds": 2
                         }
-                    }
-                ],
-                "initContainers": [
+                    },
                     {
-                        "name": "migrate",
-                        "image": "migrate:test",
-                        "readinessProbe": {
-                            "httpGet": {"path": "/healthz", "port": "9091"}
-                        }
-                    }
-                ],
-                "ephemeralContainers": [
-                    {
-                        "name": "debug",
-                        "image": "debug:test",
-                        "livenessProbe": {
-                            "tcpSocket": {"port": 9092}
-                        }
+                        "name": "sidecarish",
+                        "image": "exec:test",
+                        "livenessProbe": {"exec": {"command": ["true"]}}
                     }
                 ]
             }
         });
         let config = test_config(true, CaptureMode::Iptables);
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let commands = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container")
-            .pointer("/args/0")
-            .and_then(Value::as_str)
-            .expect("iptables plan");
-        for port in [8080, 8081, 9090, 9091, 9092] {
+
+        // Every captured probe type now targets the sidecar's own probe port.
+        for (path, container, field) in [
+            ("/spec/containers/0/livenessProbe", "app", "livenessProbe"),
+            (
+                "/spec/containers/1/readinessProbe",
+                "metrics",
+                "readinessProbe",
+            ),
+            ("/spec/containers/2/startupProbe", "grpcsvc", "startupProbe"),
+        ] {
+            let rewritten = patch_value_at(&patch, path)
+                .unwrap_or_else(|| panic!("probe rewrite missing for {path}"));
+            assert_eq!(
+                rewritten.pointer("/httpGet/port").and_then(Value::as_u64),
+                Some(u64::from(DEFAULT_APP_PROBE_PORT)),
+                "{path} must be rewritten to the sidecar probe port"
+            );
+            assert_eq!(
+                rewritten.pointer("/httpGet/path").and_then(Value::as_str),
+                Some(app_probe_path(container, field).as_str())
+            );
+            assert_eq!(
+                rewritten.pointer("/httpGet/scheme").and_then(Value::as_str),
+                Some("HTTP"),
+                "the kubelet-facing hop is always plaintext to the sidecar"
+            );
+            assert!(rewritten.get("tcpSocket").is_none());
+            assert!(rewritten.get("grpc").is_none());
+        }
+
+        // Timing fields survive verbatim.
+        let rewritten_liveness =
+            patch_value_at(&patch, "/spec/containers/0/livenessProbe").expect("liveness rewrite");
+        for (field, expected) in [
+            ("initialDelaySeconds", 7),
+            ("periodSeconds", 11),
+            ("timeoutSeconds", 3),
+            ("failureThreshold", 5),
+            ("successThreshold", 1),
+        ] {
+            assert_eq!(
+                rewritten_liveness.get(field).and_then(Value::as_u64),
+                Some(expected),
+                "{field} must be preserved by the rewrite"
+            );
+        }
+
+        // `exec` is never rewritten: it runs inside the container and is not
+        // captured.
+        assert!(
+            patch_value_at(&patch, "/spec/containers/3/livenessProbe").is_none(),
+            "exec probes must be left alone"
+        );
+
+        // The originals reach the sidecar.
+        let recorded = recorded_app_probes_from_patch(&patch);
+        assert_eq!(
+            recorded.get("app/livenessProbe"),
+            Some(&AppProbeSpec::from_http_get(
+                AppProbeHttpGet {
+                    path: "/livez".to_string(),
+                    port: 8080,
+                    scheme: AppProbeScheme::Https,
+                    host: None,
+                    http_headers: vec![AppProbeHeader {
+                        name: "X-Probe".to_string(),
+                        value: "yes".to_string(),
+                    }],
+                },
+                3,
+            ))
+        );
+        assert_eq!(
+            recorded.get("metrics/readinessProbe"),
+            Some(&AppProbeSpec::from_tcp_socket(
+                AppProbeTcpSocket { port: 9090 },
+                DEFAULT_PROBE_TIMEOUT_SECONDS,
+            ))
+        );
+        assert_eq!(
+            recorded.get("grpcsvc/startupProbe"),
+            Some(&AppProbeSpec::from_grpc(
+                AppProbeGrpc {
+                    port: 50051,
+                    service: Some("readiness".to_string()),
+                },
+                2,
+            ))
+        );
+        assert!(
+            !recorded.contains_key("sidecarish/livenessProbe"),
+            "exec probes are not recorded"
+        );
+
+        // The capture plan excludes ONLY the sidecar's own probe port. An
+        // application-port RETURN would let ordinary Service / Pod-IP traffic
+        // bypass mesh mTLS and mesh_authz entirely (the #4553 concern).
+        let commands = init_iptables_script(&patch);
+        assert!(
+            commands.contains(&format!("--dport {DEFAULT_APP_PROBE_PORT} -j RETURN")),
+            "the sidecar probe port must be excluded from inbound capture:\n{commands}"
+        );
+        for port in [8080, 9090, 50051] {
             assert!(
-                commands.contains(&format!("--dport {port} -j RETURN")),
-                "probe port {port} must be excluded from inbound capture:\n{commands}"
+                !commands.contains(&format!("--dport {port} -j RETURN")),
+                "application port {port} must stay captured:\n{commands}"
             );
         }
     }
 
     #[test]
-    fn patch_resolves_named_http_probe_ports_against_container_ports() {
+    fn patch_rewrite_resolves_named_probe_ports_against_container_ports() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
             "spec": {
@@ -3828,96 +4241,161 @@ mod tests {
                         {"containerPort": 8080, "name": "http"},
                         {"containerPort": 9090, "name": "admin"}
                     ],
-                    "livenessProbe": {
-                        "httpGet": {"path": "/livez", "port": "http"}
-                    },
-                    "readinessProbe": {
-                        "httpGet": {"path": "/readyz", "port": "admin"}
-                    }
+                    "livenessProbe": {"httpGet": {"path": "/livez", "port": "http"}},
+                    "readinessProbe": {"tcpSocket": {"port": "admin"}}
                 }]
             }
         });
         let config = test_config(true, CaptureMode::Iptables);
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let commands = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container")
-            .pointer("/args/0")
-            .and_then(Value::as_str)
-            .expect("iptables plan");
+        let recorded = recorded_app_probes_from_patch(&patch);
+        assert_eq!(
+            recorded
+                .get("app/livenessProbe")
+                .and_then(|spec| spec.http_get.as_ref())
+                .map(|http_get| http_get.port),
+            Some(8080),
+            "a named httpGet port must be resolved before it is recorded"
+        );
+        assert_eq!(
+            recorded
+                .get("app/readinessProbe")
+                .and_then(|spec| spec.tcp_socket.as_ref())
+                .map(|tcp| tcp.port),
+            Some(9090)
+        );
+        let commands = init_iptables_script(&patch);
         for port in [8080, 9090] {
             assert!(
-                commands.contains(&format!("--dport {port} -j RETURN")),
-                "named probe port must resolve to {port}:\n{commands}"
+                !commands.contains(&format!("--dport {port} -j RETURN")),
+                "resolved probe port {port} must not be excluded from capture:\n{commands}"
             );
         }
     }
 
     #[test]
-    fn patch_does_not_exclude_exec_or_grpc_probe_ports() {
-        let pod = json!({
-            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-            "spec": {
-                "containers": [{
-                    "name": "app",
-                    "image": "app:test",
-                    "livenessProbe": {
-                        "exec": {"command": ["true"]}
-                    },
-                    "readinessProbe": {
-                        "grpc": {"port": 50051}
-                    }
-                }]
-            }
-        });
-        let config = test_config(true, CaptureMode::Iptables);
-        let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let commands = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container")
-            .pointer("/args/0")
-            .and_then(Value::as_str)
-            .expect("iptables plan");
-        assert!(
-            !commands.contains("--dport 50051 -j RETURN"),
-            "gRPC probes are not HTTP/TCP kubelet ports and must not be excluded:\n{commands}"
-        );
+    fn patch_rewrite_opt_out_leaves_probes_and_capture_untouched() {
+        for annotation in [
+            "ferrum.io/rewriteAppProbes",
+            "sidecar.istio.io/rewriteAppHTTPProbers",
+        ] {
+            let pod = json!({
+                "metadata": {
+                    "labels": {"ferrum.io/mesh": "enabled"},
+                    "annotations": {annotation: "false"}
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "app",
+                        "image": "app:test",
+                        "livenessProbe": {"httpGet": {"path": "/livez", "port": 8080}}
+                    }]
+                }
+            });
+            let config = test_config(true, CaptureMode::Iptables);
+            let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
+            assert!(
+                patch_value_at(&patch, "/spec/containers/0/livenessProbe").is_none(),
+                "{annotation}=false must leave the probe alone"
+            );
+            let sidecar = patch_named_container(&patch, "ferrum-edge").expect("sidecar");
+            let env = sidecar.get("env").and_then(Value::as_array).expect("env");
+            assert!(
+                !env.iter()
+                    .any(|e| e.get("name").and_then(Value::as_str) == Some(APP_PROBES_ENV)),
+                "{annotation}=false records no probe targets"
+            );
+            let commands = init_iptables_script(&patch);
+            assert!(
+                !commands.contains(&format!("--dport {DEFAULT_APP_PROBE_PORT} -j RETURN")),
+                "no probe listener is started, so nothing is excluded:\n{commands}"
+            );
+            assert!(
+                !commands.contains("--dport 8080 -j RETURN"),
+                "opting out does NOT re-introduce the application-port bypass:\n{commands}"
+            );
+        }
     }
 
     #[test]
-    fn patch_unions_probe_ports_with_explicit_inbound_exclusions() {
+    fn patch_unions_probe_port_with_explicit_inbound_exclusions() {
         let pod = json!({
             "metadata": {
                 "labels": {"ferrum.io/mesh": "enabled"},
-                "annotations": {
-                    "traffic.sidecar.istio.io/excludeInboundPorts": "22, 8080"
-                }
+                "annotations": {"traffic.sidecar.istio.io/excludeInboundPorts": "22, 8080"}
             },
             "spec": {
                 "containers": [{
                     "name": "app",
                     "image": "app:test",
-                    "livenessProbe": {
-                        "httpGet": {"path": "/livez", "port": 8080}
-                    },
-                    "readinessProbe": {
-                        "httpGet": {"path": "/readyz", "port": 9090}
-                    }
+                    "readinessProbe": {"httpGet": {"path": "/readyz", "port": 9090}}
                 }]
             }
         });
         let mut config = test_config(true, CaptureMode::Iptables);
         config.exclude_inbound_ports = vec![22, 15090];
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None).expect("patch");
-        let commands = patch_named_container(&patch, "ferrum-edge-init")
-            .expect("init container")
-            .pointer("/args/0")
-            .and_then(Value::as_str)
-            .expect("iptables plan");
-        for port in [22, 8080, 9090, 15090] {
+        let commands = init_iptables_script(&patch);
+        for port in [22, 8080, 15090, DEFAULT_APP_PROBE_PORT] {
             assert!(
                 commands.contains(&format!("--dport {port} -j RETURN")),
-                "explicit and probe exclusions must both remain for {port}:\n{commands}"
+                "operator exclusions and the probe port must both remain for {port}:\n{commands}"
             );
         }
+        assert!(
+            !commands.contains("--dport 9090 -j RETURN"),
+            "the probe's application port is NOT excluded:\n{commands}"
+        );
+    }
+
+    #[test]
+    fn patch_is_idempotent_for_a_pod_whose_probes_were_already_rewritten() {
+        let mut pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/injected": "true"}
+            },
+            "spec": {
+                "serviceAccountName": "default",
+                "containers": [{
+                    "name": "app",
+                    "image": "app:test",
+                    "readinessProbe": {"grpc": {"port": 50051}, "timeoutSeconds": 4}
+                }],
+                "initContainers": []
+            }
+        });
+        let config = test_config(true, CaptureMode::Iptables);
+        let rewrite = app_probe_rewrite_for_pod(&pod).expect("rewrite");
+        assert_eq!(rewrite.patches.len(), 1);
+        // Apply the rewrite the way the apiserver would, then inject.
+        for op in &rewrite.patches {
+            let target = pod.pointer_mut(&op.path).expect("patch target");
+            *target = op.value.clone().expect("patch value");
+        }
+        let namespace = pod_namespace(&pod, None, &config);
+        let sidecar = sidecar_container(&config, &pod, &namespace, &rewrite.probes);
+        // The apiserver applies the whole patch at once, so the persisted pod
+        // carries the sidecar (and its recorded probe originals) before anyone
+        // recomputes the init container from it. Mirror that order: the init
+        // container's probe-port exclusion is keyed on the registrations the
+        // rewrite recovers from that record.
+        pod["spec"]["initContainers"]
+            .as_array_mut()
+            .expect("initContainers")
+            .push(sidecar);
+        let init = init_container(&config, &pod).expect("init container");
+        pod["spec"]["initContainers"]
+            .as_array_mut()
+            .expect("initContainers")
+            .push(init);
+
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None)
+            .expect("reinvocation should be accepted");
+        assert!(
+            patch.is_empty(),
+            "a second admission must recompute an identical sidecar: {patch:?}"
+        );
     }
 
     #[test]

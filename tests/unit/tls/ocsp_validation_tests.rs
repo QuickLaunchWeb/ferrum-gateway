@@ -2774,3 +2774,179 @@ fn an_approved_embedded_delegate_still_signs_under_fips_enforcement() {
     .expect("an approved delegated responder is admitted under enforcement");
     assert!(acceptance.delegated_responder);
 }
+
+// ── Runtime staple re-check (issue #4505, item 4) ──────────────────────────
+
+/// A staple that has reached its `nextUpdate` while the gateway runs is
+/// retired by the periodic re-check, and the retirement reaches the wire.
+///
+/// Serving an expired response is strictly worse than serving none: a client
+/// that enforces staple validity aborts the handshake on it, whereas an absent
+/// staple falls back to that client's own revocation behaviour. Before this,
+/// nothing revisited an accepted staple — without
+/// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` the same bytes were served
+/// forever, and with live reload only a *source byte change* could replace
+/// them.
+#[test]
+fn the_periodic_recheck_drops_a_staple_that_reached_next_update() {
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A short-lived staple: valid now, expired one hour from now.
+    let issued_at = now();
+    let expires_at = issued_at + 3_600;
+    let mut builder = ResponseBuilder::new(&pki, issued_at);
+    builder.this_update = issued_at - 60;
+    builder.next_update = Some(expires_at);
+    let staple = builder.build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &staple);
+    let policy = tls_policy();
+
+    let candidate = load_frontend_tls_candidate_from_paths(
+        &cert_path,
+        &key_path,
+        None,
+        Some(&ocsp_path),
+        false,
+        &policy,
+        30,
+        // Warning window off, so this case is only about the drop.
+        0,
+        &[],
+        None,
+    )
+    .expect("a staple inside its window is admitted");
+
+    assert_eq!(
+        served_staple(Arc::clone(&candidate.config), "localhost", b"h2"),
+        staple,
+        "the accepted staple must be served before nextUpdate"
+    );
+
+    // One second before the deadline nothing changes: a re-check must not
+    // retire material that is still valid.
+    let kept = ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(
+        expires_at - 1,
+        Some(ocsp_path.as_str()),
+    );
+    assert_eq!(kept.dropped, 0, "a staple inside its window is kept");
+    assert_eq!(kept.tracked, 1, "and stays tracked for the next pass");
+    assert_eq!(
+        served_staple(Arc::clone(&candidate.config), "localhost", b"h2"),
+        staple,
+        "a kept staple keeps reaching the wire"
+    );
+
+    // At the deadline it is retired, on the very `ServerConfig` the listener
+    // already holds — no rebuild, so this works with live reload off.
+    let dropped =
+        ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(expires_at, Some(ocsp_path.as_str()));
+    assert_eq!(dropped.dropped, 1, "the expired staple is dropped");
+    assert_eq!(
+        dropped.tracked, 0,
+        "and is no longer tracked: a refreshed response arrives as a new registration"
+    );
+    assert!(
+        served_staple(Arc::clone(&candidate.config), "localhost", b"h2").is_empty(),
+        "the served certificate must carry no staple after the re-check"
+    );
+
+    // Idempotent: a second pass has nothing left to do.
+    let again = ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(
+        expires_at + 86_400,
+        Some(ocsp_path.as_str()),
+    );
+    assert_eq!(again.dropped, 0);
+}
+
+/// The drop is a serving-state fact the TLS inventory has to report: the
+/// operator's stale bytes are still on disk, so reading the source would keep
+/// advertising a deadline for material nothing staples. Because the
+/// `ferrum_tls_revocation_expiry_seconds{kind="ocsp"}` row is derived from
+/// `TlsInventoryEntry::next_update`, clearing that field is also what makes the
+/// row disappear.
+#[test]
+fn a_dropped_staple_is_reported_by_the_tls_inventory_without_a_deadline() {
+    use ferrum_edge::tls::inventory::{InventoryScope, TlsInventory, TlsInventoryState};
+
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let issued_at = now();
+    let expires_at = issued_at + 3_600;
+    let mut builder = ResponseBuilder::new(&pki, issued_at);
+    builder.this_update = issued_at - 60;
+    builder.next_update = Some(expires_at);
+    let staple = builder.build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &staple);
+    let policy = tls_policy();
+
+    let env_config = EnvConfig {
+        frontend_tls_cert_path: Some(cert_path.clone()),
+        frontend_tls_key_path: Some(key_path.clone()),
+        frontend_tls_ocsp_response_source: Some(ocsp_path.clone()),
+        ..EnvConfig::default()
+    };
+
+    let _candidate = load_frontend_tls_candidate_from_paths(
+        &cert_path,
+        &key_path,
+        None,
+        Some(&ocsp_path),
+        false,
+        &policy,
+        30,
+        0,
+        &[],
+        None,
+    )
+    .expect("a staple inside its window is admitted");
+
+    let ocsp_entry = |inventory: &TlsInventory| {
+        inventory
+            .entries
+            .iter()
+            .find(|entry| entry.material_kind == "ocsp")
+            .cloned()
+            .expect("the configured OCSP source has an inventory entry")
+    };
+
+    let before = ocsp_entry(&TlsInventory::collect_with_scope(
+        Some(&env_config),
+        None,
+        InventoryScope::Full,
+    ));
+    assert!(matches!(before.state, TlsInventoryState::Loaded));
+    assert_eq!(
+        before.next_update.map(|at| at.timestamp()),
+        Some(expires_at),
+        "a served staple reports its deadline"
+    );
+
+    assert_eq!(
+        ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(expires_at, Some(ocsp_path.as_str()))
+            .dropped,
+        1
+    );
+
+    let after = ocsp_entry(&TlsInventory::collect_with_scope(
+        Some(&env_config),
+        None,
+        InventoryScope::Full,
+    ));
+    assert!(
+        matches!(after.state, TlsInventoryState::Invalid),
+        "a retired staple is not a healthy entry: {:?}",
+        after.state
+    );
+    assert!(
+        after
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("dropped at runtime")),
+        "the entry must say why: {:?}",
+        after.error
+    );
+    assert!(
+        after.next_update.is_none() && after.days_until_next_update.is_none(),
+        "no deadline may be reported for material that is no longer stapled"
+    );
+}

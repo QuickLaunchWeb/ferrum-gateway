@@ -346,10 +346,12 @@ fn admission_denied_message(pod: Value) -> String {
         .to_string()
 }
 
-/// Issue #4431: kubelet HTTP probe ports are inbound-excluded so a liveness
-/// probe to the Pod IP is not redirected onto Ferrum's service-host routes.
+/// Issues #4431 / #4533: kubelet application probes are REWRITTEN to the
+/// sidecar's own probe port and re-run against loopback. No application port
+/// is excluded from inbound capture — a destination-port-wide `RETURN` for an
+/// app port would also let ordinary Service / Pod-IP traffic bypass the mesh.
 #[test]
-fn admission_excludes_named_and_numeric_http_probe_ports() {
+fn admission_rewrites_application_probes_to_the_sidecar_probe_port() {
     let pod = json!({
         "metadata": {
             "labels": {"ferrum.io/mesh": "enabled"}
@@ -364,7 +366,7 @@ fn admission_excludes_named_and_numeric_http_probe_ports() {
                     "httpGet": {"path": "/livez", "port": "http"}
                 },
                 "readinessProbe": {
-                    "httpGet": {"path": "/readyz", "port": 9090}
+                    "grpc": {"port": 9090}
                 },
                 "startupProbe": {
                     "exec": {"command": ["true"]}
@@ -372,14 +374,107 @@ fn admission_excludes_named_and_numeric_http_probe_ports() {
             }]
         }
     });
-    let script = init_container_script(&injected_patch_ops(pod, |_| {}));
+    let ops = injected_patch_ops(pod, |_| {});
+
+    for (path, expected_probe_path) in [
+        (
+            "/spec/containers/0/livenessProbe",
+            "/app-probe/app/livenessProbe",
+        ),
+        (
+            "/spec/containers/0/readinessProbe",
+            "/app-probe/app/readinessProbe",
+        ),
+    ] {
+        let rewritten = ops
+            .iter()
+            .find(|op| op.pointer("/path").and_then(Value::as_str) == Some(path))
+            .and_then(|op| op.get("value"))
+            .unwrap_or_else(|| panic!("no rewrite emitted for {path}"));
+        assert_eq!(
+            rewritten.pointer("/httpGet/path").and_then(Value::as_str),
+            Some(expected_probe_path)
+        );
+        assert_eq!(
+            rewritten.pointer("/httpGet/port").and_then(Value::as_u64),
+            Some(15020)
+        );
+    }
     assert!(
-        script.contains("--dport 8080 -j RETURN"),
-        "named http probe port must resolve and be excluded:\n{script}"
+        !ops.iter()
+            .any(|op| op.pointer("/path").and_then(Value::as_str)
+                == Some("/spec/containers/0/startupProbe")),
+        "exec probes are not captured and must not be rewritten"
+    );
+
+    // The originals — with the named port resolved — reach the sidecar.
+    let recorded = sidecar_env_value(&ops, "FERRUM_MESH_APP_PROBES").expect("recorded probes");
+    let recorded: Value = serde_json::from_str(recorded).expect("probe JSON");
+    assert_eq!(
+        recorded["app/livenessProbe"]["httpGet"]["port"]
+            .as_u64()
+            .expect("resolved named port"),
+        8080
+    );
+    assert_eq!(
+        recorded["app/readinessProbe"]["grpc"]["port"]
+            .as_u64()
+            .expect("grpc probe port"),
+        9090,
+        "a gRPC probe port is a real TCP port kubelet dials, and is rewritten like any other"
+    );
+    assert_eq!(
+        sidecar_env_value(&ops, "FERRUM_MESH_APP_PROBE_PORT"),
+        Some("15020")
+    );
+
+    let script = init_container_script(&ops);
+    assert!(
+        script.contains("-p tcp --dport 15020 -j RETURN"),
+        "the sidecar's own TCP probe port must be excluded:\n{script}"
     );
     assert!(
-        script.contains("--dport 9090 -j RETURN"),
-        "numeric HTTP probe port must be excluded:\n{script}"
+        !script.contains("-p udp --dport 15020 -j RETURN"),
+        "the TCP-only probe server must not create a UDP capture bypass:\n{script}"
+    );
+    for port in [8080, 9090] {
+        assert!(
+            !script.contains(&format!("--dport {port} -j RETURN")),
+            "application port {port} must stay captured:\n{script}"
+        );
+    }
+}
+
+#[test]
+fn admission_keeps_unowned_pre_rewritten_probe_port_captured() {
+    // A probe that merely LOOKS rewritten — the sidecar's path shape on the
+    // probe port, but no recorded original for the sidecar to serve — must not
+    // unlock the probe-port exclusion: nothing in the sidecar will answer on
+    // 15020, so an application that binds it would sit outside mesh capture.
+    let pod = json!({
+        "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+        "spec": {
+            "serviceAccountName": "api",
+            "containers": [{
+                "name": "app",
+                "image": "app:test",
+                "readinessProbe": {
+                    "httpGet": {
+                        "path": "/app-probe/app/readinessProbe",
+                        "port": 15020
+                    }
+                }
+            }]
+        }
+    });
+    let ops = injected_patch_ops(pod, |_| {});
+
+    assert_eq!(sidecar_env_value(&ops, "FERRUM_MESH_APP_PROBES"), None);
+    assert_eq!(sidecar_env_value(&ops, "FERRUM_MESH_APP_PROBE_PORT"), None);
+    let script = init_container_script(&ops);
+    assert!(
+        !script.contains("--dport 15020 -j RETURN"),
+        "an application may own an unregistered probe port, so it must stay captured:\n{script}"
     );
 }
 

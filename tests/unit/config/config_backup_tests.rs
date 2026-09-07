@@ -28,7 +28,7 @@ fn test_load_config_backup_valid_json() {
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let loaded = load_config_backup(&path)
+    let loaded = load_config_backup(&path, "ferrum")
         .expect("valid backup must succeed")
         .expect("valid backup must return Some");
     assert_eq!(loaded.proxies.len(), 1);
@@ -40,7 +40,7 @@ fn test_load_config_backup_valid_json() {
 
 #[test]
 fn test_load_config_backup_file_not_found() {
-    let result = load_config_backup("/tmp/nonexistent-ferrum-backup-12345.json")
+    let result = load_config_backup("/tmp/nonexistent-ferrum-backup-12345.json", "ferrum")
         .expect("missing file is Ok(None), not Err");
     assert!(result.is_none(), "should return None for missing file");
 }
@@ -48,7 +48,8 @@ fn test_load_config_backup_file_not_found() {
 #[test]
 fn test_load_config_backup_invalid_json() {
     let (_tmp, path) = write_tmp_file("{ not valid json }}}");
-    let err = load_config_backup(&path).expect_err("invalid JSON must be Err, not Ok(None)");
+    let err =
+        load_config_backup(&path, "ferrum").expect_err("invalid JSON must be Err, not Ok(None)");
     let msg = err.to_string();
     assert!(
         msg.contains("Failed to parse config backup"),
@@ -64,6 +65,7 @@ fn test_load_config_backup_read_failure_is_not_missing() {
             .path()
             .to_str()
             .expect("temporary directory path must be UTF-8"),
+        "ferrum",
     )
     .expect_err("a configured path that cannot be read as a file must be Err");
     let msg = err.to_string();
@@ -84,7 +86,7 @@ fn test_load_config_backup_empty_config() {
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let loaded = load_config_backup(&path)
+    let loaded = load_config_backup(&path, "ferrum")
         .expect("empty valid backup must succeed")
         .expect("empty valid backup must return Some");
     assert!(loaded.proxies.is_empty());
@@ -113,7 +115,7 @@ fn test_load_config_backup_stream_proxy_has_no_listen_path() {
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let loaded = load_config_backup(&path)
+    let loaded = load_config_backup(&path, "ferrum")
         .expect("stream proxy backup must succeed")
         .expect("stream proxy backup must return Some");
     assert_eq!(
@@ -124,13 +126,16 @@ fn test_load_config_backup_stream_proxy_has_no_listen_path() {
 }
 
 #[test]
-fn test_load_config_backup_preserves_multiple_resources() {
+fn test_load_config_backup_preserves_every_resource_in_the_active_namespace() {
+    // The loader filters to the serving namespace, so this asserts the other
+    // half of that contract: nothing the active namespace owns is dropped.
     let json = r#"{
         "version": "1",
         "proxies": [
             {
                 "id": "p1",
                 "name": "proxy-one",
+                "namespace": "tenant-a",
                 "listen_path": "/one",
                 "backend_host": "host1",
                 "backend_port": 3000,
@@ -139,6 +144,7 @@ fn test_load_config_backup_preserves_multiple_resources() {
             {
                 "id": "p2",
                 "name": "proxy-two",
+                "namespace": "tenant-a",
                 "listen_path": "/two",
                 "backend_host": "host2",
                 "backend_port": 3001,
@@ -148,22 +154,32 @@ fn test_load_config_backup_preserves_multiple_resources() {
         "consumers": [{
             "id": "c1",
             "username": "user1",
-            "custom_id": "cust1"
+            "custom_id": "cust1",
+            "namespace": "tenant-a"
         }],
-        "plugin_configs": [],
+        "plugin_configs": [{
+            "id": "pc1",
+            "plugin_name": "key_auth",
+            "namespace": "tenant-a",
+            "scope": "global",
+            "config": {},
+            "enabled": false
+        }],
         "upstreams": [{
             "id": "u1",
             "name": "upstream-1",
+            "namespace": "tenant-a",
             "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
         }]
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let loaded = load_config_backup(&path)
+    let loaded = load_config_backup(&path, "tenant-a")
         .expect("multi-resource backup must succeed")
         .expect("multi-resource backup must return Some");
     assert_eq!(loaded.proxies.len(), 2);
     assert_eq!(loaded.consumers.len(), 1);
+    assert_eq!(loaded.plugin_configs.len(), 1);
     assert_eq!(loaded.upstreams.len(), 1);
     assert_eq!(loaded.consumers[0].username, "user1");
     assert_eq!(loaded.upstreams[0].name, Some("upstream-1".into()));
@@ -172,7 +188,8 @@ fn test_load_config_backup_preserves_multiple_resources() {
 #[test]
 fn test_load_config_backup_empty_file() {
     let (_tmp, path) = write_tmp_file("");
-    let err = load_config_backup(&path).expect_err("empty file must be Err, not Ok(None)");
+    let err =
+        load_config_backup(&path, "ferrum").expect_err("empty file must be Err, not Ok(None)");
     let msg = err.to_string();
     assert!(
         msg.contains("Failed to parse config backup"),
@@ -198,7 +215,7 @@ fn test_load_config_backup_rejects_invalid_regex_listen_path() {
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let err = load_config_backup(&path).expect_err("invalid regex must reject backup");
+    let err = load_config_backup(&path, "ferrum").expect_err("invalid regex must reject backup");
     let msg = err.to_string();
     assert!(
         msg.contains("failed runtime validation"),
@@ -238,7 +255,8 @@ fn test_load_config_backup_rejects_duplicate_listen_path() {
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let err = load_config_backup(&path).expect_err("duplicate listen path must reject backup");
+    let err =
+        load_config_backup(&path, "ferrum").expect_err("duplicate listen path must reject backup");
     let msg = err.to_string();
     assert!(
         msg.contains("failed runtime validation"),
@@ -269,7 +287,8 @@ fn test_load_config_backup_rejects_dangling_upstream_reference() {
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let err = load_config_backup(&path).expect_err("dangling upstream_id must reject backup");
+    let err =
+        load_config_backup(&path, "ferrum").expect_err("dangling upstream_id must reject backup");
     let msg = err.to_string();
     assert!(
         msg.contains("failed runtime validation"),
@@ -295,7 +314,7 @@ fn test_load_config_backup_accepts_current_version_integer_form() {
     );
 
     let (_tmp, path) = write_tmp_file(&json);
-    let loaded = load_config_backup(&path)
+    let loaded = load_config_backup(&path, "ferrum")
         .expect("integer current version must succeed")
         .expect("integer current version must return Some");
     assert_eq!(loaded.version, CURRENT_CONFIG_VERSION);
@@ -312,7 +331,8 @@ fn test_load_config_backup_rejects_unsupported_version() {
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let err = load_config_backup(&path).expect_err("unsupported version must reject backup");
+    let err =
+        load_config_backup(&path, "ferrum").expect_err("unsupported version must reject backup");
     let msg = err.to_string();
     assert!(
         msg.contains("version")
@@ -331,7 +351,7 @@ fn test_load_config_backup_rejects_missing_version() {
     }"#;
 
     let (_tmp, path) = write_tmp_file(json);
-    let err = load_config_backup(&path).expect_err("missing version must reject backup");
+    let err = load_config_backup(&path, "ferrum").expect_err("missing version must reject backup");
     let msg = err.to_string();
     assert!(
         msg.contains("version"),
@@ -365,7 +385,7 @@ fn backup_bootstrap_uses_rejecting_runtime_contract_not_node_local_files() {
 
     let database = include_str!("../../../src/modes/database.rs");
     let backup_start = database
-        .find("match load_config_backup(path)")
+        .find("match load_config_backup(path, &env_config.namespace)")
         .expect("database mode must call load_config_backup");
     let reserved_ports = database[backup_start..]
         .find("validate_stream_proxy_port_conflicts")
@@ -378,5 +398,308 @@ fn backup_bootstrap_uses_rejecting_runtime_contract_not_node_local_files() {
     assert!(
         database[backup_start..reserved_ports].contains("was rejected"),
         "database mode must surface actionable backup rejection errors"
+    );
+}
+
+/// Two-namespace backup fixture: an all-namespace administrative export of the
+/// kind an operator can legitimately provision as `FERRUM_DB_CONFIG_BACKUP_PATH`.
+///
+/// `tenant-a` and `tenant-b` deliberately collide on `listen_path`, proxy name
+/// and upstream name, because those are `(namespace, value)`-scoped everywhere
+/// else: the collision must not reject the candidate for either namespace.
+///
+/// The plugin configs are `enabled: false` so the fixture exercises the
+/// namespace projection without also dragging in the plugin-construction gate,
+/// which is covered by its own tests.
+const TWO_NAMESPACE_BACKUP: &str = r#"{
+    "version": "1",
+    "known_namespaces": ["tenant-a", "tenant-b"],
+    "proxies": [
+        {
+            "id": "proxy-a",
+            "name": "shared-name",
+            "namespace": "tenant-a",
+            "listen_path": "/shared",
+            "backend_host": "a.internal",
+            "backend_port": 8080,
+            "backend_scheme": "http"
+        },
+        {
+            "id": "proxy-b",
+            "name": "shared-name",
+            "namespace": "tenant-b",
+            "listen_path": "/shared",
+            "backend_host": "b.internal",
+            "backend_port": 8080,
+            "backend_scheme": "http"
+        }
+    ],
+    "consumers": [
+        {
+            "id": "consumer-a",
+            "username": "alice",
+            "namespace": "tenant-a",
+            "credentials": {"keyauth": {"key": "key-alpha"}}
+        },
+        {
+            "id": "consumer-b",
+            "username": "bob",
+            "namespace": "tenant-b",
+            "credentials": {"keyauth": {"key": "key-bravo"}}
+        }
+    ],
+    "plugin_configs": [
+        {
+            "id": "plugin-a",
+            "plugin_name": "key_auth",
+            "namespace": "tenant-a",
+            "scope": "global",
+            "config": {},
+            "enabled": false
+        },
+        {
+            "id": "plugin-b",
+            "plugin_name": "key_auth",
+            "namespace": "tenant-b",
+            "scope": "global",
+            "config": {},
+            "enabled": false
+        }
+    ],
+    "upstreams": [
+        {
+            "id": "upstream-a",
+            "name": "shared-upstream",
+            "namespace": "tenant-a",
+            "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+        },
+        {
+            "id": "upstream-b",
+            "name": "shared-upstream",
+            "namespace": "tenant-b",
+            "targets": [{"host": "10.0.0.2", "port": 8080, "weight": 100}]
+        }
+    ]
+}"#;
+
+#[test]
+fn multi_namespace_backup_serves_only_the_configured_namespace() {
+    let (_tmp, path) = write_tmp_file(TWO_NAMESPACE_BACKUP);
+    let loaded = load_config_backup(&path, "tenant-a")
+        .expect("a multi-namespace export must be a usable startup backup")
+        .expect("existing backup must return Some");
+
+    assert_eq!(loaded.proxies.len(), 1, "one namespace's proxies only");
+    assert_eq!(loaded.proxies[0].id, "proxy-a");
+    assert_eq!(loaded.consumers.len(), 1);
+    assert_eq!(loaded.consumers[0].id, "consumer-a");
+    assert_eq!(loaded.plugin_configs.len(), 1);
+    assert_eq!(loaded.plugin_configs[0].id, "plugin-a");
+    assert_eq!(loaded.upstreams.len(), 1);
+    assert_eq!(loaded.upstreams[0].id, "upstream-a");
+    assert!(
+        loaded.gateway_trust_bundles.is_empty(),
+        "trust material is never carried by a backup file"
+    );
+
+    // The foreign tenant's credential must not be reachable at all.
+    let serialized = serde_json::to_string(&loaded).expect("candidate must serialize");
+    assert!(
+        !serialized.contains("key-bravo") && !serialized.contains("bob"),
+        "no tenant-b consumer or credential may survive the filter"
+    );
+    assert!(
+        !serialized.contains("b.internal") && !serialized.contains("10.0.0.2"),
+        "no tenant-b backend or upstream target may survive the filter"
+    );
+
+    // The discovered namespace set is a count-only diagnostic; it must never be
+    // served back as this gateway's namespace list.
+    assert_eq!(loaded.known_namespaces, vec!["tenant-a".to_string()]);
+}
+
+#[test]
+fn multi_namespace_backup_serves_the_other_namespace_symmetrically() {
+    let (_tmp, path) = write_tmp_file(TWO_NAMESPACE_BACKUP);
+    let loaded = load_config_backup(&path, "tenant-b")
+        .expect("the same file must load for either namespace")
+        .expect("existing backup must return Some");
+
+    assert_eq!(loaded.proxies.len(), 1);
+    assert_eq!(loaded.proxies[0].id, "proxy-b");
+    assert_eq!(loaded.consumers.len(), 1);
+    assert_eq!(loaded.consumers[0].id, "consumer-b");
+    assert_eq!(loaded.upstreams.len(), 1);
+    assert_eq!(loaded.upstreams[0].id, "upstream-b");
+}
+
+#[test]
+fn cross_namespace_duplicate_listen_paths_do_not_reject_the_backup() {
+    // Before the projection existed this file rejected outright: the
+    // cross-resource validators saw two proxies on `/shared`. Filtering first is
+    // what makes a legitimate all-namespace export usable.
+    let (_tmp, path) = write_tmp_file(TWO_NAMESPACE_BACKUP);
+    let loaded = load_config_backup(&path, "tenant-a")
+        .expect("cross-namespace duplicates must not reject the candidate")
+        .expect("existing backup must return Some");
+    assert_eq!(loaded.proxies[0].listen_path.as_deref(), Some("/shared"));
+}
+
+#[test]
+fn duplicate_listen_paths_inside_the_active_namespace_still_reject() {
+    let json = r#"{
+        "version": "1",
+        "proxies": [
+            {
+                "id": "p1",
+                "name": "proxy-one",
+                "namespace": "tenant-a",
+                "listen_path": "/same",
+                "backend_host": "host1",
+                "backend_port": 3000,
+                "backend_scheme": "http"
+            },
+            {
+                "id": "p2",
+                "name": "proxy-two",
+                "namespace": "tenant-a",
+                "listen_path": "/same",
+                "backend_host": "host2",
+                "backend_port": 3001,
+                "backend_scheme": "http"
+            },
+            {
+                "id": "p3",
+                "name": "proxy-three",
+                "namespace": "tenant-b",
+                "listen_path": "/same",
+                "backend_host": "host3",
+                "backend_port": 3002,
+                "backend_scheme": "http"
+            }
+        ],
+        "consumers": [],
+        "plugin_configs": [],
+        "upstreams": []
+    }"#;
+
+    let (_tmp, path) = write_tmp_file(json);
+    let err = load_config_backup(&path, "tenant-a")
+        .expect_err("a duplicate inside the active namespace must still reject");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed runtime validation"),
+        "must surface runtime validation, got: {msg}"
+    );
+    assert!(
+        !msg.contains("proxy-three") && !msg.contains("host3"),
+        "the rejection must not name another tenant's resources, got: {msg}"
+    );
+}
+
+#[test]
+fn backup_with_no_resources_in_the_active_namespace_is_empty_but_valid() {
+    let (_tmp, path) = write_tmp_file(TWO_NAMESPACE_BACKUP);
+    let loaded = load_config_backup(&path, "tenant-c")
+        .expect("an unknown namespace must not be an error")
+        .expect("existing backup must return Some");
+
+    assert!(loaded.proxies.is_empty());
+    assert!(loaded.consumers.is_empty());
+    assert!(loaded.plugin_configs.is_empty());
+    assert!(loaded.upstreams.is_empty());
+    assert_eq!(
+        loaded.known_namespaces,
+        vec!["tenant-c".to_string()],
+        "a namespace with nothing in the file must never inherit a foreign one"
+    );
+}
+
+#[test]
+fn backup_load_without_a_serving_namespace_fails_closed() {
+    let (_tmp, path) = write_tmp_file(TWO_NAMESPACE_BACKUP);
+    let err = load_config_backup(&path, "")
+        .expect_err("an empty serving namespace must be a startup error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("serving namespace") && msg.contains("FERRUM_NAMESPACE"),
+        "the failure must be actionable, got: {msg}"
+    );
+}
+
+#[test]
+fn backup_rejection_text_never_carries_the_payload_or_foreign_names() {
+    // A backup that is runtime-fatal for the ACTIVE namespace: the error must
+    // describe that failure without echoing the file or the other tenant.
+    let json = r#"{
+        "version": "1",
+        "proxies": [
+            {
+                "id": "p1",
+                "name": "proxy-one",
+                "namespace": "tenant-a",
+                "listen_path": "/api",
+                "backend_host": "localhost",
+                "backend_port": 3000,
+                "backend_scheme": "http",
+                "upstream_id": "missing-upstream"
+            }
+        ],
+        "consumers": [
+            {
+                "id": "consumer-b",
+                "username": "bob",
+                "namespace": "tenant-b",
+                "credentials": {"keyauth": {"key": "key-bravo"}}
+            }
+        ],
+        "plugin_configs": [],
+        "upstreams": [
+            {
+                "id": "upstream-b",
+                "name": "secret-upstream",
+                "namespace": "tenant-b",
+                "targets": [{"host": "10.0.0.2", "port": 8080, "weight": 100}]
+            }
+        ]
+    }"#;
+
+    let (_tmp, path) = write_tmp_file(json);
+    let err = load_config_backup(&path, "tenant-a").expect_err("dangling reference must reject");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed runtime validation"),
+        "must surface runtime validation, got: {msg}"
+    );
+    // Deliberately excludes short tokens like the username: the message embeds
+    // the randomly named temporary backup path, and a 3-character needle could
+    // match it by chance. The distinctive tokens below cannot.
+    for forbidden in ["key-bravo", "secret-upstream", "10.0.0.2", "tenant-b"] {
+        assert!(
+            !msg.contains(forbidden),
+            "backup rejection leaked '{forbidden}': {msg}"
+        );
+    }
+}
+
+#[test]
+fn backup_bootstrap_projects_the_namespace_before_it_validates() {
+    // Ordering is the whole point: filtering after validation would reject a
+    // legitimate multi-namespace export on a cross-namespace duplicate, and
+    // filtering after the return would serve another tenant's resources.
+    let source = include_str!("../../../src/config/config_backup.rs");
+    let filter = source
+        .find("retain_namespace(config, namespace, NamespaceRetention::SERVING)")
+        .expect("the backup loader must project onto the serving namespace");
+    let validate = source
+        .find("collect_rejecting_runtime_config_errors(&config)")
+        .expect("the backup loader must run the rejecting runtime contract");
+    assert!(
+        filter < validate,
+        "the namespace projection must run before the rejecting runtime contract"
+    );
+    assert!(
+        source.contains("fn load_config_backup(\n    path: &str,\n    namespace: &str,\n)"),
+        "the backup loader must require a serving namespace argument"
     );
 }

@@ -46,7 +46,7 @@ For H1/H2 frontend requests, that loop is transport-neutral across mixed plain, 
 
 gRPC retries handle connection-level failures (connect refused, timeout, DNS, TLS, and pooled-sender dispatch cancellations where hyper proves the request never left the client) by buffering the request body and replaying it against alternative upstream targets. Read timeouts and gRPC application-level errors (e.g., UNAVAILABLE status in trailers) are not retried because the request was already sent to the backend.
 
-A client `grpc-timeout` is anchored once at request receipt into an absolute monotonic deadline (independent of whether the `grpc_deadline` plugin is installed). Plugins, request-body collection, pool/client acquisition, backoff, response headers, and body reads all consume that same Instant. Native gRPC and pass-through gRPC-Web dispatch each forward a decremented remaining `grpc-timeout` on every attempt rather than re-arming the original relative header. Retry attempts also reuse the real collected `HeaderMap` so duplicate metadata lines and opaque field values stay byte-identical to attempt 1.
+A client `grpc-timeout` is anchored once at request receipt into an absolute monotonic deadline (independent of whether the `grpc_deadline` plugin is installed). Plugins, request-body collection, pool/client acquisition, backoff, response headers, and body reads all consume that same Instant. Native gRPC and pass-through gRPC-Web dispatch each forward a decremented remaining `grpc-timeout` on every attempt rather than re-arming the original relative header. Native H3 computes it after QUIC/H3 pool acquisition immediately before request HEADERS construction, including replacement of a failed cached connection. Retry attempts also reuse the real collected `HeaderMap` so duplicate metadata lines and opaque field values stay byte-identical to attempt 1.
 
 WebSocket retries handle connection-level failures during the initial backend connection attempt (before the upgrade response — 101 Switching Protocols for HTTP/1.1, 200 OK for HTTP/2 Extended CONNECT). Once the WebSocket connection is established, retries no longer apply — the bidirectional stream is managed by the application layer.
 
@@ -333,3 +333,7 @@ This is equivalent to the minimal configuration since `retryable_status_codes` d
 - `retryable_methods` must contain valid HTTP methods (GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, TRACE)
 - For exponential backoff, `base_ms` must not exceed `max_ms`
 - `delay_ms` (fixed) and `max_ms` (exponential) must not exceed 300,000ms (5 minutes)
+
+### TCP passthrough connection retries
+
+TCP passthrough honors `retry_on_connect_failure` and `max_retries` for DNS, circuit-breaker admission, per-target connection-cap admission, and plain TCP connect failures. Each retry uses the existing healthy-target selection and mesh enforcement, preserves the original stream authorization deadline, and updates connection accounting for the selected target. ClientHello peeking and stream-connect plugins run once; outbound PROXY framing and encrypted client bytes are forwarded only after connection setup succeeds. No retry occurs after outbound framing or relay begins.

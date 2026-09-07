@@ -2286,10 +2286,12 @@ impl DatabaseStore {
         operation: &str,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<ProxyPluginAssociations, anyhow::Error> {
-        let sql = self.q("SELECT pp.proxy_id, pp.plugin_config_id \
-             FROM proxy_plugins pp \
-             INNER JOIN proxies p ON pp.proxy_id = p.id \
-             WHERE p.namespace = ?");
+        // `proxy_plugins` carries its own `namespace` column and keys on
+        // `(namespace, proxy_id, plugin_config_id)` (issue #4627), so the
+        // junction is read directly instead of joining `proxies` for the
+        // tenant predicate.
+        let sql =
+            self.q("SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE namespace = ?");
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
             .fetch_all(&mut **tx)
@@ -2307,6 +2309,7 @@ impl DatabaseStore {
 
     async fn load_proxy_plugin_associations_for_proxy_ids(
         &self,
+        namespace: &str,
         proxy_ids: &[String],
         operation: &str,
         use_primary: bool,
@@ -2320,12 +2323,20 @@ impl DatabaseStore {
         } else {
             self.rpool()
         };
-        self.load_proxy_plugin_associations_for_proxy_ids_from_pool(proxy_ids, operation, &pool)
-            .await
+        self.load_proxy_plugin_associations_for_proxy_ids_from_pool(
+            namespace, proxy_ids, operation, &pool,
+        )
+        .await
     }
 
+    /// Load junction rows for `proxy_ids` **within `namespace`**.
+    ///
+    /// The namespace predicate is load-bearing (issue #4627): proxy ids are
+    /// only unique per tenant, so a bare-id `IN (...)` would pull another
+    /// tenant's associations into this tenant's proxies.
     async fn load_proxy_plugin_associations_for_proxy_ids_from_pool(
         &self,
+        namespace: &str,
         proxy_ids: &[String],
         operation: &str,
         pool: &AnyPool,
@@ -2340,10 +2351,11 @@ impl DatabaseStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = self.q(&format!(
-                "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
+                "SELECT proxy_id, plugin_config_id FROM proxy_plugins \
+                 WHERE namespace = ? AND proxy_id IN ({})",
                 placeholders
             ));
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(&sql).bind(namespace);
             for id in chunk {
                 query = query.bind(id);
             }
@@ -2681,6 +2693,36 @@ impl DatabaseStore {
             )
             .validate_hosts(ValidationAction::Warn)
             .run()?;
+
+        // Serving-mode repairability (issue #4526): plugin construction is the
+        // real schema gate for most plugins, and a stored row that no serving
+        // mode can construct used to abort `database` mode startup at
+        // `ProxyState::new` — before the admin listener bound — so the operator
+        // could not delete it in-band. Quarantine those rows here instead, so
+        // the process starts with the plugin omitted and the offending row
+        // still readable and deletable through the admin API. CP loads keep
+        // rejecting: an unconstructible row must never be broadcast.
+        if matches!(purpose, FullConfigLoadPurpose::Runtime) {
+            let quarantined =
+                crate::config::validation_pipeline::quarantine_unconstructible_plugin_configs(
+                    &mut config,
+                );
+            for message in &quarantined {
+                error!(
+                    "Database config: quarantined unconstructible plugin config — {}",
+                    message
+                );
+            }
+            if !quarantined.is_empty() {
+                error!(
+                    "Quarantined {} plugin config(s) during full config load; serving without \
+                     them and publishing config_rejected so they can be repaired through the \
+                     admin API",
+                    quarantined.len()
+                );
+            }
+            config.quarantined_plugin_configs = quarantined;
+        }
 
         let validation_errors = collect_rejecting_runtime_config_errors(&config);
         if !validation_errors.is_empty() {
@@ -3451,9 +3493,11 @@ impl DatabaseStore {
 
         // Persist plugin associations in the junction table
         for assoc in &proxy.plugins {
-            sqlx::query(
-                &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
-            )
+            sqlx::query(&self.q(
+                "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+                 VALUES (?, ?, ?)",
+            ))
+            .bind(&proxy.namespace)
             .bind(&proxy.id)
             .bind(&assoc.plugin_config_id)
             .execute(&mut *tx)
@@ -3578,15 +3622,18 @@ impl DatabaseStore {
         .await?;
 
         // Update plugin associations: remove old, insert new
-        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id = ?"))
+        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
+            .bind(&proxy.namespace)
             .bind(&proxy.id)
             .execute(&mut *tx)
             .await?;
 
         for assoc in &proxy.plugins {
-            sqlx::query(
-                &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
-            )
+            sqlx::query(&self.q(
+                "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+                 VALUES (?, ?, ?)",
+            ))
+            .bind(&proxy.namespace)
             .bind(&proxy.id)
             .bind(&assoc.plugin_config_id)
             .execute(&mut *tx)
@@ -3656,11 +3703,13 @@ impl DatabaseStore {
         };
         let upstream_id: Option<String> = proxy_row.try_get::<String, _>("upstream_id").ok();
 
-        let spec_row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id, namespace FROM api_specs WHERE proxy_id = ?"))
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let spec_row: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT id, namespace FROM api_specs WHERE namespace = ? AND proxy_id = ?"),
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let spec_owner: Option<(String, String)> = spec_row
             .as_ref()
             .map(|row| Ok::<_, anyhow::Error>((row.try_get("id")?, row.try_get("namespace")?)))
@@ -3669,18 +3718,22 @@ impl DatabaseStore {
             self.ensure_no_external_spec_upstream_refs_tx(&mut tx, spec_namespace, spec_id, id)
                 .await?;
         }
-        let proxy_scoped_plugin_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT id, namespace FROM plugin_configs WHERE proxy_id = ?"))
-                .bind(id)
-                .fetch_all(&mut *tx)
-                .await?;
+        let proxy_scoped_plugin_rows: Vec<AnyRow> = sqlx::query(
+            &self
+                .q("SELECT id, namespace FROM plugin_configs WHERE namespace = ? AND proxy_id = ?"),
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
         let proxy_scoped_plugins: Vec<(String, String)> = proxy_scoped_plugin_rows
             .iter()
             .map(|row| Ok::<_, anyhow::Error>((row.try_get("id")?, row.try_get("namespace")?)))
             .collect::<Result<_, _>>()?;
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
-        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id = ?"))
+        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
+            .bind(namespace)
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -3786,7 +3839,8 @@ impl DatabaseStore {
         let orphaned_configs: Vec<(String, String)> = sqlx::query(&self.q(
             "SELECT pc.id, pc.namespace FROM plugin_configs pc \
                  WHERE pc.scope = 'proxy_group' AND pc.namespace = ? \
-                 AND NOT EXISTS (SELECT 1 FROM proxy_plugins pp WHERE pp.plugin_config_id = pc.id)",
+                 AND NOT EXISTS (SELECT 1 FROM proxy_plugins pp \
+                     WHERE pp.namespace = pc.namespace AND pp.plugin_config_id = pc.id)",
         ))
         .bind(namespace)
         .fetch_all(&mut **tx)
@@ -3930,7 +3984,7 @@ impl DatabaseStore {
 
         let proxy_ids = [id.to_string()];
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_proxy_ids(&proxy_ids, operation, true)
+            .load_proxy_plugin_associations_for_proxy_ids(namespace, &proxy_ids, operation, true)
             .await?;
         let plugins = plugins_by_proxy.remove(id).unwrap_or_default();
         Self::ensure_no_unmatched_proxy_plugin_associations(operation, &plugins_by_proxy)?;
@@ -4156,6 +4210,120 @@ impl DatabaseStore {
         result
     }
 
+    /// Reconcile the `proxy_plugins` junction for a proxy-scoped plugin config
+    /// write, inside the caller's transaction (issue #4611).
+    ///
+    /// `scope: "proxy"` + `proxy_id` is the operator's *attachment* intent, but
+    /// the runtime only applies a plugin config the target proxy lists in its
+    /// association array (`docs/plugins.md`). Writing only `plugin_configs`
+    /// therefore committed a config that `GET /proxies/{id}` reported as
+    /// unattached and that the proxy never applied, while the write surface
+    /// answered `201`/`200`. Both sides now move together.
+    ///
+    /// Reconciliation is validity-driven, so it also repairs a scope/`proxy_id`
+    /// move:
+    /// - `proxy` — the only valid association is `proxy_id`; every other
+    ///   association is invalid config (`GatewayConfig::validate` rejects a
+    ///   proxy referencing a config targeted at a different proxy) and is
+    ///   removed.
+    /// - `global` — a global config must not be associated with any proxy, so
+    ///   every association is removed.
+    /// - `proxy_group` — associations are operator-managed via `proxy.plugins`
+    ///   and any proxy may reference the config, so existing rows are left
+    ///   alone. Stripping them would make the config an orphan that
+    ///   [`Self::cleanup_orphaned_proxy_group_plugins`] deletes on the next
+    ///   proxy write.
+    ///
+    /// Returns the proxies whose association set actually changed, so the
+    /// caller can bump `updated_at` and record their `config_changes` rows.
+    async fn sync_proxy_scoped_plugin_association_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        plugin_config_id: &str,
+        scope: &PluginScope,
+        proxy_id: Option<&str>,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        if *scope == PluginScope::ProxyGroup {
+            return Ok(Vec::new());
+        }
+        let desired = match scope {
+            PluginScope::Proxy => proxy_id,
+            _ => None,
+        };
+
+        // Every association row must decode before destructive mutation: a
+        // silently dropped row would leave an invalid association behind while
+        // the write reported success (same contract as `delete_plugin_config`).
+        let existing_rows: Vec<AnyRow> =
+            sqlx::query(&self.q(
+                "SELECT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?",
+            ))
+            .bind(namespace)
+            .bind(plugin_config_id)
+            .fetch_all(&mut **tx)
+            .await?;
+        let attached: Vec<String> = existing_rows
+            .iter()
+            .map(|row| {
+                row.try_get::<String, _>("proxy_id").map_err(|e| {
+                    anyhow::Error::from(e).context(
+                        "operation=sync_proxy_scoped_plugin_association resource=proxy_plugins column=proxy_id: failed to decode association row required for proxy attachment",
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut touched: Vec<String> = Vec::new();
+        let detach_sql = self.q("DELETE FROM proxy_plugins \
+             WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ?");
+        for current in &attached {
+            if desired == Some(current.as_str()) {
+                continue;
+            }
+            sqlx::query(&detach_sql)
+                .bind(namespace)
+                .bind(current)
+                .bind(plugin_config_id)
+                .execute(&mut **tx)
+                .await?;
+            touched.push(current.clone());
+        }
+
+        if let Some(desired) = desired
+            && !attached.iter().any(|current| current.as_str() == desired)
+        {
+            sqlx::query(&self.q(
+                "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+                 VALUES (?, ?, ?)",
+            ))
+            .bind(namespace)
+            .bind(desired)
+            .bind(plugin_config_id)
+            .execute(&mut **tx)
+            .await?;
+            touched.push(desired.to_string());
+        }
+
+        if !touched.is_empty() {
+            // Advance `updated_at` so the incremental poller / CP broadcast
+            // publishes the proxy whose plugin set just changed.
+            let touch_ts = Utc::now().to_rfc3339();
+            let touch_sql =
+                self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
+            for proxy in &touched {
+                sqlx::query(&touch_sql)
+                    .bind(&touch_ts)
+                    .bind(proxy)
+                    .bind(namespace)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        }
+
+        Ok(touched)
+    }
+
     pub async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let config_json = serde_json::to_string(&pc.config)?;
@@ -4185,8 +4353,26 @@ impl DatabaseStore {
         .await?;
         self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
             .await?;
+        // Attach/re-home/detach the proxy association in the same transaction
+        // so a committed proxy-scoped write is actually applied (issue #4611).
+        let touched_proxies = self
+            .sync_proxy_scoped_plugin_association_tx(
+                &mut tx,
+                &pc.namespace,
+                &pc.id,
+                &pc.scope,
+                pc.proxy_id.as_deref(),
+            )
+            .await?;
+        for proxy_id in &touched_proxies {
+            self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                .await?;
+        }
         if pc.scope == PluginScope::Proxy
             && let Some(proxy_id) = pc.proxy_id.as_deref()
+            && !touched_proxies
+                .iter()
+                .any(|touched| touched.as_str() == proxy_id)
         {
             self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
                 .await?;
@@ -4249,8 +4435,26 @@ impl DatabaseStore {
         .await?;
         self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
             .await?;
+        // Attach/re-home/detach the proxy association in the same transaction
+        // so a committed proxy-scoped write is actually applied (issue #4611).
+        let touched_proxies = self
+            .sync_proxy_scoped_plugin_association_tx(
+                &mut tx,
+                &pc.namespace,
+                &pc.id,
+                &pc.scope,
+                pc.proxy_id.as_deref(),
+            )
+            .await?;
+        for proxy_id in &touched_proxies {
+            self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                .await?;
+        }
         if pc.scope == PluginScope::Proxy
             && let Some(proxy_id) = pc.proxy_id.as_deref()
+            && !touched_proxies
+                .iter()
+                .any(|touched| touched.as_str() == proxy_id)
         {
             self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
                 .await?;
@@ -4295,10 +4499,13 @@ impl DatabaseStore {
         // failure would delete the plugin while omitting proxies.updated_at
         // bumps and proxy config_change upserts (issue #3209).
         let affected_proxy_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT proxy_id FROM proxy_plugins WHERE plugin_config_id = ?"))
-                .bind(id)
-                .fetch_all(&mut *tx)
-                .await?;
+            sqlx::query(&self.q(
+                "SELECT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?",
+            ))
+            .bind(namespace)
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
         let affected_proxy_ids: Vec<String> = affected_proxy_rows
             .iter()
             .map(|row| {
@@ -4310,11 +4517,17 @@ impl DatabaseStore {
             })
             .collect::<Result<_, _>>()?;
 
-        // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
-        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE plugin_config_id = ?"))
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        // Clean up junction table (defense in depth alongside ON DELETE CASCADE).
+        // The namespace predicate is what keeps a plugin-config delete in one
+        // tenant from unbinding a same-id plugin config in another (issue
+        // #4627).
+        sqlx::query(
+            &self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?"),
+        )
+        .bind(namespace)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
 
         if !affected_proxy_ids.is_empty() {
             let updated_at = Utc::now().to_rfc3339();
@@ -4495,6 +4708,7 @@ impl DatabaseStore {
 
         let mut plugins_by_proxy = self
             .load_proxy_plugin_associations_for_proxy_ids_from_pool(
+                namespace,
                 &proxy_ids,
                 "list_proxies_paginated",
                 pool,
@@ -5244,13 +5458,21 @@ impl DatabaseStore {
         Ok(true)
     }
 
+    /// Enabled `mesh_route_dispatch` plugin configs in `namespace`.
+    ///
+    /// A rule's `destination.upstream_id` resolves against the upstreams the
+    /// gateway loaded for the plugin's own namespace, and since issue #4627 an
+    /// upstream id is only unique within a namespace. Scanning other tenants
+    /// would report a same-id upstream in another namespace as a live
+    /// reference and refuse an unrelated delete.
     async fn mesh_route_dispatch_plugin_configs_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
-        let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled = 1"),
-        )
+        let rows: Vec<AnyRow> = sqlx::query(&self.q("SELECT * FROM plugin_configs \
+             WHERE namespace = ? AND plugin_name = ? AND enabled = 1"))
+        .bind(namespace)
         .bind("mesh_route_dispatch")
         .fetch_all(&mut **tx)
         .await?;
@@ -5268,7 +5490,9 @@ impl DatabaseStore {
         upstream_id: &str,
         namespace: &str,
     ) -> Result<Option<PluginConfig>, anyhow::Error> {
-        let plugins = self.mesh_route_dispatch_plugin_configs_tx(tx).await?;
+        let plugins = self
+            .mesh_route_dispatch_plugin_configs_tx(tx, namespace)
+            .await?;
         Ok(plugins.into_iter().find(|plugin| {
             plugin.namespace == namespace
                 && mesh_route_dispatch_references_upstream_id(plugin, upstream_id)
@@ -6224,6 +6448,7 @@ impl DatabaseStore {
             .collect();
         let mut plugins_by_proxy = self
             .load_proxy_plugin_associations_for_proxy_ids(
+                namespace,
                 &changed_ids,
                 "load_incremental_config",
                 true,
@@ -6681,8 +6906,9 @@ impl DatabaseStore {
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
         let insert_sql = self.q(Self::PROXY_INSERT_SQL);
-        let assoc_sql =
-            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+        let assoc_sql = self.q(
+            "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
+        );
 
         for proxy in proxies {
             self.ensure_proxy_route_unique_tx(&mut *tx, proxy, None)
@@ -6814,6 +7040,7 @@ impl DatabaseStore {
             if attach_plugins {
                 for assoc in &proxy.plugins {
                     sqlx::query(&assoc_sql)
+                        .bind(&proxy.namespace)
                         .bind(&proxy.id)
                         .bind(&assoc.plugin_config_id)
                         .execute(&mut **tx)
@@ -6878,10 +7105,11 @@ impl DatabaseStore {
         proxies: &[Proxy],
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
-        let assoc_exists_sql = self
-            .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
-        let assoc_sql =
-            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+        let assoc_exists_sql = self.q("SELECT 1 FROM proxy_plugins \
+             WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ? LIMIT 1");
+        let assoc_sql = self.q(
+            "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
+        );
         let touch_proxy_sql =
             self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
         let mut seen = HashSet::new();
@@ -6892,6 +7120,7 @@ impl DatabaseStore {
                     continue;
                 }
                 let already_attached = sqlx::query(&assoc_exists_sql)
+                    .bind(&proxy.namespace)
                     .bind(&proxy.id)
                     .bind(&assoc.plugin_config_id)
                     .fetch_optional(&mut **tx)
@@ -6901,6 +7130,7 @@ impl DatabaseStore {
                     continue;
                 }
                 sqlx::query(&assoc_sql)
+                    .bind(&proxy.namespace)
                     .bind(&proxy.id)
                     .bind(&assoc.plugin_config_id)
                     .execute(&mut **tx)
@@ -7099,8 +7329,9 @@ impl DatabaseStore {
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
         let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, trigger_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        let assoc_sql =
-            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+        let assoc_sql = self.q(
+            "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
+        );
 
         for pc in configs {
             let config_json = serde_json::to_string(&pc.config)?;
@@ -7128,6 +7359,7 @@ impl DatabaseStore {
                 && let Some(proxy_id) = pc.proxy_id.as_deref()
             {
                 sqlx::query(&assoc_sql)
+                    .bind(&pc.namespace)
                     .bind(proxy_id)
                     .bind(&pc.id)
                     .execute(&mut **tx)
@@ -7499,7 +7731,7 @@ impl DatabaseStore {
             .select_resource_ids_tx(tx, "upstreams", namespace, None, true)
             .await?;
 
-        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id IN (SELECT id FROM proxies WHERE namespace = ?)"))
+        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
@@ -8774,6 +9006,37 @@ impl DatabaseStore {
             .execute(&mut **tx)
             .await?;
 
+        // `proxies`, `upstreams`, `plugin_configs`, `proxy_plugins`, and
+        // `api_specs` all carry `namespace` inside their primary key and inside
+        // every relationship between them (issue #4627), so they are copied
+        // parent-first under the new name and then deleted under the old one —
+        // the same shape `consumers` and `gateway_trust_bundles` use above. An
+        // in-place `UPDATE ... SET namespace = ?` has no ordering that keeps
+        // the composite foreign keys satisfied.
+        for (table, columns) in crate::config::namespace_registry::NAMESPACE_RENAME_COPY_TABLES {
+            let (insert_columns, select_expr) = Self::namespace_rename_copy_sql_parts(columns);
+            self.copy_namespace_pk_rows_tx(
+                &mut *tx,
+                table,
+                &insert_columns,
+                &select_expr,
+                current_name,
+                new_name,
+            )
+            .await?;
+        }
+        for (table, _) in crate::config::namespace_registry::NAMESPACE_RENAME_COPY_TABLES
+            .iter()
+            .rev()
+        {
+            sqlx::query(&self.q(&format!("DELETE FROM {table} WHERE namespace = ?")))
+                .bind(current_name)
+                .execute(&mut **tx)
+                .await?;
+        }
+
+        // `audit_events` is keyed on `id` alone and has no foreign keys, so its
+        // authorization-scoping `namespace` column is still rewritten in place.
         for table in crate::config::namespace_registry::NAMESPACE_RENAME_SIMPLE_TABLES {
             let sql = format!("UPDATE {table} SET namespace = ? WHERE namespace = ?");
             sqlx::query(&self.q(&sql))
@@ -8851,6 +9114,23 @@ impl DatabaseStore {
             .execute(&mut **tx)
             .await?;
         Ok(())
+    }
+
+    /// Build the `INSERT` column list and the matching `SELECT` projection for
+    /// one `NAMESPACE_RENAME_COPY_TABLES` entry.
+    ///
+    /// `namespace` becomes a placeholder in the projection. It is always the
+    /// FIRST placeholder in the finished statement because the projection
+    /// precedes the `WHERE namespace = ?` predicate, which is the bind order
+    /// [`Self::copy_namespace_pk_rows_tx`] uses.
+    fn namespace_rename_copy_sql_parts(columns: &[&str]) -> (String, String) {
+        let insert_columns = columns.join(", ");
+        let select_expr = columns
+            .iter()
+            .map(|column| if *column == "namespace" { "?" } else { *column })
+            .collect::<Vec<_>>()
+            .join(", ");
+        (insert_columns, select_expr)
     }
 
     /// Copy one namespace's rows of a namespace-keyed table under the new name.
@@ -9329,9 +9609,11 @@ impl DatabaseStore {
         {
             let p = &bundle.proxy;
             for assoc in &p.plugins {
-                sqlx::query(
-                    &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
-                )
+                sqlx::query(&self.q(
+                    "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+                     VALUES (?, ?, ?)",
+                ))
+                .bind(&spec.namespace)
                 .bind(&p.id)
                 .bind(&assoc.plugin_config_id)
                 .execute(&mut *tx)
@@ -9807,10 +10089,9 @@ impl DatabaseStore {
             .collect();
         for previous_id in &previous_declared_assoc_ids {
             if !desired_assoc_ids.contains(previous_id) {
-                sqlx::query(
-                    &self
-                        .q("DELETE FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?"),
-                )
+                sqlx::query(&self.q("DELETE FROM proxy_plugins \
+                     WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ?"))
+                .bind(&spec.namespace)
                 .bind(&bundle.proxy.id)
                 .bind(previous_id)
                 .execute(&mut *tx)
@@ -9818,9 +10099,9 @@ impl DatabaseStore {
             }
         }
         for assoc in &bundle.proxy.plugins {
-            sqlx::query(
-                &self.q("DELETE FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?"),
-            )
+            sqlx::query(&self.q("DELETE FROM proxy_plugins \
+                 WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ?"))
+            .bind(&spec.namespace)
             .bind(&bundle.proxy.id)
             .bind(&assoc.plugin_config_id)
             .execute(&mut *tx)
@@ -9828,9 +10109,11 @@ impl DatabaseStore {
         }
         // Re-insert — plugin_configs rows now exist (inserted above), so FK is satisfied.
         for assoc in &bundle.proxy.plugins {
-            sqlx::query(
-                &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
-            )
+            sqlx::query(&self.q(
+                "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+                 VALUES (?, ?, ?)",
+            ))
+            .bind(&spec.namespace)
             .bind(&bundle.proxy.id)
             .bind(&assoc.plugin_config_id)
             .execute(&mut *tx)
@@ -9943,10 +10226,13 @@ impl DatabaseStore {
         relevant_assoc_ids.extend(desired_assoc_ids.iter().cloned());
 
         let assoc_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?"))
-                .bind(&spec.proxy_id)
-                .fetch_all(&mut **tx)
-                .await?;
+            sqlx::query(&self.q(
+                "SELECT plugin_config_id FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?",
+            ))
+            .bind(&spec.namespace)
+            .bind(&spec.proxy_id)
+            .fetch_all(&mut **tx)
+            .await?;
         let mut current_relevant_assoc_ids = HashSet::new();
         for row in &assoc_rows {
             if let Ok(id) = row.try_get::<String, _>("plugin_config_id")
@@ -10017,7 +10303,11 @@ impl DatabaseStore {
         let row: Option<AnyRow> = sqlx::query(&self.q(concat!(
             "SELECT p.id AS proxy_id, p.upstream_id AS upstream_id ",
             "FROM proxies p ",
-            "INNER JOIN upstreams u ON p.upstream_id = u.id ",
+            // Upstream identity is (namespace, id) since issue #4627, so the
+            // join must carry the namespace or it would match a same-id
+            // upstream owned by a different tenant.
+            "INNER JOIN upstreams u ",
+            "ON p.namespace = u.namespace AND p.upstream_id = u.id ",
             "WHERE u.namespace = ? AND u.api_spec_id = ? AND p.id <> ? ",
             "LIMIT 1"
         )))
@@ -10071,9 +10361,12 @@ impl DatabaseStore {
             spec_upstream_ids.insert(id);
         }
 
-        let plugin_rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled = 1"),
-        )
+        // Namespace-scoped for the same reason as
+        // `mesh_route_dispatch_plugin_configs_tx`: a same-id upstream in
+        // another tenant is not a reference to this spec's upstream.
+        let plugin_rows: Vec<AnyRow> = sqlx::query(&self.q("SELECT * FROM plugin_configs \
+             WHERE namespace = ? AND plugin_name = ? AND enabled = 1"))
+        .bind(namespace)
         .bind("mesh_route_dispatch")
         .fetch_all(&mut **tx)
         .await?;

@@ -2284,9 +2284,39 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_k8s_controller_watch_errors_total",
+    "type": "counter",
+    "help": "Kubernetes watch stream errors observed across every watched scope, including refused initial lists and failed watch starts.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_k8s_controller_watch_idle_relists_total",
     "type": "counter",
     "help": "Watch-scope reflector rebuilds triggered because a scope delivered no event for the configured idle window, or because a replacement generation never finished its initial list.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_watch_relist_missed_adds_total",
+    "type": "counter",
+    "help": "Objects an authoritative Kubernetes relist found that the watch scope's previous store never held: creations no Apply event delivered.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_watch_relist_missed_deletes_total",
+    "type": "counter",
+    "help": "Objects an authoritative Kubernetes relist found missing from the watch scope's previous store: withdrawals no Delete event delivered.",
     "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",
@@ -2463,6 +2493,106 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_mesh_app_probe_active_connections",
+    "type": "gauge",
+    "help": "Application-probe listener connections currently admitted.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_app_probe_active_probes",
+    "type": "gauge",
+    "help": "Loopback application probes executing right now.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_app_probe_max_active_probes",
+    "type": "gauge",
+    "help": "Configured concurrent loopback application-probe budget (0 = unlimited).",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_app_probe_max_connections",
+    "type": "gauge",
+    "help": "Configured application-probe listener connection cap (0 = unlimited).",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_app_probe_max_connections_per_ip",
+    "type": "gauge",
+    "help": "Configured per-source-IP application-probe connection cap (0 = unlimited).",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_app_probe_rejected_connections_total",
+    "type": "counter",
+    "help": "Application-probe connections refused in the accept loop before any task or HTTP state was allocated, by reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_app_probe_rejected_probes_total",
+    "type": "counter",
+    "help": "Probe requests refused because the active-probe budget was full.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_app_probe_total",
+    "type": "counter",
+    "help": "Rewritten kubelet application probes performed by the sidecar against the application over loopback, by bounded outcome.",
+    "labels": [
+      "container",
+      "probe",
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_app_probe",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
   },
   {
     "name": "ferrum_mesh_bpf_accept_to_first_byte_microseconds",
@@ -2847,6 +2977,55 @@
     "subsystem": "mesh_node_waypoint",
     "export_surface": "/metrics",
     "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_capture_active_connections",
+    "type": "gauge",
+    "help": "Captured inbound connections currently holding an admission permit.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_capture_max_connections",
+    "type": "gauge",
+    "help": "Configured capture-listener connection cap (0 = unlimited).",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_capture_max_connections_per_ip",
+    "type": "gauge",
+    "help": "Configured per-source-IP capture-listener connection cap (0 = unlimited).",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_capture_rejected_connections_total",
+    "type": "counter",
+    "help": "Captured inbound connections refused in the accept loop before a task was allocated, by bounded reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
     "emission": "conditional"
   },
   {

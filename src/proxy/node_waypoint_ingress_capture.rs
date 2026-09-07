@@ -56,15 +56,52 @@
 //! pod-veth `ferrum_tc_inbound` guard admits it as an authorized relay dial and
 //! `ferrum_tc_ingress_redirect` bypasses it as already-relayed instead of
 //! steering it back here in a loop.
+//!
+//! # Admission (issue #4626)
+//!
+//! Gate 0, ahead of all four above, is connection admission — and it runs in the
+//! accept loop, not in the spawned task. This listener fronts ordinary
+//! application traffic for every enrolled pod on the node, so a peer that can
+//! reach one PERMISSIVE/DISABLE workload (or that simply dials the capture port
+//! directly, which gate 1 refuses) could otherwise hold arbitrarily many tasks,
+//! descriptors, plugin states, and backend sockets: the `ConnectionGuard` the
+//! task took only *recorded* occupancy for graceful drain, it never reserved or
+//! refused capacity. Impact is node-wide, not per-pod.
+//!
+//! So, between `accept()` and `tokio::spawn`:
+//!
+//! 1. `overload.reject_new_connections` — the same single relaxed atomic load
+//!    the ordinary proxy accept loop performs, at the same boundary. Critical
+//!    overload admits nothing.
+//! 2. A [`crate::util::conn_limit::ConnLimiter`] sized from
+//!    `FERRUM_MAX_CONNECTIONS` with a `FERRUM_TCP_MAX_CONNECTIONS_PER_IP`
+//!    per-source share. `max_connections` is a per-listener cap in Ferrum
+//!    rather than one process-wide pool (see the in-netns capture listeners in
+//!    `modes::mesh`), so this listener gets its own limiter of that size — a
+//!    saturated capture path must not starve inbound HBONE, and vice versa.
+//!
+//! The per-source key is the socket peer. The redirect NATs nothing, so that IS
+//! the real client address; and the effective source the relay derives later is
+//! only knowable after the task exists, which is one allocation too late.
+//!
+//! The permit is moved into the connection task and released on drop, so it
+//! covers every exit: not-captured, destination-denied, STRICT refusal, dial
+//! failure, relay error, cancellation, and shutdown. Repeated accept errors go
+//! through `AcceptBackoff` + a rate-limited log, so fd exhaustion cannot spin
+//! the loop.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::ProxyState;
 use crate::modes::mesh::config::MtlsMode;
+use crate::modes::mesh::node_waypoint_observability::{
+    NodeWaypointCaptureAdmissionRejectReason, record_capture_admission_rejection,
+};
+use crate::util::conn_limit::{ConnLimiter, ConnPermit};
 
 /// Accept backlog for the capture listener. Matches the value the generic proxy
 /// listener uses for mesh listeners.
@@ -117,8 +154,21 @@ pub async fn start_listener(
         )
     })?;
 
+    // This listener's own admission controller (issue #4626). Sized from
+    // `FERRUM_MAX_CONNECTIONS` with a `FERRUM_TCP_MAX_CONNECTIONS_PER_IP`
+    // per-source share, exactly like the stream data path, and built through
+    // `pool_shard_amount` because captured application traffic is a data-plane
+    // hot path rather than a management surface.
+    let limiter = build_capture_conn_limiter(&state);
+    let limits = limiter.snapshot();
+    crate::modes::mesh::node_waypoint_observability::install_capture_conn_limiter(Arc::clone(
+        &limiter,
+    ));
+
     info!(
         %addr,
+        max_connections = limits.max_connections,
+        max_connections_per_ip = limits.max_connections_per_ip,
         "NodeWaypoint transparent inbound capture listener bound; the eBPF tc ingress redirect \
          steers captured podIP:appPort traffic here"
     );
@@ -126,13 +176,53 @@ pub async fn start_listener(
         let _ = tx.send(());
     }
 
+    // Repeated `accept()` failures under fd exhaustion (EMFILE/ENFILE) neither
+    // consume the pending connection nor clear read-readiness, so without a
+    // backoff the select! arm re-fires immediately and spins the CPU and the
+    // log pipeline. Both helpers are the ones every other Ferrum accept loop
+    // uses.
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
+    let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
+    let mut reject_log = crate::util::accept_backoff::LogRateLimiter::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, remote_addr)) => {
+                        accept_backoff.on_success();
+                        // Gate 0, before any clone or spawn: a refused socket
+                        // costs one accept() and one atomic — never a task,
+                        // relay state, or backend dial.
+                        let permit = match admit_captured_connection(
+                            &limiter,
+                            &state,
+                            remote_addr,
+                        ) {
+                            Ok(permit) => permit,
+                            Err(reason) => {
+                                record_capture_admission_rejection(reason);
+                                if let Some(suppressed) =
+                                    reject_log.on_event(crate::socket_opts::monotonic_now_ms())
+                                {
+                                    warn!(
+                                        suppressed,
+                                        %addr,
+                                        client_ip = %remote_addr.ip(),
+                                        reason = reason.as_str(),
+                                        "Refusing a NodeWaypoint captured connection at the \
+                                         admission ceiling before allocating a task"
+                                    );
+                                }
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let state = Arc::clone(&state);
                         tokio::spawn(async move {
+                            // Held for the whole relay lifetime: dropping the
+                            // task future releases the global and per-source
+                            // slots on every exit, including cancellation.
+                            let _admission = permit;
                             // Counted for graceful drain like every other
                             // accepted connection.
                             let _conn_guard =
@@ -141,7 +231,19 @@ pub async fn start_listener(
                         });
                     }
                     Err(e) => {
-                        debug!(%addr, error = %e, "Capture listener accept failed");
+                        if let Some(suppressed) =
+                            accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
+                        {
+                            warn!(
+                                suppressed,
+                                %addr,
+                                error = %e,
+                                "NodeWaypoint capture listener accept failed"
+                            );
+                        }
+                        if let Some(delay) = accept_backoff.on_error(e.kind()) {
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
             }
@@ -151,6 +253,67 @@ pub async fn start_listener(
             }
         }
     }
+}
+
+/// Build this listener's connection admission controller.
+///
+/// `FERRUM_MAX_CONNECTIONS` is a **per-listener** cap in Ferrum, not one
+/// process-wide pool (the in-netns capture listeners document the same choice),
+/// so the capture path gets its own limiter of that size: a saturated capture
+/// path must not be able to starve inbound HBONE, and vice versa. `0` on either
+/// knob disables that dimension, matching every other surface.
+pub fn build_capture_conn_limiter(state: &ProxyState) -> Arc<ConnLimiter> {
+    capture_conn_limiter_from_env(&state.env_config)
+}
+
+/// The [`build_capture_conn_limiter`] body, taking only the configuration it
+/// actually reads so the sizing contract is testable without a `ProxyState`.
+pub fn capture_conn_limiter_from_env(env_config: &crate::config::EnvConfig) -> Arc<ConnLimiter> {
+    Arc::new(ConnLimiter::with_per_ip_shard_amount(
+        env_config.max_connections,
+        // `usize` on 64-bit; a 32-bit build clamps rather than wrapping.
+        usize::try_from(env_config.tcp_max_connections_per_ip).unwrap_or(usize::MAX),
+        env_config.pool_shard_amount,
+    ))
+}
+
+/// Decide whether one accepted socket is admitted.
+///
+/// Ordered so the cheapest, most decisive check runs first: under critical
+/// overload nothing is admitted at all, which is the same verdict (and the same
+/// single relaxed atomic load) the ordinary proxy accept loop reaches.
+fn admit_captured_connection(
+    limiter: &Arc<ConnLimiter>,
+    state: &ProxyState,
+    remote_addr: SocketAddr,
+) -> Result<ConnPermit, NodeWaypointCaptureAdmissionRejectReason> {
+    admit_captured_connection_with(
+        limiter,
+        state
+            .overload
+            .reject_new_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        remote_addr.ip(),
+    )
+}
+
+/// The admission decision itself, with the overload verdict already read.
+///
+/// Split out so the ordering contract — overload first, then the global cap,
+/// then the per-source share — is exercisable without standing up a
+/// `ProxyState`, and so a rejection is provably reachable before any task
+/// exists rather than only observable after one.
+pub fn admit_captured_connection_with(
+    limiter: &Arc<ConnLimiter>,
+    reject_new_connections: bool,
+    remote_ip: std::net::IpAddr,
+) -> Result<ConnPermit, NodeWaypointCaptureAdmissionRejectReason> {
+    if reject_new_connections {
+        return Err(NodeWaypointCaptureAdmissionRejectReason::Overload);
+    }
+    limiter
+        .try_acquire(remote_ip)
+        .map_err(NodeWaypointCaptureAdmissionRejectReason::from)
 }
 
 /// The original destination of a captured connection.

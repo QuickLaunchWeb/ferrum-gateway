@@ -57,9 +57,15 @@ DTLS_CLIENT_IMAGE="${FERRUM_LIVE_DTLS_CLIENT_IMAGE:-ferrum-live-dtls-client:loca
 DTLS_CLIENT_DOCKERFILE="$ROOT_DIR/tests/k8s/node_waypoint_ebpf_live/dtls-client.Dockerfile"
 RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
 IMAGE_REPOSITORY="${FERRUM_LIVE_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
-IMAGE_TAG="${FERRUM_LIVE_IMAGE_TAG:-0.9.0}"
+# Default to the crate version so a release bump cannot desynchronise this lane
+# from the tree it tests; CI overrides both with the live image tag it built.
+FERRUM_TREE_VERSION="$(sed -nE '/^\[package\]$/,/^\[/{s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p;}' "$ROOT_DIR/Cargo.toml")"
+IMAGE_TAG="${FERRUM_LIVE_IMAGE_TAG:-$FERRUM_TREE_VERSION}"
 DEFAULT_CHART_IMAGE_REPOSITORY="${FERRUM_LIVE_DEFAULT_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
-DEFAULT_CHART_IMAGE_TAG="${FERRUM_LIVE_DEFAULT_IMAGE_TAG:-0.9.0}"
+# The chart's own appVersion is what an untouched install renders, so the
+# expectation follows the chart rather than a literal that a release bump
+# would silently break.
+DEFAULT_CHART_IMAGE_TAG="${FERRUM_LIVE_DEFAULT_IMAGE_TAG:-$(sed -nE 's/^appVersion:[[:space:]]*"?([^"]+)"?[[:space:]]*$/\1/p' "$CHART_DIR/Chart.yaml")}"
 BPFTOOL_IMAGE="${FERRUM_LIVE_BPFTOOL_IMAGE:-quay.io/cilium/cilium:v1.16.5}"
 REQUIRE_DUAL_STACK="${FERRUM_LIVE_REQUIRE_DUAL_STACK:-false}"
 DOCKER_NODE_EVIDENCE="${FERRUM_LIVE_DOCKER_NODE_EVIDENCE:-false}"

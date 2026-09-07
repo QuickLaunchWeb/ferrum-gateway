@@ -18,7 +18,13 @@
 //! like real proxy traffic and benefit from connection reuse and cached DNS
 //! resolution across targets.
 
-mod grpc_health_v1 {
+/// Generated `grpc.health.v1` client and server stubs.
+///
+/// Public so the mesh application-probe server (issue #4533) and the test
+/// suites can share exactly the health protocol the active health checker
+/// speaks, rather than adding a second copy of the proto or a `tonic-health`
+/// dependency.
+pub mod grpc_health_v1 {
     tonic::include_proto!("grpc.health.v1");
 }
 

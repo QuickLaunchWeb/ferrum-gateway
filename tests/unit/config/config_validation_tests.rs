@@ -614,7 +614,25 @@ fn runtime_plugin_file_dependency_validation_runs_off_async_workers() {
     let validation = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(validation.contains("validate_plugin_file_dependencies_off_thread"));
     assert!(validation.contains("tokio::task::spawn_blocking"));
-    assert!(validation.contains("GeoRestriction::validate_config"));
+    // Geo shape validation must stay MMDB-free at admission. Since issue #4526
+    // the pipeline reaches it through the shared plugin construction gate
+    // rather than a per-plugin match, so pin both halves of that route: the
+    // pipeline calls the gate, and the gate routes `geo_restriction` to the
+    // shape-only `validate_config` before any constructor that would open the
+    // node-local database.
+    assert!(validation.contains("collect_rejecting_plugin_config_errors"));
+    assert!(validation.contains("validate_plugin_config_with_http_client("));
+    let plugins = include_str!("../../../src/plugins/mod.rs");
+    let gate_start = plugins
+        .find("pub(crate) fn validate_plugin_config_with_http_client(")
+        .expect("shared plugin construction gate");
+    let geo_route = plugins[gate_start..]
+        .find("geo_restriction::GeoRestriction::validate_config(config)")
+        .expect("gate routes geo_restriction to the shape-only validator");
+    assert!(
+        !plugins[gate_start..gate_start + geo_route].contains("GeoRestriction::new("),
+        "admission must never open the node-local MMDB"
+    );
 
     for source in [
         include_str!("../../../src/config/db_loader.rs"),
@@ -720,5 +738,202 @@ fn runtime_config_rejection_includes_tcp_throttle_attachment_validation() {
     assert!(
         shared.contains("validate_tcp_connection_throttle_attachments(config)"),
         "database and CP snapshots must reject unsupported TCP-throttle attachments"
+    );
+}
+
+// ===========================================================================
+// CP admission parity: the shared rejecting contract runs the real plugin
+// construction gate over every enabled plugin config (issue #4526)
+// ===========================================================================
+
+fn plugin_config_for_gate(id: &str, plugin_name: &str, config: serde_json::Value) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: plugin_name.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn cp_admission_rejects_request_size_limiting_with_an_unknown_key() {
+    // Exactly the manual reproduction from issue #4526: a stored row whose
+    // config carries a typo'd key. Construction — not the JSON schema — is the
+    // gate, so before #4526 this passed CP admission and was broadcast to a
+    // fleet that could not construct it.
+    let config = GatewayConfig {
+        plugin_configs: vec![plugin_config_for_gate(
+            "rsl-typo",
+            "request_size_limiting",
+            json!({"max_bytes": 1024, "max_bytez": 1}),
+        )],
+        ..GatewayConfig::default()
+    };
+
+    let errors =
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("request_size_limiting") && error.contains("rsl-typo")),
+        "CP admission must reject an unconstructible plugin config naming the plugin and \
+         its config id: {errors:?}"
+    );
+}
+
+#[test]
+fn cp_admission_accepts_a_constructible_plugin_config() {
+    let config = GatewayConfig {
+        plugin_configs: vec![plugin_config_for_gate(
+            "rsl-ok",
+            "request_size_limiting",
+            json!({"max_bytes": 1024}),
+        )],
+        ..GatewayConfig::default()
+    };
+
+    assert!(
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config)
+            .is_empty(),
+        "a constructible plugin config must still be admitted"
+    );
+}
+
+#[test]
+fn cp_admission_skips_disabled_and_optional_fail_open_plugin_configs() {
+    // Mirrors `plugin_cache::try_create_plugin`: an OptionalFailOpen plugin is
+    // omitted with a warning by every serving mode, so it must not reject a
+    // snapshot the whole fleet would otherwise accept. A disabled row is never
+    // constructed at all.
+    let mut disabled = plugin_config_for_gate(
+        "rsl-disabled",
+        "request_size_limiting",
+        json!({"max_bytez": 1}),
+    );
+    disabled.enabled = false;
+
+    let config = GatewayConfig {
+        plugin_configs: vec![
+            disabled,
+            plugin_config_for_gate("stdout-typo", "stdout_logging", json!({"filtr": {}})),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    assert!(
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config)
+            .is_empty(),
+        "disabled rows and OptionalFailOpen plugins must not reject a CP snapshot"
+    );
+}
+
+#[test]
+fn cp_admission_rejects_an_unknown_plugin_name() {
+    let config = GatewayConfig {
+        plugin_configs: vec![plugin_config_for_gate(
+            "ghost",
+            "not_a_real_plugin",
+            json!({}),
+        )],
+        ..GatewayConfig::default()
+    };
+
+    let errors =
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config);
+    assert!(
+        errors.iter().any(|error| error.contains("ghost")),
+        "an unknown plugin name fails closed on every serving mode and must not be \
+         broadcast: {errors:?}"
+    );
+}
+
+#[test]
+fn serving_mode_quarantine_drops_only_unconstructible_optional_plugins() {
+    // `database` mode may omit broken optional instrumentation for in-band
+    // repair, but must retain broken fail-closed controls so shared validation
+    // rejects the candidate rather than serving without them.
+    let mut config = GatewayConfig {
+        plugin_configs: vec![
+            plugin_config_for_gate(
+                "rsl-ok",
+                "request_size_limiting",
+                json!({"max_bytes": 1024}),
+            ),
+            plugin_config_for_gate(
+                "rsl-typo",
+                "request_size_limiting",
+                json!({"max_bytes": 1024, "max_bytez": 1}),
+            ),
+            plugin_config_for_gate("stdout-typo", "stdout_logging", json!({"filtr": {}})),
+            plugin_config_for_gate("cid", "correlation_id", json!({})),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    let quarantined =
+        ferrum_edge::_test_support::quarantine_unconstructible_plugin_configs_for_test(&mut config);
+
+    assert_eq!(quarantined.len(), 1, "only the bad row is quarantined");
+    assert!(
+        quarantined[0].contains("stdout-typo"),
+        "the quarantine message names the offending plugin config: {quarantined:?}"
+    );
+    let surviving: Vec<&str> = config
+        .plugin_configs
+        .iter()
+        .map(|pc| pc.id.as_str())
+        .collect();
+    assert_eq!(surviving, vec!["rsl-ok", "rsl-typo", "cid"]);
+    assert!(
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config)
+            .iter()
+            .any(|error| error.contains("rsl-typo")),
+        "the retained FailClosed plugin must still reject runtime publication"
+    );
+}
+
+#[test]
+fn database_mode_quarantines_instead_of_exiting_before_the_admin_listener() {
+    // The defect was an ordering one: `ProxyState::new` ran before the admin
+    // listener bound, so a row no serving mode could construct exited the
+    // process with no in-band repair path. Serving-mode full loads now
+    // quarantine; CP loads still reject so the row is never broadcast.
+    let db_loader = include_str!("../../../src/config/db_loader.rs");
+    let mongo = include_str!("../../../src/config/mongo_store.rs");
+    for (label, source) in [("sqlx", db_loader), ("mongo", mongo)] {
+        let quarantine = source
+            .find("quarantine_unconstructible_plugin_configs(")
+            .unwrap_or_else(|| panic!("{label} full load must quarantine plugin configs"));
+        let rejecting = source
+            .find("collect_rejecting_runtime_config_errors(&config)")
+            .unwrap_or_else(|| panic!("{label} full load must keep the rejecting contract"));
+        assert!(
+            quarantine < rejecting,
+            "{label}: quarantine must run BEFORE the rejecting contract, or the load still \
+             fails and the admin listener never binds"
+        );
+        assert!(
+            source.contains("matches!(purpose, FullConfigLoadPurpose::Runtime)"),
+            "{label}: only serving-mode loads may quarantine — CP admission must reject"
+        );
+    }
+
+    let database_mode = include_str!("../../../src/modes/database.rs");
+    assert!(
+        database_mode.contains("cfg.quarantined_plugin_configs.is_empty()"),
+        "database startup must raise config_rejected when the load quarantined a row"
+    );
+    assert!(
+        database_mode.contains("quarantined_plugin_configs: usize"),
+        "the poll-loop commit must know a reload quarantined a row so it does not clear \
+         config_rejected"
     );
 }

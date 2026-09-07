@@ -181,6 +181,7 @@ fn generation(
     enabled: bool,
 ) -> GatewayConfig {
     let mut config = GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         version: "1".to_string(),
         proxies: vec![test_proxy("gated", &["gate"])],
         consumers: vec![],

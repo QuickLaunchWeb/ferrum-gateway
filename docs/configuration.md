@@ -162,7 +162,7 @@ value.
 
 | `FERRUM_AUDIT_RETENTION_DAYS` | No | — | Optional age-based retention for durable `audit_events` rows. When set, each namespace independently deletes rows with `ts` older than this many days using indexed, chunked deletes (batch size 1000). Valid range: `1`–`36500`. Unset disables age prune. Does not change insert enqueue semantics |
 | `FERRUM_AUDIT_RETENTION_MAX_ROWS` | No | `100000` | Soft per-namespace row cap for durable `audit_events`. Each namespace targets the newest N events ordered by deterministic `(ts, id)` and prunes older rows with indexed, chunked deletes (batch size 1000, max 8 batches per prune). Insert-path enforcement is cadence-gated: after a verified at-or-under-cap check, one gateway instance may admit up to `min(1000, N)` further inserts for that namespace before the next O(N) boundary scan; when a prune exhausts its batch budget, subsequent inserts keep draining immediately. Explicit prune calls always evaluate the cap. Set to `0` to disable the row cap and retain audit rows indefinitely by count. Valid range: `0` (unlimited) or `1`–`10000000`. One namespace never prunes another |
-| `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` | No | `false` (forced on when `FERRUM_CP_NAMESPACES` is multi-namespace) | When `true`, namespace-scoped Admin API routes (proxies, consumers, upstreams, plugin configs, api-specs, batch, backup, restore, audit) require the admin JWT to carry an `ns` claim (single string or array of strings, same shapes as the CP/DP gRPC plane) authorizing the `X-Ferrum-Namespace` value; requests outside the claimed namespaces are rejected with 403. In `cp` mode this is engaged automatically when `FERRUM_CP_NAMESPACES` names more than one namespace or `*`, matching the CP/DP gRPC plane — admin tokens without an `ns` claim are then refused on those routes. When `false` and the CP scope is single-namespace, any valid admin JWT may address any namespace and the header is a routing selector only |
+| `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` | No | `false` (forced on when `FERRUM_CP_NAMESPACES` is multi-namespace) | When `true`, namespace-scoped Admin API routes (proxies, consumers, upstreams, plugin configs, api-specs, batch, backup, restore, audit, gateway-trust-bundles, gateway-trust including gateway-trust/status) require the admin JWT to carry an `ns` claim (single string or array of strings, same shapes as the CP/DP gRPC plane) authorizing the `X-Ferrum-Namespace` value; requests outside the claimed namespaces are rejected with 403. In `cp` mode this is engaged automatically when `FERRUM_CP_NAMESPACES` names more than one namespace or `*`, matching the CP/DP gRPC plane — admin tokens without an `ns` claim are then refused on those routes. When `false` and the CP scope is single-namespace, any valid admin JWT may address any namespace and the header is a routing selector only |
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | PEM CA bundle for Admin API client certificate verification |
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE` | No | — | Source override for `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Skip Admin API TLS certificate verification (development/testing only). Emits a startup warning outside production. **Refused when `FERRUM_MESH_PRODUCTION_MODE=true`** (shared `EnvConfig` validation used by `validate` and runtime startup). Independently refused under FIPS enforce |
@@ -196,7 +196,7 @@ value.
 | `FERRUM_DB_REJECTED_DELTA_BACKOFF_INITIAL_SECONDS` | No | `1` | Database-mode initial retry backoff after a DB incremental delta is rejected by validation. The poller retries after this delay and does not advance the accepted cursor. CP mode uses `FERRUM_DB_POLL_INTERVAL`. |
 | `FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS` | No | `30` | Database-mode maximum retry backoff for the same rejected DB incremental delta. Values below the initial backoff are clamped up to the initial value. |
 | `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` | No | `3` | Database-mode number of identical rejected DB incremental deltas before attempting an authoritative primary-backed full reload while preserving the last known-good config if that snapshot fails or is rejected. |
-| `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup, used as a startup fallback in two cases. (1) Connect-time bootstrap (**SQL backends only**): when every configured SQL database URL is unreachable at startup with a transient connectivity/resource/connect-timeout error, the gateway comes up on a lazy pool serving the backup while background polling retries the primary and failover URLs. MongoDB has no lazy-pool bootstrap — if all configured Mongo URLs are unreachable at startup the process exits. (2) Post-connect load fallback (**all backends, including MongoDB**): when the database connects/migrates but the initial config load fails transiently, the backup is served. In both cases a non-transient schema/auth/config/query failure fails startup instead of bootstrapping from the backup, so a broken primary is never masked by stale on-disk config. **Gateway trust is not carried by this file and is fail-closed while it is in use:** `GatewayConfig.gateway_trust_bundles` is deliberately not serialized (it must never ride the ConfigSync `config_json` wire, where a multi-namespace control plane would leak every served namespace's trust material to one subscriber), so a backup-sourced snapshot cannot say whether the namespace has a trust record — and an arbitrarily old externally provisioned file could not be trusted to answer it if it did. A process that bootstraps from the backup therefore **refuses gateway-to-mesh identity outright** (native gRPC mesh dispatch answers Trailers-Only `UNAVAILABLE`; HTTP-family mesh dispatch and mesh TCP/UDP egress refuse before any dial) rather than silently falling back to source-loaded SVID trust, which could re-enable a root the committed database generation had withdrawn. Ordinary non-mesh proxying is unaffected. `GET /gateway-trust/status` reports `authority_unresolved: true` for the duration, and the refusal clears on the first authoritative database full reload. |
+| `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup, used as a startup fallback in two cases. (1) Connect-time bootstrap (**SQL backends only**): when every configured SQL database URL is unreachable at startup with a transient connectivity/resource/connect-timeout error, the gateway comes up on a lazy pool serving the backup while background polling retries the primary and failover URLs. MongoDB has no lazy-pool bootstrap — if all configured Mongo URLs are unreachable at startup the process exits. (2) Post-connect load fallback (**all backends, including MongoDB**): when the database connects/migrates but the initial config load fails transiently, the backup is served. In both cases a non-transient schema/auth/config/query failure fails startup instead of bootstrapping from the backup, so a broken primary is never masked by stale on-disk config. **The backup is filtered to the gateway's configured namespace (`FERRUM_NAMESPACE`) before it is validated or served**, so a multi-namespace export — including an all-namespace administrative backup — is safe to provision here: only the configured namespace's proxies, consumers, credentials, plugin configs, upstreams and trust material are loaded, and a `listen_path`, proxy name or upstream name reused in another namespace does not reject the file. Duplicates *within* the configured namespace still reject as before, and a backup holding nothing for that namespace starts an empty-but-valid configuration rather than serving another tenant's. **Gateway trust is not carried by this file and is fail-closed while it is in use:** `GatewayConfig.gateway_trust_bundles` is deliberately not serialized (it must never ride the ConfigSync `config_json` wire, where a multi-namespace control plane would leak every served namespace's trust material to one subscriber), so a backup-sourced snapshot cannot say whether the namespace has a trust record — and an arbitrarily old externally provisioned file could not be trusted to answer it if it did. A process that bootstraps from the backup therefore **refuses gateway-to-mesh identity outright** (native gRPC mesh dispatch answers Trailers-Only `UNAVAILABLE`; HTTP-family mesh dispatch and mesh TCP/UDP egress refuse before any dial) rather than silently falling back to source-loaded SVID trust, which could re-enable a root the committed database generation had withdrawn. Ordinary non-mesh proxying is unaffected. `GET /gateway-trust/status` reports `authority_unresolved: true` for the duration, and the refusal clears on the first authoritative database full reload. |
 | `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. SQL failover is attempted only for transient connectivity, resource-exhaustion, and connection-timeout errors; query/statement timeouts and other query, schema, data, constraint, authentication, and configuration errors fail startup/reconnect without switching databases. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
 | `FERRUM_DB_FAILOVER_ALLOW_WRITES` | No | `false` | Allow **config-database** Admin API mutations (proxies/upstreams/consumers/plugins/credentials/API specs/batch/restore) while the active pool points at a `FERRUM_DB_FAILOVER_URLS` entry. Default `false` fails closed (503) so operators cannot accidentally write to a sticky failover replica that will be erased when the primary recovers and republishes. Set `true` only when the operator asserts synchronously replicated multi-primary replication — **single-replica-only**: enable on one gateway process at a time; the failback fence is process-local and is not coordinated across replicas. After an Admin mutation is admitted on failover, Ferrum fences automatic primary failback until the process is restarted after operator reconciliation or confirmed replication catch-up, so a stale primary cannot replace failover-side configuration. Authenticated `/health` reports `primary_failback_fenced`. Polling and reads stay available either way, and a fenced primary does not suppress reconnect attempts to configured failover URLs. Managed TLS/ACME store mutations are independent and are not gated by this flag. DNS/TLS reconnect paths target the configured primary URL and record primary topology only after a successful primary reconnect; failover reconnects keep failover topology labeling. |
 | `FERRUM_DB_READ_REPLICA_URL` | No | — | SQL read replica URL for eligible admin-only reads. Runtime config polling and writes always use the active primary/failover pool. The configured read replica is eligible only while the configured primary topology is active; Ferrum closes and suppresses its pool during failover, then reconnects it once after primary failback. MongoDB read preferences are ignored by Ferrum's config store |
@@ -254,8 +254,15 @@ replica-set pollers read ordered `config_changes` rows/documents after the
 accepted cursor, collapse each resource to the final operation in the batch, and
 point-load only those changed IDs. Delete records carry removals, so normal
 incremental polling does not scan every runtime collection or table ID.
-Retained-history gaps and saturated change batches force the same authoritative
-full-reload path.
+Retained-history gaps, saturated change batches (10,000 or more unread
+`config_changes` rows for the namespace), and consumer changes (which rehydrate
+quarantined credentials) force the same authoritative full-reload path. The
+reload records the change-log watermark it read before loading as its accepted
+cursor, so rows committed while it ran are picked up by the next incremental
+poll, and its validation cost is linear in cheap per-row work: the plugin
+validation sweep builds one screening client per reload rather than one per
+plugin config, so a 30k-proxy full reload finishes well inside the time bulk
+provisioning needs to append another saturated batch (issue #4116).
 
 Repeated rejected database deltas use bounded backoff and low-cardinality
 metrics. After `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` identical
@@ -546,6 +553,11 @@ With the xDS ADS protocol, invalid resource updates are NACKed and the last acce
 | `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` | No | `300` | **DP-side (mesh mode).** Seconds a *foreign* config authority must be observed continuously before the data plane adopts it and restarts ordering from its revision. The same policy applies independently to each native remote-cluster discovery source. This is the no-permanent-lockout bound for control-plane state loss and deliberate source resets. `0` disables adoption, leaving `POST /mesh/config-revision/reset` as the local-slice recovery; remote discovery then requires its source to resume the accepted authority. A sequence rewind *inside* one authority is never auto-adopted — it is indistinguishable from the rollback the gate exists to prevent — so that case is recovered locally with the reset endpoint or by bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID` |
 | `FERRUM_MESH_EGRESS_STREAM_ENABLED` | No | `false` | Opt-in for stream-family (TCP / UDP) egress proxy materialization in `EgressGateway` topology. When enabled, each per-port stream egress listener terminates SVID-mTLS (reusing the mesh-inbound `ServerConfig` — server identity = gateway SVID, peer verifier = SPIFFE against the trust bundle) and runs `mesh_authz` at accept, the same authn/z as HTTP egress. **A verified client certificate is required:** because the egress gateway is a security boundary onto external networks, a `PERMISSIVE` `PeerAuthentication` (the default when no STRICT policy is in force) is escalated to require a client cert for this topology, so a cert-less client is rejected at the handshake instead of being admitted to the external backend. Fail-closed: if no mTLS material is loaded the stream listener defers its bind instead of falling back to plaintext (mirrors the inbound posture); if `PERMISSIVE` resolves with no trust anchor at all the listener cannot authenticate clients and refuses to start. Set `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` to restore the legacy plaintext + unauthenticated posture. HTTP-family egress is unaffected by this flag |
 | `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT` | No | `false` | Explicit opt-out that makes stream-family egress listeners plaintext + unauthenticated (the legacy posture). Only meaningful with `FERRUM_MESH_EGRESS_STREAM_ENABLED=true`. Default-off: stream egress terminates SVID-mTLS and runs `mesh_authz`. When `true`, `mesh_authz` cannot verify SPIFFE peer identity (no TLS client cert), so any pod that can reach the egress gateway reaches the external destination through it with no authorization check — a loud warning is logged at startup. Enable only with compensating network controls |
+| `FERRUM_MESH_APP_PROBE_PORT` | No | `15020` | **Mesh (sidecar) only.** Port the sidecar serves rewritten kubelet application probes on (`GET /app-probe/<container>/<startupProbe\|readinessProbe\|livenessProbe>` → `200`/`503`). The injector rewrites each application `httpGet` / `tcpSocket` / `grpc` probe to target this port and the sidecar re-runs the ORIGINAL probe against `127.0.0.1`, so no application port is ever excluded from inbound capture. Only this port is excluded — it terminates in the sidecar. `0` disables the listener; the server also does not start when the pod has no rewritten probes. Matches Istio's status port |
+| `FERRUM_MESH_APP_PROBES` | No | *(empty)* | **Injector-emitted, mesh (sidecar) only.** JSON object mapping `<container>/<probeField>` to the original probe handler (`httpGet` / `tcpSocket` / `grpc`, with named ports already resolved, plus `timeoutSeconds`). This is the COMPLETE set of targets the probe server will ever contact: it accepts no target, port, path, or scheme from a request, and every probe it runs goes to `127.0.0.1`. Set by the sidecar injector; operators do not normally write it by hand. An unparseable value fails mesh startup rather than silently dropping probes |
+| `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS` | No | `128` | **Mesh (sidecar) only.** Maximum concurrent connections the application-probe listener admits. That listener is plaintext, wildcard-bound, and deliberately exempt from inbound mesh capture, so any peer that can reach the Pod IP reaches it without mTLS or `mesh_authz`; the cap is enforced in the accept loop **before** a task, HTTP state, or loopback probe is allocated, and over-limit sockets are dropped (TCP RST). Sized separately from `FERRUM_MAX_CONNECTIONS` on purpose — this is the sidecar's own status port, not a data-plane proxy listener, and the data-plane default would bound nothing here. `0` = unlimited |
+| `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP` | No | `32` | **Mesh (sidecar) only.** Per-source-IP share of `FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS`, so one host cannot occupy the whole budget and starve kubelet's own probes (kubelet dials from the node). Keyed on the socket peer: the connection is unauthenticated and pre-HTTP at the admission point, so there is no forwarded identity to trust. Must not exceed the global cap — a per-IP cap that can never fire is refused at startup. `0` = unlimited |
+| `FERRUM_MESH_APP_PROBE_MAX_ACTIVE_PROBES` | No | `16` | **Mesh (sidecar) only.** Maximum loopback application probes executing concurrently. A second, independent budget taken immediately before the probe runs: one admitted keep-alive connection can pipeline probe requests without limit, and each accepted one opens a fresh loopback connection into the application container for up to its `timeoutSeconds` (bounded at 600s), so connection capacity alone does not bound application-facing concurrency. Over-budget requests get a bounded `503` with `Connection: close` rather than queueing. `0` = unlimited |
 | `FERRUM_MESH_DNS_PROXY_ENABLED` | No | `false` | Enable the transparent mesh DNS proxy. Requires traffic capture rules to redirect workload DNS traffic to `FERRUM_MESH_DNS_LISTEN_ADDR` |
 | `FERRUM_MESH_DNS_LISTEN_ADDR` | No | `127.0.0.1:15053` | UDP/TCP listen address for transparent DNS. TCP is used for truncated responses and resolver fallback |
 | `FERRUM_MESH_DNS_UPSTREAM_ADDR` | No | `127.0.0.53:53` | Upstream DNS resolver for non-mesh names. The default targets systemd-resolved; set this to your node, pod, or cluster resolver (for example CoreDNS) in non-systemd environments |
@@ -688,7 +700,7 @@ For NodeWaypoint discovery, `FERRUM_K8S_CONTROLLER_NAMESPACE` identifies the nam
 | `FERRUM_GATEWAY_API_STATUS_ADDRESS` | No | — | Optional Gateway API address advertised in `Gateway.status.addresses`. IP strings are reported as `IPAddress`; other values are reported as `Hostname` |
 | `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS` | No | `false` | Whether an active dynamic Gateway API listener bind failure also degrades `/health` readiness (`ready: false`, HTTP 503, `status: "degraded"`) in file, database, and data-plane modes. Default `false` reports `status: "degraded"` with HTTP 200 and `ready: true`, because a Gateway listener port is control-plane input and its failure is recoverable on the 30s retry — one unbindable port should not withdraw a replica whose other listeners serve normally. `/live` stays healthy and no healthy listener is closed either way |
 | `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` | No | `300` | Periodic re-reconcile interval (seconds) for the K8s controller. Re-translates the current reflector-store contents; it does **not** re-list Kubernetes, so it cannot recover objects a stalled watch never delivered — see `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` |
-| `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` | No | `300` | Rebuild a watch scope's reflector from an authoritative Kubernetes list once that scope has delivered no event for this many seconds. Bounds how long a watch that stalls without failing (kube-rs raises an error only when a watch *fails*) can keep objects invisible to every reconcile. Watch bookmarks are consumed inside kube-rs, so a healthy quiet scope also relists on every window — with dozens of scope watchers per controller, lowering this raises the full-list rate against the API server. The replacement is swapped in make-before-break, so the scope never briefly reports zero objects. `0` disables recovery. Clamped to `0`–`86400` |
+| `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` | No | `300` | Rebuild a watch scope's reflector from an authoritative Kubernetes list once that scope has delivered no event for this many seconds. Bounds how long a watch that stalls without failing (kube-rs raises an error only when a watch *fails*) can keep objects invisible to every reconcile. Watch bookmarks are consumed inside kube-rs, so a healthy quiet scope also relists on every window — with dozens of scope watchers per controller, lowering this raises the full-list rate against the API server. The replacement is swapped in make-before-break, so the scope never briefly reports zero objects. A relist whose authoritative list disagrees with the store it replaces logs a warning naming the objects that vanished or appeared without a watch event and advances `ferrum_k8s_controller_watch_relist_missed_deletes_total` / `_missed_adds_total`. A scope whose list the API server refuses (HTTP 403) or fails is held between attempts instead, and its idle clock pauses while the hold runs — the hold is the retry, so a refused scope does not relist into the same refusal. `0` disables recovery. Clamped to `0`–`86400` |
 | `FERRUM_K8S_RECONCILE_DEBOUNCE_MS` | No | `500` | Debounce window (ms) for the K8s controller — watch events arriving within this window are batched into a single reconciliation |
 | `FERRUM_K8S_KUBECONFIG_PATH` | No | — | Override kubeconfig path for out-of-cluster development. When unset, the controller tries the in-cluster service-account config first, then falls back to standard kubeconfig inference (`KUBECONFIG` / `~/.kube/config`) |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
@@ -915,7 +927,7 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_ACME_MAX_ACCOUNTS` | No | `256` | Logical create ceiling for ACME accounts |
 | `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` | No | `16` | Per-certificate terminal ACME order history retention |
 | `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` | No | `30` | Warn when configured certificates expire within this many days; `0` disables warnings |
-| `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` | No | `30` | Warn when revocation material (CRL `nextUpdate`, stapled OCSP `nextUpdate`) expires within this many days; `0` disables warnings. Expired revocation material is refused at reload **and at startup**, so this is the advance notice before a restart-blocking outage. Also exported as `ferrum_tls_revocation_expiry_seconds` |
+| `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` | No | `30` | Warn when revocation material (CRL `nextUpdate`, stapled OCSP `nextUpdate`) expires within this many days; `0` disables warnings. Expired revocation material is refused at reload **and at startup**, so this is the advance notice before a restart-blocking outage. For a stapled OCSP response the warning re-fires on the hourly staple re-check, which also drops a staple that has reached its `nextUpdate` (see `docs/frontend_tls.md`). Also exported as `ferrum_tls_revocation_expiry_seconds` |
 | `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` | No | `300` | Maximum age of the cached, non-secret TLS inventory snapshot behind the `/metrics` certificate gauges. Scrapes read the snapshot only (no certificate/key/Kubernetes/secret-manager I/O) and schedule a single-flight background refresh once it is older than this bound; `0` disables the refresh and leaves the gauges absent |
 | `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data. For HTTP/3 without frontend mTLS, enabling this sets QUIC rustls `max_early_data_size` to `u32::MAX` (the only enabled size quinn accepts; there is no finite QUIC TLS byte cap) and Ferrum enforces the method allowlist at admission. **CONNECT-UDP is never admitted in early data** even when `CONNECT` is listed — UDP has no `Early-Data: 1` header for a target to refuse a replay, so the H3 handler returns `425 Too Early` before routing. Operator-enabled H3 WebSocket 0-RTT is unchanged. HTTPS/H1/H2 currently keep rustls 0-RTT disabled until per-request early-data state is available. Inert for HTTP/3 when `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` is set: the H3 listener sets QUIC rustls `max_early_data_size` to `0`, keeps the full 1-RTT handshake (a startup warning records this), and frontend H3 mTLS keeps working |
 
@@ -1019,6 +1031,14 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` | No | `100` | Delay between plugin HTTP transport retry attempts |
 
 ### Runtime Tuning
+
+The `response_caching` plugin's freshness settings live in its plugin configuration,
+not environment variables. With the default `respect_cache_control: true`, origin
+`s-maxage`, `max-age`, and then `Expires - Date` precede the `ttl_seconds` fallback.
+Missing `Date` uses response receipt time; invalid or repeated expiry metadata is
+conservatively expired. Setting `respect_cache_control: false` explicitly overrides
+origin freshness with `ttl_seconds`, while Age and response-delay accounting remain
+active. See [response_caching](plugins.md#response_caching) for the complete rules.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -1191,8 +1211,10 @@ FERRUM_FRONTEND_TLS_CERT_PATH = "/path/with spaces/cert.pem"
 ```
 
 - Lines starting with `#` are comments
-- Inline comments are supported: `KEY = value # comment`
-- Values can be quoted with double or single quotes (quotes are stripped)
+- Unquoted values support inline comments starting with a space followed by `#`: `KEY = value # comment`
+- Values can be quoted with double or single quotes. The first matching quote closes the value; surrounding quotes are stripped, and everything inside (including whitespace, `#`, the other quote character, and backslashes) is literal. There is no escape processing.
+- After a closing quote, only whitespace and an optional `#` comment are allowed: `FERRUM_MODE = "file" # file mode`. A comment can also immediately follow the closing quote.
+- Unclosed quotes or other text after a closing quote are parse errors identifying the key and line number.
 - Empty lines are ignored
 
 A reference `ferrum.conf` with all available fields and descriptions is included in the repository root.
@@ -1285,13 +1307,62 @@ deadline above.
 
 The bound is on transport write *progress*, so it fires while the upload pump is
 blocked on bridge capacity — that expiry surfaces as `504` /
-`X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout`. A backend
-that accepts the connection and never reads therefore only trips it while the
-upload is still backpressured: once the local kernel send buffer has absorbed the
-entire body, as it will for a small or medium POST against a never-reading peer,
-the pump observes a clean end-of-stream and the wait for response headers is
-bounded by `backend_read_timeout_ms` instead. Tracked as issue
-[#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411).
+`X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout`.
+
+Write progress includes the **post-end-of-stream drain of the local send queue**
+(issue [#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411)). Once the
+last request byte has been handed to the kernel there is no HTTP-level receipt
+that the backend read it, but the kernel still knows how many bytes the peer has
+not accepted. While the response-header wait runs, Ferrum samples the backend
+socket's send-queue depth every `min(100ms, backend_write_timeout_ms / 4)`.
+Progress means a **strictly decreasing** depth; a depth that is non-zero and has
+not decreased for `backend_write_timeout_ms` is a write stall and ends the
+attempt with the same `504` / `X-Gateway-Error: backend_timeout` /
+`error_class=read_write_timeout`. A depth that oscillates without falling below
+its previous low-water mark is a stall, not progress. A body the peer's kernel
+has fully accepted (send queue empty) is bounded by `backend_read_timeout_ms`, as
+before — the gateway's write genuinely completed.
+
+Two limits of that drain bound are irreducible without a read receipt and are
+stated here rather than approximated with a timing heuristic:
+
+- **Platform.** The send-queue query is Linux (`SIOCOUTQ`) and macOS
+  (`SO_NWRITE`) only. On Windows — and on any other target — the drain bound is
+  disarmed and a never-reading backend remains bounded by
+  `backend_read_timeout_ms`.
+- **Bodies smaller than the peer's receive buffer.** A peer that never calls
+  `recv()` still absorbs roughly its initial receive-buffer size (about 128 KiB
+  on Linux defaults; receive-buffer autotuning only grows on application reads).
+  An upload that fits entirely inside that window leaves the gateway's send queue
+  empty, is indistinguishable from a delivered upload at the transport layer, and
+  is bounded by `backend_read_timeout_ms`.
+- **Transport coverage.** The drain bound is armed only for HTTP/1.1 backend
+  connections dialed by the bundled HTTP client, whose socket the vendored
+  connection-admission hook reports for the request that caused the dial. It
+  is **not** armed for the direct HTTP/2 backend pool, the native gRPC HTTP/2
+  pool, or a bundled-client connection that negotiated HTTP/2 over ALPN: those
+  connections are multiplexed, so their kernel send queue is shared by every
+  stream on them and cannot be attributed to one request. Nor is it armed for
+  uploads tunnelled inside an HBONE CONNECT session (the outer socket is shared
+  by every tunnel multiplexed on it), or for HTTP/3, whose upload backpressure
+  is QUIC stream flow control rather than a kernel send queue. All of those
+  paths keep the pre-end-of-stream idle bound and `backend_read_timeout_ms`.
+- **Requests served on an already-pooled bundled-client connection.** The bundled
+  HTTP client does not hand the gateway its sockets; it reports each socket it
+  *dials* to the gateway, and the drain bound is armed for the request that
+  caused that dial. A request served on a connection the client already had open
+  arms no drain bound and is governed by `backend_read_timeout_ms`. This does not
+  weaken the bound for the failure it exists to catch: a connection whose send
+  queue is stalled never completes its request, so it is never returned to the
+  idle pool, and every request against a backend that accepts and stops reading
+  therefore dials a fresh socket.
+
+On a multiplexed HTTP/2 connection the send queue is shared by every stream on
+it. Aggregate depth is not a safe progress signal: acknowledged bytes can be
+immediately replaced by DATA from another stream while every stream continues
+to progress. Ferrum therefore never turns that connection-wide measurement into
+a per-request write timeout, which is why only HTTP/1.1 connections publish a
+socket to the drain watch.
 
 The bound starts when the backend transport begins consuming the request body —
 the first moment a connection provably exists and the request head is written —
@@ -1483,7 +1554,33 @@ When using Database or CP modes, Ferrum auto-creates the following tables on sta
 - **`proxies`** — Proxy route definitions. Per-namespace `listen_path` uniqueness is host-scoped and enforced at admission (not by a database `UNIQUE` constraint); a non-unique secondary index on `(namespace, listen_path)` supports candidate scans only
 - **`consumers`** — API consumer/user definitions
 - **`plugin_configs`** — Plugin configurations (global, per-proxy, or proxy-group scoped)
-- **`proxy_plugins`** — Many-to-many linking proxies to plugin configs
+- **`proxy_plugins`** — Many-to-many linking proxies to plugin configs, scoped to one namespace
 - **`upstreams`** — Upstream groups for load-balanced backends (targets stored as JSON, with algorithm and health check configuration)
+- **`api_specs`** — Admin-only API-spec metadata; never read by the proxy runtime
+
+### Resource identity is `(namespace, id)`
+
+`proxies`, `upstreams`, `plugin_configs`, `api_specs`, and `consumers` each use a
+composite **`PRIMARY KEY (namespace, id)`**, so the same resource id may exist in
+two namespaces and one tenant can never reserve an id another tenant needs.
+Every relationship between them carries the namespace too:
+
+| Table | Key columns | References | ON DELETE |
+|---|---|---|---|
+| `proxies` | `(namespace, upstream_id)` | `upstreams(namespace, id)` | `RESTRICT` |
+| `plugin_configs` | `(namespace, proxy_id)` | `proxies(namespace, id)` | `CASCADE` |
+| `proxy_plugins` | `(namespace, proxy_id)` | `proxies(namespace, id)` | `CASCADE` |
+| `proxy_plugins` | `(namespace, plugin_config_id)` | `plugin_configs(namespace, id)` | `CASCADE` |
+| `api_specs` | `(namespace, proxy_id)` | `proxies(namespace, id)` | `CASCADE` |
+
+`proxy_plugins` has its own `namespace` column and a
+`PRIMARY KEY (namespace, proxy_id, plugin_config_id)`; both of its foreign keys
+reuse that single column, so an association is structurally incapable of joining
+a proxy in one namespace to a plugin config in another.
+
+MongoDB matches this: the `proxies`, `upstreams`, `plugin_configs`, `api_specs`,
+and `consumers` collections use the composite `_id` `"{namespace}:{id}"`
+(the namespace charset forbids `:`, so the first `:` is an unambiguous
+delimiter). The `id` and `namespace` fields stay in every document.
 
 See [migrations.md](migrations.md) for schema migration details.

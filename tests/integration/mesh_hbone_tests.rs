@@ -123,6 +123,7 @@ fn create_mesh_proxy_state_with_config(
     plugin_configs: Vec<PluginConfig>,
 ) -> ProxyState {
     let config = GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         version: "1".to_string(),
         proxies: vec![proxy],
         consumers,
@@ -837,6 +838,7 @@ fn spiffe_identity_global_plugin_config() -> PluginConfig {
 fn create_egress_udp_gateway_state(mesh: MeshConfig) -> ProxyState {
     let spiffe_plugin = spiffe_identity_global_plugin_config();
     let config = GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         version: "1".to_string(),
         // One unrelated HTTP route keeps the config shaped like a real gateway.
         // It can never serve these CONNECTs: a `udp`-marked CONNECT is forced to
@@ -1265,6 +1267,7 @@ fn materialize_source_side_external_udp(
         ..MeshConfig::default()
     };
     let config = GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         version: "1".to_string(),
         proxies: vec![],
         consumers: vec![],
@@ -4317,6 +4320,7 @@ fn create_post_plugin_third_workload_state(
 ) -> ProxyState {
     let spiffe_plugin = spiffe_identity_global_plugin_config();
     let config = GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         version: "1".to_string(),
         // Unrelated HTTP route: CONNECT to 127.0.0.1:b_port misses it, so
         // synthesis builds `__mesh-inbound-hbone-relay` and the global plugin

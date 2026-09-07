@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, watch};
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 
 #[cfg(unix)]
@@ -8940,13 +8940,30 @@ fn default_test_spool_owner_spec(node_id: &str) -> SpoolOwnerSpec<'_> {
     }
 }
 
+/// Operator-facing message for a spool probe that failed for a reason other
+/// than the name having vanished (callers handle `NotFound` before this).
+fn spool_probe_failure(what: &str, path: &Path, error: &std::io::Error) -> String {
+    format!(
+        "{PLUGIN_NAME}: failed to {what} '{}': {error}",
+        path.display()
+    )
+}
+
+/// Whether an enumerated temp/claim is old enough to be reclaimed.
+///
+/// A name that has already vanished reports `false`, not an error: the walk that
+/// listed it and this stat are separate syscalls, so a peer writer sharing the
+/// namespace can finalize or roll the name back in between. There is nothing
+/// left to reclaim and nothing to report as stranded, and returning an error
+/// would let that ordinary peer step fail the whole reconcile pass. Every other
+/// stat failure still refuses, which keeps the "unreadable temp is protected"
+/// rule intact for a live peer write.
 fn spool_temp_is_stale(path: &Path, now: SystemTime, age_secs: u64) -> Result<bool, String> {
-    let meta = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to stat spool temp '{}': {error}",
-            path.display()
-        )
-    })?;
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(spool_probe_failure("stat spool temp", path, &error)),
+    };
     if meta.file_type().is_symlink() {
         return Ok(false);
     }
@@ -9235,6 +9252,13 @@ enum SpoolFileClass {
 }
 
 /// Bounded, symlink-free, cycle-free walk of one managed subtree.
+///
+/// The walk tolerates an enumerated name vanishing before its `lstat` probe: a
+/// peer writer sharing the namespace may finalize, restore, or roll back a
+/// `*.write-<tag>-<gen>.tmp` or `*.claim-*.inflight` between the two syscalls,
+/// and that ordinary step must not fail an unrelated writer's inventory. It is
+/// still fail-closed for every other probe error, for symlinks, and for
+/// directories that escape the canonical root.
 struct SpoolWalk<'a> {
     root: &'a Path,
     class: SpoolFileClass,
@@ -9242,6 +9266,10 @@ struct SpoolWalk<'a> {
     max_entries: usize,
     visited: HashSet<DirIdentity>,
     canonical_root: Option<PathBuf>,
+    /// Snapshotted once per walk rather than per entry: the slot is a global
+    /// mutex and this walk runs under the namespace lock over a bounded but
+    /// large entry budget.
+    entry_probe_hook: Option<SpoolWalkHookForTests>,
 }
 
 impl<'a> SpoolWalk<'a> {
@@ -9298,6 +9326,7 @@ impl<'a> SpoolWalk<'a> {
             max_entries,
             visited: HashSet::new(),
             canonical_root,
+            entry_probe_hook: snapshot_spool_walk_hook_for_tests(),
         })
     }
 
@@ -9344,14 +9373,36 @@ impl<'a> SpoolWalk<'a> {
             self.entry_count = self.entry_count.saturating_add(1);
             let path = entry.path();
             ensure_path_within_root(self.root, &path)?;
+            if let Some(hook) = self.entry_probe_hook.as_deref() {
+                hook(SpoolWalkHookPoint::BeforeEntryProbe, &path);
+            }
             // Never follow symlinks for scan, replay, eviction, quarantine, or
             // temp cleanup: the entry must be the real node we enumerated.
-            let meta = fs::symlink_metadata(&path).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: failed to lstat spool path '{}': {error}",
-                    path.display()
-                )
-            })?;
+            //
+            // `read_dir` enumeration and this probe are two separate syscalls,
+            // so a peer writer sharing the namespace (another `SpoolManager`
+            // generation in this process, or another process on the volume) can
+            // finalize, restore, or roll back the name in between. `NotFound`
+            // here is unambiguously "the name is gone": `symlink_metadata` is an
+            // `lstat`, which does not follow the final component, so a dangling
+            // symlink still reports `Ok` with `is_symlink()` set and can never
+            // be laundered into a skip. A vanished entry needs no scan, replay,
+            // eviction, quarantine, or temp cleanup, so skipping it is the
+            // correct outcome for every caller of this walk — and failing the
+            // whole walk instead would let a peer's ordinary temp rollback abort
+            // an unrelated writer's quota admission.
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        "Chargeback sink skipped a spool entry that vanished between enumeration and probe"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(spool_probe_failure("lstat spool path", &path, &error)),
+            };
             let file_type = meta.file_type();
             if file_type.is_symlink() {
                 warn!(
@@ -10570,6 +10621,48 @@ pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
 
 fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
     spool_write_hook_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+/// Deterministic injection point inside the bounded spool tree walk.
+///
+/// `read_dir` enumeration and the per-entry `lstat` probe are separate
+/// syscalls. External tests use this seam to mutate an enumerated name in that
+/// exact window, so the peer-writer race the walk must tolerate is reproduced
+/// deterministically rather than by timing two threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpoolWalkHookPoint {
+    /// One directory entry has been enumerated and containment-checked; its
+    /// `lstat` probe has not run.
+    BeforeEntryProbe,
+}
+
+/// The hook carries the enumerated entry path, so a hook installed by one test
+/// must ignore every invocation outside its own spool root: the slot is
+/// process-global and the test binary runs tests in parallel.
+type SpoolWalkHookForTests = Arc<dyn Fn(SpoolWalkHookPoint, &Path) + Send + Sync + 'static>;
+
+fn spool_walk_hook_slot() -> &'static Mutex<Option<SpoolWalkHookForTests>> {
+    static HOOK: OnceLock<Mutex<Option<SpoolWalkHookForTests>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install or clear a process-global hook inside the bounded spool tree walk.
+///
+/// Tests must clear the hook before finishing (including panic paths) and
+/// ignore every invocation whose entry path is outside their own spool root.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn set_spool_walk_hook_for_tests(hook: Option<SpoolWalkHookForTests>) {
+    if let Ok(mut slot) = spool_walk_hook_slot().lock() {
+        *slot = hook;
+    }
+}
+
+fn snapshot_spool_walk_hook_for_tests() -> Option<SpoolWalkHookForTests> {
+    spool_walk_hook_slot()
         .lock()
         .ok()
         .and_then(|slot| slot.clone())

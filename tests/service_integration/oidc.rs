@@ -26,7 +26,7 @@ use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::common::containers::fail_in_ci_else_skip;
+use crate::common::containers::{fail_in_ci_else_skip, fixture_http_client};
 use crate::common::hydra::{
     FIXTURE_EMAIL, FIXTURE_ROLE, FIXTURE_SUBJECT, HydraClient, HydraContainer,
     TokenEndpointAuthMethod, rewrite_authorization_nonce, start_hydra_container,
@@ -366,7 +366,7 @@ async fn sleep_past_ttl_secs(ttl_secs: u64) {
 }
 
 async fn fetch_hydra_discovery(hydra: &HydraContainer) -> Value {
-    reqwest::Client::new()
+    fixture_http_client()
         .get(hydra.discovery_url())
         .send()
         .await

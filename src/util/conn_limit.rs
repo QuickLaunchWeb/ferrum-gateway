@@ -49,10 +49,14 @@
 //! check-and-increment runs under the DashMap shard lock so two concurrent
 //! accepts for one IP cannot both slip past the cap.
 //!
-//! This is intentionally **not** wired through `pool_shard_amount`: these are
-//! low-rate management/control-plane listeners, not a proxy hot path, so the
-//! per-IP map uses DashMap's default sharding (matching `health_check` /
-//! `circuit_breaker`).
+//! [`ConnLimiter::new`] is intentionally **not** wired through
+//! `pool_shard_amount`: the admin and CP gRPC listeners are low-rate
+//! management/control-plane surfaces, not a proxy hot path, so their per-IP map
+//! uses DashMap's default sharding (matching `health_check` /
+//! `circuit_breaker`). Data-plane accept loops build the same limiter through
+//! [`ConnLimiter::with_per_ip_shard_amount`] instead, which sizes the per-IP
+//! map with [`crate::util::sharding::pool_shard_amount`] as every other
+//! hot-path `DashMap` in the gateway does.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -120,6 +124,7 @@ impl ConnLimiterSnapshot {
 /// HTTPS, or the CP gRPC listener across every TLS certificate reload
 /// generation — so the cap applies to the surface as a whole rather than per
 /// listener or per certificate generation.
+#[derive(Debug)]
 pub struct ConnLimiter {
     /// Global slot pool. `None` when `max_connections == 0` (cap disabled).
     semaphore: Option<Arc<Semaphore>>,
@@ -141,6 +146,16 @@ impl ConnLimiter {
     /// == 0` disables the per-IP cap. With both zero the limiter only tracks the
     /// `active` gauge and never rejects.
     pub fn new(max_connections: usize, max_connections_per_ip: usize) -> Self {
+        Self::with_per_ip_map(max_connections, max_connections_per_ip, DashMap::new())
+    }
+
+    /// Shared body of both constructors: everything except the per-IP map,
+    /// whose sharding is the one thing the two differ on.
+    fn with_per_ip_map(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        per_ip_active: DashMap<IpAddr, u32>,
+    ) -> Self {
         let semaphore = if max_connections > 0 {
             // Clamp to the tokio semaphore ceiling so an absurd operator value
             // can't panic `Semaphore::new`.
@@ -153,11 +168,37 @@ impl ConnLimiter {
             semaphore,
             max_connections,
             max_connections_per_ip,
-            per_ip_active: DashMap::new(),
+            per_ip_active,
             active: AtomicU64::new(0),
             rejected_max_connections: AtomicU64::new(0),
             rejected_max_connections_per_ip: AtomicU64::new(0),
         }
+    }
+
+    /// Build a limiter whose per-IP map is sharded for a **data-plane** accept
+    /// loop (issue #4626).
+    ///
+    /// Identical to [`ConnLimiter::new`] except that the per-IP `DashMap` is
+    /// sized through [`crate::util::sharding::pool_shard_amount`], which every
+    /// hot-path map in the gateway goes through: the NodeWaypoint transparent
+    /// inbound capture listener fronts ordinary application traffic for every
+    /// enrolled pod on the node, so its accept path sees real data-plane
+    /// concurrency rather than the handful of management connections the admin
+    /// and CP gRPC surfaces see.
+    ///
+    /// `shard_amount_override` is the operator's `FERRUM_POOL_SHARD_AMOUNT`
+    /// (`0` = auto-derive from the host topology).
+    pub fn with_per_ip_shard_amount(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        shard_amount_override: usize,
+    ) -> Self {
+        let shards = crate::util::sharding::pool_shard_amount(shard_amount_override);
+        Self::with_per_ip_map(
+            max_connections,
+            max_connections_per_ip,
+            DashMap::with_capacity_and_shard_amount(0, shards),
+        )
     }
 
     /// Convenience constructor for an uncapped limiter. Used by the external
@@ -267,6 +308,7 @@ impl ConnLimiter {
 
 /// RAII guard representing one admitted connection. Releases the global +
 /// per-IP slots exactly once on drop.
+#[derive(Debug)]
 pub struct ConnPermit {
     limiter: Arc<ConnLimiter>,
     remote_ip: IpAddr,

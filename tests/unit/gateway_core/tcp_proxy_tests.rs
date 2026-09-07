@@ -9,9 +9,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use ferrum_edge::_test_support::{
     StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
-    classify_stream_error, disconnect_cause_for_failure, relay_failure_is_client_facing,
-    tcp_fault_admission_retry_delays_for_test, tcp_fault_admission_should_cancel_for_test,
-    tcp_stream_summary_from_clocks_for_test, wait_for_tcp_peer_reset_for_test,
+    classify_stream_error, classify_stream_setup_error, disconnect_cause_for_failure,
+    relay_failure_is_client_facing, tcp_fault_admission_retry_delays_for_test,
+    tcp_fault_admission_should_cancel_for_test, tcp_stream_summary_from_clocks_for_test,
+    wait_for_tcp_peer_reset_for_test,
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
@@ -129,6 +130,41 @@ fn test_classify_stream_error_preserves_dns_failures() {
         anyhow::anyhow!("DNS resolution returned no addresses for backend.local"),
     );
     assert_eq!(classify_stream_error(&typed), ErrorClass::DnsLookupError);
+}
+
+/// Issue #4536: the TCP accept loop's PRE-COPY failure path (DNS, the backend
+/// dial, the backend TLS handshake) classifies with the setup-phase
+/// classifier, because the connect phase is call-site knowledge the error
+/// value does not carry. A refused / RST'd / port-exhausted dial must stay
+/// pre-wire there so `retry_on_connect_failure` and the connect-failure
+/// disconnect cause keep working — while the SAME io kinds inside the copy
+/// loop stay post-wire.
+#[test]
+fn pre_copy_dial_failures_are_pre_wire_and_copy_loop_failures_are_not() {
+    let refused: anyhow::Error =
+        anyhow::Error::new(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
+    assert_eq!(
+        classify_stream_setup_error(&refused),
+        ErrorClass::ConnectionRefused
+    );
+    assert!(!ferrum_edge::retry::request_reached_wire(
+        classify_stream_setup_error(&refused)
+    ));
+    assert!(
+        ferrum_edge::retry::request_reached_wire(classify_stream_error(&refused)),
+        "the same ECONNREFUSED surfaced from the copy loop is post-wire"
+    );
+
+    let dial_rst: anyhow::Error =
+        anyhow::Error::new(io::Error::new(io::ErrorKind::ConnectionReset, "syn-rst"));
+    assert_eq!(
+        classify_stream_setup_error(&dial_rst),
+        ErrorClass::ConnectionRefused
+    );
+    assert_eq!(
+        classify_stream_error(&dial_rst),
+        ErrorClass::ConnectionReset
+    );
 }
 
 // ── Test helpers for bidirectional_copy direction tracking ───────────────────

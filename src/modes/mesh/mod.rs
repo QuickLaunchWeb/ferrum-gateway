@@ -7,6 +7,7 @@
 //! existing plugins work in mesh context.
 
 pub mod access_log_filter;
+pub mod app_probe;
 pub mod config;
 pub mod config_consumer;
 pub mod dns_proxy;
@@ -15293,6 +15294,32 @@ async fn arm_mesh_runtime_startup(
     } else {
         None
     };
+
+    // Rewritten kubelet application probes (issue #4533). The injector points
+    // every application `httpGet` / `tcpSocket` / `grpc` probe at this
+    // listener and records the ORIGINAL handler in `FERRUM_MESH_APP_PROBES`;
+    // the sidecar then probes the application over loopback, which capture
+    // never touches. No application port is excluded from inbound capture, so
+    // ordinary Service / Pod-IP traffic to those ports still terminates in the
+    // mesh proxy under mTLS and `mesh_authz`. Absent env (no rewritten probes)
+    // or port `0` starts nothing.
+    // Admission for that listener comes from the resolved env config, and the
+    // process overload state is handed in so critical overload sheds new probe
+    // connections at the same boundary the ordinary proxy accept loop does
+    // (issue #4625).
+    match crate::modes::mesh::app_probe::start_from_env(
+        env_config,
+        Some(Arc::clone(&proxy_state.overload)),
+        shutdown_tx.subscribe(),
+    ) {
+        Ok(Some(handle)) => owner.push_mesh_background(handle),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(error.context(
+                "failed to start the mesh application-probe rewrite server; kubelet probes                  rewritten by the injector would fail closed",
+            ));
+        }
+    }
 
     // By default inbound mTLS remains a startup-only decision (`inbound_mtls_mode`
     // and `validate_egress_gateway_mtls_config` resolved earlier, before the

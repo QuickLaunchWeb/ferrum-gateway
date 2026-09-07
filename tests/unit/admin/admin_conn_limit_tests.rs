@@ -27,8 +27,7 @@ fn admits_up_to_cap_then_rejects() {
     // does not require `AdminConnPermit: Debug`.
     let reason = limiter
         .try_acquire(ip(4))
-        .err()
-        .expect("4th should be rejected");
+        .expect_err("4th should be rejected");
     assert_eq!(reason, AdminConnRejectReason::MaxConnections);
 
     let snap = limiter.snapshot();
@@ -66,8 +65,7 @@ fn per_ip_cap_isolates_sources() {
     let _a2 = limiter.try_acquire(ip(1)).expect("A 2nd");
     let reason = limiter
         .try_acquire(ip(1))
-        .err()
-        .expect("A 3rd should be rejected");
+        .expect_err("A 3rd should be rejected");
     assert_eq!(reason, AdminConnRejectReason::MaxConnectionsPerIp);
 
     // A different IP is unaffected.

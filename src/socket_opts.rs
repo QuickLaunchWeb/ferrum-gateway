@@ -694,6 +694,93 @@ pub fn get_tcp_info(_fd: i32) -> Option<TcpConnectionInfo> {
     None
 }
 
+// ── Send-queue depth (SIOCOUTQ / SO_NWRITE) ────────────────────────────
+
+/// Bytes this socket has handed to the kernel that the PEER has not yet
+/// acknowledged: unsent bytes still in the write queue plus sent-but-unacked
+/// bytes (issue #4411).
+///
+/// This is the only application-reachable receipt for "the backend is not
+/// consuming what we wrote". Once hyper has handed the last request byte to the
+/// kernel there is no HTTP-level acknowledgement to wait on, but a peer that
+/// never calls `recv()` fills its receive buffer, closes its receive window,
+/// and leaves the remainder of the upload parked here for the life of the
+/// connection. A depth that never decreases is therefore a real, monotonic
+/// transport stall rather than a timing heuristic.
+///
+/// Linux: `ioctl(SIOCOUTQ)`, which is the same request number as `TIOCOUTQ`
+/// and returns `sk_wmem_queued`-accounted unsent + unacked bytes. `TCP_INFO`'s
+/// `tcpi_notsent_bytes` + `tcpi_unacked` is the same quantity split in two; the
+/// single ioctl is preferred because it needs no struct-layout agreement with
+/// the running kernel.
+#[cfg(target_os = "linux")]
+pub fn socket_send_queue_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: `fd` is borrowed from a live socket by the caller and `SIOCOUTQ`
+    // writes exactly one `c_int` through the pointer.
+    let ret = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, std::ptr::addr_of_mut!(queued)) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if queued < 0 {
+        return Err(std::io::Error::other(
+            "SIOCOUTQ reported a negative send queue",
+        ));
+    }
+    Ok(queued as u64)
+}
+
+/// macOS equivalent: `SO_NWRITE` reports the bytes still queued for
+/// transmission on the socket.
+#[cfg(target_os = "macos")]
+pub fn socket_send_queue_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
+    let mut queued: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is borrowed from a live socket by the caller; `SO_NWRITE`
+    // writes exactly one `c_int` and `len` describes that buffer.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NWRITE,
+            std::ptr::addr_of_mut!(queued).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if queued < 0 {
+        return Err(std::io::Error::other(
+            "SO_NWRITE reported a negative send queue",
+        ));
+    }
+    Ok(queued as u64)
+}
+
+/// Every other platform — Windows included — has no portable send-queue query,
+/// so the post-EOS drain bound stays disarmed there and
+/// `backend_read_timeout_ms` remains the only bound on a never-reading peer.
+/// Documented next to `backend_write_timeout_ms` in `docs/configuration.md`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn socket_send_queue_bytes(_fd: i32) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "send-queue depth is not observable on this platform",
+    ))
+}
+
+// Reached from the binary only through `BackendSocketHandle`, whose production
+// callers are per-request transports; with none active it is test-support only.
+#[allow(dead_code)]
+/// Whether [`socket_send_queue_bytes`] can answer at all on this build target.
+///
+/// Callers use it to skip installing the sampler entirely rather than paying a
+/// failing syscall per sample.
+pub const fn send_queue_probe_supported() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
 // ── SO_BUSY_POLL (low-latency polling) ─────────────────────────────────
 
 /// Enable `SO_BUSY_POLL` on a socket (Linux 3.11+ only).

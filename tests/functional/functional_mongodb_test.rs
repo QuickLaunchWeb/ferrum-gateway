@@ -1359,6 +1359,13 @@ async fn submit_hand_managed_proxy(
     );
 }
 
+/// MongoDB durable key for a namespaced resource document: `"{namespace}:{id}"`
+/// (`PRIMARY KEY (namespace, id)` parity, issue #4627). Test-side mirror of the
+/// store's private `namespaced_doc_id`.
+fn mongo_doc_id(namespace: &str, id: &str) -> String {
+    format!("{namespace}:{id}")
+}
+
 async fn owned_proxy_delete_snapshot(
     db: &MongoDatabase,
     fixture: &OwnedProxyDeleteFixture,
@@ -1367,22 +1374,28 @@ async fn owned_proxy_delete_snapshot(
     OwnedProxyDeleteSnapshot {
         proxies: db
             .collection::<Document>("proxies")
-            .count_documents(doc! { "_id": fixture.proxy_id.as_str(), "namespace": "ferrum" })
+            .count_documents(
+                doc! { "_id": mongo_doc_id("ferrum", &fixture.proxy_id), "namespace": "ferrum" },
+            )
             .await
             .expect("count fixture proxies"),
         plugin_configs: db
             .collection::<Document>("plugin_configs")
-            .count_documents(doc! { "_id": fixture.plugin_id.as_str(), "namespace": "ferrum" })
+            .count_documents(
+                doc! { "_id": mongo_doc_id("ferrum", &fixture.plugin_id), "namespace": "ferrum" },
+            )
             .await
             .expect("count fixture plugin configs"),
         api_specs: db
             .collection::<Document>("api_specs")
-            .count_documents(doc! { "_id": spec_id, "namespace": "ferrum" })
+            .count_documents(doc! { "_id": mongo_doc_id("ferrum", spec_id), "namespace": "ferrum" })
             .await
             .expect("count fixture API specs"),
         upstreams: db
             .collection::<Document>("upstreams")
-            .count_documents(doc! { "_id": fixture.upstream_id.as_str(), "namespace": "ferrum" })
+            .count_documents(
+                doc! { "_id": mongo_doc_id("ferrum", &fixture.upstream_id), "namespace": "ferrum" },
+            )
             .await
             .expect("count fixture upstreams"),
         config_changes: db
@@ -1599,7 +1612,7 @@ async fn test_mongodb_standalone_proxy_delete_scopes_owner_preflight_to_namespac
     let foreign_spec_id = format!("foreign-owner-{}", &Uuid::new_v4().to_string()[..8]);
     db.collection::<Document>("api_specs")
         .insert_one(doc! {
-            "_id": foreign_spec_id.as_str(),
+            "_id": mongo_doc_id("other-namespace", &foreign_spec_id),
             "namespace": "other-namespace",
             "proxy_id": proxy_id.as_str(),
         })
@@ -1619,7 +1632,9 @@ async fn test_mongodb_standalone_proxy_delete_scopes_owner_preflight_to_namespac
     );
     assert_eq!(
         db.collection::<Document>("proxies")
-            .count_documents(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+            .count_documents(
+                doc! { "_id": mongo_doc_id("ferrum", &proxy_id), "namespace": "ferrum" }
+            )
             .await
             .expect("count deleted hand-managed proxy"),
         0
@@ -1627,7 +1642,7 @@ async fn test_mongodb_standalone_proxy_delete_scopes_owner_preflight_to_namespac
     assert_eq!(
         db.collection::<Document>("api_specs")
             .count_documents(
-                doc! { "_id": foreign_spec_id.as_str(), "namespace": "other-namespace" },
+                doc! { "_id": mongo_doc_id("other-namespace", &foreign_spec_id), "namespace": "other-namespace" },
             )
             .await
             .expect("count foreign owner metadata"),
@@ -1660,7 +1675,7 @@ async fn test_mongodb_standalone_proxy_delete_refuses_malformed_ownership_stamp(
     let db = mongo_database(&mongo_url).await;
     db.collection::<Document>("proxies")
         .update_one(
-            doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" },
+            doc! { "_id": mongo_doc_id("ferrum", &proxy_id), "namespace": "ferrum" },
             doc! { "$set": { "api_spec_id": 42 } },
         )
         .await
@@ -1681,7 +1696,7 @@ async fn test_mongodb_standalone_proxy_delete_refuses_malformed_ownership_stamp(
     let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
     let proxies_after = db
         .collection::<Document>("proxies")
-        .count_documents(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+        .count_documents(doc! { "_id": mongo_doc_id("ferrum", &proxy_id), "namespace": "ferrum" })
         .await
         .expect("count proxy after refusal");
     let changes_after = db
@@ -1693,7 +1708,7 @@ async fn test_mongodb_standalone_proxy_delete_refuses_malformed_ownership_stamp(
     // Remove the intentionally undecodable fixture before asserts so a failed
     // expectation cannot poison the shared CI MongoDB used by later startups.
     db.collection::<Document>("proxies")
-        .delete_one(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+        .delete_one(doc! { "_id": mongo_doc_id("ferrum", &proxy_id), "namespace": "ferrum" })
         .await
         .expect("cleanup malformed ownership fixture");
 

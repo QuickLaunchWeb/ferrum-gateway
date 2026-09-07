@@ -1304,7 +1304,6 @@ pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     #[cfg(unix)]
     #[test]
@@ -1333,25 +1332,38 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fd_count_uses_procfs_stat_aggregate_when_available() {
-        let counted = count_open_fds();
-        assert!(counted > 0, "Process should have at least some open FDs");
-        assert_ne!(counted, u64::MAX, "live /proc/self/fd must be readable");
-        if let Some(from_stat) = linux_fd_count_from_stat("/proc/self/fd") {
-            // `counted` and `from_stat` are two samples of a LIVE counter taken
-            // at different instants, and each call itself opens `/proc/self/fd`
-            // for the duration of its own read, so an exact match is not
-            // assertable: CI observed 32 vs 33. What the sampler must not do is
-            // fall back to `FDSize` (allocated slots, a power of two such as 64
-            // or 128) or to a stale value, so assert agreement within a small
-            // tolerance — wide enough for the transient descriptors, far too
-            // narrow to admit an allocation-rounded FDSize.
+        // `counted` and `from_stat` are two samples of a LIVE counter taken at
+        // different instants, each call itself opens `/proc/self/fd` for the
+        // duration of its own read, and every other test in this binary is
+        // opening and closing descriptors meanwhile, so one pair is not
+        // assertable: CI observed 32 vs 33, then 32 vs 29. Take the closest of
+        // a few back-to-back pairs. What the sampler must not do is fall back
+        // to `FDSize` (allocated slots, a power of two such as 64 or 128) or
+        // to a stale value, so the closest pair must still agree within a
+        // small tolerance — wide enough for transient descriptors, far too
+        // narrow to admit an allocation-rounded FDSize.
+        let mut closest: Option<(u64, u64, u64)> = None;
+        for _ in 0..8 {
+            let counted = count_open_fds();
+            assert!(counted > 0, "Process should have at least some open FDs");
+            assert_ne!(counted, u64::MAX, "live /proc/self/fd must be readable");
+            let Some(from_stat) = linux_fd_count_from_stat("/proc/self/fd") else {
+                return;
+            };
             let drift = counted.abs_diff(from_stat);
-            assert!(
-                drift <= 2,
-                "count_open_fds must prefer the procfs st_size aggregate: \
-                 counted={counted} from_stat={from_stat} drift={drift}"
-            );
+            if closest.is_none_or(|(_, _, best)| drift < best) {
+                closest = Some((counted, from_stat, drift));
+            }
+            if drift <= 2 {
+                break;
+            }
         }
+        let (counted, from_stat, drift) = closest.expect("at least one sample pair");
+        assert!(
+            drift <= 2,
+            "count_open_fds must prefer the procfs st_size aggregate: \
+             counted={counted} from_stat={from_stat} drift={drift}"
+        );
     }
 
     /// A non-procfs directory must take the walk fallback. Using `st_size`
@@ -1708,71 +1720,74 @@ mod tests {
         );
     }
 
-    /// Saturate every worker with a synchronous CPU-bound sleep, then verify
-    /// the probe surfaces the resulting scheduling delay.
-    ///
-    /// Strategy: spawn one synchronous-sleep task per worker and have a
-    /// separate OS thread wait until every blocker has entered its sleep before
-    /// starting the latency probe. Each per-worker probe must then queue behind
-    /// in-progress sleep work, so the MAX observed reschedule latency is
-    /// bounded below by the sleep duration minus minor scheduling overhead.
-    ///
-    /// The OLD single-task implementation would also detect this scenario
-    /// (because the driver itself can't make forward progress with every
-    /// worker pinned), but only because the single yield_now happens to land
-    /// behind a sleeping task — by luck of which worker the driver runs on.
-    /// The new per-worker probe is GUARANTEED to surface the worst-case
-    /// worker, not just the driver's worker.
+    /// Keep every worker occupied until the production probe has actually
+    /// queued its tasks. A start counter followed by fixed sleeps only proved
+    /// historical saturation: CI could delay the probe until all sleeps ended.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn measure_event_loop_latency_detects_saturated_workers() {
         let handle = tokio::runtime::Handle::current();
         let num_workers = handle.metrics().num_workers();
-        // Sleep budget for the blockers. Each worker stalls inside
-        // `std::thread::sleep(SLEEP_MS)`, so the probe's queue wait is
-        // bounded above by SLEEP_MS minus the post-signal grace below.
-        const SLEEP_MS: u64 = 400;
-        // Bridge the unavoidable race between the blocker future's signal
-        // (`started.fetch_add` runs FIRST, then `std::thread::sleep`) and
-        // the worker actually entering its blocking sleep. On a contended
-        // CI host the OS scheduler can pause the worker between those two
-        // instructions long enough for the probe — submitted the instant
-        // `started == num_workers` — to land on a still-free worker and
-        // return in microseconds. This grace gives every blocker time to
-        // commit to its sleep call before the probe submits.
-        const POST_SIGNAL_GRACE_MS: u64 = 100;
-
-        let started = Arc::new(AtomicUsize::new(0));
-        let probe_started = Arc::clone(&started);
-        let probe_thread = std::thread::spawn(move || {
-            while probe_started.load(Ordering::Acquire) < num_workers {
-                std::thread::yield_now();
-            }
-            std::thread::sleep(Duration::from_millis(POST_SIGNAL_GRACE_MS));
-            handle.block_on(measure_event_loop_latency())
-        });
-
-        // Spawn one CPU-bound sleep per worker. The probe thread waits until
-        // all of them have started, avoiding a race where the probe runs before
-        // the runtime is actually saturated.
+        const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+        const BLOCKED_AFTER_QUEUE: Duration = Duration::from_millis(50);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::with_capacity(num_workers);
         let mut blockers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            let started = Arc::clone(&started);
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            let started_tx = started_tx.clone();
             blockers.push(tokio::spawn(async move {
-                started.fetch_add(1, Ordering::Release);
-                std::thread::sleep(Duration::from_millis(SLEEP_MS));
+                started_tx.send(()).expect("probe observes worker entry");
+                // No await between the signal and this blocking receive: the
+                // worker cannot poll another task until it is released.
+                release_rx
+                    .recv_timeout(FIXTURE_TIMEOUT)
+                    .expect("fixture releases every worker");
             }));
         }
+        drop(started_tx);
 
-        for b in blockers {
-            let _ = b.await;
+        let release_thread = std::thread::spawn(move || {
+            // Release even if the probe panics or fails to queue, so cleanup
+            // never relies on a blocked runtime making forward progress.
+            let queued = queued_rx.recv_timeout(FIXTURE_TIMEOUT);
+            if queued.is_ok() {
+                std::thread::sleep(BLOCKED_AFTER_QUEUE);
+            }
+            for release in releases {
+                let _ = release.send(());
+            }
+            queued.expect("production probe must queue before worker release");
+        });
+        let probe_thread = std::thread::spawn(move || {
+            for _ in 0..num_workers {
+                started_rx
+                    .recv_timeout(FIXTURE_TIMEOUT)
+                    .expect("every runtime worker must be occupied");
+            }
+            handle.block_on(async move {
+                let mut probe = std::pin::pin!(measure_event_loop_latency());
+                let mut queued_tx = Some(queued_tx);
+                std::future::poll_fn(|cx| {
+                    let result = std::future::Future::poll(probe.as_mut(), cx);
+                    if let Some(queued_tx) = queued_tx.take() {
+                        assert!(result.is_pending(), "occupied workers must queue probes");
+                        queued_tx.send(()).expect("release thread waits for probe");
+                    }
+                    result
+                })
+                .await
+            })
+        });
+
+        for blocker in blockers {
+            blocker.await.expect("worker blocker should not panic");
         }
-        let latency = probe_thread
+        let latency = probe_thread.join().expect("latency probe should not panic");
+        release_thread
             .join()
-            .expect("latency probe thread should not panic");
-
-        // Conservative lower bound: 25ms is well above µs-scale healthy
-        // readings, well below the (SLEEP_MS - POST_SIGNAL_GRACE_MS) budget,
-        // and tolerant of CI jitter.
+            .expect("worker release should not panic");
         assert!(
             latency >= Duration::from_millis(25),
             "expected probe to surface ≥25ms saturation, got {:?} \

@@ -37,6 +37,7 @@
 pub mod auth_lifetime;
 pub mod backend_capabilities;
 pub mod backend_dispatch;
+pub mod backend_send_queue;
 pub mod body;
 pub mod client_ip;
 pub mod datagram_client_address;
@@ -123,6 +124,7 @@ mod ktls_live_kernel_tests;
 /// the syscall wrappers are Linux-only.
 #[allow(dead_code)] // Several code points/helpers are exercised only by tests.
 pub mod ktls_record;
+pub mod max_forwards;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
@@ -135,7 +137,10 @@ pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
-pub(crate) mod node_waypoint_ingress_capture;
+// `pub` rather than `pub(crate)`: the admission helpers this module exposes
+// (issue #4626) are covered by the external unit-test crate, which is where the
+// repository's testing policy puts them.
+pub mod node_waypoint_ingress_capture;
 pub mod node_waypoint_udp_destination;
 pub mod node_waypoint_udp_identity;
 pub mod node_waypoint_udp_reply_source;
@@ -6748,7 +6753,10 @@ pub struct ProxyState {
 }
 
 #[inline]
-fn via_header_for_inbound_version(state: &ProxyState, version: hyper::Version) -> &Option<String> {
+pub(crate) fn via_header_for_inbound_version(
+    state: &ProxyState,
+    version: hyper::Version,
+) -> &Option<String> {
     match version {
         hyper::Version::HTTP_2 => &state.via_header_http2,
         hyper::Version::HTTP_3 => &state.via_header_http3,
@@ -31686,6 +31694,62 @@ async fn handle_proxy_request_inner(
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647). One checked,
+    // bounded hop-budget decision, taken here — after authentication,
+    // authorization, the `cors` plugin's local preflight answer, and every
+    // `before_proxy` transform, and before any transport (reqwest, direct H2,
+    // H3 client, HBONE, mesh mTLS, WebSocket) can contact the origin. A
+    // decremented budget is written into the authoritative outbound map, so
+    // every retry attempt and every raw/materialized merge below forwards the
+    // reduced value and the client's original can never reappear. The native
+    // HTTP/3 frontend (`src/http3/server.rs`) applies the same helper at the
+    // same point in its ladder — keep both call sites in sync. Free for every
+    // non-OPTIONS request; one map lookup for OPTIONS without the field.
+    match max_forwards::apply_options_max_forwards(
+        &method,
+        &mut owned_proxy_headers,
+        &mut ctx.headers,
+    ) {
+        max_forwards::MaxForwardsDecision::Forward
+        | max_forwards::MaxForwardsDecision::Decremented => {}
+        max_forwards::MaxForwardsDecision::Terminal(terminal) => {
+            let reject = boxed_finalize_reject_response(
+                &plugins,
+                &mut ctx,
+                terminal.status(),
+                terminal.body(),
+                max_forwards::max_forwards_response_headers(
+                    terminal,
+                    proxy.allowed_methods.as_deref(),
+                ),
+                is_grpc_request,
+                grpc_web_response_content_type.is_none(),
+            )
+            .await;
+            apply_grpc_reject_metadata(&mut ctx, &reject);
+            let grpc_web_response = boxed_build_grpc_web_reject_response(
+                &plugins,
+                &mut ctx,
+                grpc_web_response_content_type,
+                &reject,
+            )
+            .await;
+            boxed_log_rejected_request(
+                &plugins,
+                &ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                max_forwards::MAX_FORWARDS_REJECTION_PHASE,
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(&state, reject.http_status.as_u16());
+            if let Some(response) = grpc_web_response {
+                return Ok(response);
+            }
+            return Ok(build_response_from_normalized_reject(reject));
+        }
+    }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
     // Controlled by `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`. This handles the
@@ -47567,7 +47631,19 @@ where
     let Some(pump) = pump else {
         return Ok(fut.await);
     };
+    // Issue #4411: the bundled HTTP client dials its backend socket on THIS
+    // task, inside `fut`, and reports it through the vendored
+    // connection-admission hook rather than handing the gateway a `TcpStream`.
+    // Arming the pump's slot as a task-local for exactly the polls of this
+    // dispatch is what lets that hook publish into the right request's pump —
+    // and only that request's. Transports that publish their own socket have
+    // already filled the slot; it is write-once, so they still win. The future
+    // is pinned once, here, and the scope borrows it: wrapping it by value
+    // copied the gateway's largest state machine onto a worker stack that an
+    // HTTP/3 → plain dispatch already fills to the brim.
     tokio::pin!(fut);
+    let mut fut =
+        backend_send_queue::ReqwestBackendSocketScope::new(fut, pump.backend_socket_slot());
     tokio::select! {
         biased;
         output = &mut fut => Ok(output),
@@ -52290,6 +52366,15 @@ async fn proxy_to_backend_http2(
 
     let backend_req = Request::from_parts(parts, body);
 
+    // Post-EOS transport-drain bound (issue #4411): publish the backend socket
+    // BEFORE the first body frame can cross the pump's bridge, so the pump can
+    // charge a never-draining send queue to `backend_write_timeout_ms` once the
+    // upload has been handed over in full. Direct-H2 is the sharpest case: the
+    // pre-EOS idle arm cannot fire after the last frame, and hyper has no
+    // request-side receipt to offer.
+    if let Some(pump) = upload_pump.as_mut() {
+        pump.bind_backend_socket(sender.backend_socket());
+    }
     // Send to backend with read timeout (0 = no timeout)
     let h2_send_fut = sender.send_request(backend_req);
     let request_body_too_large = || {
@@ -64329,6 +64414,7 @@ mod tests {
 
     fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
         GatewayConfig {
+            quarantined_plugin_configs: Vec::new(),
             version: "1".to_string(),
             proxies,
             consumers: vec![],

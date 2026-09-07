@@ -836,6 +836,23 @@ impl reqwest::ConnectionAdmission for ReqwestConnectionAdmission {
             Err(limit) => Err(Box::new(limit)),
         }
     }
+
+    /// Publish the newly dialed backend socket for the dispatch that caused it
+    /// (issue #4411).
+    ///
+    /// Vendored patch 004 reports the descriptor after the dial (and any TLS
+    /// handshake) resolved and before the connection reaches hyper, so the
+    /// socket is alive here and no request byte has been written yet. The
+    /// descriptor is duplicated inside this call; nothing keeps the bare
+    /// number.
+    ///
+    /// The admission cap and this callback are independent: a destination with
+    /// no configured `maxConnections` still gets an `unlimited()` token, so the
+    /// drain bound does not depend on a connection-pool policy being set.
+    #[cfg(unix)]
+    fn established(&self, _token: &reqwest::ConnectionAdmissionToken, fd: std::os::fd::RawFd) {
+        crate::proxy::backend_send_queue::publish_reqwest_backend_socket(fd);
+    }
 }
 
 /// Recognize a reqwest error caused by this limiter refusing a new socket.

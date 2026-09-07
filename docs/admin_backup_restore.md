@@ -162,7 +162,10 @@ must be protected as secrets. The export audit record carries a
 or revisions.
 
 > **Not the same file as `FERRUM_DB_CONFIG_BACKUP_PATH`.** The database-outage
-> startup backup is a raw `GatewayConfig` document and carries no trust section
+> startup backup is a raw `GatewayConfig` document. It may describe any number of
+> namespaces — an all-namespace export is a valid thing to put there — because
+> the startup loader projects it onto the gateway's own `FERRUM_NAMESPACE` before
+> validating or serving it. It carries no trust section
 > at all, because `gateway_trust_bundles` is deliberately not serialized into
 > `GatewayConfig` (it must never ride the ConfigSync `config_json` wire). A
 > process that boots from that file therefore treats its namespace trust state

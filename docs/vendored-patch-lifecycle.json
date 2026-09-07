@@ -44,6 +44,14 @@
         "tungstenite-004-fragment-accounting",
         "tokio-tungstenite-004-fragment-accounting-delegator"
       ]
+    },
+    {
+      "id": "reqwest-connection-admission",
+      "description": "Patch 004 adds a defaulted method to patch 003's ConnectionAdmission trait; both live in vendor/reqwest-0.13.3-ferrum-patched and must retire together.",
+      "patch_ids": [
+        "reqwest-003-connection-admission-hook",
+        "reqwest-004-connection-established-fd"
+      ]
     }
   ],
   "patches": [
@@ -131,7 +139,7 @@
       "reaffirmation": null,
       "retirement": {
         "trigger": "Reqwest exposes a connection-lifecycle/admission hook, or un-seals the connector connection type so a connector_layer can own a drop guard for the connection's lifetime.",
-        "co_retirement_group": null,
+        "co_retirement_group": "reqwest-connection-admission",
         "compatible_release_test": {
           "status": "not_started",
           "notes": null
@@ -142,6 +150,40 @@
         "tests/integration/mesh_destination_rule_connection_pool_audit_tests.rs::cap_exhaustion_refuses_the_second_physical_dial",
         "tests/integration/mesh_destination_rule_connection_pool_audit_tests.rs::distinct_reqwest_pool_keys_share_one_destination_ceiling",
         "tests/integration/mesh_destination_rule_connection_pool_audit_tests.rs::h2_streams_multiplex_without_consuming_extra_slots"
+      ]
+    },
+    {
+      "id": "reqwest-004-connection-established-fd",
+      "label": "reqwest established-connection socket callback",
+      "crate": "reqwest",
+      "vendored_version": "0.13.3",
+      "vendor_path": "vendor/reqwest-0.13.3-ferrum-patched",
+      "docs_path": "docs/upstream-reqwest-patches/004-connection-established-fd/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "backend_write_timeout_ms bounds the post-EOS drain of the backend socket's send queue (issue #4411), which requires the socket. reqwest returns a sealed Conn from its connector and connector_layer sees the same sealed type, so no public API exposes the connection's TcpStream. An additive, defaulted established(token, fd) callback on the patch-003 admission trait reports it at the one place a new physical connection is created.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "seanmonstar/reqwest",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Reqwest exposes a connection-lifecycle hook that carries the connection socket, or un-seals the connector connection type so a connector_layer can read it. Retires together with reqwest-003-connection-admission-hook, whose trait this extends.",
+        "co_retirement_group": "reqwest-connection-admission",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/backend_timeout_enforcement_tests.rs::vendored_established_hook::established_reports_the_dialed_socket_once_per_physical_connection",
+        "tests/integration/backend_timeout_enforcement_tests.rs::in_process_kernel_absorb_write_timeout_maps_to_504",
+        "tests/integration/backend_timeout_enforcement_tests.rs::in_process_h2c_kernel_absorb_write_timeout_maps_to_504",
+        "tests/functional/scripted_backend_tests.rs::h1_kernel_absorb_write_timeout_maps_to_504_backend_timeout",
+        "tests/functional/scripted_backend_h2_tests.rs::h2_reqwest_kernel_absorb_write_timeout_maps_to_504"
       ]
     },
     {

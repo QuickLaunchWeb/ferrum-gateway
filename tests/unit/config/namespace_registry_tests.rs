@@ -7,15 +7,16 @@ use ferrum_edge::config::batch_atomicity::{
 use ferrum_edge::config::namespace_registry::{
     CreateNamespaceRequest, MAX_NAMESPACE_DESCRIPTION_CHARS, NAMESPACE_OCCUPANCY_TABLES,
     NAMESPACE_REGISTRY_ADMISSION_KEY, NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE,
-    NAMESPACE_RENAME_SIMPLE_TABLES, NAMESPACES_REGISTRY_BACKFILL_ID, NamespaceRegistryCorrupt,
-    NamespaceRegistryError, NamespaceRegistryRetryableConflict, SCHEMA_COMPAT_TABLE,
-    UpdateNamespaceBody, is_namespace_registry_retryable_conflict, mtls_dns_admission_namespaces,
-    namespace_prefixed_id_suffix_field, namespace_registry_admission_keys, normalize_description,
-    normalize_protected_namespaces, parse_namespace_rfc3339, protected_namespaces_contains,
-    require_canonical_stored_description, require_namespace_identity,
-    require_namespace_keyed_embedded_namespace, require_namespace_keyed_identity,
-    require_namespace_prefixed_identity, require_namespace_registry_admission_keys,
-    require_namespace_registry_admission_leases, validate_namespace_name,
+    NAMESPACE_RENAME_COPY_TABLES, NAMESPACE_RENAME_SIMPLE_TABLES, NAMESPACES_REGISTRY_BACKFILL_ID,
+    NamespaceRegistryCorrupt, NamespaceRegistryError, NamespaceRegistryRetryableConflict,
+    SCHEMA_COMPAT_TABLE, UpdateNamespaceBody, is_namespace_registry_retryable_conflict,
+    mtls_dns_admission_namespaces, namespace_prefixed_id_suffix_field,
+    namespace_registry_admission_keys, normalize_description, normalize_protected_namespaces,
+    parse_namespace_rfc3339, protected_namespaces_contains, require_canonical_stored_description,
+    require_namespace_identity, require_namespace_keyed_embedded_namespace,
+    require_namespace_keyed_identity, require_namespace_prefixed_identity,
+    require_namespace_registry_admission_keys, require_namespace_registry_admission_leases,
+    validate_namespace_name,
 };
 
 #[test]
@@ -317,7 +318,7 @@ fn require_namespace_prefixed_identity_requires_suffix_field_and_embedded_namesp
         "identity_value"
     );
     assert!(namespace_prefixed_id_suffix_field("gateway_trust_bundles").is_err());
-    assert!(namespace_prefixed_id_suffix_field("proxies").is_err());
+    assert!(namespace_prefixed_id_suffix_field("audit_events").is_err());
 
     assert_eq!(
         require_namespace_prefixed_identity("ns", "ns:alice", Some("ns"), "id", Some("alice"))
@@ -463,34 +464,76 @@ fn schema_compat_marker_cannot_collide_with_tenant_namespaces() {
 
 #[test]
 fn namespace_rename_simple_tables_move_audit_history_with_tenant() {
-    // In-place SQL rename rewrites live resource rows and the authorization-
-    // scoping audit_events.namespace column so an old namespace name cannot
-    // expose the renamed tenant's events. namespace_at_event is a different
+    // `audit_events` is the only in-place rewrite left: it is keyed on `id`
+    // alone and has no foreign keys. Its authorization-scoping `namespace`
+    // column must follow the renamed tenant so an old namespace name cannot
+    // expose the renamed tenant's events. `namespace_at_event` is a different
     // column and is not part of this rewrite.
-    assert_eq!(
-        NAMESPACE_RENAME_SIMPLE_TABLES,
-        &[
-            "proxies",
-            "plugin_configs",
-            "upstreams",
-            "api_specs",
-            "audit_events",
-        ]
-    );
-    assert!(
-        NAMESPACE_RENAME_SIMPLE_TABLES.contains(&"audit_events"),
-        "audit_events must follow a renamed tenant"
-    );
-    for live in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
-        assert!(
-            NAMESPACE_RENAME_SIMPLE_TABLES.contains(&live),
-            "{live} must still move with the tenant"
-        );
-    }
+    assert_eq!(NAMESPACE_RENAME_SIMPLE_TABLES, &["audit_events"]);
     // Occupancy still treats API specs as live tenant metadata, and still
     // excludes audit history so leftover events cannot block DELETE.
     assert!(NAMESPACE_OCCUPANCY_TABLES.contains(&"api_specs"));
     assert!(!NAMESPACE_OCCUPANCY_TABLES.contains(&"audit_events"));
+}
+
+/// Issue #4627: the four resource tables and the junction key on
+/// `(namespace, ...)`, so a rename copies them under the new name parent-first
+/// and deletes the old rows. An in-place `UPDATE ... SET namespace = ?` cannot
+/// satisfy the composite foreign keys at any statement boundary.
+#[test]
+fn namespace_rename_copy_tables_cover_every_namespace_keyed_resource_table() {
+    let tables: Vec<&str> = NAMESPACE_RENAME_COPY_TABLES
+        .iter()
+        .map(|(table, _)| *table)
+        .collect();
+    assert_eq!(
+        tables,
+        vec![
+            "upstreams",
+            "proxies",
+            "plugin_configs",
+            "proxy_plugins",
+            "api_specs",
+        ],
+        "copy order is parent-first; deletes run in reverse"
+    );
+    for (table, columns) in NAMESPACE_RENAME_COPY_TABLES {
+        assert!(
+            columns.contains(&"namespace"),
+            "{table} copy plan must project the namespace column"
+        );
+        assert!(
+            !NAMESPACE_RENAME_SIMPLE_TABLES.contains(table),
+            "{table} must not also be rewritten in place"
+        );
+        let mut sorted = columns.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "{table} copy plan repeats a column");
+    }
+}
+
+#[test]
+fn namespace_prefixed_id_suffix_field_covers_every_composite_key_collection() {
+    for collection in [
+        "consumers",
+        "proxies",
+        "upstreams",
+        "plugin_configs",
+        "api_specs",
+    ] {
+        assert_eq!(
+            namespace_prefixed_id_suffix_field(collection).expect(collection),
+            "id",
+            "{collection} keys on \"{{namespace}}:{{id}}\" in MongoDB"
+        );
+    }
+    assert_eq!(
+        namespace_prefixed_id_suffix_field("consumer_identity_index").unwrap(),
+        "identity_value"
+    );
+    assert!(namespace_prefixed_id_suffix_field("config_changes").is_err());
 }
 
 fn admission_hold(key: &str) -> NamespaceAdmissionLeaseHold<'_> {

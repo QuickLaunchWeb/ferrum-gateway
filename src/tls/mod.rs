@@ -35,6 +35,7 @@ pub mod lease;
 pub mod managed;
 pub mod multi_cert;
 pub mod ocsp;
+pub mod ocsp_recheck;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 pub(crate) mod private_file;
@@ -488,19 +489,23 @@ pub fn days_until_next_update(next_update_unix: i64, now_unix: i64) -> i64 {
 ///
 /// `warning_days == 0` disables the warning, matching
 /// `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS`.
-fn warn_if_revocation_material_near_expiry(
+///
+/// Returns whether the warning fired, so the periodic staple re-check
+/// ([`crate::tls::ocsp_recheck`]) can report how many of the staples it still
+/// tracks are inside the window without re-deriving the predicate.
+pub(crate) fn warn_if_revocation_material_near_expiry(
     material_kind: &'static str,
     display_source_id: &str,
     next_update_unix: i64,
     warning_days: u64,
     now_unix: i64,
-) {
+) -> bool {
     if warning_days == 0 {
-        return;
+        return false;
     }
     let remaining_days = days_until_next_update(next_update_unix, now_unix);
     if remaining_days > warning_days as i64 {
-        return;
+        return false;
     }
     warn!(
         revocation_material = material_kind,
@@ -512,6 +517,7 @@ fn warn_if_revocation_material_near_expiry(
          nextUpdate will not come back: refresh the material before then, or enable live \
          reload so a refreshed copy is adopted without a restart"
     );
+    true
 }
 
 /// Load Certificate Revocation Lists from a PEM file.
@@ -1132,6 +1138,17 @@ pub struct FrontendTlsCandidate {
     pub client_trust: AcceptedClientTrust,
 }
 
+/// The identity and deadline of a staple this load accepted, carried from the
+/// OCSP admission block to the registration that arms the periodic re-check.
+struct AcceptedStaple {
+    /// The operator's configured source string — the TLS inventory's
+    /// `source.identifier`, so the two agree about which entry was retired.
+    configured_source_id: String,
+    /// The already-redacted display id, the only form ever logged.
+    display_source_id: String,
+    next_update: i64,
+}
+
 /// [`load_tls_config_with_client_auth_from_sources_and_ocsp`] that also returns
 /// the accepted candidate's client-trust identity.
 #[allow(clippy::too_many_arguments)]
@@ -1166,6 +1183,7 @@ pub fn load_frontend_tls_candidate(
     // to *this* leaf and issuer. Accepting arbitrary bytes here made a reload
     // able to publish a staple that strict clients abort on, while the log said
     // the response had loaded successfully.
+    let mut accepted_staple: Option<AcceptedStaple> = None;
     let ocsp_response = match ocsp_response_source {
         Some(source) => {
             let material = load_material_blocking(source, MaterialKind::Ocsp)?;
@@ -1185,11 +1203,12 @@ pub fn load_frontend_tls_candidate(
                 ocsp_delegated_responder = acceptance.delegated_responder,
                 "Validated and stapled OCSP response for server TLS config"
             );
-            // Lead-time notice (issue #4505). The staple is validated once here
-            // and then served verbatim for the lifetime of this config: Ferrum
-            // has no OCSP responder client, so nothing re-fetches it. This warn
-            // is the operator's cue to refresh before the next restart refuses
-            // the stale bytes outright.
+            // Lead-time notice (issue #4505). Ferrum has no OCSP responder
+            // client, so nothing inside the gateway re-fetches these bytes;
+            // this warn is the operator's cue to refresh before the deadline.
+            // The periodic re-check armed below re-fires it hourly while the
+            // staple stays inside the window, and retires the staple outright
+            // once it reaches `nextUpdate`.
             warn_if_revocation_material_near_expiry(
                 "ocsp",
                 &material.display_source_id,
@@ -1197,6 +1216,11 @@ pub fn load_frontend_tls_candidate(
                 revocation_expiry_warning_days,
                 ASN1Time::now().timestamp(),
             );
+            accepted_staple = Some(AcceptedStaple {
+                configured_source_id: source.source_id(),
+                display_source_id: material.display_source_id.clone(),
+                next_update: acceptance.next_update,
+            });
             bytes
         }
         None => Vec::new(),
@@ -1211,6 +1235,23 @@ pub fn load_frontend_tls_candidate(
         ocsp_response,
         tls_policy.crypto_provider.as_ref(),
     )?;
+
+    // Issue #4505 item 4: hand the exact resolver this candidate installs to
+    // the periodic re-check, which retires the staple once it reaches
+    // `nextUpdate`. Registration happens whether or not live reload is enabled
+    // — without it there is no other event that could ever revisit these bytes.
+    // The registry holds only a `Weak`, so a candidate that is never published
+    // (a rejected reload, a `validate` run) drops out on its own.
+    if let Some(accepted_staple) = accepted_staple {
+        crate::tls::ocsp_recheck::register_stapled_response(
+            &cert_resolver,
+            accepted_staple.configured_source_id,
+            accepted_staple.display_source_id,
+            accepted_staple.next_update,
+            revocation_expiry_warning_days,
+        );
+    }
+    let cert_resolver: Arc<dyn rustls::server::ResolvesServerCert> = cert_resolver;
 
     let mut client_trust = None;
     let config = finish_frontend_server_config_capturing_trust(
@@ -1477,7 +1518,12 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
 }
 
 struct ServerCertResolverLoad {
-    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    /// The concrete resolver, not an `Arc<dyn ResolvesServerCert>`.
+    ///
+    /// The stapled-OCSP re-check (issue #4505) has to retire the staple on the
+    /// exact resolver the published `ServerConfig` serves, so the caller keeps
+    /// the concrete handle and coerces a clone of it for rustls.
+    resolver: Arc<crate::tls::acme::AcmeTlsAlpnResolver>,
     key_source_id: String,
 }
 
@@ -1520,7 +1566,7 @@ fn acme_tls_alpn_cert_resolver(
     key: PrivateKeyDer<'static>,
     ocsp_response: Vec<u8>,
     crypto_provider: &CryptoProvider,
-) -> Result<Arc<dyn rustls::server::ResolvesServerCert>, anyhow::Error> {
+) -> Result<Arc<crate::tls::acme::AcmeTlsAlpnResolver>, anyhow::Error> {
     let mut certified_key = rustls::sign::CertifiedKey::from_der(cert_chain, key, crypto_provider)
         .map_err(|error| {
             anyhow::anyhow!("server TLS cert and key do not form a valid pair: {error}")
@@ -1538,7 +1584,7 @@ fn acme_tls_alpn_pkcs11_cert_resolver(
     cert_chain: Vec<CertificateDer<'static>>,
     uri: &CertSourceUri,
     ocsp_response: Vec<u8>,
-) -> Result<Arc<dyn rustls::server::ResolvesServerCert>, anyhow::Error> {
+) -> Result<Arc<crate::tls::acme::AcmeTlsAlpnResolver>, anyhow::Error> {
     let mut certified_key = crate::tls::pkcs11::certified_key_from_uri(cert_chain, uri)?;
     if !ocsp_response.is_empty() {
         certified_key.ocsp = Some(ocsp_response);
@@ -1553,7 +1599,7 @@ fn acme_tls_alpn_pkcs11_cert_resolver(
     _cert_chain: Vec<CertificateDer<'static>>,
     uri: &CertSourceUri,
     _ocsp_response: Vec<u8>,
-) -> Result<Arc<dyn rustls::server::ResolvesServerCert>, anyhow::Error> {
+) -> Result<Arc<crate::tls::acme::AcmeTlsAlpnResolver>, anyhow::Error> {
     Err(anyhow::anyhow!(
         "PKCS#11 TLS key source '{}' requires building ferrum-edge with the 'pkcs11' cargo feature",
         uri.source_id()

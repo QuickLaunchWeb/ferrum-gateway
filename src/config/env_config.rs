@@ -1422,7 +1422,7 @@ impl std::fmt::Display for BackendEgressPolicy {
 }
 
 /// Resolve a configuration value: env var takes precedence over conf file.
-fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
+pub(crate) fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
     if let Ok(env_val) = env::var(key) {
         if conf.get(key).is_some_and(|conf_val| conf_val != env_val) {
             tracing::info!("{key}: environment variable overrides ferrum.conf default");
@@ -2437,6 +2437,34 @@ pub struct EnvConfig {
     /// file per pod, name=pod_uid, contents=cgroup path) for the mesh proxy's
     /// in-netns capture listeners to consume.
     pub mesh_node_waypoint_pod_registry_dir: String,
+    /// Maximum concurrent connections the sidecar's kubelet application-probe
+    /// listener (`FERRUM_MESH_APP_PROBE_PORT`, default `:15020`) admits.
+    ///
+    /// That listener is deliberately exempt from inbound mesh capture, so any
+    /// peer that can reach the Pod IP reaches it without mTLS or `mesh_authz`
+    /// (issue #4625). It is the sidecar's own status port, not a data-plane
+    /// proxy listener, so it is sized separately from `FERRUM_MAX_CONNECTIONS`
+    /// — kubelet probe concurrency is a handful of sockets, and a data-plane
+    /// ceiling of 100000 would bound nothing here. Enforced in the accept loop
+    /// before a task or any HTTP state is allocated. Default: 128. `0` =
+    /// unlimited.
+    pub mesh_app_probe_max_connections: usize,
+    /// Maximum concurrent application-probe listener connections per source IP.
+    ///
+    /// Keyed on the socket peer — the connection is unauthenticated and
+    /// pre-HTTP at the admission point, so there is no forwarded identity to
+    /// trust. Kubelet dials from the node, so a flood from any other source
+    /// cannot consume the share kubelet's own probes need. Default: 32. `0` =
+    /// unlimited.
+    pub mesh_app_probe_max_connections_per_ip: usize,
+    /// Maximum concurrently executing loopback application probes.
+    ///
+    /// A second, independent budget acquired immediately before the probe runs,
+    /// so keep-alive and pipelined request patterns cannot exceed
+    /// application-facing loopback concurrency while connection capacity
+    /// remains. Over-budget probe requests get a bounded `503` with
+    /// `Connection: close` rather than queueing. Default: 16. `0` = unlimited.
+    pub mesh_app_probe_max_active_probes: usize,
     /// This NodeWaypoint proxy's own Kubernetes pod UID (downward API
     /// `metadata.uid`), published on the reply-source channel so the node-agent
     /// can resolve the relay's cgroup-v2 subtree and write the non-forgeable
@@ -3875,6 +3903,12 @@ impl Default for EnvConfig {
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
             mesh_node_waypoint_pod_registry_dir: "/run/ferrum/node-waypoint-pods".to_string(),
+            mesh_app_probe_max_connections:
+                crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_CONNECTIONS,
+            mesh_app_probe_max_connections_per_ip:
+                crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP,
+            mesh_app_probe_max_active_probes:
+                crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES,
             mesh_node_waypoint_relay_pod_uid: None,
             mesh_svid_rotation_drain_seconds: 0,
             mesh_policy_deny_log_capacity: crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY,
@@ -4460,6 +4494,9 @@ impl EnvConfig {
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_pod_registry_dir: String = "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" => "/run/ferrum/node-waypoint-pods".to_string();
+            mesh_app_probe_max_connections: usize = "FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS" => crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_CONNECTIONS;
+            mesh_app_probe_max_connections_per_ip: usize = "FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP" => crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_CONNECTIONS_PER_IP;
+            mesh_app_probe_max_active_probes: usize = "FERRUM_MESH_APP_PROBE_MAX_ACTIVE_PROBES" => crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES;
             mesh_node_waypoint_relay_pod_uid: Option<String> = "FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID";
             mesh_svid_rotation_drain_seconds: u64 = "FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS" => 0u64;
             mesh_policy_deny_log_capacity: usize = "FERRUM_MESH_POLICY_DENY_LOG_CAPACITY" => crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY;
@@ -5313,6 +5350,9 @@ impl EnvConfig {
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,
             mesh_node_waypoint_pod_registry_dir,
+            mesh_app_probe_max_connections,
+            mesh_app_probe_max_connections_per_ip,
+            mesh_app_probe_max_active_probes,
             mesh_node_waypoint_relay_pod_uid,
             mesh_svid_rotation_drain_seconds,
             mesh_policy_deny_log_capacity,
@@ -6566,6 +6606,7 @@ impl EnvConfig {
         }
 
         self.validate_h3_connect_udp_limits()?;
+        self.validate_mesh_app_probe_limits()?;
 
         // Issue #4261: the HTTP/3 frontend derives BOTH its advertised
         // SETTINGS_MAX_FIELD_SECTION_SIZE and its receive-side buffered
@@ -7772,6 +7813,57 @@ impl EnvConfig {
                  per-IP cap, raise the global cap, or set the per-IP cap to 0 to disable it \
                  deliberately.",
                 self.cp_grpc_max_connections_per_ip, self.cp_grpc_max_connections
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse an application-probe admission budget that cannot be enforced
+    /// (issue #4625).
+    ///
+    /// The connection cap becomes the permit count of a `tokio::sync::Semaphore`
+    /// inside [`crate::util::conn_limit::ConnLimiter`], and the active-probe
+    /// budget is a second semaphore, so both share the CP gRPC / CONNECT-UDP
+    /// ceiling rather than being clamped silently. The per-IP rule matches
+    /// `validate_cp_grpc_connection_limits`: a per-IP cap above the global cap
+    /// can never fire, which is exactly the condition it exists to prevent.
+    ///
+    /// Mode-independent on purpose — the probe listener is started from
+    /// `FERRUM_MESH_APP_PROBE_PORT` in the injected sidecar, and `validate`
+    /// should refuse a bad value wherever an operator writes it.
+    pub fn validate_mesh_app_probe_limits(&self) -> Result<(), String> {
+        let max_conn_limit = crate::util::conn_limit::MAX_CONN_LIMIT;
+        if self.mesh_app_probe_max_connections > max_conn_limit {
+            return Err(format!(
+                "FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS ({}) exceeds the maximum supported value \
+                 {max_conn_limit}. Use 0 to disable the cap entirely.",
+                self.mesh_app_probe_max_connections
+            ));
+        }
+        if self.mesh_app_probe_max_connections_per_ip > max_conn_limit {
+            return Err(format!(
+                "FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP ({}) exceeds the maximum supported \
+                 value {max_conn_limit}. Use 0 to disable the per-IP cap.",
+                self.mesh_app_probe_max_connections_per_ip
+            ));
+        }
+        if self.mesh_app_probe_max_active_probes > max_conn_limit {
+            return Err(format!(
+                "FERRUM_MESH_APP_PROBE_MAX_ACTIVE_PROBES ({}) exceeds the maximum supported value \
+                 {max_conn_limit}. Use 0 to disable the active-probe budget entirely.",
+                self.mesh_app_probe_max_active_probes
+            ));
+        }
+        if self.mesh_app_probe_max_connections > 0
+            && self.mesh_app_probe_max_connections_per_ip > self.mesh_app_probe_max_connections
+        {
+            return Err(format!(
+                "FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS_PER_IP ({}) is greater than \
+                 FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS ({}), so the per-IP cap can never be \
+                 reached and a single source could consume the entire application-probe \
+                 connection budget. Lower the per-IP cap, raise the global cap, or set the \
+                 per-IP cap to 0 to disable it deliberately.",
+                self.mesh_app_probe_max_connections_per_ip, self.mesh_app_probe_max_connections
             ));
         }
         Ok(())

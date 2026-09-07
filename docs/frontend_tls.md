@@ -552,9 +552,11 @@ timestamps, and secret source URIs are never logged.
 
 ### Surfaces CRLs do not reach
 
-CRLs are not applied to DP-to-CP gRPC or to reqwest-based plugin egress; those
-stacks do not expose a compatible CRL configuration. `kafka_logging` uses
-librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead.
+CRLs are not applied to the DP gRPC client’s verification of CP server
+certificates or to reqwest-based plugin egress; those stacks do not expose a
+compatible CRL configuration. The CP gRPC server does enforce the configured
+CRL when verifying DP client certificates, including on live reload.
+`kafka_logging` uses librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead.
 Skip-verify health probes (`backend_tls_verify_server_cert: false` or
 `FERRUM_TLS_NO_VERIFY`) skip CRL enforcement, matching the data-path skip-verify
 contract. TCP and UDP probes perform no TLS handshake and are unaffected.
@@ -588,7 +590,7 @@ digests and never contain source URIs, credentials, or provider payloads.
 | **Frontend DTLS live reload** | `FERRUM_DTLS_CERT_PATH` / `_SOURCE`, `FERRUM_DTLS_KEY_PATH` / `_SOURCE`, `FERRUM_DTLS_CLIENT_CA_CERT_PATH` / `_SOURCE`, `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` when any active source is file/provider/Kubernetes/managed-backed |
 | **Backend TLS live reload** | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_SOURCE`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` / `_SOURCE`, `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE`, per-proxy/per-upstream backend TLS source fields, and `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` |
 | **Database TLS live reload** | `FERRUM_DB_TLS_CA_CERT_PATH` / `_SOURCE`, `FERRUM_DB_TLS_CLIENT_CERT_PATH` / `_SOURCE`, and `FERRUM_DB_TLS_CLIENT_KEY_PATH` / `_SOURCE` in database/CP modes when `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` |
-| **CP gRPC TLS live reload** | `FERRUM_CP_GRPC_TLS_CERT_PATH` / `_SOURCE`, `FERRUM_CP_GRPC_TLS_KEY_PATH` / `_SOURCE`, and `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` / `_SOURCE` in CP mode |
+| **CP gRPC TLS live reload** | `FERRUM_CP_GRPC_TLS_CERT_PATH` / `_SOURCE`, `FERRUM_CP_GRPC_TLS_KEY_PATH` / `_SOURCE`, and `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` / `_SOURCE`, plus `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` in CP mode |
 | **DP gRPC TLS live reload** | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` / `_SOURCE`, `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` / `_SOURCE`, and `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` / `_SOURCE` in DP mode |
 | **Loaded but static** | Inline frontend/admin/DTLS/backend/database/CP-gRPC/DP-gRPC sources |
 | **Gateway SVID rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE`: file-backed sources are re-read once per second, provider URIs are re-fetched on `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` or the source's `?poll=`, and inline PEM stays static until config reload |
@@ -604,7 +606,7 @@ key, and transmits the complete chain; it never publishes only a usable prefix.
 
 The frontend/admin live-reload poller atomically swaps a validated `rustls::ServerConfig` for new handshakes. The frontend DTLS poller validates cert/key/optional client-CA/CRL inputs as one immutable generation, publishes that generation into shared reconcile state, and live-swaps it into every active DTLS server without rebinding the UDP socket. Stream-listener reconciliation resolves and fingerprints all TLS source material before it takes the listener-state lock; it compares and swaps only prepared keys/configs while locked and never awaits with that guard held. Cert/key-only rotation and additive client-trust changes leave established TLS/DTLS sessions on the config they negotiated with; an accepted client-trust narrowing retires the affected scope's client-certificate-authenticated sessions as described below. Subsequent sessions use the accepted generation. A failed or timed-out candidate keeps the complete previous generation in service on every listener and logs a warning without exposing PEM contents, secret URIs, or private material. Disabling `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` preserves static-until-restart behavior for all of these surfaces.
 
-For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
+For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change. Every candidate reloads the configured CRL source; malformed, expired, or unavailable CRL material rejects the candidate and retains the last accepted slot. Existing CP gRPC streams are not retired by this reload; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
 
 ### Stapled OCSP Responses
 
@@ -683,29 +685,52 @@ selection key, and SHA-1 remains admitted there. See
 [`docs/fips.md`](fips.md). Outside enforcement nothing changes, so ordinary
 deployments keep interoperating with responders that still sign with SHA-1.
 
-**Freshness is checked when the material is loaded, not per handshake.** The
-validity window above is evaluated while the `ServerConfig` candidate is being
-built — at startup, at config reload, and when a watched OCSP source's bytes
-change. An accepted staple is then served unchanged until one of those events
-happens again, so a response that passes `nextUpdate` while the gateway is
-running keeps being stapled.
+**Certificate binding is checked when the material is loaded, not per
+handshake; freshness is re-checked hourly.** The full validity window above is
+evaluated while the `ServerConfig` candidate is being built — at startup, at
+config reload, and when a watched OCSP source's bytes change. In addition, a
+background task re-evaluates the accepted `nextUpdate` of every served staple
+**once an hour**, and retires a staple that has reached it.
 
-The reason it keeps being stapled is that **Ferrum has no OCSP responder
-client**: nothing inside the gateway fetches a fresh response, so there is no
-event to re-validate against and dropping the staple unilaterally would only
-trade one failure mode (a stale staple strict clients reject) for another (no
-staple at all, which a must-staple certificate also fails). Staple refresh is
-therefore the operator's own fetch loop plus live reload. Refresh the OCSP
-source before `nextUpdate` elapses: with
+The re-check interval is a fixed constant, not an environment variable. It is
+not a policy choice — it is a bound on how long an expired staple could keep
+being served — and an hour is far inside the shortest window any responder
+issues, so a knob there would only be a way to disable the protection.
+
+**Dropping is the safe state, not a fallback.** Serving a response past its
+`nextUpdate` is strictly worse than serving none: a client that enforces staple
+validity — a browser with OCSP checking on, or a peer honouring a must-staple
+certificate — aborts the handshake outright on an expired response, whereas an
+absent staple falls back to that client's own revocation behaviour. The
+retirement is applied to the certificate resolver the listener already serves,
+so it takes effect on the next handshake for HTTP/1.1, HTTP/2, HTTP/3 and
+TCP+TLS at once, **whether or not `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is
+set**, and without rebuilding or re-reading anything. An `admin` HTTPS listener
+behaves identically. The drop is logged as a `warn!` naming the redacted source,
+and the TLS inventory entry for that source reports the retirement instead of
+its stale `nextUpdate`, so the
+`ferrum_tls_revocation_expiry_seconds{kind="ocsp"}` row for it stops being
+exported rather than counting further and further negative for material nothing
+staples.
+
+**Refresh is still the operator's job.** Ferrum has **no OCSP responder
+client**: nothing inside the gateway fetches a fresh response, so re-attaching
+one is the operator's own fetch loop plus live reload. Refresh the OCSP source
+before `nextUpdate` elapses: with
 `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` a file or provider source is
-re-read and re-validated as soon as its bytes change, and rewriting the source
-with a stale or otherwise invalid response is rejected while the previous
-known-good material keeps serving. Without live reload the only way to adopt a
-refreshed staple is a restart — and a restart after `nextUpdate` is refused by
-the same admission check, exactly as for CRLs above.
+re-read and re-validated as soon as its bytes change — including after a drop,
+which the ordinary reload path repairs by building a new resolver carrying the
+new response — and rewriting the source with a stale or otherwise invalid
+response is rejected while the previous known-good material keeps serving.
+Without live reload the only way to adopt a refreshed staple is a restart — and
+a restart after `nextUpdate` is refused by the same admission check, exactly as
+for CRLs above. A must-staple certificate has no working posture between the
+drop and one of those two events; the drop does not create that gap, it only
+stops hiding it behind a handshake failure the client blames on the response.
 
 A staple inside `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` of its `nextUpdate` logs a
-`warn!` at load and is exported as
+`warn!` at load, re-logs it on **every hourly re-check** while it stays inside
+the window — so the signal is not load-time only — and is exported as
 `ferrum_tls_revocation_expiry_seconds{kind="ocsp"}` on the authenticated
 `/metrics` surface.
 
@@ -1074,7 +1099,7 @@ Every authorized certificate for the data plane's namespace is installed into on
 
 1. **Declared listener match.** Exact listener `hostname` claims win first, followed by declared one-label wildcards. A declared name is authoritative: certificate-derived aliases from other listeners are never added as alternative signing candidates for it.
 2. **Certificate SAN alias.** When no listener hostname claims the SNI, exact DNS SANs win over one-label wildcard SANs. `*.example.com` answers `a.example.com`, but not `a.b.example.com` and not bare `example.com` (RFC 6125).
-3. **Fallback listener.** A ClientHello with no SNI, or an SNI no certificate covers, is answered from the namespace's deterministic default — the first catch-all listener (one with no `hostname`) when there is one, otherwise the first admitted listener. Gateway owners precede ListenerSet extensions, then older resources and complete listener-key order decide ties. Selection never fails a handshake merely for lack of a name match; it uses the fallback exactly as a single-certificate listener would.
+3. **Fallback listener.** A ClientHello with no SNI, or an SNI no certificate covers, is answered from the namespace's deterministic default — the first catch-all listener (one with no `hostname`) when there is one, otherwise the first admitted listener. Gateway owners precede ListenerSet extensions, then older resources and complete listener-key order decide ties. Selection never fails a handshake merely for lack of a name match; it uses the fallback exactly as a single-certificate listener would. The decision is order-independent end to end: the Kubernetes controller's reconcile snapshot is deduplicated across served-version aliases (the preferred served version of one object wins: GA, then beta, then alpha, by Kubernetes version priority) and sorted by group, kind, namespace, and name before translation, so the same cluster state — including a stale watch store that still holds a deleted Gateway — always yields the same fallback winner. Such a stale Gateway is retired by the idle relist (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`) — but only once EACH served-version scope that held it (`Gateway` is watched under `v1` and `v1beta1`, each relisting on its own schedule) has relisted; every relist logs the objects it found missing, so the first such warning can precede the slot's retirement by up to one more window.
 
 Each exact, wildcard, or fallback listener retains all of its certificate candidates in declared order and chooses the first signing key compatible with the ClientHello's offered signature schemes. This makes an RSA/ECDSA `certificateRefs` pair effective instead of silently pinning the first algorithm. If a name is claimed but none of its candidates is cryptographically compatible, the handshake fails closed rather than falling through to an unrelated listener's certificate.
 

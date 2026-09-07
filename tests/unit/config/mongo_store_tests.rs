@@ -211,10 +211,11 @@ fn list_namespaces_scans_gateway_trust_bundles() {
 /// created" as *every id minus the reported write-error indices*. That is only
 /// correct for an UNORDERED `insert_many`: an ordered insert stops at the first
 /// write error, so every id after it would be reported as created and then
-/// deleted by the compensating `delete_many({_id: {$in: ...}})`. Mongo `_id`s
-/// are bare resource ids with no namespace qualifier, so that delete reaches
-/// another namespace's documents. Every standalone batch insert paired with the
-/// helper must therefore stay `.ordered(false)`.
+/// deleted by the compensating `delete_many({_id: {$in: ...}})`. Since issue
+/// #4627 those `_id`s are namespace-qualified, so the over-delete can no longer
+/// escape the tenant — but it would still destroy that tenant's untouched
+/// documents. Every standalone batch insert paired with the helper must
+/// therefore stay `.ordered(false)`.
 #[test]
 fn standalone_insert_rollback_is_only_paired_with_unordered_inserts() {
     const CALL: &str = "Self::rollback_ids_for_unordered_insert_error(";
@@ -243,6 +244,52 @@ fn standalone_insert_rollback_is_only_paired_with_unordered_inserts() {
     assert!(
         sites >= 5,
         "expected every standalone batch insert rollback site to be scanned, found {sites}"
+    );
+}
+
+/// Issue #4627: every namespaced resource collection stores its documents under
+/// the composite `"{namespace}:{id}"` durable key, so one tenant cannot squat a
+/// bare id another tenant needs.
+#[test]
+fn namespaced_resource_documents_use_composite_durable_keys() {
+    for converter in [
+        "fn proxy_to_doc(",
+        "fn plugin_config_to_doc(",
+        "fn upstream_to_doc(",
+        "fn api_spec_to_doc(",
+        "fn consumer_to_doc(",
+    ] {
+        let start = MONGO_STORE_SOURCE
+            .find(converter)
+            .unwrap_or_else(|| panic!("missing {converter}"));
+        let body = &MONGO_STORE_SOURCE[start..];
+        let insert = body
+            .find("doc.insert(\"_id\"")
+            .unwrap_or_else(|| panic!("{converter} must set _id"));
+        let line_end = body[insert..]
+            .find('\n')
+            .map(|offset| insert + offset)
+            .unwrap_or(body.len());
+        let line = &body[insert..line_end];
+        assert!(
+            line.contains("namespaced_doc_id(") || line.contains("consumer_doc_id("),
+            "{converter} must key on the composite \"{{namespace}}:{{id}}\" durable id, got: {line}"
+        );
+    }
+
+    assert!(
+        MONGO_STORE_SOURCE.contains(concat!(
+            "fn namespaced_doc_id(namespace: &str, id: &str) -> String {\n",
+            "        format!(\"{namespace}:{id}\")"
+        )),
+        "the composite durable key must stay \"{{namespace}}:{{id}}\""
+    );
+    assert!(
+        MONGO_STORE_SOURCE.contains(concat!(
+            "fn consumer_doc_id(namespace: &str, id: &str) -> String {\n",
+            "        namespaced_doc_id(namespace, id)"
+        )),
+        "consumer_doc_id must remain an alias for the shared composite helper"
     );
 }
 

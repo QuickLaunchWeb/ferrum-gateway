@@ -36,7 +36,7 @@ async fn get_index_names(pool: &sqlx::AnyPool) -> Vec<String> {
 
 /// Compound and junction-table indexes created by V001.
 const EXPECTED_INDEX_NAMES: &[&str] = &[
-    "idx_proxy_plugins_plugin_config_id",
+    "idx_proxy_plugins_ns_plugin_config_id",
     "idx_consumer_credential_index_consumer_id",
     "idx_proxies_ns_updated",
     "idx_consumers_ns_updated",

@@ -60,7 +60,47 @@ thread_local! {
 /// so in-path 413 enforcement is unchanged. The limiter treats
 /// `max_bytes = 0` as deny-all — callers must never pass the operator
 /// spelling `0` into it (issue #3942).
-pub type Http2Sender = http2::SendRequest<DirectH2RequestBody>;
+/// One checked-out direct-H2 transport.
+///
+/// Its socket is deliberately not exposed for a per-request post-EOS drain
+/// check. The connection is multiplexed, so its send queue includes bytes from
+/// every stream and cannot safely provide a write-timeout verdict for any one
+/// request.
+///
+/// Deref/DerefMut to the sender so every existing `ready()` / `send_request()` /
+/// `is_closed()` call site is unchanged; cloning is one `Arc` bump on top of
+/// hyper's own clone.
+#[derive(Clone, Debug)]
+pub struct Http2Sender {
+    inner: http2::SendRequest<DirectH2RequestBody>,
+}
+
+impl Http2Sender {
+    pub(crate) fn new(inner: http2::SendRequest<DirectH2RequestBody>) -> Self {
+        Self { inner }
+    }
+
+    /// No per-request socket is available for this multiplexed transport.
+    pub(crate) fn backend_socket(
+        &self,
+    ) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
+        None
+    }
+}
+
+impl std::ops::Deref for Http2Sender {
+    type Target = http2::SendRequest<DirectH2RequestBody>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for Http2Sender {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
 
 /// Terminal protocol outcome for one DNS candidate.
 ///
@@ -349,7 +389,7 @@ impl Http2PoolManager {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
                 });
-                Ok(Http2CandidateOutcome::Established(sender))
+                Ok(Http2CandidateOutcome::Established(Http2Sender::new(sender)))
             }
         })
         .await

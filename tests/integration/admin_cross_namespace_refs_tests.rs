@@ -22,14 +22,21 @@
 //!      that lives in namespace `A` is rejected with 400.
 //!   4. Same-namespace references continue to succeed (regression guard).
 
+use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
     serve_admin_on_listener,
 };
+use ferrum_edge::config::db_backend::BatchConfigWriteMode;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, PluginAssociation,
+    PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
+};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -933,5 +940,526 @@ fn mongo_mesh_route_dispatch_upstream_ref_lookup_filters_by_namespace() {
         find_body.matches("\"namespace\": namespace,").count(),
         2,
         "Mongo lookup must namespace-predicate both session branches"
+    );
+}
+
+// ============================================================================
+// Issue #4627 — durable identity is `(namespace, id)`
+//
+// Before this fix `proxies`, `upstreams`, `plugin_configs`, and `api_specs`
+// used the bare `id` as their sole SQL primary key (and as the bare MongoDB
+// `_id`), while every admin existence check was namespace-scoped. One tenant
+// could therefore reserve a conventional id — `payments`, `auth`, `default` —
+// and permanently deny it to every other tenant, and the difference between a
+// validation failure, a successful create, and a duplicate-key persistence
+// failure was a cross-tenant existence oracle.
+//
+// These tests run against a real SQLite store because `DatabaseStore` is the
+// shared implementation behind every SQL dialect.
+// ============================================================================
+
+fn ns_upstream(namespace: &str, id: &str) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        name: None,
+        targets: vec![UpstreamTarget {
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 100,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        }],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        source_labels: Default::default(),
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
+    }
+}
+
+fn ns_plugin_config(namespace: &str, id: &str, scope: PluginScope) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        plugin_name: "stdout_logging".to_string(),
+        config: json!({}),
+        scope,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn ns_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        name: None,
+        hosts: vec![],
+        listen_path: Some(listen_path.to_string()),
+        backend_scheme: Some(BackendScheme::Http),
+        dispatch_kind: DispatchKind::from(BackendScheme::Http),
+        backend_host: "localhost".to_string(),
+        backend_port: 3000,
+        backend_path: None,
+        strip_listen_path: true,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 5000,
+        backend_read_timeout_ms: 30000,
+        backend_write_timeout_ms: 30000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
+        dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: AuthMode::Single,
+        plugins: Vec::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
+        pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
+        upstream_id: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
+        websocket_idle_timeout_seconds: None,
+        allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
+        backend_proxy_protocol: None,
+        stream_match: None,
+        compiled_stream_match: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        pending_limit_scope: None,
+    }
+}
+
+/// Build the identical `(upstream, plugin_config, proxy)` graph in `namespace`,
+/// using the SAME bare ids in every tenant.
+async fn seed_identical_graph(store: &DatabaseStore, namespace: &str) {
+    store
+        .create_upstream(&ns_upstream(namespace, "payments"))
+        .await
+        .unwrap_or_else(|e| panic!("upstream create in {namespace} must succeed: {e}"));
+    store
+        .create_plugin_config(&ns_plugin_config(
+            namespace,
+            "auth",
+            PluginScope::ProxyGroup,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("plugin create in {namespace} must succeed: {e}"));
+    let mut proxy = ns_proxy(namespace, "edge", "/edge");
+    proxy.upstream_id = Some("payments".to_string());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "auth".to_string(),
+    }];
+    store
+        .create_proxy(&proxy)
+        .await
+        .unwrap_or_else(|e| panic!("proxy create in {namespace} must succeed: {e}"));
+}
+
+/// Everything that identifies a namespace's persisted graph, in a form two
+/// snapshots can be compared with. `loaded_at` is deliberately excluded: it is
+/// the load timestamp, not tenant state.
+fn config_fingerprint(config: &GatewayConfig) -> String {
+    let mut proxies = config.proxies.clone();
+    proxies.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut plugin_configs = config.plugin_configs.clone();
+    plugin_configs.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut upstreams = config.upstreams.clone();
+    upstreams.sort_by(|a, b| a.id.cmp(&b.id));
+    serde_json::to_string(&json!({
+        "proxies": proxies,
+        "plugin_configs": plugin_configs,
+        "upstreams": upstreams,
+    }))
+    .expect("config fingerprint must serialize")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_namespaces_own_the_same_bare_resource_ids_independently() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+
+    // The pre-#4627 schema failed the SECOND tenant here on a global primary
+    // key, even though its own namespace had no such id.
+    seed_identical_graph(&store, NAMESPACE_A).await;
+    seed_identical_graph(&store, NAMESPACE_B).await;
+
+    for namespace in [NAMESPACE_A, NAMESPACE_B] {
+        let upstream = store
+            .get_upstream(namespace, "payments")
+            .await
+            .expect("upstream read must succeed")
+            .expect("upstream must exist in its own namespace");
+        assert_eq!(upstream.namespace, namespace);
+
+        let plugin = store
+            .get_plugin_config(namespace, "auth")
+            .await
+            .expect("plugin read must succeed")
+            .expect("plugin must exist in its own namespace");
+        assert_eq!(plugin.namespace, namespace);
+
+        let proxy = store
+            .get_proxy(namespace, "edge")
+            .await
+            .expect("proxy read must succeed")
+            .expect("proxy must exist in its own namespace");
+        assert_eq!(proxy.namespace, namespace);
+        assert_eq!(proxy.upstream_id.as_deref(), Some("payments"));
+        assert_eq!(
+            proxy
+                .plugins
+                .iter()
+                .map(|assoc| assoc.plugin_config_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["auth"],
+            "each tenant's junction rows must resolve to its own plugin config"
+        );
+
+        let full = store
+            .load_full_config(namespace)
+            .await
+            .expect("full load must succeed");
+        assert_eq!(full.proxies.len(), 1);
+        assert_eq!(full.upstreams.len(), 1);
+        assert_eq!(full.plugin_configs.len(), 1);
+        for owner in full
+            .proxies
+            .iter()
+            .map(|p| p.namespace.as_str())
+            .chain(full.upstreams.iter().map(|u| u.namespace.as_str()))
+            .chain(full.plugin_configs.iter().map(|p| p.namespace.as_str()))
+        {
+            assert_eq!(owner, namespace, "full load must not cross tenants");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_same_id_graph_leaves_the_other_namespace_byte_for_byte_unchanged() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+    seed_identical_graph(&store, NAMESPACE_A).await;
+    seed_identical_graph(&store, NAMESPACE_B).await;
+
+    let before = config_fingerprint(
+        &store
+            .load_full_config(NAMESPACE_B)
+            .await
+            .expect("baseline load"),
+    );
+
+    assert!(
+        store
+            .delete_proxy(NAMESPACE_A, "edge")
+            .await
+            .expect("proxy delete must succeed")
+    );
+    // `delete_proxy` also sweeps tenant A's now-unreferenced proxy_group plugin
+    // and orphaned upstream; whatever it left is removed explicitly so the
+    // namespace ends empty either way.
+    store
+        .delete_plugin_config(NAMESPACE_A, "auth")
+        .await
+        .expect("plugin delete must not error");
+    store
+        .delete_upstream(NAMESPACE_A, "payments")
+        .await
+        .expect("upstream delete must not error");
+
+    let after = config_fingerprint(
+        &store
+            .load_full_config(NAMESPACE_B)
+            .await
+            .expect("post-delete load"),
+    );
+    assert_eq!(
+        before, after,
+        "deleting tenant A's same-id graph must leave tenant B untouched"
+    );
+
+    let empty = store
+        .load_full_config(NAMESPACE_A)
+        .await
+        .expect("emptied namespace must still load");
+    assert!(empty.proxies.is_empty());
+    assert!(empty.plugin_configs.is_empty());
+    assert!(empty.upstreams.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_config_delete_does_not_detach_a_same_id_plugin_in_another_namespace() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+    seed_identical_graph(&store, NAMESPACE_A).await;
+    seed_identical_graph(&store, NAMESPACE_B).await;
+
+    assert!(
+        store
+            .delete_plugin_config(NAMESPACE_A, "auth")
+            .await
+            .expect("plugin delete must succeed")
+    );
+
+    let a_proxy = store
+        .get_proxy(NAMESPACE_A, "edge")
+        .await
+        .expect("tenant A proxy must still read")
+        .expect("tenant A proxy must survive its plugin delete");
+    assert!(
+        a_proxy.plugins.is_empty(),
+        "tenant A's own association must be removed with its plugin config"
+    );
+
+    let b_proxy = store
+        .get_proxy(NAMESPACE_B, "edge")
+        .await
+        .expect("tenant B proxy must read")
+        .expect("tenant B proxy must exist");
+    assert_eq!(
+        b_proxy
+            .plugins
+            .iter()
+            .map(|assoc| assoc.plugin_config_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["auth"],
+        "a plugin delete in one tenant must not unbind the same-id plugin in another"
+    );
+    assert!(
+        store
+            .get_plugin_config(NAMESPACE_B, "auth")
+            .await
+            .expect("tenant B plugin must read")
+            .is_some(),
+        "tenant B's plugin config must survive"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_group_orphan_cleanup_only_reaps_the_deleting_namespaces_plugin() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+    seed_identical_graph(&store, NAMESPACE_A).await;
+    seed_identical_graph(&store, NAMESPACE_B).await;
+
+    // Deleting the only proxy that referenced the proxy_group plugin runs the
+    // orphan sweep; it must scan only the deleting tenant's junction rows.
+    assert!(
+        store
+            .delete_proxy(NAMESPACE_A, "edge")
+            .await
+            .expect("proxy delete must succeed")
+    );
+
+    assert!(
+        store
+            .get_plugin_config(NAMESPACE_A, "auth")
+            .await
+            .expect("tenant A plugin read must succeed")
+            .is_none(),
+        "tenant A's now-orphaned proxy_group plugin must be reaped"
+    );
+    assert!(
+        store
+            .get_plugin_config(NAMESPACE_B, "auth")
+            .await
+            .expect("tenant B plugin read must succeed")
+            .is_some(),
+        "tenant B's same-id proxy_group plugin is still referenced and must survive"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_delta_removals_are_keyed_on_namespace_and_id() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+    seed_identical_graph(&store, NAMESPACE_A).await;
+    seed_identical_graph(&store, NAMESPACE_B).await;
+
+    let a_cursor = store
+        .latest_change_sequence(NAMESPACE_A)
+        .await
+        .expect("tenant A cursor");
+    let b_cursor = store
+        .latest_change_sequence(NAMESPACE_B)
+        .await
+        .expect("tenant B cursor");
+
+    assert!(
+        store
+            .delete_proxy(NAMESPACE_A, "edge")
+            .await
+            .expect("proxy delete must succeed")
+    );
+
+    let a_delta = store
+        .load_incremental_config(NAMESPACE_A, a_cursor)
+        .await
+        .expect("tenant A delta must load");
+    assert!(
+        a_delta
+            .removed_proxy_ids
+            .iter()
+            .any(|key| key.namespace == NAMESPACE_A && key.id == "edge"),
+        "tenant A's delta must carry the namespace-qualified removal"
+    );
+
+    let b_delta = store
+        .load_incremental_config(NAMESPACE_B, b_cursor)
+        .await
+        .expect("tenant B delta must load");
+    assert!(
+        b_delta.removed_proxy_ids.is_empty(),
+        "a same-id delete in another tenant must not appear as a removal here: {:?}",
+        b_delta.removed_proxy_ids
+    );
+    assert!(
+        b_delta.added_or_modified_proxies.is_empty(),
+        "tenant B saw no mutation and must receive an empty proxy delta"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clearing_one_namespace_leaves_the_same_id_resources_in_the_other() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+    seed_identical_graph(&store, NAMESPACE_A).await;
+    seed_identical_graph(&store, NAMESPACE_B).await;
+
+    let before = config_fingerprint(
+        &store
+            .load_full_config(NAMESPACE_B)
+            .await
+            .expect("baseline load"),
+    );
+
+    // The restore path's clear step, and the cascade behind DELETE /namespaces.
+    store
+        .delete_all_resources(NAMESPACE_A, &BatchConfigWriteMode::Admission)
+        .await
+        .expect("namespace clear must succeed");
+
+    let cleared = store
+        .load_full_config(NAMESPACE_A)
+        .await
+        .expect("cleared namespace must load");
+    assert!(cleared.proxies.is_empty());
+    assert!(cleared.plugin_configs.is_empty());
+    assert!(cleared.upstreams.is_empty());
+
+    let after = config_fingerprint(
+        &store
+            .load_full_config(NAMESPACE_B)
+            .await
+            .expect("post-clear load"),
+    );
+    assert_eq!(
+        before, after,
+        "clearing one tenant must leave the other byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_same_id_creates_succeed_across_namespaces_and_admit_one_within_one() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+    let store = Arc::new(store);
+
+    // Different namespaces, same bare id: BOTH must land.
+    let cross =
+        {
+            let a = Arc::clone(&store);
+            let b = Arc::clone(&store);
+            let left = tokio::spawn(async move {
+                a.create_upstream(&ns_upstream(NAMESPACE_A, "shared")).await
+            });
+            let right = tokio::spawn(async move {
+                b.create_upstream(&ns_upstream(NAMESPACE_B, "shared")).await
+            });
+            (
+                left.await.expect("task A must not panic"),
+                right.await.expect("task B must not panic"),
+            )
+        };
+    assert!(
+        cross.0.is_ok() && cross.1.is_ok(),
+        "same bare id in two namespaces must both persist: {:?} / {:?}",
+        cross.0.as_ref().err().map(ToString::to_string),
+        cross.1.as_ref().err().map(ToString::to_string)
+    );
+    for namespace in [NAMESPACE_A, NAMESPACE_B] {
+        assert!(
+            store
+                .get_upstream(namespace, "shared")
+                .await
+                .expect("read must succeed")
+                .is_some()
+        );
+    }
+
+    // Same namespace, same id: exactly one may land.
+    let same = {
+        let a = Arc::clone(&store);
+        let b = Arc::clone(&store);
+        let left =
+            tokio::spawn(async move { a.create_upstream(&ns_upstream(NAMESPACE_A, "solo")).await });
+        let right =
+            tokio::spawn(async move { b.create_upstream(&ns_upstream(NAMESPACE_A, "solo")).await });
+        (
+            left.await.expect("task A must not panic"),
+            right.await.expect("task B must not panic"),
+        )
+    };
+    let admitted = usize::from(same.0.is_ok()) + usize::from(same.1.is_ok());
+    assert_eq!(
+        admitted, 1,
+        "concurrent same-namespace creates of one id must admit exactly one"
     );
 }

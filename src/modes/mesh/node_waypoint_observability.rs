@@ -47,6 +47,7 @@
 //! duplicate them here.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
 
@@ -73,6 +74,15 @@ static DESTINATION_POLICY_REJECTION_AUTHZ_DENY: AtomicU64 = AtomicU64::new(0);
 static DESTINATION_POLICY_REJECTION_SCOPE_MISSING: AtomicU64 = AtomicU64::new(0);
 static DESTINATION_POLICY_REJECTION_DESTINATION_SCOPE_MISSING: AtomicU64 = AtomicU64::new(0);
 static DESTINATION_POLICY_REJECTION_RELAY_DESTINATION_DENIED: AtomicU64 = AtomicU64::new(0);
+
+static CAPTURE_ADMISSION_REJECTED_OVERLOAD: AtomicU64 = AtomicU64::new(0);
+static CAPTURE_ADMISSION_REJECTED_MAX_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static CAPTURE_ADMISSION_REJECTED_MAX_CONNECTIONS_PER_IP: AtomicU64 = AtomicU64::new(0);
+
+/// The capture listener's connection limiter, installed when that listener
+/// binds so `/metrics` can publish its occupancy and configured ceilings
+/// without the listener owning a rendering path of its own.
+static CAPTURE_CONN_LIMITER: OnceLock<Arc<crate::util::conn_limit::ConnLimiter>> = OnceLock::new();
 
 static MISSING_DESTINATION_METADATA: AtomicU64 = AtomicU64::new(0);
 static PLAINTEXT_FALLBACK_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -160,6 +170,95 @@ impl NodeWaypointDestinationPolicyRejectReason {
             }
             Self::RelayDestinationDenied => &DESTINATION_POLICY_REJECTION_RELAY_DESTINATION_DENIED,
         }
+    }
+}
+
+/// Why the transparent inbound capture listener refused an accepted socket in
+/// the accept loop, before any task existed (issue #4626).
+///
+/// A closed set: these strings are the only `reason` label values the capture
+/// admission family ever carries, and none is derived from the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeWaypointCaptureAdmissionRejectReason {
+    /// The process is shedding new connections under critical overload.
+    Overload,
+    /// The listener's global connection cap (`FERRUM_MAX_CONNECTIONS`).
+    MaxConnections,
+    /// The per-source-IP share (`FERRUM_TCP_MAX_CONNECTIONS_PER_IP`).
+    MaxConnectionsPerIp,
+}
+
+impl NodeWaypointCaptureAdmissionRejectReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Overload => "overload",
+            Self::MaxConnections => "max_connections",
+            Self::MaxConnectionsPerIp => "max_connections_per_ip",
+        }
+    }
+
+    fn counter(self) -> &'static AtomicU64 {
+        match self {
+            Self::Overload => &CAPTURE_ADMISSION_REJECTED_OVERLOAD,
+            Self::MaxConnections => &CAPTURE_ADMISSION_REJECTED_MAX_CONNECTIONS,
+            Self::MaxConnectionsPerIp => &CAPTURE_ADMISSION_REJECTED_MAX_CONNECTIONS_PER_IP,
+        }
+    }
+}
+
+impl From<crate::util::conn_limit::ConnRejectReason> for NodeWaypointCaptureAdmissionRejectReason {
+    fn from(reason: crate::util::conn_limit::ConnRejectReason) -> Self {
+        match reason {
+            crate::util::conn_limit::ConnRejectReason::MaxConnections => Self::MaxConnections,
+            crate::util::conn_limit::ConnRejectReason::MaxConnectionsPerIp => {
+                Self::MaxConnectionsPerIp
+            }
+        }
+    }
+}
+
+/// Capture-listener admission counters, plus the live limiter view when the
+/// listener is running.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct NodeWaypointCaptureAdmissionSnapshot {
+    pub rejected_overload: u64,
+    pub rejected_max_connections: u64,
+    pub rejected_max_connections_per_ip: u64,
+    /// Configured global cap; `None` until the capture listener binds.
+    pub max_connections: Option<usize>,
+    /// Configured per-source-IP cap; `None` until the capture listener binds.
+    pub max_connections_per_ip: Option<usize>,
+    /// Connections currently holding a permit; `None` until the listener binds.
+    pub active_connections: Option<u64>,
+}
+
+/// Publish the capture listener's limiter for metrics and diagnostics. Called
+/// once, when that listener binds.
+pub fn install_capture_conn_limiter(limiter: Arc<crate::util::conn_limit::ConnLimiter>) {
+    let _ = CAPTURE_CONN_LIMITER.set(limiter);
+}
+
+/// Record one capture-listener admission refusal.
+///
+/// Deliberately NOT gated on [`is_enabled`]: the capture listener only exists
+/// in the NodeWaypoint topology, and a refusal that vanished because a toggle
+/// had not been flipped is exactly the signal an operator needs during a flood.
+pub fn record_capture_admission_rejection(reason: NodeWaypointCaptureAdmissionRejectReason) {
+    reason.counter().fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the capture-listener admission state.
+pub fn capture_admission_snapshot() -> NodeWaypointCaptureAdmissionSnapshot {
+    let limiter = CAPTURE_CONN_LIMITER.get().map(|limiter| limiter.snapshot());
+    NodeWaypointCaptureAdmissionSnapshot {
+        rejected_overload: CAPTURE_ADMISSION_REJECTED_OVERLOAD.load(Ordering::Relaxed),
+        rejected_max_connections: CAPTURE_ADMISSION_REJECTED_MAX_CONNECTIONS
+            .load(Ordering::Relaxed),
+        rejected_max_connections_per_ip: CAPTURE_ADMISSION_REJECTED_MAX_CONNECTIONS_PER_IP
+            .load(Ordering::Relaxed),
+        max_connections: limiter.map(|snapshot| snapshot.max_connections),
+        max_connections_per_ip: limiter.map(|snapshot| snapshot.max_connections_per_ip),
+        active_connections: limiter.map(|snapshot| snapshot.active_connections),
     }
 }
 
@@ -498,6 +597,89 @@ NodeWaypoint (fail-closed instead of retaining a plaintext backend).\n",
         snap.plaintext_fallback_attempts,
         gateway_ns_label,
     );
+
+    render_capture_admission(output, gateway_ns_label);
+}
+
+/// Render the transparent inbound capture listener's admission families
+/// (issue #4626).
+///
+/// Fixed cardinality: no source-IP label, and the `reason` values come from
+/// [`NodeWaypointCaptureAdmissionRejectReason`]. Ceilings and occupancy are
+/// emitted only once the listener has bound and installed its limiter, so a
+/// NodeWaypoint without inbound capture does not advertise a misleading zero
+/// ceiling; the rejection counters always emit a zero baseline.
+fn render_capture_admission(output: &mut String, gateway_ns_label: &str) {
+    let snap = capture_admission_snapshot();
+
+    output.push_str(
+        "# HELP ferrum_mesh_node_waypoint_capture_rejected_connections_total \
+Captured inbound connections refused in the accept loop before a task was allocated, by \
+bounded reason.\n",
+    );
+    output
+        .push_str("# TYPE ferrum_mesh_node_waypoint_capture_rejected_connections_total counter\n");
+    for (reason, value) in [
+        (
+            NodeWaypointCaptureAdmissionRejectReason::Overload,
+            snap.rejected_overload,
+        ),
+        (
+            NodeWaypointCaptureAdmissionRejectReason::MaxConnections,
+            snap.rejected_max_connections,
+        ),
+        (
+            NodeWaypointCaptureAdmissionRejectReason::MaxConnectionsPerIp,
+            snap.rejected_max_connections_per_ip,
+        ),
+    ] {
+        output.push_str(&format!(
+            "ferrum_mesh_node_waypoint_capture_rejected_connections_total{{reason=\"{}\"{}}} {}\n",
+            escape_label_value(reason.as_str()),
+            gateway_ns_label,
+            value
+        ));
+    }
+
+    if let Some(active) = snap.active_connections {
+        output.push_str(
+            "# HELP ferrum_mesh_node_waypoint_capture_active_connections Captured inbound \
+connections currently holding an admission permit.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_node_waypoint_capture_active_connections gauge\n");
+        render_gauge_like_counter(
+            output,
+            "ferrum_mesh_node_waypoint_capture_active_connections",
+            active,
+            gateway_ns_label,
+        );
+    }
+    if let Some(max) = snap.max_connections {
+        output.push_str(
+            "# HELP ferrum_mesh_node_waypoint_capture_max_connections Configured capture-listener \
+connection cap (0 = unlimited).\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_node_waypoint_capture_max_connections gauge\n");
+        render_gauge_like_counter(
+            output,
+            "ferrum_mesh_node_waypoint_capture_max_connections",
+            max as u64,
+            gateway_ns_label,
+        );
+    }
+    if let Some(max) = snap.max_connections_per_ip {
+        output.push_str(
+            "# HELP ferrum_mesh_node_waypoint_capture_max_connections_per_ip Configured \
+per-source-IP capture-listener connection cap (0 = unlimited).\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_node_waypoint_capture_max_connections_per_ip gauge\n");
+        render_gauge_like_counter(
+            output,
+            "ferrum_mesh_node_waypoint_capture_max_connections_per_ip",
+            max as u64,
+            gateway_ns_label,
+        );
+    }
 }
 
 fn render_gauge_like_counter(output: &mut String, name: &str, value: u64, gateway_ns_label: &str) {

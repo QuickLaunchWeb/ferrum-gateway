@@ -21,7 +21,10 @@ use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-use super::common::containers::{BoxError, fail_in_ci_else_skip};
+use super::common::containers::{
+    BoxError, CONTAINER_START_TIMEOUT, fail_in_ci_else_skip, fixture_http_client,
+    with_phase_deadline,
+};
 use super::common::host_ports::{
     allocate_host_port, is_host_port_collision, retry_on_host_port_collision,
 };
@@ -44,39 +47,53 @@ async fn start_clickhouse_container(
     const START_ATTEMPTS: u32 = 3;
 
     for attempt in 1..=START_ATTEMPTS {
-        match GenericImage::new(CLICKHOUSE_IMAGE, CLICKHOUSE_TAG)
-            .with_exposed_port(CLICKHOUSE_HTTP_PORT.tcp())
-            .with_mapped_port(host_port, CLICKHOUSE_HTTP_PORT.tcp())
-            .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
-            .start()
-            .await
-        {
+        // The image pull + container start is the one phase that can block on
+        // something outside this host (a stalled registry). Bound it so the
+        // failure names the phase instead of being killed by nextest with a
+        // message that names only the test (issue #4600).
+        let started = tokio::time::Instant::now();
+        let start = with_phase_deadline(
+            &format!("ClickHouse image pull/start (attempt {attempt}/{START_ATTEMPTS})"),
+            CONTAINER_START_TIMEOUT,
+            GenericImage::new(CLICKHOUSE_IMAGE, CLICKHOUSE_TAG)
+                .with_exposed_port(CLICKHOUSE_HTTP_PORT.tcp())
+                .with_mapped_port(host_port, CLICKHOUSE_HTTP_PORT.tcp())
+                .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
+                .start(),
+        )
+        .await?;
+        match start {
             Ok(container) => return Ok(container),
             Err(error) => {
+                let elapsed = started.elapsed().as_secs_f64();
                 if is_host_port_collision(&error.to_string()) {
-                    return Err(format!("ClickHouse container start failed: {error}").into());
+                    return Err(format!(
+                        "ClickHouse image pull/start failed after {elapsed:.1}s: {error}"
+                    )
+                    .into());
                 }
                 if attempt == START_ATTEMPTS {
                     return Err(format!(
-                        "ClickHouse container failed to start after \
-                         {START_ATTEMPTS} attempts: {error}"
+                        "ClickHouse image pull/start failed after \
+                         {START_ATTEMPTS} attempts (last attempt {elapsed:.1}s): {error}"
                     )
                     .into());
                 }
                 eprintln!(
-                    "ClickHouse container start attempt {attempt}/{START_ATTEMPTS} \
-                     failed; retrying: {error}"
+                    "ClickHouse image pull/start attempt {attempt}/{START_ATTEMPTS} \
+                     failed after {elapsed:.1}s; retrying: {error}"
                 );
                 tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
             }
         }
     }
 
-    Err("ClickHouse container start retry loop did not execute".into())
+    Err("ClickHouse image pull/start retry loop did not execute".into())
 }
 
 async fn wait_clickhouse_ready(client: &reqwest::Client, url: &str) -> Result<(), BoxError> {
     let ping = format!("{url}/ping");
+    let started = tokio::time::Instant::now();
     let mut last_error = String::new();
     for _ in 0..90 {
         match client.get(&ping).send().await {
@@ -95,7 +112,11 @@ async fn wait_clickhouse_ready(client: &reqwest::Client, url: &str) -> Result<()
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Err(format!("ClickHouse /ping not ready within 45s: {last_error}").into())
+    Err(format!(
+        "ClickHouse /ping readiness not reached (elapsed {:.1}s): {last_error}",
+        started.elapsed().as_secs_f64()
+    )
+    .into())
 }
 
 async fn start_clickhouse() -> Result<ClickHouseFixture, BoxError> {
@@ -106,7 +127,9 @@ async fn start_clickhouse() -> Result<ClickHouseFixture, BoxError> {
     })
     .await?;
     let url = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
+    // Bounded per-request and per-connect: a ClickHouse that accepts the
+    // connection and then never answers must fail the phase, not the job.
+    let client = fixture_http_client();
     wait_clickhouse_ready(&client, &url).await?;
     Ok(ClickHouseFixture {
         _container: container,
@@ -184,7 +207,12 @@ async fn clickhouse_post(
         .body(body)
         .send()
         .await
-        .map_err(|error| format!("ClickHouse request failed to send: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "ClickHouse HTTP request failed (bounded by the fixture client's \
+                 request/connect timeouts): {error}"
+            )
+        })?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -207,11 +235,13 @@ async fn apply_ddl(fixture: &ClickHouseFixture) -> Result<(), String> {
     for (index, statement) in statements.iter().enumerate() {
         let ordinal = index + 1;
         let total = statements.len();
+        let started = tokio::time::Instant::now();
         match clickhouse_post(fixture, &[], statement.clone()).await {
             Ok(_) => {}
             Err(error) => {
                 return Err(format!(
-                    "DDL statement {ordinal} of {total} failed: {error}"
+                    "DDL statement {ordinal} of {total} failed after {:.1}s: {error}",
+                    started.elapsed().as_secs_f64()
                 ));
             }
         }
@@ -224,6 +254,7 @@ fn insert_query() -> String {
 }
 
 async fn insert_json_each_row(fixture: &ClickHouseFixture, body: String) -> Result<(), String> {
+    let started = tokio::time::Instant::now();
     clickhouse_post(
         fixture,
         &[("database", "ferrum"), ("query", &insert_query())],
@@ -231,6 +262,12 @@ async fn insert_json_each_row(fixture: &ClickHouseFixture, body: String) -> Resu
     )
     .await
     .map(|_| ())
+    .map_err(|error| {
+        format!(
+            "insert failed after {:.1}s: {error}",
+            started.elapsed().as_secs_f64()
+        )
+    })
 }
 
 fn http_summary(request_id: &str, consumer: &str) -> TransactionSummary {
@@ -410,16 +447,26 @@ async fn wait_for_count(
     at_least: u64,
 ) -> Result<u64, String> {
     let query = format!("SELECT count() FROM ferrum.charges_raw FINAL WHERE {where_clause}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(15);
     loop {
-        let body = clickhouse_post(fixture, &[("query", query.as_str())], String::new()).await?;
+        let body = clickhouse_post(fixture, &[("query", query.as_str())], String::new())
+            .await
+            .map_err(|error| {
+                format!(
+                    "count poll query failed after {:.1}s: {error}",
+                    started.elapsed().as_secs_f64()
+                )
+            })?;
         let count = body.trim().parse::<u64>().unwrap_or(0);
         if count >= at_least {
             return Ok(count);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "expected at least {at_least} row(s) for {where_clause}"
+                "count poll: expected at least {at_least} row(s) for {where_clause} \
+                 (elapsed {:.1}s)",
+                started.elapsed().as_secs_f64()
             ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

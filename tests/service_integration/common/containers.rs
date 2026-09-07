@@ -16,7 +16,8 @@
 
 #![allow(dead_code)] // helpers are used selectively per backend module
 
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 use testcontainers::core::{ExecCommand, IntoContainerPort};
 use testcontainers::runners::AsyncRunner;
@@ -25,6 +26,91 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use super::host_ports::{allocate_host_port, retry_on_host_port_collision};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+// ---------------------------------------------------------------------------
+// Per-phase deadlines (issue #4600)
+// ---------------------------------------------------------------------------
+//
+// Every fixture phase that talks to Docker or to the service over the network
+// must be bounded, and a breached bound must name the phase. Without this a
+// stalled registry pull or a request the server never answers hangs the case
+// until nextest's `terminate-after` kill, and that kill message names only the
+// test — it says nothing about which phase was stuck. The readiness/poll loops
+// each fixture already carries stay as they are; these bound the phases that
+// had no deadline at all.
+
+/// Wall-clock bound on one container `start()` (image pull + create + start).
+/// A cold runner pulling a multi-hundred-megabyte image is slow, but it is not
+/// unbounded — 5 minutes is well past the observed worst case (~1 min) and far
+/// short of the 60-minute job budget.
+pub const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Per-request bound for fixture HTTP calls to a loopback service. Generous
+/// for a container on the same host; the point is that no single request can
+/// hang forever.
+pub const FIXTURE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connect bound for the same calls. A refused connection returns immediately;
+/// this covers a port that accepts the SYN and then never completes the
+/// handshake.
+pub const FIXTURE_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A `reqwest::Client` with request and connect deadlines, for fixture-side
+/// HTTP against a locally started container. Never use `Client::new()` in a
+/// fixture: its default is no request timeout at all.
+pub fn fixture_http_client() -> reqwest::Client {
+    fixture_http_client_builder()
+        .build()
+        .expect("fixture reqwest client builds with only timeouts set")
+}
+
+/// The same bounded builder, for fixtures that need extra settings (e.g. a
+/// redirect policy) before `build()`.
+pub fn fixture_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(FIXTURE_HTTP_TIMEOUT)
+        .connect_timeout(FIXTURE_HTTP_CONNECT_TIMEOUT)
+}
+
+/// Run `future` under `limit`, reporting `phase` and the measured elapsed time
+/// if the deadline is breached. The future's own output is returned untouched,
+/// so callers keep their existing error handling and retry logic.
+pub async fn with_phase_deadline<F: Future>(
+    phase: &str,
+    limit: Duration,
+    future: F,
+) -> Result<F::Output, BoxError> {
+    let started = Instant::now();
+    match tokio::time::timeout(limit, future).await {
+        Ok(output) => Ok(output),
+        Err(_) => Err(format!(
+            "{phase} exceeded its {:.0}s deadline (elapsed {:.1}s)",
+            limit.as_secs_f64(),
+            started.elapsed().as_secs_f64()
+        )
+        .into()),
+    }
+}
+
+/// [`with_phase_deadline`] specialised to a container `start()`: bounds the
+/// image pull and start, and flattens the timeout into the future's own
+/// `Result` error type.
+pub async fn start_within_deadline<F, T, E>(service: &str, future: F) -> Result<T, BoxError>
+where
+    F: Future<Output = Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match with_phase_deadline(
+        &format!("{service} image pull/start"),
+        CONTAINER_START_TIMEOUT,
+        future,
+    )
+    .await?
+    {
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("{service} image pull/start failed: {error}").into()),
+    }
+}
 
 /// Decide how to handle an unavailable container.
 ///
@@ -63,18 +149,21 @@ pub struct ConsulContainer {
 pub async fn start_consul_dev_container() -> Result<ConsulContainer, BoxError> {
     let (container, port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
-        let container = GenericImage::new("hashicorp/consul", "1.19")
-            .with_exposed_port(8500.tcp())
-            .with_mapped_port(host_port, 8500.tcp())
-            .with_cmd(["agent", "-dev", "-client", "0.0.0.0"])
-            .start()
-            .await?;
+        let container = start_within_deadline(
+            "Consul",
+            GenericImage::new("hashicorp/consul", "1.19")
+                .with_exposed_port(8500.tcp())
+                .with_mapped_port(host_port, 8500.tcp())
+                .with_cmd(["agent", "-dev", "-client", "0.0.0.0"])
+                .start(),
+        )
+        .await?;
         Ok((container, host_port))
     })
     .await?;
 
     let addr = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
+    let client = fixture_http_client();
 
     wait_consul_ready(&client, &addr).await?;
 
@@ -148,18 +237,21 @@ pub struct OpenLdapContainer {
 pub async fn start_openldap_container() -> Result<OpenLdapContainer, BoxError> {
     let (container, port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
-        let container = GenericImage::new("osixia/openldap", "1.5.0")
-            .with_exposed_port(LDAP_CONTAINER_PORT.tcp())
-            .with_mapped_port(host_port, LDAP_CONTAINER_PORT.tcp())
-            // Readiness is confirmed by `seed_ldif`, which retries `ldapadd` until
-            // the final slapd is answering on TCP — so we do not have to match a
-            // startup log line/stream or race the first-boot bootstrap (which only
-            // serves the bootstrap directory over a private socket).
-            .with_env_var("LDAP_ORGANISATION", "Ferrum Test")
-            .with_env_var("LDAP_DOMAIN", "example.org")
-            .with_env_var("LDAP_ADMIN_PASSWORD", LDAP_ADMIN_PASSWORD)
-            .start()
-            .await?;
+        let container = start_within_deadline(
+            "OpenLDAP",
+            GenericImage::new("osixia/openldap", "1.5.0")
+                .with_exposed_port(LDAP_CONTAINER_PORT.tcp())
+                .with_mapped_port(host_port, LDAP_CONTAINER_PORT.tcp())
+                // Readiness is confirmed by `seed_ldif`, which retries `ldapadd` until
+                // the final slapd is answering on TCP — so we do not have to match a
+                // startup log line/stream or race the first-boot bootstrap (which only
+                // serves the bootstrap directory over a private socket).
+                .with_env_var("LDAP_ORGANISATION", "Ferrum Test")
+                .with_env_var("LDAP_DOMAIN", "example.org")
+                .with_env_var("LDAP_ADMIN_PASSWORD", LDAP_ADMIN_PASSWORD)
+                .start(),
+        )
+        .await?;
         Ok((container, host_port))
     })
     .await?;
@@ -225,15 +317,7 @@ impl OpenLdapContainer {
     }
 
     async fn exec_sh(&self, script: &str) -> Result<ExecOutput, BoxError> {
-        let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
-        let mut result = self._container.exec(ExecCommand::new(cmd)).await?;
-        let stdout = result.stdout_to_vec().await?;
-        let stderr = result.stderr_to_vec().await?;
-        Ok(ExecOutput {
-            exit_code: result.exit_code().await?,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        })
+        exec_sh_within_deadline("OpenLDAP", &self._container, script).await
     }
 }
 
@@ -251,6 +335,36 @@ fn ldapadd_only_already_exists(combined: &str) -> bool {
         }
     }
     saw_ldap_diag && combined.contains("adding new entry")
+}
+
+/// Wall-clock bound on one `docker exec` inside a fixture container. The
+/// callers retry these in bounded loops, but a single `exec` that never
+/// returns would hang the loop itself.
+const CONTAINER_EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run `sh -c <script>` inside `container` under [`CONTAINER_EXEC_TIMEOUT`],
+/// naming the service and the elapsed time if the deadline is breached.
+async fn exec_sh_within_deadline(
+    service: &str,
+    container: &ContainerAsync<GenericImage>,
+    script: &str,
+) -> Result<ExecOutput, BoxError> {
+    let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+    with_phase_deadline(
+        &format!("{service} container exec"),
+        CONTAINER_EXEC_TIMEOUT,
+        async {
+            let mut result = container.exec(ExecCommand::new(cmd)).await?;
+            let stdout = result.stdout_to_vec().await?;
+            let stderr = result.stderr_to_vec().await?;
+            Ok::<_, BoxError>(ExecOutput {
+                exit_code: result.exit_code().await?,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            })
+        },
+    )
+    .await?
 }
 
 struct ExecOutput {
@@ -295,7 +409,7 @@ pub async fn start_redpanda_container() -> Result<RedpandaContainer, BoxError> {
         let host_port = allocate_host_port()?;
         let advertise = format!("internal://127.0.0.1:9092,external://127.0.0.1:{host_port}");
 
-        let container = GenericImage::new("redpandadata/redpanda", "v24.2.4")
+        let image = GenericImage::new("redpandadata/redpanda", "v24.2.4")
             .with_exposed_port(9093.tcp())
             .with_mapped_port(host_port, 9093.tcp())
             .with_cmd([
@@ -317,9 +431,8 @@ pub async fn start_redpanda_container() -> Result<RedpandaContainer, BoxError> {
                 advertise,
                 "--set".to_string(),
                 "redpanda.auto_create_topics_enabled=false".to_string(),
-            ])
-            .start()
-            .await?;
+            ]);
+        let container = start_within_deadline("Redpanda", image.start()).await?;
         Ok((container, host_port))
     })
     .await?;
@@ -525,15 +638,7 @@ impl RedpandaContainer {
     }
 
     async fn exec_sh(&self, script: &str) -> Result<ExecOutput, BoxError> {
-        let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
-        let mut result = self.container.exec(ExecCommand::new(cmd)).await?;
-        let stdout = result.stdout_to_vec().await?;
-        let stderr = result.stderr_to_vec().await?;
-        Ok(ExecOutput {
-            exit_code: result.exit_code().await?,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        })
+        exec_sh_within_deadline("Redpanda", &self.container, script).await
     }
 }
 

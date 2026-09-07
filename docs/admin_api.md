@@ -36,7 +36,7 @@ Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, and `/audit`. Those routes are selected by `X-Ferrum-Namespace`.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`.
 - The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, `GET /namespaces` is **filtered** to the JWT `ns` claim — a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
 - Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected: `X-Ferrum-Namespace` does not select a tenant there. Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
@@ -155,6 +155,10 @@ and reason needed for node-local repair while HBONE/TCP control remains
 diagnosable.
 
 In database **and control-plane** mode, if a **full** config load is rejected by the runtime-config validation contract (a reachable backend served a semantically-invalid snapshot — e.g. a partial/direct-DB write) **or by typed SQL row decoding** (a reachable backend served an undecodable row — e.g. malformed JSON in a column) the gateway keeps serving the last known-good config **and keeps the admin API writable**: `db_available` stays true because admin writes are the in-band repair path for the offending resource. Re-enabling writes is gated on any deferred schema migration applying first, so a reachable backend whose schema is still pending keeps writes blocked while `config_rejected` stays set. The rejection also skips failover (the same invalid snapshot lives on every replica). The authenticated `/health` detail then carries `config_rejected: true` and `status: "degraded"` (the boolean detail is authenticated-only; the coarse `degraded` status is also visible unauthenticated). The flag is sticky and clears only after an accepted authoritative **full** reload (an accepted incremental poll does not clear it). While the backend is later unreachable (`admin_writes_enabled` false) the `config_rejected` detail is suppressed so it never advertises the writable repair path during an outage, even though the underlying flag remains set. A genuine connectivity failure is unaffected and still flips `admin_writes_enabled` to false. Startup still fails loudly for undecodable rows (backup bootstrap is not eligible), matching the non-transient decode policy.
+
+In **database** mode a stored `plugin_configs` row that the shared plugin **construction** gate refuses (unknown key, bad regex, out-of-range value) is **quarantined** rather than fatal **only when the plugin's failure policy is `OptionalFailOpen`** (logging, metrics and other instrumentation): the serving-mode full load drops that row, logs one `error!` naming the plugin, its config id, and the constructor error, omits it from the plugin cache, and raises `config_rejected`. The process therefore reaches its admin listener with the offending row still visible through `GET /plugins` and deletable through `DELETE /plugins/{id}`, which is the in-band repair path. `config_rejected` is *not* cleared by a later accepted reload that still had to quarantine a row. A refused `FailClosed` or `KeepLastKnownGood` row, and any unknown or retired plugin name, is **never** quarantined: the serving-mode load rejects the whole snapshot and the process refuses to start, because silently omitting an authentication, authorization or traffic-policy plugin would serve requests without the control the operator configured. Repair those rows out of band (directly in the database) before restarting. Control-plane mode **rejects** every unconstructible snapshot outright, so such a row is never broadcast to the data-plane fleet.
+
+A malformed `FailClosed` / `KeepLastKnownGood` row therefore never yields a serving snapshot with that plugin omitted, on any path: a cold start without `FERRUM_DB_CONFIG_BACKUP_PATH` exits before any proxy or admin listener binds; a cold start with a usable backup serves the backup generation — security plugins included — with `config_rejected` raised and admin writes available for in-band repair; and a hot reload whose authoritative full load contains such a row never reaches `update_config`, so the complete previous runtime generation keeps serving. End-to-end coverage lives in `tests/functional/functional_plugin_quarantine_test.rs`.
 
 In **file** mode, if a SIGHUP reload candidate fails read, parse, validation, or apply, the gateway likewise keeps serving the last known-good config and raises the same `config_rejected` signal: authenticated `/health` reports `config_rejected: true` with `status: "degraded"` (boolean detail authenticated-only; coarse `degraded` also visible unauthenticated). File-mode admin stays read-only; operators repair by fixing the config file and reloading. The flag clears on the next Applied or Unchanged reload.
 
@@ -395,6 +399,33 @@ Both admin listeners (plaintext and HTTPS) serve HTTP/1.1 and HTTP/2 — HTTPS n
 Sizing note: there is no listener-wide budget for concurrently buffered request bodies, so the theoretical ceiling on retained body bytes is `FERRUM_ADMIN_MAX_CONNECTIONS` x `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` x the route's size cap. Reaching it requires credentials for a body-consuming route (every one of them is role-gated, and the role gate runs before the body is read), and in practice the binding constraint is the caller's upload bandwidth times the body deadline rather than the stream product — a caller can only hold what it has actually transmitted. Deployments that expose the admin plane to lower-trust `operator` tokens should size `FERRUM_ADMIN_MAX_CONNECTIONS`, `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`, and `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` against the process memory limit rather than relying on the defaults.
 
 ## Namespaces
+
+### Resource identity is `(namespace, id)`
+
+Proxy, upstream, plugin-config, API-spec, and consumer ids are unique **within a
+namespace**, not globally. Two tenants may each create an upstream `payments`
+and a proxy `edge`; neither can reserve an id the other needs, and no admin
+response ever mixes them. This is enforced in persistence, not only in
+admission: SQL uses a composite `PRIMARY KEY (namespace, id)` on all five
+tables, the `proxy_plugins` junction keys on
+`(namespace, proxy_id, plugin_config_id)` with namespace-qualified foreign keys
+to both sides, and MongoDB stores each document under
+`_id = "{namespace}:{id}"` (issue #4627; consumers since issue #2121).
+
+Practical consequences for API clients:
+
+- A `POST` that would collide with a same-id resource in another namespace now
+  succeeds. `409 Conflict` means the id is taken **in your namespace**.
+- `PUT`, `GET`, and `DELETE` continue to address `(X-Ferrum-Namespace, id)`; an
+  id that exists only in another namespace is a `404`, never someone else's
+  resource.
+- A `plugin_config.proxy_id`, a proxy's `upstream_id`, an API spec's `proxy_id`,
+  and every entry of a proxy's `plugins` array resolve **only** within the
+  request's namespace. A reference to an id owned by another tenant is rejected
+  at admission with `400` and is structurally impossible to persist.
+- Store-level duplicate-key details are never surfaced in a response body; a
+  conflict is reported through the normal `409`/`400` shapes, so response codes
+  cannot be used to probe whether another tenant owns a guessed id.
 
 Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate runs a **one-time** compatibility backfill: a database that has never completed it inserts every pre-existing derived name from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the canonical `ferrum` row, then durably marks that backfill complete. A failed or partial attempt leaves the marker absent so a later startup retries the same idempotent inserts. That compatibility pass takes the **same global namespace-registry admission lease** every live create/rename/delete takes, and it commits as **one transaction** so it cannot read derived names next to a concurrent confirmed `DELETE` and then resurrect the removed row. On SQL the transaction's first statement verifies the lease row *and locks it* (`SELECT ... FOR UPDATE`; on SQLite the equivalent conditional `UPDATE`, which takes the single database writer lock), then holds that lock across the derived-name scan, the inserts, the marker, and the commit. Because every competing lease acquisition is a write to that same row, no other gateway can take the global key while the pass runs — so a pass that simply takes longer than one lease duration still commits instead of rolling back and starving; the commit-boundary check proves the same owner and generation, which only an ownership change could alter and nothing can alter under the lock. On MongoDB the pass runs the derived-name discovery, the registry upserts, the strict split-identity validation, the completion marker, and the owner/generation lease proof inside a single transaction, so the name set cannot go stale before it is durable; a delete that acquired the lease first fails the in-transaction proof, and one that tries to acquire it later write-conflicts with the same lease document the transaction touches. A standalone `mongod` has no multi-document transactions, so the pass **writes nothing at all** there rather than claiming an atomicity that topology does not have — `POST`/`PUT`/`DELETE /namespaces` already return `501` before mutating anything on that topology, `GET /namespaces` is the registry ∪ derived union either way, and the marker stays absent so the first replica-set-capable startup performs the full fenced pass. A lease already held elsewhere simply defers the pass — the marker stays absent, which is the same crash-retry state — and the lease is released on every path, success or error, so a failed pass never stalls namespace CRUD for its full lease duration. Once completion is durable, later connect/migrate/reconnect/startup passes do **not** reseed deleted names or materialize newer derived-only names. The marker lives in internal compatibility state (`_ferrum_schema_compat`), not as a fake registry row, and never appears in `GET /namespaces`. Nothing else is seeded: the backfill never reads the process environment, so a deployment-specific `FERRUM_NAMESPACE` that has no resources yet is created through `POST /namespaces`. Ordinary resource writes with a new `X-Ferrum-Namespace` still isolate data and appear in `GET /namespaces` as derived names, but they do **not** insert a registry row.
 
@@ -799,6 +830,32 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   }' \
   http://localhost:9000/plugins/config
 ```
+
+### Proxy-scoped configs attach the proxy association
+
+A proxy-scoped plugin applies only when the target proxy lists it in `plugins`;
+`proxy_id` alone never attaches it (see `docs/plugins.md` → Scope). In
+**database mode** the Admin API keeps the two surfaces in step, atomically:
+
+| Write | Effect on `proxies[].plugins` |
+| --- | --- |
+| `POST /plugins/config` with `scope: "proxy"`, `proxy_id: P` | appends `{"plugin_config_id": "<id>"}` to `P` (idempotent) |
+| `PUT /plugins/config/{id}` moving `proxy_id` from `P1` to `P2` | removes it from `P1`, adds it to `P2` |
+| `PUT /plugins/config/{id}` changing `scope` to `global` | removes the stale association |
+| `DELETE /plugins/config/{id}` | removes it from every proxy that lists it |
+
+The plugin-config row and the association commit in one transaction, and every
+touched proxy's `updated_at` advances so the next poll / control-plane
+broadcast republishes it. `GET /proxies/{id}` is therefore authoritative: a
+`201` from `POST /plugins/config` means *attached*, not merely created. A
+`proxy_id` that does not exist in the request's namespace is rejected with
+`400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
+is persisted, as before.
+
+`scope: "proxy_group"` associations are unaffected — they are operator-managed
+through `PUT /proxies/{id}` and stay valid for any proxy in the namespace. File
+mode is unchanged: the configuration file's association arrays are the only
+attachment surface there.
 
 Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes.
 
@@ -1328,7 +1385,7 @@ Returns the connection status to the Control Plane:
 - **`status`**: `online` when the gRPC stream to the CP is active, `offline` when disconnected (e.g., CP is down, DP is in backoff retry).
 - **`is_primary`**: `true` when connected to the primary (first) CP URL, `false` when connected to a fallback CP (multi-CP failover).
 - **`last_config_received_at`**: Timestamp of the last successfully *accepted* config update (full snapshot or delta) from the CP. Rejected resource deltas do not advance this stamp. `null` if no config has been accepted yet.
-- **`config_diverged`**: Sticky operator signal set when a non-empty ConfigSync DELTA is rejected. Cleared only after an authoritative FULL_SNAPSHOT is accepted. Last-known-good config continues to serve while `true`.
+- **`config_diverged`**: Sticky operator signal set when a non-empty ConfigSync DELTA is rejected, or when an admitted FULL_SNAPSHOT fails to apply (most commonly a plugin config this data plane cannot construct — the DP logs the plugin name, config id, and constructor error). Cleared only after an authoritative FULL_SNAPSHOT is accepted. Last-known-good config continues to serve while `true`. `ConfigSync.Subscribe` is server-streaming with no client acknowledgement, so this DP-side field is the in-band signal that a data plane is frozen; the CP's `last_sync_at` only records that the CP *sent* an update.
 - **`config_diverged_since`**: When sticky divergence was first raised (`null` when not diverged).
 - **`config_divergence_recoveries_total`**: Count of divergence → FULL_SNAPSHOT recovery transitions.
 

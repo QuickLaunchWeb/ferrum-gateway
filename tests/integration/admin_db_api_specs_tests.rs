@@ -394,12 +394,15 @@ async fn submit_bundle_remains_available_with_unrelated_malformed_plugin_associa
         ))
         .await
         .expect("seed proxy-scoped plugin failed");
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind(&wrong_association_proxy_id)
-        .bind(&malformed_plugin_id)
-        .execute(&store.pool())
-        .await
-        .expect("seed out-of-band malformed association failed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
+    )
+    .bind(ns)
+    .bind(&wrong_association_proxy_id)
+    .bind(&malformed_plugin_id)
+    .execute(&store.pool())
+    .await
+    .expect("seed out-of-band malformed association failed");
 
     let proxy_id = uid("submit-repair-new-proxy");
     let spec_id = uid("submit-repair-new-spec");
@@ -808,12 +811,15 @@ async fn restore_bundle_ignores_unrelated_malformed_plugin_association() {
         ))
         .await
         .expect("seed proxy-scoped plugin failed");
-    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
-        .bind(&wrong_association_proxy_id)
-        .bind(&malformed_plugin_id)
-        .execute(&store.pool())
-        .await
-        .expect("seed out-of-band malformed association failed");
+    sqlx::query(
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
+    )
+    .bind(ns)
+    .bind(&wrong_association_proxy_id)
+    .bind(&malformed_plugin_id)
+    .execute(&store.pool())
+    .await
+    .expect("seed out-of-band malformed association failed");
 
     let restored_proxy_id = uid("restore-repair-recovered-proxy");
     let spec_id = uid("restore-repair-spec");

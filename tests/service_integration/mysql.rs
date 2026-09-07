@@ -15,7 +15,9 @@ use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-use super::common::containers::{BoxError, fail_in_ci_else_skip};
+use super::common::containers::{
+    BoxError, CONTAINER_START_TIMEOUT, fail_in_ci_else_skip, with_phase_deadline,
+};
 use super::common::host_ports::{
     allocate_host_port, is_host_port_collision, retry_on_host_port_collision,
 };
@@ -37,35 +39,46 @@ async fn start_mysql_container(
     const START_ATTEMPTS: u32 = 3;
 
     for attempt in 1..=START_ATTEMPTS {
-        match GenericImage::new("mysql", "8.4")
-            .with_exposed_port(3306.tcp())
-            .with_mapped_port(host_port, 3306.tcp())
-            .with_env_var("MYSQL_ROOT_PASSWORD", password)
-            .with_env_var("MYSQL_ROOT_HOST", "%")
-            .with_env_var("MYSQL_DATABASE", "ferrum")
-            .start()
-            .await
-        {
+        let started = tokio::time::Instant::now();
+        let start = with_phase_deadline(
+            &format!("MySQL image pull/start (attempt {attempt}/{START_ATTEMPTS})"),
+            CONTAINER_START_TIMEOUT,
+            GenericImage::new("mysql", "8.4")
+                .with_exposed_port(3306.tcp())
+                .with_mapped_port(host_port, 3306.tcp())
+                .with_env_var("MYSQL_ROOT_PASSWORD", password)
+                .with_env_var("MYSQL_ROOT_HOST", "%")
+                .with_env_var("MYSQL_DATABASE", "ferrum")
+                .start(),
+        )
+        .await?;
+        match start {
             Ok(container) => return Ok(container),
             Err(error) => {
+                let elapsed = started.elapsed().as_secs_f64();
                 if is_host_port_collision(&error.to_string()) {
-                    return Err(format!("MySQL container start failed: {error}").into());
+                    return Err(format!(
+                        "MySQL image pull/start failed after {elapsed:.1}s: {error}"
+                    )
+                    .into());
                 }
                 if attempt == START_ATTEMPTS {
                     return Err(format!(
-                        "MySQL container failed to start after {START_ATTEMPTS} attempts: {error}"
+                        "MySQL image pull/start failed after {START_ATTEMPTS} attempts \
+                         (last attempt {elapsed:.1}s): {error}"
                     )
                     .into());
                 }
                 eprintln!(
-                    "MySQL container start attempt {attempt}/{START_ATTEMPTS} failed; retrying: {error}"
+                    "MySQL image pull/start attempt {attempt}/{START_ATTEMPTS} failed \
+                     after {elapsed:.1}s; retrying: {error}"
                 );
                 tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
             }
         }
     }
 
-    Err("MySQL container start retry loop did not execute".into())
+    Err("MySQL image pull/start retry loop did not execute".into())
 }
 
 async fn start_mysql() -> Result<MySqlFixture, BoxError> {
@@ -79,6 +92,7 @@ async fn start_mysql() -> Result<MySqlFixture, BoxError> {
     let url = format!("mysql://root:{PASSWORD}@127.0.0.1:{port}/ferrum");
 
     sqlx::any::install_default_drivers();
+    let started = tokio::time::Instant::now();
     let mut last_error = String::new();
     for _ in 0..90 {
         match sqlx::any::AnyPoolOptions::new()
@@ -100,7 +114,11 @@ async fn start_mysql() -> Result<MySqlFixture, BoxError> {
             }
         }
     }
-    Err(format!("MySQL did not become ready within 45s: {last_error}").into())
+    Err(format!(
+        "MySQL connect readiness not reached (elapsed {:.1}s): {last_error}",
+        started.elapsed().as_secs_f64()
+    )
+    .into())
 }
 
 async fn index_definition(pool: &sqlx::AnyPool, index_name: &str) -> Vec<(String, i64)> {

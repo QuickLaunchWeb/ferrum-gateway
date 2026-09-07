@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/ci.yml"><img src="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/coverage.yml"><img src="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/coverage.yml/badge.svg?branch=main" alt="Coverage"></a>
-  <a href="https://github.com/ferrum-edge/ferrum-edge/releases/tag/latest"><img src="https://img.shields.io/github/v/release/ferrum-edge/ferrum-edge?include_prereleases" alt="Release"></a>
+  <a href="https://github.com/ferrum-edge/ferrum-edge/releases"><img src="https://img.shields.io/github/v/release/ferrum-edge/ferrum-edge?include_prereleases" alt="Release"></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License"></a>
   <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge" alt="Docker Pulls"></a>
 </p>
@@ -53,15 +53,23 @@ On Kubernetes, map each mode to its chart or external contract in
 
 - **Rust** toolchain — latest stable (the repo pins `channel = "stable"` via `rust-toolchain.toml`; rustup will auto-install on first `cargo` invocation). CI runs clippy with `-D warnings` against the current stable, so local toolchains MUST be at parity.
 - **protoc** (Protocol Buffers compiler) for gRPC code generation — install `protobuf-compiler` or set `PROTOC` to the executable path
+- **sccache and platform linker tools** — required by `.cargo/config.toml`; complete the
+  [one-time bootstrap](CONTRIBUTING.md#one-time-local-bootstrap) before building.
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
 
 ## Installation
 
 ### From Source
 
+The bootstrap below requires Homebrew on macOS or apt-based Linux. The fast-linker
+configuration covers x86_64 and ARM64 GNU/Linux and macOS. For other platforms, manual
+installation, or building without sccache and fast linkers, follow the
+[platform limits and fallback instructions](CONTRIBUTING.md#one-time-local-bootstrap).
+
 ```bash
 git clone https://github.com/ferrum-edge/ferrum-edge.git
 cd ferrum-edge
+./scripts/install-build-deps.sh
 cargo build --release
 
 # Install to PATH
@@ -73,12 +81,12 @@ ferrum-edge version
 
 Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
 
-Pin an explicit release tag in download URLs. Ferrum's moving `latest` tag is published as a prerelease, while GitHub's `/releases/latest` redirect and the `releases/latest` API endpoint skip prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and do not pin production to the mutable `latest` prerelease.
+Pin an explicit release tag in download URLs. Production artifacts are published only for version tags; merging main no longer refreshes a moving `latest` build. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
 
 ```bash
 # Example: Linux x86_64
 set -euo pipefail
-TAG=<published-tag>  # from GitHub Releases / container registry (not a chart default)
+TAG='<published-tag>'  # from GitHub Releases / container registry (not a chart default)
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
@@ -92,8 +100,18 @@ Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86
 
 ### Docker
 
+Choose a published version, not a source tag or chart `appVersion` that is still
+in release preparation. Historical `latest` images are not refreshed by main CI.
+
+Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`, anonymously
+pullable) and to GitHub Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Use the
+Docker Hub path unless you have confirmed the GHCR package is visible to you: a GHCR
+package that is not public returns `401 Unauthorized` to an anonymous `docker pull`.
+
 ```bash
-docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
+# Replace with a version whose image has completed publication.
+TAG='<published-tag>'
+docker pull "docker.io/ferrumedge/ferrum-edge:${TAG}"
 
 docker run -d --name ferrum-edge \
   -p 8000:8000 \
@@ -103,7 +121,7 @@ docker run -d --name ferrum-edge \
   -e FERRUM_ADMIN_JWT_SECRET="please-change-me-to-a-32+character-secret" \
   -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
   -v ferrum_data:/data \
-  ghcr.io/ferrum-edge/ferrum-edge:latest
+  "docker.io/ferrumedge/ferrum-edge:${TAG}"
 ```
 
 > **Admin API exposure.** The admin API is a management plane. Both admin

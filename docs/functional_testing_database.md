@@ -340,7 +340,8 @@ Lists all proxies.
 The test uses SQLite with the following schema (automatically created):
 
 **proxies table**
-- `id` (TEXT PRIMARY KEY): Unique proxy identifier
+- `id` (TEXT): Proxy identifier, unique within its namespace
+- `namespace` (TEXT): Owning tenant; `PRIMARY KEY (namespace, id)`
 - `listen_path` (TEXT NOT NULL UNIQUE): Path the proxy listens on
 - `backend_scheme` (TEXT): Backend protocol (http/https)
 - `backend_host` (TEXT): Backend hostname
@@ -349,7 +350,8 @@ The test uses SQLite with the following schema (automatically created):
 - ... (additional timeout and TLS fields)
 
 **consumers table**
-- `id` (TEXT PRIMARY KEY): Consumer identifier
+- `id` (TEXT): Consumer identifier, unique within its namespace
+- `namespace` (TEXT): Owning tenant; `PRIMARY KEY (namespace, id)`
 - `username` (TEXT): Username
 - `custom_id` (TEXT): Custom identifier
 - ... (credential and timing fields)

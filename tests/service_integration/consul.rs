@@ -14,7 +14,7 @@ use ferrum_edge::service_discovery::consul::ConsulDiscoverer;
 use serde_json::json;
 
 use crate::common::containers::{
-    ConsulContainer, fail_in_ci_else_skip, start_consul_dev_container,
+    ConsulContainer, fail_in_ci_else_skip, fixture_http_client, start_consul_dev_container,
 };
 
 /// Start Consul or self-skip (locally) / hard-fail (CI).
@@ -35,7 +35,7 @@ fn discoverer(
     healthy_only: bool,
 ) -> ConsulDiscoverer {
     ConsulDiscoverer::new(
-        reqwest::Client::new(),
+        fixture_http_client(),
         addr.to_string(),
         service.to_string(),
         None, // datacenter

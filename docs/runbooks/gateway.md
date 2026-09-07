@@ -286,11 +286,16 @@ restart-blocking outage.
    fresh, so you are not alerting on a stale snapshot.
 3. The gateway log — the same condition is logged at startup and on every
    reload once the remaining lifetime is under
-   `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` (default 30 days).
+   `FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS` (default 30 days). For a stapled OCSP
+   response the warning also re-fires on the hourly staple re-check, so it
+   recurs without a reload.
 
 **Remediation.** Publish a freshly issued CRL (or a new stapled OCSP
 response) through the configured source; Ferrum reloads revocation material
-from watched sources without a restart. Do **not** restart the gateway as a
+from watched sources without a restart. Note that a stapled OCSP response that
+reaches its `nextUpdate` is **dropped** by the hourly re-check — the listener
+then serves no staple, which is the safer state but leaves a must-staple
+certificate unusable until a fresh response is published. Do **not** restart the gateway as a
 remedy — if the material has already expired, the restart is exactly the
 outage this alert warns about. Verify the gauge moves after the source is
 updated; if it does not, the watcher is not seeing the new material.

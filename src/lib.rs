@@ -1,9 +1,8 @@
 //! Ferrum Edge — A high-performance edge proxy built in Rust.
 //!
 //! This crate re-exports the public API surface used by integration tests,
-//! functional tests, and custom plugins. The binary entry point is in `main.rs`;
-//! this `lib.rs` simply makes internal modules accessible to external test crates
-//! without duplicating module declarations.
+//! functional tests, and custom plugins. The binary imports these shared modules
+//! and owns its startup pipeline, so library consumers do not compile CLI startup.
 
 /// The Ferrum Edge binary/crate version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -101,6 +100,7 @@ pub mod _test_support {
     use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
+    use crate::plugins::oidc_relying_party::refresh_flight_test_seams as oidc_refresh_flight_seams;
 
     /// Parse-only URI authority and Host header a Unix WebSocket handshake uses.
     ///
@@ -2116,6 +2116,102 @@ pub mod _test_support {
         })
     }
 
+    // ── OIDC refresh single-flight seams (issue #4640) ──────────────────────
+
+    /// A refresh single-flight registry with caller-chosen retention and cap,
+    /// so eviction, expiry, and follower outcomes are reachable in unit tests.
+    pub struct OidcRefreshFlightsForTest {
+        harness: oidc_refresh_flight_seams::RefreshFlightHarness,
+    }
+
+    pub enum OidcRefreshFlightJoinForTest<'a> {
+        Leader(OidcRefreshFlightLeaderForTest<'a>),
+        Follower(OidcRefreshFlightFollowerForTest),
+        Completed,
+    }
+
+    /// Owns a leader's slot exactly as the request path does: dropping it
+    /// without publishing is a cancelled leader.
+    pub struct OidcRefreshFlightLeaderForTest<'a> {
+        leader: oidc_refresh_flight_seams::RefreshFlightLeader<'a>,
+    }
+
+    pub struct OidcRefreshFlightFollowerForTest {
+        follower: oidc_refresh_flight_seams::RefreshFlightFollower,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OidcRefreshFlightWaitForTest {
+        Published,
+        LeaderGone,
+        TimedOut,
+    }
+
+    impl OidcRefreshFlightsForTest {
+        pub fn new(retention: Duration, max_retained: usize) -> Self {
+            Self {
+                harness: oidc_refresh_flight_seams::RefreshFlightHarness::new(
+                    retention,
+                    max_retained,
+                ),
+            }
+        }
+
+        pub fn join(&self, key: [u8; 32]) -> OidcRefreshFlightJoinForTest<'_> {
+            match self.harness.join(key) {
+                oidc_refresh_flight_seams::RefreshFlightJoin::Leader(leader) => {
+                    OidcRefreshFlightJoinForTest::Leader(OidcRefreshFlightLeaderForTest { leader })
+                }
+                oidc_refresh_flight_seams::RefreshFlightJoin::Follower(follower) => {
+                    OidcRefreshFlightJoinForTest::Follower(OidcRefreshFlightFollowerForTest {
+                        follower,
+                    })
+                }
+                oidc_refresh_flight_seams::RefreshFlightJoin::Completed => {
+                    OidcRefreshFlightJoinForTest::Completed
+                }
+            }
+        }
+
+        /// Run the cap-reached eviction pass directly.
+        pub fn evict_completed(&self) {
+            self.harness.evict_completed();
+        }
+
+        pub fn flight_count(&self) -> usize {
+            self.harness.flight_count()
+        }
+
+        pub fn contains(&self, key: &[u8; 32]) -> bool {
+            self.harness.contains(key)
+        }
+    }
+
+    impl OidcRefreshFlightLeaderForTest<'_> {
+        /// Publish a deferred outcome completed `age` ago and retain the slot.
+        pub fn publish_completed_ago(self, age: Duration) -> Result<(), String> {
+            self.leader.publish_completed_ago(age)
+        }
+    }
+
+    impl OidcRefreshFlightFollowerForTest {
+        /// Await the leader's outcome with the production follower wait bound.
+        pub async fn wait(&mut self) -> OidcRefreshFlightWaitForTest {
+            use oidc_refresh_flight_seams::RefreshFlightWaitOutcome as Outcome;
+            match self.follower.wait().await {
+                Outcome::Published => OidcRefreshFlightWaitForTest::Published,
+                Outcome::LeaderGone => OidcRefreshFlightWaitForTest::LeaderGone,
+                Outcome::TimedOut => OidcRefreshFlightWaitForTest::TimedOut,
+            }
+        }
+    }
+
+    /// `From<String>` classification of a refresh failure: `Some(error)` when
+    /// it is a deferrable `Other`, `None` when it is a spent credential.
+    pub fn oidc_refresh_failure_from_string_for_test(error: String) -> Option<String> {
+        oidc_refresh_flight_seams::refresh_failure_from_string(error)
+    }
+
     pub fn prepare_basic_auth_credential_for_test(
         credential: &mut serde_json::Value,
     ) -> Result<(), StatusCode> {
@@ -2205,6 +2301,14 @@ pub mod _test_support {
         config: &crate::config::types::GatewayConfig,
     ) -> Vec<String> {
         crate::config::validation_pipeline::collect_rejecting_runtime_config_errors(config)
+    }
+
+    /// Drop every enabled plugin config the shared construction gate refuses,
+    /// returning the operator-facing rejection messages (issue #4526).
+    pub fn quarantine_unconstructible_plugin_configs_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::config::validation_pipeline::quarantine_unconstructible_plugin_configs(config)
     }
 
     pub async fn lock_namespace_config_admission_for_test(
@@ -2428,6 +2532,16 @@ pub mod _test_support {
             )
             .run()
             .map_err(|error| error.to_string())
+    }
+
+    // ── plugins/utils/http_client ────────────────────────────────────────────
+    /// Process-wide number of plugin `reqwest::Client` constructions so far.
+    ///
+    /// Config-load validation sweeps must build a bounded number of clients
+    /// per sweep regardless of how many plugin configs they screen (issue
+    /// #4116); tests take a before/after delta around one full load.
+    pub fn plugin_http_client_builds_for_test() -> u64 {
+        crate::plugins::utils::http_client::plugin_http_client_builds()
     }
 
     // ── plugins/request_mirror ───────────────────────────────────────────────
@@ -3337,6 +3451,12 @@ pub mod _test_support {
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
+    }
+
+    /// The pre-copy (setup-phase) stream classifier the TCP accept loop uses
+    /// for DNS / dial / handshake / plugin-reject failures (issue #4536).
+    pub fn classify_stream_setup_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
+        crate::proxy::tcp_proxy::classify_stream_setup_error(error)
     }
 
     /// Production typed emit for an opaque-TLS SNI peek refusal (issue #4407).
@@ -9987,6 +10107,86 @@ pub mod _test_support {
         }
     }
 
+    /// One observation of the post-EOS backend send-queue drain rule
+    /// (issue #4411), as [`crate::proxy::backend_send_queue`] classifies it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SendQueueProbeVerdict {
+        /// The peer's kernel accepted everything; `backend_read_timeout_ms`
+        /// governs from here.
+        Drained,
+        /// Strictly decreasing, or the watermark has not elapsed yet.
+        Progressing,
+        /// Non-zero and not strictly decreasing for the whole watermark.
+        Stalled,
+    }
+
+    /// The progress rule behind the post-EOS `backend_write_timeout_ms` drain
+    /// bound, driven directly so the "oscillating depth is a stall" invariant
+    /// can be proven without a socket or a clock (issue #4411).
+    pub struct SendQueueProgressProbe {
+        inner: crate::proxy::backend_send_queue::SendQueueProgress,
+    }
+
+    impl SendQueueProgressProbe {
+        pub fn new(now_ms: u64, write_timeout_ms: u64) -> Self {
+            Self {
+                inner: crate::proxy::backend_send_queue::SendQueueProgress::new(
+                    now_ms,
+                    write_timeout_ms,
+                ),
+            }
+        }
+
+        pub fn observe(&mut self, depth: u64, now_ms: u64) -> SendQueueProbeVerdict {
+            use crate::proxy::backend_send_queue::SendQueueVerdict;
+            match self.inner.observe(depth, now_ms) {
+                SendQueueVerdict::Drained => SendQueueProbeVerdict::Drained,
+                SendQueueVerdict::Progressing => SendQueueProbeVerdict::Progressing,
+                SendQueueVerdict::Stalled => SendQueueProbeVerdict::Stalled,
+            }
+        }
+    }
+
+    /// Sampling cadence the drain watch uses: `min(100ms, write_timeout / 4)`.
+    pub fn send_queue_sample_interval_ms(write_timeout_ms: u64) -> u64 {
+        crate::proxy::backend_send_queue::sample_interval(write_timeout_ms).as_millis() as u64
+    }
+
+    /// Whether this build target can answer a send-queue query at all.
+    pub fn send_queue_probe_supported() -> bool {
+        crate::socket_opts::send_queue_probe_supported()
+    }
+
+    /// Debug-build counters for every link of the bundled HTTP client's
+    /// socket handoff and the upload pump's post-EOS drain judgment (issue
+    /// #4411), so an acceptance test that misses the drain bound can report
+    /// which link never happened. Empty in release builds.
+    pub fn post_eos_drain_diagnostics() -> Vec<(&'static str, u64)> {
+        crate::proxy::backend_send_queue::diagnostics::snapshot()
+    }
+
+    /// Send-queue depth of a raw descriptor, through the same handle the
+    /// bundled HTTP client's dispatch path builds from vendored reqwest patch
+    /// 004's `established` callback (issue #4411).
+    #[cfg(unix)]
+    pub fn raw_fd_send_queue_bytes(fd: std::os::fd::RawFd) -> Option<u64> {
+        crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from_raw_fd(fd)?
+            .send_queue_bytes()
+    }
+
+    /// Watch a live socket's send queue exactly as the upload pump does after a
+    /// clean EOS. `true` means the drain stalled for the whole watermark.
+    pub async fn await_backend_send_queue_stall(
+        stream: &tokio::net::TcpStream,
+        write_timeout_ms: u64,
+    ) -> Option<bool> {
+        let handle = crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(stream)?;
+        Some(
+            crate::proxy::backend_send_queue::await_send_queue_stall(&handle, write_timeout_ms)
+                .await,
+        )
+    }
+
     /// One gateway-owned BUFFERED upload pump under test (issue #4055).
     ///
     /// The buffered reqwest dispatch has no body adapter to hang a deadline
@@ -12784,7 +12984,10 @@ pub mod _test_support {
         >,
         senders: Vec<
             tokio::sync::mpsc::UnboundedSender<
-                kube::runtime::watcher::Event<kube::api::DynamicObject>,
+                Result<
+                    kube::runtime::watcher::Event<kube::api::DynamicObject>,
+                    kube::runtime::watcher::Error,
+                >,
             >,
         >,
         resource: kube::api::ApiResource,
@@ -12826,6 +13029,31 @@ pub mod _test_support {
             self.metrics.snapshot().watch_idle_relists
         }
 
+        /// Watch stream errors the production watcher counted (issue #4491),
+        /// one per attempt whatever the logging decision was.
+        pub fn watch_errors(&self) -> u64 {
+            self.metrics.snapshot().watch_errors
+        }
+
+        /// Objects a relist found missing from the store it replaced without a
+        /// `Delete` event having delivered the withdrawal (issue #4491).
+        pub fn watch_relist_missed_deletes(&self) -> u64 {
+            self.metrics.snapshot().watch_relist_missed_deletes
+        }
+
+        /// Objects a relist found that the store it replaced never held
+        /// (issue #4491).
+        pub fn watch_relist_missed_adds(&self) -> u64 {
+            self.metrics.snapshot().watch_relist_missed_adds
+        }
+
+        /// Reconciler wake-ups the scope set has issued so far: the change
+        /// notifier's monotonic revision. A watch item that changes nothing
+        /// (kube-rs's `Init`) must not advance it (issue #4491).
+        pub async fn change_notifications(&self) -> u64 {
+            *self.store_set.lock().await.subscribe().borrow()
+        }
+
         /// Raise the demand-driven evidence refresh the reconciler publication
         /// boundary raises when it has to withhold mesh content under a
         /// sequence it cannot advance (issue #3611). Every subscribed watch
@@ -12862,7 +13090,16 @@ pub mod _test_support {
             event: kube::runtime::watcher::Event<kube::api::DynamicObject>,
         ) {
             self.senders[generation]
-                .send(event)
+                .send(Ok(event))
+                .expect("scripted watch generation stream was dropped");
+        }
+
+        /// Deliver one watch stream error on `generation`'s stream, exactly as
+        /// kube-rs's `watcher` yields a failed list or watch (issue #4491).
+        /// Panics if that generation was never scripted.
+        pub fn emit_error(&self, generation: usize, error: kube::runtime::watcher::Error) {
+            self.senders[generation]
+                .send(Err(error))
                 .expect("scripted watch generation stream was dropped");
         }
 
@@ -12959,7 +13196,7 @@ pub mod _test_support {
         use crate::k8s_controller::watcher::{
             RelistPolicy, WatchBoundaryReader, WatchTarget, run_watcher_generations,
         };
-        use futures_util::{Stream, StreamExt};
+        use futures_util::Stream;
         use kube::api::{ApiResource, DynamicObject};
         use kube::runtime::{reflector, watcher};
 
@@ -13014,8 +13251,7 @@ pub mod _test_support {
             match receivers.pop_front() {
                 Some(rx) => Box::pin(reflector::reflector(
                     writer,
-                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
-                        .map(Ok::<_, watcher::Error>),
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
                 )),
                 // Unscripted generations stay silent forever rather than ending,
                 // so they never look like a watch that closed.

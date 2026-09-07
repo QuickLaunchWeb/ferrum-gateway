@@ -407,6 +407,7 @@ mod tests {
         upstreams: Vec<Upstream>,
     ) -> GatewayConfig {
         GatewayConfig {
+            quarantined_plugin_configs: Vec::new(),
             version: "1".to_string(),
             proxies,
             consumers: vec![],

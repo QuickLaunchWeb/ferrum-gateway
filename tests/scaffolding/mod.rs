@@ -53,6 +53,7 @@ pub mod clients;
 pub mod harness;
 pub mod matrix;
 pub mod network;
+pub mod ocsp;
 pub mod ports;
 
 // Curated re-exports so a test's imports fit on one line.

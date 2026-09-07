@@ -1141,10 +1141,18 @@ where
     }
 }
 
-async fn plugin_has_proxy_association(
+/// Does any proxy *other than* `own_proxy_id` reference this plugin config?
+///
+/// A proxy-scoped create writes its own association as part of the same
+/// transaction (issue #4611), so that association is not third-party state and
+/// must not veto late-create compensation — deleting the config removes it
+/// again. Any other proxy referencing the config is a genuine intervening
+/// write.
+async fn plugin_has_foreign_proxy_association(
     db: &dyn DatabaseBackend,
     namespace: &str,
     plugin_id: &str,
+    own_proxy_id: Option<&str>,
 ) -> DbResult<bool> {
     let mut offset = 0_i64;
     const PAGE_SIZE: i64 = 1_000;
@@ -1154,10 +1162,11 @@ async fn plugin_has_proxy_association(
             .await?;
         let items_len = page.items.len() as i64;
         if page.items.iter().any(|proxy| {
-            proxy
-                .plugins
-                .iter()
-                .any(|association| association.plugin_config_id == plugin_id)
+            own_proxy_id != Some(proxy.id.as_str())
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin_id)
         }) {
             return Ok(true);
         }
@@ -1853,6 +1862,47 @@ async fn validate_mtls_auth_candidate(
     config
         .validate_unique_mtls_credentials()
         .map_err(AfterValidateError::Conflict)
+}
+
+/// The proxy candidates a proxy-scoped plugin write will change (issue #4611).
+///
+/// The Admin API now appends `{plugin_config_id}` to the target proxy in the
+/// same transaction as the config row, so admission must validate the graph the
+/// write will actually produce — otherwise an unsupported attachment (a
+/// `tcp_connection_throttle` on a UDP proxy, say) would pass the pre-persist
+/// checks and only fail inside the store.
+///
+/// Only the *gaining* proxy is materialised: detaching can never introduce a
+/// composition conflict that the pre-attach graph did not already have.
+async fn plugin_attach_proxy_candidates(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    resource: &PluginConfig,
+) -> DbResult<Vec<Proxy>> {
+    if resource.scope != PluginScope::Proxy {
+        return Ok(Vec::new());
+    }
+    let Some(proxy_id) = resource.proxy_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    // A missing proxy is already rejected by the `check_proxy_exists` gate
+    // above; treat a race here as "nothing extra to validate" and let the
+    // store's own referential checks decide. The write-path getter is used
+    // deliberately: a proxy carrying a pre-existing invalid association must
+    // stay repairable rather than turning every plugin write into a 503.
+    let Some(mut proxy) = db.get_proxy_for_write(namespace, proxy_id).await? else {
+        return Ok(Vec::new());
+    };
+    if !proxy
+        .plugins
+        .iter()
+        .any(|association| association.plugin_config_id == resource.id)
+    {
+        proxy.plugins.push(crate::config::types::PluginAssociation {
+            plugin_config_id: resource.id.clone(),
+        });
+    }
+    Ok(vec![proxy])
 }
 
 /// Validate the exact post-mutation graph for cross-resource plugin contracts
@@ -4088,13 +4138,26 @@ impl AdminResource for PluginConfig {
         if current.updated_at != written.updated_at {
             return Ok(false);
         }
-        if plugin_has_proxy_association(db, namespace, &written.id).await? {
+        let own_proxy_id = if written.scope == PluginScope::Proxy {
+            written.proxy_id.as_deref()
+        } else {
+            None
+        };
+        if plugin_has_foreign_proxy_association(db, namespace, &written.id, own_proxy_id).await? {
             return Ok(false);
         }
         let mut candidate = db.load_namespace_snapshot(namespace).await?;
         candidate
             .plugin_configs
             .retain(|plugin| plugin.namespace != namespace || plugin.id != written.id);
+        // Compensating the create also drops the association the create wrote
+        // (issue #4611) — the delete cascades it — so the candidate graph must
+        // not keep a proxy pointing at the removed config.
+        for proxy in &mut candidate.proxies {
+            proxy
+                .plugins
+                .retain(|association| association.plugin_config_id != written.id);
+        }
         Ok(
             validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client)
                 .await
@@ -4186,11 +4249,16 @@ impl AdminResource for PluginConfig {
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
         }
+        // Validate the graph the write will produce, including the proxy
+        // association it attaches (issue #4611).
+        let attach_candidates = plugin_attach_proxy_candidates(db, namespace, resource)
+            .await
+            .map_err(AfterValidateError::Db)?;
         validate_plugin_graph_candidates(
             db,
             state,
             namespace,
-            &[],
+            &attach_candidates,
             std::slice::from_ref(resource),
             None,
         )

@@ -145,6 +145,31 @@ impl Service<Uri> for Connector {
 pub trait ConnectionAdmission: Send + Sync + 'static {
     /// Admit one new physical connection to `dst`, or refuse it.
     fn admit(&self, dst: &Uri) -> Result<ConnectionAdmissionToken, BoxError>;
+
+    /// Ferrum patch 004 — the connection admitted by `admit` now exists.
+    ///
+    /// Called at most once per admitted dial, after the transport (and any TLS
+    /// handshake) has produced a socket and before the connection is handed to
+    /// hyper, so no request byte has been written yet. `fd` is the raw
+    /// descriptor of the underlying `TcpStream`, borrowed for the duration of
+    /// the call only: the connection owns it, and an implementation that needs
+    /// it afterwards must duplicate it (`dup`). A dial that produced no TCP
+    /// socket — a Unix-domain or named-pipe transport, or a connection whose
+    /// stream the connector could not reach — does not call this at all.
+    ///
+    /// `token` is the same token `admit` returned for this connection, so an
+    /// implementation can key what it records on the connection's identity.
+    ///
+    /// Only HTTP/1.1 connections are reported: a connection that negotiated
+    /// HTTP/2 over ALPN is multiplexed, and its socket cannot be attributed to
+    /// the single request that dialed it.
+    ///
+    /// The default implementation does nothing, so an existing
+    /// `ConnectionAdmission` needs no change.
+    #[cfg(unix)]
+    fn established(&self, token: &ConnectionAdmissionToken, fd: std::os::fd::RawFd) {
+        let _ = (token, fd);
+    }
 }
 
 /// Opaque handle whose `Drop` marks the end of one physical connection's
@@ -236,15 +261,90 @@ impl TlsInfoFactory for AdmittedConn {
     }
 }
 
+/// Ferrum patch 004: one-shot cell the connect path fills with the raw
+/// descriptor of a newly dialed TCP socket.
+///
+/// The connect future is boxed and `'static`, so the descriptor cannot be
+/// returned by borrow; a cheap shared cell carries it from the branch that can
+/// still see the concrete stream out to [`with_admission`], which is the only
+/// place holding the connection's admission token. `-1` means "no TCP socket
+/// was observed" (a local-transport dial, or a stream the connector could not
+/// reach), and the hook is then not called at all.
+#[derive(Clone)]
+struct EstablishedFd(Arc<std::sync::atomic::AtomicI32>);
+
+#[allow(dead_code)]
+impl EstablishedFd {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicI32::new(-1)))
+    }
+
+    /// Record the descriptor of the socket this dial produced.
+    fn set(&self, fd: i32) {
+        self.0.store(fd, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(unix)]
+    fn get(&self) -> Option<std::os::fd::RawFd> {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            -1 => None,
+            fd => Some(fd),
+        }
+    }
+}
+
+/// Ferrum patch 004: the raw descriptor of the TCP socket underneath a stream
+/// the rustls connector just produced.
+///
+/// Both variants wrap the `HttpConnector`'s `TokioIo<TcpStream>`; the accessor
+/// chain for the TLS variant is the same one this module already uses to reach
+/// the stream for `set_nodelay`.
+#[cfg(all(unix, feature = "__rustls"))]
+fn rustls_stream_raw_fd(
+    io: &hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>,
+) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    match io {
+        hyper_rustls::MaybeHttpsStream::Http(tcp) => Some(tcp.inner().as_raw_fd()),
+        hyper_rustls::MaybeHttpsStream::Https(stream) => {
+            let (tcp, _) = stream.inner().get_ref();
+            Some(tcp.inner().inner().as_raw_fd())
+        }
+    }
+}
+
 /// Ferrum patch 003: await one connect attempt and, on success, bind the
 /// admission token to the resulting physical connection. On failure the token
 /// drops here, releasing the reservation for a handshake that never produced a
 /// socket.
-async fn with_admission<F>(f: F, token: Option<ConnectionAdmissionToken>) -> Result<Conn, BoxError>
+async fn with_admission<F>(
+    f: F,
+    token: Option<ConnectionAdmissionToken>,
+    hook: Option<Arc<dyn ConnectionAdmission>>,
+    established: EstablishedFd,
+) -> Result<Conn, BoxError>
 where
     F: Future<Output = Result<Conn, BoxError>>,
 {
     let conn = f.await?;
+    // Ferrum patch 004: report the socket before the connection reaches hyper,
+    // so the hook observes it strictly before the first request byte is
+    // written. `hook` and `token` are `Some` together or not at all.
+    //
+    // Only an HTTP/1.1 connection is reported. A connection that negotiated
+    // HTTP/2 over ALPN is multiplexed: its kernel send queue is shared by every
+    // stream hyper opens on it, so no per-request consumer of the descriptor
+    // (a send-queue drain bound, say) could attribute that queue to the request
+    // that caused the dial. Such connections leave the hook uncalled.
+    #[cfg(unix)]
+    if let (Some(hook), Some(token), Some(fd)) = (hook.as_ref(), token.as_ref(), established.get())
+    {
+        if !conn.connected().is_negotiated_h2() {
+            hook.established(token, fd);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (&hook, &established);
     Ok(match token {
         None => conn,
         Some(token) => Conn {
@@ -802,11 +902,26 @@ impl ConnectorService {
             .map_err(Into::into)
     }
 
-    async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
+    async fn connect_with_maybe_proxy(
+        self,
+        dst: Uri,
+        is_proxy: bool,
+        // Ferrum patch 004: filled with the dialed socket's descriptor.
+        established: EstablishedFd,
+    ) -> Result<Conn, BoxError> {
+        // Ferrum patch 004: not every feature/target combination reaches a
+        // branch that can report a descriptor.
+        let _ = &established;
         match self.inner {
             #[cfg(not(feature = "__tls"))]
             Inner::Http(mut http) => {
                 let io = http.call(dst).await?;
+                // Ferrum patch 004.
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    established.set(io.inner().as_raw_fd());
+                }
                 Ok(Conn {
                     inner: self.verbose.wrap(io),
                     is_proxy,
@@ -865,6 +980,12 @@ impl ConnectorService {
 
                 let mut http = hyper_rustls::HttpsConnector::from((http, tls.clone()));
                 let io = http.call(dst).await?;
+                // Ferrum patch 004: the socket exists and no request byte has
+                // been written yet.
+                #[cfg(unix)]
+                if let Some(fd) = rustls_stream_raw_fd(&io) {
+                    established.set(fd);
+                }
 
                 if let hyper_rustls::MaybeHttpsStream::Https(stream) = io {
                     if !self.nodelay {
@@ -972,13 +1093,22 @@ impl ConnectorService {
         }
     }
 
-    async fn connect_via_proxy(self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
+    async fn connect_via_proxy(
+        self,
+        dst: Uri,
+        proxy: Intercepted,
+        // Ferrum patch 004: filled with the dialed socket's descriptor.
+        established: EstablishedFd,
+    ) -> Result<Conn, BoxError> {
+        // Ferrum patch 004: only the plain-HTTP proxy arm reaches a TCP dial
+        // this connector can see.
+        let _ = &established;
         log::debug!("proxy({proxy:?}) intercepts '{:?}'", dst.host());
 
         #[cfg(feature = "socks")]
         match proxy.uri().scheme_str().ok_or("proxy scheme expected")? {
             "socks4" | "socks4a" | "socks5" | "socks5h" => {
-                return self.connect_socks(dst, proxy).await
+                return self.connect_socks(dst, proxy).await;
             }
             _ => (),
         }
@@ -1080,7 +1210,8 @@ impl ConnectorService {
             Inner::Http(_) => (),
         }
 
-        self.connect_with_maybe_proxy(proxy_dst, true).await
+        self.connect_with_maybe_proxy(proxy_dst, true, established)
+            .await
     }
 
     #[cfg(any(unix, target_os = "windows"))]
@@ -1133,27 +1264,46 @@ impl Service<Uri> for ConnectorService {
             },
         };
 
+        // Ferrum patch 004: the dialed socket's descriptor, reported to the
+        // admission hook once the connection exists. Costs one small allocation
+        // per NEW physical connection; pooled reuse never reaches `call`.
+        let established = EstablishedFd::new();
+
         // Local transports (UDS, Windows Named Pipes) skip proxies
         #[cfg(any(unix, target_os = "windows"))]
         if self.should_use_local_transport() {
             return Box::pin(with_admission(
                 with_timeout(self.clone().connect_local_transport(dst), timeout),
                 admission,
+                self.connection_admission.clone(),
+                established,
             ));
         }
 
         for prox in self.proxies.iter() {
             if let Some(intercepted) = prox.intercept(&dst) {
                 return Box::pin(with_admission(
-                    with_timeout(self.clone().connect_via_proxy(dst, intercepted), timeout),
+                    with_timeout(
+                        self.clone()
+                            .connect_via_proxy(dst, intercepted, established.clone()),
+                        timeout,
+                    ),
                     admission,
+                    self.connection_admission.clone(),
+                    established,
                 ));
             }
         }
 
         Box::pin(with_admission(
-            with_timeout(self.clone().connect_with_maybe_proxy(dst, false), timeout),
+            with_timeout(
+                self.clone()
+                    .connect_with_maybe_proxy(dst, false, established.clone()),
+                timeout,
+            ),
             admission,
+            self.connection_admission.clone(),
+            established,
         ))
     }
 }

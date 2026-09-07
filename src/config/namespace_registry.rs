@@ -306,7 +306,8 @@ pub const NAMESPACE_OCCUPANCY_TABLES: &[&str] = &[
 ///
 /// Tables keyed by `namespace` (or by a namespace-derived primary key) are NOT
 /// here — they are copied and removed explicitly so the primary key moves with
-/// the row. `config_admission_locks` is never touched at all: those rows are
+/// the row (see [`NAMESPACE_RENAME_COPY_TABLES`]).
+/// `config_admission_locks` is never touched at all: those rows are
 /// the leases proving the mutation, and removing one before commit would
 /// destroy the very fence the transaction verifies against.
 ///
@@ -315,18 +316,169 @@ pub const NAMESPACE_OCCUPANCY_TABLES: &[&str] = &[
 /// namespace converge, and those tombstones need the old name's history and
 /// retention floor to stay where they are.
 ///
-/// `audit_events` is included so the authorization-scoping `namespace` column
-/// follows the renamed tenant. Leaving those rows under the old name would
-/// disclose the previous tenant's history to a later occupant of that name
-/// (rename removes the source `namespaces` row and frees the name). The
-/// immutable `namespace_at_event` column is not part of this rewrite: it
-/// preserves the namespace identity recorded when the event occurred.
-pub const NAMESPACE_RENAME_SIMPLE_TABLES: &[&str] = &[
-    "proxies",
-    "plugin_configs",
-    "upstreams",
-    "api_specs",
-    "audit_events",
+/// `audit_events` is the only remaining in-place rewrite. Its `namespace`
+/// column is authorization-scoping and must follow the renamed tenant:
+/// leaving those rows under the old name would disclose the previous tenant's
+/// history to a later occupant of that name (rename removes the source
+/// `namespaces` row and frees the name). The immutable `namespace_at_event`
+/// column is not part of this rewrite: it preserves the namespace identity
+/// recorded when the event occurred. `audit_events` has no foreign keys and is
+/// keyed on `id` alone, so an in-place update is still safe there.
+pub const NAMESPACE_RENAME_SIMPLE_TABLES: &[&str] = &["audit_events"];
+
+/// Resource tables a rename must COPY under the new name and then delete under
+/// the old one, parent-first, in exactly this order.
+///
+/// Since issue #4627 `proxies`, `upstreams`, `plugin_configs`, and `api_specs`
+/// key on `(namespace, id)` and `proxy_plugins` keys on
+/// `(namespace, proxy_id, plugin_config_id)`, and every relationship between
+/// them is namespace-qualified. That makes an in-place
+/// `UPDATE <table> SET namespace = ?` impossible: moving a parent orphans its
+/// children, and moving a child points it at a parent that has not moved, so no
+/// ordering of such updates keeps every constraint satisfied at statement
+/// boundaries. `consumers` and `gateway_trust_bundles` already used the
+/// copy-then-delete shape for the same reason.
+///
+/// The order below is the INSERT order; deletes run in reverse. Each entry is
+/// the complete column list of the table in `V001SqlBuilder`; the `namespace`
+/// entry becomes the bound new name in the `SELECT` projection.
+/// `sql_namespace_rename_copy_plan_matches_baseline_schema` in
+/// `tests/unit/config/db_loader_tests.rs` fails if a column is added to one of
+/// these tables without being added here.
+pub const NAMESPACE_RENAME_COPY_TABLES: &[(&str, &[&str])] = &[
+    (
+        "upstreams",
+        &[
+            "id",
+            "namespace",
+            "name",
+            "targets",
+            "algorithm",
+            "hash_on",
+            "hash_on_cookie_config",
+            "health_checks",
+            "service_discovery",
+            "subsets",
+            "backend_tls_client_cert_path",
+            "backend_tls_client_key_path",
+            "backend_tls_verify_server_cert",
+            "backend_tls_server_ca_cert_path",
+            "backend_tls_sni",
+            "backend_tls_san_allow_list",
+            "api_spec_id",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "proxies",
+        &[
+            "id",
+            "namespace",
+            "name",
+            "hosts",
+            "listen_path",
+            "backend_scheme",
+            "backend_host",
+            "backend_port",
+            "backend_path",
+            "strip_listen_path",
+            "preserve_host_header",
+            "backend_connect_timeout_ms",
+            "backend_read_timeout_ms",
+            "backend_write_timeout_ms",
+            "backend_tls_client_cert_path",
+            "backend_tls_client_key_path",
+            "backend_tls_verify_server_cert",
+            "backend_tls_server_ca_cert_path",
+            "dns_override",
+            "dns_cache_ttl_seconds",
+            "auth_mode",
+            "upstream_id",
+            "upstream_subset",
+            "circuit_breaker",
+            "retry",
+            "response_body_mode",
+            "pool_idle_timeout_seconds",
+            "pool_enable_http_keep_alive",
+            "pool_enable_http2",
+            "pool_tcp_keepalive_seconds",
+            "pool_http2_keep_alive_interval_seconds",
+            "pool_http2_keep_alive_timeout_seconds",
+            "pool_http2_initial_stream_window_size",
+            "pool_http2_initial_connection_window_size",
+            "pool_http2_adaptive_window",
+            "pool_http2_max_frame_size",
+            "pool_http2_max_concurrent_streams",
+            "pool_http3_connections_per_backend",
+            "pool_max_requests_per_connection",
+            "listen_port",
+            "frontend_tls",
+            "passthrough",
+            "udp_idle_timeout_seconds",
+            "tcp_idle_timeout_seconds",
+            "websocket_idle_timeout_seconds",
+            "allowed_methods",
+            "allowed_ws_origins",
+            "udp_max_response_amplification_factor",
+            "stream_proxy_protocol",
+            "backend_proxy_protocol",
+            "stream_match",
+            "api_spec_id",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "plugin_configs",
+        &[
+            "id",
+            "namespace",
+            "plugin_name",
+            "config",
+            "scope",
+            "proxy_id",
+            "enabled",
+            "priority_override",
+            "trigger_json",
+            "api_spec_id",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "proxy_plugins",
+        &["namespace", "proxy_id", "plugin_config_id"],
+    ),
+    (
+        "api_specs",
+        &[
+            "id",
+            "namespace",
+            "proxy_id",
+            "spec_version",
+            "spec_format",
+            "spec_content",
+            "content_encoding",
+            "uncompressed_size",
+            "content_hash",
+            "title",
+            "info_version",
+            "description",
+            "contact_name",
+            "contact_email",
+            "license_name",
+            "license_identifier",
+            "tags",
+            "server_urls",
+            "operation_count",
+            "resource_hash",
+            "external_ref_snapshot",
+            "external_ref_digest",
+            "created_at",
+            "updated_at",
+        ],
+    ),
 ];
 
 /// One canonical trim/length rule for `description`, shared by create and
@@ -681,7 +833,10 @@ pub fn namespace_prefixed_id_suffix_field(
     collection_name: &str,
 ) -> Result<&'static str, NamespaceRegistryCorrupt> {
     match collection_name {
-        "consumers" => Ok("id"),
+        // Every namespaced resource collection keys on the composite
+        // `"{namespace}:{id}"` — consumers since issue #2121, the other four
+        // since issue #4627 — and carries the bare value in `id`.
+        "consumers" | "proxies" | "upstreams" | "plugin_configs" | "api_specs" => Ok("id"),
         "consumer_identity_index" => Ok("identity_value"),
         _ => Err(NamespaceRegistryCorrupt::field("identity")),
     }

@@ -453,6 +453,7 @@ pub fn gateway_config_with_mesh(
     mesh: MeshConfig,
 ) -> GatewayConfig {
     GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         version: "test".to_string(),
         proxies,
         upstreams,

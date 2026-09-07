@@ -103,6 +103,7 @@ fn prepared_mesh_plugin_configs(
     mesh: MeshConfig,
 ) -> Vec<ferrum_edge::config::types::PluginConfig> {
     let config = ferrum_edge::config::types::GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         version: "test".to_string(),
         proxies: Vec::new(),
         upstreams: Vec::new(),
@@ -1899,6 +1900,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         .push(TrustDomain::new("aliased.local").expect("trust domain"));
     let mesh = mesh_config_with(Vec::new(), Vec::new(), vec![allow]);
     let config = ferrum_edge::config::types::GatewayConfig {
+        quarantined_plugin_configs: Vec::new(),
         version: "test".to_string(),
         proxies: Vec::new(),
         upstreams: Vec::new(),

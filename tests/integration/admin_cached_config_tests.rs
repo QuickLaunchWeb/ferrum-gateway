@@ -8249,7 +8249,8 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
     .await
     .expect("global plugin insert must succeed");
     sqlx::query(
-        "INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES ('proxy-1', 'global-invalid')",
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+         VALUES ('ferrum', 'proxy-1', 'global-invalid')",
     )
     .execute(&pool)
     .await
@@ -8332,7 +8333,8 @@ async fn test_proxy_get_namespace_miss_does_not_validate_other_namespace_associa
     .await
     .expect("other namespace global plugin insert must succeed");
     sqlx::query(
-        "INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES ('other-proxy', 'other-global-invalid')",
+        "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
+         VALUES ('other', 'other-proxy', 'other-global-invalid')",
     )
     .execute(&pool)
     .await
@@ -8733,7 +8735,11 @@ async fn tcp_connection_throttle_admin_rejects_udp_attachment_before_persistence
     let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
     assert_eq!(status, 201, "Create UDP proxy failed: {body:?}");
 
-    // A scoped definition is dormant until the proxy association exists.
+    // Since issue #4611 a proxy-scoped `POST /plugins/config` also writes the
+    // proxy association, so the definition is never "dormant": the unsupported
+    // attachment is rejected at the create, before anything is persisted.
+    // (This used to return 201 and only fail on the follow-up
+    // `PUT /proxies/{id}` that attached it.)
     let plugin = json!({
         "id": "udp-throttle-admin-plugin",
         "plugin_name": "tcp_connection_throttle",
@@ -8743,23 +8749,6 @@ async fn tcp_connection_throttle_admin_rejects_udp_attachment_before_persistence
         "config": {"max_connections_per_key": 1}
     });
     let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
-    assert_eq!(status, 201, "Create dormant throttle failed: {body:?}");
-
-    let attached = json!({
-        "id": "udp-throttle-admin-proxy",
-        "backend_scheme": "udp",
-        "backend_host": "localhost",
-        "backend_port": 5353,
-        "listen_port": 19011,
-        "plugins": [{"plugin_config_id": "udp-throttle-admin-plugin"}]
-    });
-    let (status, body) = admin_put(
-        &base_url,
-        "/proxies/udp-throttle-admin-proxy",
-        &token,
-        &attached,
-    )
-    .await;
     assert_eq!(
         status, 400,
         "UDP throttle attachment was persisted: {body:?}"
@@ -8774,6 +8763,18 @@ async fn tcp_connection_throttle_admin_rejects_udp_attachment_before_persistence
             .as_array()
             .is_some_and(|plugins| plugins.is_empty()),
         "rejected attachment changed the persisted proxy: {persisted:?}"
+    );
+
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/plugins/config/udp-throttle-admin-plugin",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "the rejected throttle config must not be persisted"
     );
 }
 

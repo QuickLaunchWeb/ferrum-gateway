@@ -41,6 +41,8 @@ pub(crate) mod incremental_apply;
 pub mod migrations;
 pub mod mongo_index_plan;
 pub mod mongo_store;
+/// Shared namespace projection for `GatewayConfig` snapshots.
+pub mod namespace_filter;
 // The registry's fault-injection installer is driven by external tests through
 // the lib target; the bin target recompiles this module without that caller, so
 // it would otherwise read as dead code there.

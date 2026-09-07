@@ -544,6 +544,19 @@ tree without using Ferrum's advisory lock. That process is outside the spool
 coordination trust boundary; the cross-process guarantees here apply to Ferrum
 instances that share the namespace and obey `.spool-quota.lock`.
 
+Because those peers share the namespace, the bounded spool tree walk that backs
+quota admission, replay listing, eviction, and temp/claim reconciliation
+tolerates an enumerated name disappearing before it is probed. Directory
+enumeration and the per-entry `lstat` are separate syscalls, so a peer's
+ordinary finalize, claim restore, or post-refusal rollback can unlink a
+`*.write-<process_tag>-<generation>.tmp` or `*.claim-*.inflight` inside that
+window. The walk skips the vanished name instead of failing the caller: a path
+with no directory entry occupies no quota bytes, needs no replay, eviction,
+quarantine, or cleanup, and one peer's routine step must not abort an unrelated
+writer's admission. This is not a weakening of the symlink refusal --- `lstat`
+never follows the final component, so a dangling symlink still reports a symlink
+and is still rejected --- and every other probe failure remains fail-closed.
+
 A failed manifest publish therefore leaves the manifest entry in place, and
 Ferrum does **not** treat that as success. The durability error is still
 returned, live storage is not marked prepared, the batch is not accepted, and

@@ -90,6 +90,137 @@ pub(crate) async fn validate_plugin_file_dependencies_off_thread(
     .map_err(|error| anyhow::anyhow!("MaxMind database validation worker failed: {error}"))?
 }
 
+/// One enabled plugin config the shared plugin-construction gate refuses.
+pub(crate) struct RejectedPluginConfig {
+    /// Index into [`GatewayConfig::plugin_configs`].
+    pub index: usize,
+    /// Operator-facing message, identical in shape to the one the admin API
+    /// returns for a rejected `POST /plugins`.
+    pub message: String,
+}
+
+/// Run the real plugin construction/shape gate — the same one file mode runs at
+/// startup and the same one `plugin_cache::try_create_plugin` runs while
+/// staging a `PluginCache` — over every enabled plugin config whose
+/// registration policy rejects publication.
+///
+/// Mirrors `try_create_plugin`'s failure handling exactly, so CP admission and
+/// data-plane publication share ONE contract (issue #4526):
+///
+/// * `OptionalFailOpen` plugins are skipped: a serving mode omits them from the
+///   published cache with a warning rather than rejecting the generation.
+/// * `FailClosed`, `KeepLastKnownGood`, and unknown/retired plugin names all
+///   reject, because every serving mode refuses the whole generation for them.
+///
+/// Constructors that need node-local resources (the `geo_restriction` MMDB, the
+/// `body_validator` / `ai_response_guard` / `ai_transcript_audit` descriptor
+/// sets, `udp_logging` DTLS material, `oidc_relying_party` discovery, and the
+/// `transaction_log_schema` registry) are already routed to their shape-only
+/// entry points inside `validate_plugin_config_with_http_client`, so this never
+/// requires a data-plane file to exist on the admitting node.
+/// `adaptive_concurrency` construction is pure shape parsing plus a fresh
+/// limiter, so it needs no special case.
+pub(crate) fn collect_rejecting_plugin_config_errors(
+    config: &GatewayConfig,
+) -> Vec<RejectedPluginConfig> {
+    collect_plugin_config_errors(config, false)
+}
+
+fn collect_plugin_config_errors(
+    config: &GatewayConfig,
+    optional_fail_open_only: bool,
+) -> Vec<RejectedPluginConfig> {
+    // Backend egress policy is node-local environment configuration. An
+    // admitting CP whose `FERRUM_BACKEND_ALLOW_IPS` differs from the serving
+    // node's must not refuse a row over an address policy it does not own, so
+    // this gate screens SCHEMA and construction only; the serving mode still
+    // applies its own egress screen when it builds the cache.
+    let backend_allow_ips = BackendEgressPolicy::unrestricted();
+    // Built once for the whole sweep: `validate_plugin_config_with_policy`
+    // would construct a fresh validation client (and its DNS cache) per plugin
+    // config, and CP delta admission runs this on every accepted batch.
+    let http_client = crate::plugins::PluginHttpClient::default()
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+        .with_process_compression_admission_policy();
+
+    let mut rejected = Vec::new();
+    for (index, plugin_config) in config.plugin_configs.iter().enumerate() {
+        if !plugin_config.enabled {
+            continue;
+        }
+        let failure_policy = crate::plugins::plugin_failure_policy(&plugin_config.plugin_name);
+        if optional_fail_open_only
+            != (failure_policy == Some(crate::plugins::PluginFailurePolicy::OptionalFailOpen))
+        {
+            continue;
+        }
+        // `validate_config_graph` (run by the caller) already validated schema
+        // definitions and their referrers in definition-first order against an
+        // isolated staged registry. Re-validating a participant here would
+        // consult the live registry after that bracket was aborted, so only the
+        // policy-only admission checks apply.
+        let result = if crate::plugins::transaction_log_schema::participates_in_config_graph(
+            plugin_config,
+        ) {
+            crate::plugins::validate_plugin_config_policy_only(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+                &backend_allow_ips,
+            )
+        } else {
+            crate::plugins::validate_plugin_config_with_http_client(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+                http_client.clone(),
+            )
+            .and_then(|()| {
+                crate::plugins::validate_plugin_config_policy_only(
+                    &plugin_config.plugin_name,
+                    &plugin_config.config,
+                    &backend_allow_ips,
+                )
+            })
+        };
+        if let Err(error) = result {
+            rejected.push(RejectedPluginConfig {
+                index,
+                message: format!(
+                    "Plugin '{}' (id={}): {error}",
+                    plugin_config.plugin_name, plugin_config.id
+                ),
+            });
+        }
+    }
+    rejected
+}
+
+/// Drop enabled OptionalFailOpen plugin configs the construction gate refuses,
+/// returning the operator-facing rejection messages for the rows removed.
+///
+/// Serving-mode (`FullConfigLoadPurpose::Runtime`) full loads call this so a
+/// unconstructible optional instrumentation cannot stop `database` mode before
+/// its admin listener binds — the process starts with that plugin quarantined,
+/// `config_rejected` raised, and the row still readable and deletable through
+/// the admin API (issue #4526, the in-band repair contract of issue #2158). CP
+/// loads deliberately do NOT call it: the CP must refuse to broadcast a
+/// snapshot no data plane can construct. FailClosed, KeepLastKnownGood, and
+/// unknown/retired plugins are never quarantined: they must continue to reject
+/// publication rather than silently removing a security control.
+pub(crate) fn quarantine_unconstructible_plugin_configs(config: &mut GatewayConfig) -> Vec<String> {
+    let rejected = collect_plugin_config_errors(config, true);
+    if rejected.is_empty() {
+        return Vec::new();
+    }
+    let mut messages = Vec::with_capacity(rejected.len());
+    // Remove back-to-front so earlier indexes stay valid.
+    for entry in rejected.into_iter().rev() {
+        config.plugin_configs.remove(entry.index);
+        messages.push(entry.message);
+    }
+    messages.reverse();
+    messages
+}
+
 /// Collect the rejecting runtime-config validation contract shared by
 /// database full loads and CP incremental updates.
 ///
@@ -140,40 +271,17 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
         errors.extend(found);
     }
     // Serving modes reject malformed fail-closed plugins while staging the
-    // PluginCache. CP mode has no runtime PluginCache, so validate the
-    // security-critical ip_restriction and geo_restriction shapes here as well
-    // before a database snapshot or delta can be accepted and broadcast. This
-    // intentionally invokes the same side-effect-free validators used by
-    // file/admin/DP admission rather than duplicating their allowed-key
-    // contracts. Geo shape validation never opens its node-local MMDB.
-    //
-    // Do not generalize this from PluginFailurePolicy::FailClosed alone. That
-    // policy describes data-plane cache publication, not a pure CP schema
-    // contract: some registered constructors intentionally depend on node-local
-    // resources, while adaptive_concurrency requires gateway/cache state.
-    // Broader CP parity needs explicit shape-only validators and mode/resource
-    // contracts for each such plugin.
-    for plugin_config in &config.plugin_configs {
-        if !plugin_config.enabled {
-            continue;
-        }
-        let shape_error = match plugin_config.plugin_name.as_str() {
-            "ip_restriction" => {
-                crate::plugins::ip_restriction::IpRestriction::new(&plugin_config.config)
-                    .map(|_| ())
-            }
-            "geo_restriction" => crate::plugins::geo_restriction::GeoRestriction::validate_config(
-                &plugin_config.config,
-            ),
-            _ => continue,
-        };
-        if let Err(error) = shape_error {
-            errors.push(format!(
-                "Plugin '{}' (id={}): {error}",
-                plugin_config.plugin_name, plugin_config.id
-            ));
-        }
-    }
+    // PluginCache. CP mode has no runtime PluginCache, so run the SAME
+    // construction gate here before a database snapshot or delta can be
+    // accepted and broadcast (issue #4526). Without it a `plugin_configs` row
+    // no serving mode can construct passes CP admission, is broadcast, and
+    // freezes every DP on its last-known-good cache — with no acknowledgement
+    // on the server-streaming `ConfigSync.Subscribe` to show it.
+    errors.extend(
+        collect_rejecting_plugin_config_errors(config)
+            .into_iter()
+            .map(|rejected| rejected.message),
+    );
     if let Err(found) = crate::plugin_cache::validate_plugin_security_composition_candidate(
         config,
         &crate::plugins::PluginHttpClient::default()
@@ -488,6 +596,17 @@ impl<'a> ValidationPipeline<'a> {
                             backend_allow_ips.clone(),
                         )
                         .with_process_compression_admission_policy();
+                    // Built ONCE for the whole sweep (issue #4116). Every
+                    // enabled plugin config in the namespace is screened here,
+                    // and constructing the two-client validation stack plus its
+                    // resolver per config cost ~20 ms per proxy on both SQLite
+                    // and PostgreSQL — a ten-minute full reload at 30k proxies,
+                    // longer than the poller needs to accumulate another
+                    // saturated change batch, so the fallback thrashed instead
+                    // of converging. Same shape as the single-config
+                    // `validate_plugin_config_with_policy` entry point.
+                    let plugin_http_client =
+                        crate::plugins::plugin_config_validation_http_client(backend_allow_ips);
                     if let Err(graph_errors) =
                         crate::plugins::transaction_log_schema::validate_config_graph(
                             config,
@@ -531,11 +650,14 @@ impl<'a> ValidationPipeline<'a> {
                             }
                             continue;
                         }
-                        if let Err(err) = crate::plugins::validate_plugin_config_with_policy(
-                            &plugin_config.plugin_name,
-                            &plugin_config.config,
-                            backend_allow_ips,
-                        ) {
+                        if let Err(err) =
+                            crate::plugins::validate_plugin_config_with_policy_and_client(
+                                &plugin_config.plugin_name,
+                                &plugin_config.config,
+                                backend_allow_ips,
+                                plugin_http_client.clone(),
+                            )
+                        {
                             let message = format!(
                                 "Plugin '{}' (id={}): {}",
                                 plugin_config.plugin_name, plugin_config.id, err

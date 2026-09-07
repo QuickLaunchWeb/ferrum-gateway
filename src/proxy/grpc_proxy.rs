@@ -900,10 +900,7 @@ impl GrpcConnectionPool {
         )
     }
 
-    pub async fn get_sender(
-        &self,
-        proxy: &Proxy,
-    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+    pub async fn get_sender(&self, proxy: &Proxy) -> Result<GrpcPooledSender, GrpcProxyError> {
         self.get_sender_with_purpose(proxy, GrpcEstablishmentPurpose::Request)
             .await
     }
@@ -917,7 +914,7 @@ impl GrpcConnectionPool {
     pub async fn get_sender_for_capability_probe(
         &self,
         proxy: &Proxy,
-    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+    ) -> Result<GrpcPooledSender, GrpcProxyError> {
         self.get_sender_with_purpose(proxy, GrpcEstablishmentPurpose::CapabilityProbe)
             .await
     }
@@ -926,7 +923,7 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
         purpose: GrpcEstablishmentPurpose,
-    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+    ) -> Result<GrpcPooledSender, GrpcProxyError> {
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -1054,7 +1051,7 @@ impl GrpcConnectionPool {
 enum GrpcPhase1 {
     /// A cached sender was immediately ready — short-circuit to the caller
     /// without cloning the pool key or hitting `create_or_get_existing_owned`.
-    Hit(http2::SendRequest<GrpcBody>),
+    Hit(GrpcPooledSender),
     /// No shard was immediately ready. Carry the cloned shard key (with
     /// `#<start_shard>` appended) plus the unsharded `base_len` and
     /// `start` so the post-await error fallback can reconstruct shard
@@ -1112,7 +1109,7 @@ impl GrpcPoolManager {
         svid_generation: Option<u64>,
         purpose: GrpcEstablishmentPurpose,
         attempt: Option<CoalescedCreateAttempt>,
-    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+    ) -> Result<GrpcPooledSender, GrpcProxyError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
@@ -1340,7 +1337,7 @@ impl GrpcPoolManager {
         tcp: TcpStream,
         pool_config: &PoolConfig,
         conn_slot: Option<SharedBackendConnectionGuard>,
-    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+    ) -> Result<GrpcPooledSender, GrpcProxyError> {
         let settings_received = Arc::new(AtomicBool::new(false));
         let io = TokioIo::new(crate::proxy::h2c_preface::H2cPrefaceIo::new(
             tcp,
@@ -1376,7 +1373,7 @@ impl GrpcPoolManager {
             }
         });
 
-        Ok(sender)
+        Ok(GrpcPooledSender::new(sender))
     }
 
     /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
@@ -1387,7 +1384,7 @@ impl GrpcPoolManager {
         server_name: rustls::pki_types::ServerName<'static>,
         pool_config: &PoolConfig,
         conn_slot: Option<SharedBackendConnectionGuard>,
-    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+    ) -> Result<GrpcPooledSender, GrpcProxyError> {
         let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::TlsHandshake,
@@ -1424,13 +1421,13 @@ impl GrpcPoolManager {
             }
         });
 
-        Ok(sender)
+        Ok(GrpcPooledSender::new(sender))
     }
 }
 
 #[async_trait]
 impl PoolManager for GrpcPoolManager {
-    type Connection = http2::SendRequest<GrpcBody>;
+    type Connection = GrpcPooledSender;
 
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
         self.write_pool_key(
@@ -1444,7 +1441,7 @@ impl PoolManager for GrpcPoolManager {
         write_grpc_shard_key_inplace(buf, base_len, shard);
     }
 
-    async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<GrpcBody>> {
+    async fn create(&self, _key: &str, proxy: &Proxy) -> Result<GrpcPooledSender> {
         self.create_connection(
             proxy,
             self.svid_generation_for_proxy(proxy),
@@ -3663,7 +3660,7 @@ fn hbone_dispatch_authority<'a>(
 async fn open_hbone_grpc_sender(
     hbone: &HboneGrpcTransport<'_>,
     proxy: &Proxy,
-) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+) -> Result<GrpcPooledSender, GrpcProxyError> {
     let plan = &hbone.plan;
     let tunnel = hbone
         .pool
@@ -3737,7 +3734,48 @@ async fn open_hbone_grpc_sender(
             debug!("hbone_pool: nested gRPC HTTP/2 connection closed: {}", e);
         }
     });
-    Ok(sender)
+    // The socket underneath this sender is the OUTER HBONE session, shared by
+    // every tunnel multiplexed on it and owned by the HBONE pool, so no
+    // per-request send-queue bound is published here (issue #4411).
+    Ok(GrpcPooledSender::new(sender))
+}
+
+/// One pooled native-gRPC HTTP/2 transport.
+///
+/// Its socket is deliberately not exposed for a per-request post-EOS drain
+/// check. The connection is multiplexed, so its send queue includes bytes from
+/// every stream and cannot safely provide a write-timeout verdict for any one
+/// request.
+///
+/// Deref/DerefMut to the sender, so every existing `ready()` / `send_request()`
+/// / `is_closed()` call site is unchanged.
+#[derive(Clone, Debug)]
+pub struct GrpcPooledSender {
+    inner: http2::SendRequest<GrpcBody>,
+}
+
+impl GrpcPooledSender {
+    fn new(inner: http2::SendRequest<GrpcBody>) -> Self {
+        Self { inner }
+    }
+
+    fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
+        None
+    }
+}
+
+impl std::ops::Deref for GrpcPooledSender {
+    type Target = http2::SendRequest<GrpcBody>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for GrpcPooledSender {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 
 /// An acquired HTTP/2 sender for one gRPC dispatch attempt.
@@ -3746,7 +3784,7 @@ pub(crate) enum GrpcDispatchSender {
     /// gRPC pool AND by the nested HTTP/2 connection the HBONE transport runs
     /// inside its CONNECT byte tunnel — the wire shape is identical, so the
     /// request path cannot diverge between them.
-    H2(http2::SendRequest<GrpcBody>),
+    H2(GrpcPooledSender),
     MeshMtls(crate::proxy::mesh_mtls_pool::MeshMtlsSender),
 }
 
@@ -3768,6 +3806,18 @@ impl std::fmt::Display for GrpcDispatchSendError {
 }
 
 impl GrpcDispatchSender {
+    /// The backend socket this transport writes to, when it can safely support
+    /// a per-request post-EOS send-queue drain bound.
+    ///
+    /// All current variants return `None`: H2 is multiplexed, while mesh-mTLS
+    /// owns its socket outside this dispatcher.
+    fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
+        match self {
+            Self::H2(sender) => sender.backend_socket(),
+            Self::MeshMtls(_) => None,
+        }
+    }
+
     /// Send the outbound gRPC request. The mesh-mTLS arm wraps the SHARED
     /// [`GrpcBody`] rather than re-encoding it, so request framing (DATA plus a
     /// terminal TRAILERS frame), inline receive-limit accounting, upload
@@ -4437,6 +4487,9 @@ async fn proxy_grpc_streaming_dispatch(
     // only now that a sender exists and immediately before dispatch.
     if let Some(pump) = upload_pump.as_mut() {
         pump.arm_write_watermark();
+        // Same seam publishes the backend socket, so `backend_write_timeout_ms`
+        // also bounds the post-EOS drain of the local send queue (issue #4411).
+        pump.bind_backend_socket(sender.backend_socket());
     }
     let send_fut = sender.send_request(backend_req);
     let send_wait = async {
@@ -4865,6 +4918,9 @@ pub(crate) async fn proxy_grpc_request_core(
     });
     if let Some(pump) = upload_pump.as_mut() {
         pump.arm_write_watermark();
+        // Same seam publishes the backend socket, so `backend_write_timeout_ms`
+        // also bounds the post-EOS drain of the local send queue (issue #4411).
+        pump.bind_backend_socket(sender.backend_socket());
     }
     let send_fut = sender.send_request(backend_req);
     let map_send_err = |e: GrpcDispatchSendError| {

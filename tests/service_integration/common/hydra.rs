@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use url::Url;
 
-use super::containers::BoxError;
+use super::containers::{BoxError, fixture_http_client_builder, start_within_deadline};
 use super::host_ports::{allocate_host_ports, retry_on_host_port_collision};
 
 /// Pinned Hydra image (public OSS). Bump deliberately with fixture review.
@@ -146,7 +146,7 @@ async fn start_hydra_container_once() -> Result<HydraContainer, BoxError> {
             .unwrap_or(0)
     );
 
-    let container = GenericImage::new(HYDRA_IMAGE, HYDRA_TAG)
+    let image = GenericImage::new(HYDRA_IMAGE, HYDRA_TAG)
         .with_exposed_port(HYDRA_PUBLIC_PORT.tcp())
         .with_exposed_port(HYDRA_ADMIN_PORT.tcp())
         .with_mapped_port(public_port, HYDRA_PUBLIC_PORT.tcp())
@@ -165,16 +165,13 @@ async fn start_hydra_container_once() -> Result<HydraContainer, BoxError> {
         .with_env_var("OIDC_SUBJECT_IDENTIFIERS_SUPPORTED_TYPES", "public")
         .with_env_var("STRATEGIES_ACCESS_TOKEN", "opaque")
         .with_env_var("STRATEGIES_SCOPE", "exact")
-        .with_cmd(["serve", "all", "--dev"])
-        .start()
-        .await
-        .map_err(|e| format!("Hydra container start failed: {e}"))?;
+        .with_cmd(["serve", "all", "--dev"]);
+    let container = start_within_deadline("Hydra", image.start()).await?;
 
     let public_url = format!("http://127.0.0.1:{public_port}");
     let admin_url = format!("http://127.0.0.1:{admin_port}");
-    let client = reqwest::Client::builder()
+    let client = fixture_http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
         .build()?;
 
     Ok(HydraContainer {

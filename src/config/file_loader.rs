@@ -358,6 +358,17 @@ pub fn load_config_from_file(
     // `validate_regex_listen_paths`, `validate_unique_resource_ids`, etc.)
     // stay above this filter because they enforce properties that should
     // hold for every namespace in the file, not just the active one.
+    //
+    // This retain is deliberately NOT
+    // `crate::config::namespace_filter::retain_namespace` (the shared
+    // projection used by the database-mode startup backup and the
+    // namespace-scoped admin export). It runs mid-pipeline on a `&mut`
+    // candidate, it must leave the multi-namespace `known_namespaces` list
+    // populated above intact so file mode's `GET /namespaces` keeps its
+    // documented contract, and it must not narrow the Gateway TLS delivery
+    // fields a file source is entitled to author. Any namespace-owned field
+    // added to `GatewayConfig` still fails to compile in the shared helper,
+    // which is where the exhaustiveness gate lives.
     let pre_filter_counts = (
         config.proxies.len(),
         config.consumers.len(),

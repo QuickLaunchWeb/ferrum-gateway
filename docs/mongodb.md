@@ -85,7 +85,7 @@ These `FERRUM_DB_*` settings apply to both SQL and MongoDB backends:
 | `FERRUM_DB_TYPE` | Set to `mongodb` |
 | `FERRUM_DB_URL` | MongoDB connection string (`mongodb://` or `mongodb+srv://`) |
 | `FERRUM_DB_POLL_INTERVAL` | Polling interval in seconds (same as SQL) |
-| `FERRUM_DB_CONFIG_BACKUP_PATH` | On-disk JSON backup served if the initial config load fails transiently after connect. Unlike SQL backends, MongoDB has no lazy-pool connect-time bootstrap: if every configured Mongo URL is unreachable at startup the process exits rather than serving the backup |
+| `FERRUM_DB_CONFIG_BACKUP_PATH` | On-disk JSON backup served if the initial config load fails transiently after connect. Filtered to `FERRUM_NAMESPACE` before validation, so a multi-namespace export is safe to use. Unlike SQL backends, MongoDB has no lazy-pool connect-time bootstrap: if every configured Mongo URL is unreachable at startup the process exits rather than serving the backup |
 | `FERRUM_DB_FAILOVER_URLS` | Comma-separated fallback MongoDB URLs (same pattern as SQL, but see [Failover](#failover) below) |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Slow query warning threshold (same as SQL) |
 | `FERRUM_DB_TLS_MODE` | MongoDB TLS policy: `disable`, `require`, or `verify-full` (see [TLS](#tls)) |
@@ -582,7 +582,7 @@ spec:
     spec:
       containers:
         - name: ferrum-edge
-          image: ghcr.io/ferrum-edge/ferrum-edge:latest
+          image: docker.io/ferrumedge/ferrum-edge:latest
           ports:
             - containerPort: 8000  # Proxy
             - containerPort: 9000  # Admin API
@@ -610,6 +610,44 @@ spec:
 ```
 
 For MongoDB itself, consider using the [MongoDB Community Kubernetes Operator](https://github.com/mongodb/mongodb-kubernetes-operator) to manage replica sets.
+
+## Document Keys and Namespaces
+
+Every namespaced resource collection — `proxies`, `upstreams`, `plugin_configs`,
+`api_specs`, and `consumers` — stores its documents under the composite durable
+key
+
+```
+_id = "{namespace}:{id}"
+```
+
+matching the SQL `PRIMARY KEY (namespace, id)`. The namespace charset forbids
+`:`, so the first `:` is an unambiguous delimiter and no two `(namespace, id)`
+pairs can collide. `consumers` has used this shape since issue #2121; the other
+four adopted it in issue #4627 so a resource id is unique **per namespace**
+rather than globally: two tenants may each own a `payments` upstream, and one
+tenant can no longer reserve an id another tenant needs.
+
+The serde-serialized `id` and `namespace` fields remain in every document, and
+every read strips `_id` before deserializing. **Hand-written queries and
+mongosh maintenance must build the composite key**, and any projection that
+needs the bare resource id must ask for `id`, never `_id`:
+
+```js
+// Correct
+db.upstreams.findOne({ _id: "tenant-a:payments", namespace: "tenant-a" })
+db.proxies.find({ namespace: "tenant-a" }, { _id: 0, id: 1 })
+
+// Wrong — matches nothing
+db.upstreams.findOne({ _id: "payments" })
+```
+
+Plugin associations stay embedded in the proxy document's `plugins` array
+(there is no `proxy_plugins` collection); because the proxy document is already
+namespace-keyed, an association cannot bind across tenants. Namespace rename
+moves these documents to a new `_id` with the same fail-closed split-identity
+validation used for consumers: `_id`, the embedded `namespace`, and the `id`
+field must agree, or the whole rename aborts as typed registry corruption.
 
 ## Schema and Migrations
 

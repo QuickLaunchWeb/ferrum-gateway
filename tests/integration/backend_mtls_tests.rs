@@ -538,20 +538,35 @@ fn gateway_error_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
 }
 
 /// Anonymous HTTPS proxy against an origin that requires a client
-/// certificate: 502, pre-wire class, pre-wire gateway-error token.
+/// certificate: 502 with a phase-honest class.
 ///
-/// Regression for issue #4406. Distinct from #4053 (HTTPS-to-plaintext
-/// already `tls_error`) and #4051 (omitted `close_notify` is not
-/// `tls_error`).
+/// Regression for issue #4406, **reconciled by issue #4536**. Distinct from
+/// #4053 (HTTPS-to-plaintext already `tls_error`) and #4051 (omitted
+/// `close_notify` is not `tls_error`).
 ///
-/// The live reqwest error on this path is hyper `Canceled` / connection
-/// not ready: rustls dies on the connection future and is **not** in the
-/// request chain, so the class is `ConnectionPoolError` (typed
-/// `is_canceled`), not `tls_error`. When a typed rustls handshake error
-/// *is* in the chain, it remains `tls_error`. Either way the failure is
-/// pre-wire.
+/// Two live shapes are possible on the shared reqwest HTTP/1 pool, and the
+/// difference is not something this gateway can observe:
+///
+/// * hyper `Canceled` / "connection not ready" — rustls dies on the connection
+///   future and is **not** in the request chain. That is the typed
+///   `is_canceled` contract (the request was never dispatched), so the class
+///   is the PRE-wire `ConnectionPoolError` and the token stays
+///   `connection_failure`.
+/// * a typed rustls `AlertReceived(CertificateRequired)` reached with
+///   `is_connect() == false`. reqwest's connect phase has already returned, so
+///   the classifier has **no** independent evidence that the handshake had not
+///   completed — and rustls raises the very same alert variants after
+///   application data (issue #4536, TLS 1.3 post-handshake auth). It is
+///   therefore classified conservatively as the POST-wire `ConnectionReset`,
+///   so `retry_on_connect_failure` cannot replay a non-idempotent request past
+///   `retryable_methods`. #4406's pre-wire verdict for this specific shape is
+///   deliberately reversed; the misconfiguration is still a 502.
+///
+/// Setup-phase mTLS rejections keep `tls_error` by CONTEXT on every path that
+/// dials for itself (direct H2 / gRPC / native H3 / HBONE pools, the
+/// WebSocket dial) — pinned in `tests/unit/gateway_core/retry_tests.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn anonymous_proxy_to_required_client_cert_origin_is_pre_wire() {
+async fn anonymous_proxy_to_required_client_cert_origin_is_phase_honest() {
     ensure_crypto_provider();
     let ca = TestCa::new("issue-4406-mtls-ca").expect("test CA");
     let (cert_pem, key_pem) = ca.valid().expect("server leaf");
@@ -588,21 +603,32 @@ async fn anonymous_proxy_to_required_client_cert_origin_is_pre_wire() {
     assert!(
         matches!(
             live_class,
-            ErrorClass::ConnectionPoolError | ErrorClass::TlsError
+            ErrorClass::ConnectionPoolError | ErrorClass::ConnectionReset
         ),
-        "reqwest handshake without a client cert must be pre-wire \
-         (pool cancel or typed rustls), not connection_reset/refused; \
+        "a client-cert rejection on the shared reqwest pool is either a typed \
+         hyper pool cancel (pre-wire) or an ambiguous post-connect rustls \
+         alert (post-wire) — never refused/request_error; \
          is_connect={} class={live_class:?} err={live_err:?}",
         live_err.is_connect(),
     );
-    assert_ne!(live_class, ErrorClass::ConnectionReset);
     assert_ne!(live_class, ErrorClass::ConnectionRefused);
     assert_ne!(live_class, ErrorClass::RequestError);
-    assert!(
-        !ferrum_edge::retry::request_reached_wire(live_class),
-        "backend mTLS handshake failure is pre-wire: retry_on_connect_failure \
-         may replay; nothing reached the origin application layer"
-    );
+    // The pre-wire/post-wire verdict must follow the class, and a post-connect
+    // rustls alert must NOT be pre-wire (issue #4536): the alert kind is
+    // peer-controlled and cannot prove the request went unprocessed.
+    match live_class {
+        ErrorClass::ConnectionPoolError => assert!(
+            !ferrum_edge::retry::request_reached_wire(live_class),
+            "hyper's typed is_canceled contract is that the request was never \
+             dispatched, so this shape stays pre-wire"
+        ),
+        ErrorClass::ConnectionReset => assert!(
+            ferrum_edge::retry::request_reached_wire(live_class),
+            "an ambiguous post-connect TLS alert must not arm the \
+             connect-failure replay (issue #4536)"
+        ),
+        other => panic!("unexpected class {other:?}"),
+    }
 
     let yaml = file_mode_yaml_for_backend_with(
         origin_port,
@@ -636,12 +662,12 @@ async fn anonymous_proxy_to_required_client_cert_origin_is_pre_wire() {
         "body={}",
         resp.body_text(),
     );
-    // TlsError and ConnectionPoolError are both pre-wire, so the public
-    // token is connection_failure (not backend_error, which is the
-    // post-wire 502 token this misconfig previously emitted).
-    assert_eq!(
-        gateway_error_header(&resp.headers),
-        Some("connection_failure"),
-        "pre-wire handshake 502 must carry X-Gateway-Error=connection_failure"
+    // The public token follows the class the live shape produced: a typed pool
+    // cancel is pre-wire (`connection_failure`), while an ambiguous
+    // post-connect TLS alert is post-wire (`backend_error`). Both are a 502.
+    let token = gateway_error_header(&resp.headers);
+    assert!(
+        matches!(token, Some("connection_failure") | Some("backend_error")),
+        "unexpected X-Gateway-Error {token:?} for a backend mTLS rejection"
     );
 }

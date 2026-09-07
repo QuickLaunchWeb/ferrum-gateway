@@ -2124,7 +2124,19 @@ fn build_tls_alpn01_certified_key(
 /// means TLS-ALPN-01 validation keeps working unchanged for every listener,
 /// whichever credential shape sits underneath it.
 enum AcmeResolverFallback {
-    Single(Arc<rustls::sign::CertifiedKey>),
+    /// One operator-configured credential.
+    ///
+    /// The slot is swappable so the periodic stapled-OCSP re-check (issue
+    /// #4505) can retire a staple that has reached its `nextUpdate` without
+    /// rebuilding the `ServerConfig`. That matters because the served
+    /// `Arc<ServerConfig>` is *not* replaceable when
+    /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is off, and because the
+    /// HTTP/3 listener rebuilds its own TLS 1.3 config around **this same
+    /// resolver** — so one atomic store reaches HTTP/1.1, HTTP/2, HTTP/3, and
+    /// TCP+TLS at once. Reads are a single `ArcSwap` load on the handshake
+    /// path, replacing the `Arc` clone this arm did before; nothing on the
+    /// per-request hot path observes it.
+    Single(arc_swap::ArcSwap<rustls::sign::CertifiedKey>),
     Resolver(Arc<dyn rustls::server::ResolvesServerCert>),
 }
 
@@ -2134,7 +2146,7 @@ impl AcmeResolverFallback {
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         match self {
-            Self::Single(certified_key) => Some(certified_key.clone()),
+            Self::Single(certified_key) => Some(certified_key.load_full()),
             Self::Resolver(resolver) => resolver.resolve(client_hello),
         }
     }
@@ -2157,9 +2169,32 @@ impl std::fmt::Debug for AcmeTlsAlpnResolver {
 impl AcmeTlsAlpnResolver {
     pub fn new(fallback: Arc<rustls::sign::CertifiedKey>) -> Self {
         Self {
-            fallback: AcmeResolverFallback::Single(fallback),
+            fallback: AcmeResolverFallback::Single(arc_swap::ArcSwap::new(fallback)),
             cache: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Retire the stapled OCSP response this resolver serves (issue #4505).
+    ///
+    /// Returns whether a staple was actually removed. Serving a response past
+    /// its `nextUpdate` is strictly worse than serving none: a client that
+    /// checks staple validity aborts the handshake outright, while an absent
+    /// staple falls back to that client's own revocation behaviour. The
+    /// stapleless `CertifiedKey` is built once here and published atomically,
+    /// so no handshake pays for the retirement and none can observe a torn
+    /// credential.
+    pub fn drop_stapled_ocsp_response(&self) -> bool {
+        let AcmeResolverFallback::Single(slot) = &self.fallback else {
+            return false;
+        };
+        let current = slot.load_full();
+        if current.ocsp.is_none() {
+            return false;
+        }
+        let mut without_staple = (*current).clone();
+        without_staple.ocsp = None;
+        slot.store(Arc::new(without_staple));
+        true
     }
 
     /// Wrap an inner resolver (Gateway multi-certificate SNI selection) so

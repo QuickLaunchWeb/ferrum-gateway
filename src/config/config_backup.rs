@@ -6,6 +6,17 @@
 //! failing entirely. The backup is never written by the gateway — it's purely
 //! an external resilience mechanism for Kubernetes and similar environments.
 //!
+//! The file is provisioned by an operator and may well be an all-namespace
+//! administrative export, so the loader projects it onto the gateway's
+//! configured namespace (`FERRUM_NAMESPACE`) BEFORE validating or returning it.
+//! Without that projection a gateway configured for one tenant would spend the
+//! whole outage the fallback exists to bridge binding another tenant's
+//! listeners and loading another tenant's consumers, credentials, plugin
+//! policy, upstreams and trust material. Filtering first is also what keeps a
+//! cross-namespace duplicate `listen_path` or proxy name in the file from
+//! rejecting a candidate that is perfectly valid for the served namespace;
+//! duplicates INSIDE the active namespace still reject exactly as before.
+//!
 //! Before serving, the loader applies the same rejecting runtime validation
 //! contract as database full loads (`collect_rejecting_runtime_config_errors`).
 //! Warning-only / node-local checks (certificate paths, optional plugin file
@@ -13,6 +24,7 @@
 //! runtime-fatal for DB-mode snapshots and must not block backup bootstrap.
 
 use crate::config::config_migration::ConfigMigrator;
+use crate::config::namespace_filter::{NamespaceRetention, retain_namespace};
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
 use tracing::{error, info, warn};
@@ -22,12 +34,33 @@ use tracing::{error, info, warn};
 /// (e.g. K8S pod restart while DB is down). The file is expected to be provided
 /// externally (e.g. via ConfigMap, PersistentVolume, or sidecar export).
 ///
+/// `namespace` is the gateway's configured serving namespace and is REQUIRED:
+/// the returned candidate contains only the resources that namespace owns, so a
+/// multi-namespace export is safe to provision as a startup backup.
+///
 /// Returns `Ok(None)` if the file does not exist. Returns `Err` with an
 /// actionable message when the file exists but cannot be parsed, is at an
 /// unsupported config version (with no migration path under the build-out
-/// policy), or fails the rejecting runtime validation contract. Returns
-/// `Ok(Some(config))` only for a snapshot that is safe to serve.
-pub fn load_config_backup(path: &str) -> Result<Option<GatewayConfig>, anyhow::Error> {
+/// policy), carries an empty serving namespace, or fails the rejecting runtime
+/// validation contract. Returns `Ok(Some(config))` only for a snapshot that is
+/// safe to serve. A backup holding no resources in the active namespace yields
+/// an empty-but-valid candidate, never a foreign one.
+pub fn load_config_backup(
+    path: &str,
+    namespace: &str,
+) -> Result<Option<GatewayConfig>, anyhow::Error> {
+    // Fail closed rather than letting "" behave as a namespace that matches
+    // nothing today and might match everything after a refactor.
+    // `EnvConfig::validate()` already rejects an empty `FERRUM_NAMESPACE` at
+    // startup; this is the loader's own guarantee that it cannot run without a
+    // serving namespace.
+    if namespace.is_empty() {
+        anyhow::bail!(
+            "Config backup at {path} cannot be loaded without a serving namespace; \
+             set FERRUM_NAMESPACE"
+        );
+    }
+
     // Read once and classify the result directly. `Path::exists()` both creates
     // a check/use race and returns false for some metadata errors, which would
     // incorrectly collapse an inaccessible configured backup to `Ok(None)`.
@@ -73,6 +106,15 @@ pub fn load_config_backup(path: &str) -> Result<Option<GatewayConfig>, anyhow::E
     config.normalize_fields();
     config.resolve_upstream_tls();
 
+    // Project onto the serving namespace BEFORE the rejecting contract runs.
+    // The cross-resource validators treat `listen_path`, proxy/upstream name and
+    // consumer identity as `(namespace, value)`-scoped, exactly as the admin API
+    // and the SQL unique indexes do, so running them over a multi-namespace file
+    // would reject a candidate that is valid for the namespace being served.
+    // Duplicates within the active namespace are untouched by the filter and
+    // still reject.
+    let (config, filter_summary) = retain_namespace(config, namespace, NamespaceRetention::SERVING);
+
     let validation_errors = collect_rejecting_runtime_config_errors(&config);
     if !validation_errors.is_empty() {
         for message in &validation_errors {
@@ -85,11 +127,20 @@ pub fn load_config_backup(path: &str) -> Result<Option<GatewayConfig>, anyhow::E
         );
     }
 
+    // COUNT-ONLY diagnostic. The namespaces present in the file are never named
+    // and never reach a serving or authorization decision: `retain_namespace`
+    // has already reduced the candidate to the configured namespace, and
+    // `known_namespaces` was collapsed to it.
     info!(
-        "Config backup loaded: {} proxies, {} consumers from {}",
+        "Config backup loaded for namespace '{}': {} proxies, {} consumers from {} \
+         ({} namespace(s) present in the file, {} resource(s) excluded as \
+         out-of-namespace)",
+        namespace,
         config.proxies.len(),
         config.consumers.len(),
-        path
+        path,
+        filter_summary.source_namespace_count,
+        filter_summary.excluded_resources
     );
     Ok(Some(config))
 }

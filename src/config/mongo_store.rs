@@ -11,12 +11,18 @@
 //! | `upstreams` | `upstreams` |
 //!
 //! **Document model**: Each document is a direct BSON serialization of the
-//! domain type (`Proxy`, `Consumer`, etc.) with `_id` set to the resource's
-//! `id` field. Consumers are the exception: their `_id` is the composite
-//! `"{namespace}:{id}"` (see [`consumer_doc_id`]) so consumer ids are unique
-//! per namespace rather than globally. Plugin associations are embedded in
-//! the proxy document's `plugins` array (no junction table needed — unlike
-//! the relational model).
+//! domain type (`Proxy`, `Consumer`, etc.). Every namespaced resource
+//! collection — `proxies`, `upstreams`, `plugin_configs`, `api_specs`, and
+//! `consumers` — uses the composite `_id` `"{namespace}:{id}"` (see
+//! [`namespaced_doc_id`]) so resource ids are unique per namespace rather than
+//! globally, matching the SQL `PRIMARY KEY (namespace, id)`. `consumers` got
+//! there first (issue #2121); the other four followed in issue #4627 so one
+//! tenant can no longer squat a bare id another tenant needs, and a
+//! namespace-scoped admission check can no longer pass only to fail on a
+//! global duplicate key. The serde-serialized `id` and `namespace` fields
+//! remain in every document, and all reads strip `_id` before deserializing.
+//! Plugin associations are embedded in the proxy document's `plugins` array
+//! (no junction table needed — unlike the relational model).
 //!
 //! **Full loads and incremental polling**: Replica-set full loads use a
 //! snapshot transaction so the runtime config is read from one multi-collection
@@ -941,6 +947,72 @@ mod inner {
         /// ArcSwap (and after failover `mark_failover`), before primary
         /// `mark_primary` finalizes the transition.
         pub while_holding: Option<MongoReconnectTransitionHook>,
+    }
+
+    /// Mirror the junction reconciliation onto an admission candidate so the
+    /// graph validated before a proxy-scoped plugin write is the graph the
+    /// write actually commits (issue #4611).
+    fn apply_proxy_association_to_candidate(candidate: &mut GatewayConfig, pc: &PluginConfig) {
+        if pc.scope == PluginScope::ProxyGroup {
+            return;
+        }
+        let desired = match pc.scope {
+            PluginScope::Proxy => pc.proxy_id.as_deref(),
+            _ => None,
+        };
+        for proxy in &mut candidate.proxies {
+            if proxy.namespace != pc.namespace {
+                continue;
+            }
+            let should_have = desired == Some(proxy.id.as_str());
+            let has = proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == pc.id);
+            if should_have && !has {
+                proxy.plugins.push(PluginAssociation {
+                    plugin_config_id: pc.id.clone(),
+                });
+            } else if !should_have && has {
+                proxy
+                    .plugins
+                    .retain(|association| association.plugin_config_id != pc.id);
+            }
+        }
+    }
+
+    /// Proxies needing a `config_changes` row for a plugin-config write: every
+    /// proxy whose association set moved, plus the proxy-scoped target itself
+    /// (recorded unconditionally, as before, so an otherwise no-op re-write
+    /// still republishes the proxy that applies the config).
+    fn plugin_config_touched_proxies(
+        pc: &PluginConfig,
+        plan: &ProxyAssociationPlan,
+    ) -> Vec<String> {
+        let mut touched = plan.touched.clone();
+        if pc.scope == PluginScope::Proxy
+            && let Some(proxy_id) = pc.proxy_id.as_deref()
+            && !touched.iter().any(|current| current.as_str() == proxy_id)
+        {
+            touched.push(proxy_id.to_string());
+        }
+        touched
+    }
+
+    /// The proxy-association reconciliation a proxy-scoped plugin-config write
+    /// must perform alongside the `plugin_configs` document (issue #4611).
+    ///
+    /// Computed before the mutation so the transaction (or the standalone
+    /// sequence) knows exactly which proxies change and which need a
+    /// `config_changes` row.
+    #[derive(Clone, Default)]
+    struct ProxyAssociationPlan {
+        /// The proxy that must gain the association, if it does not have it.
+        attach: Option<String>,
+        /// Proxies whose association is no longer valid for this config.
+        detach: Vec<String>,
+        /// `detach` plus `attach` — every proxy whose plugin set changes.
+        touched: Vec<String>,
     }
 
     #[derive(Clone)]
@@ -3355,6 +3427,218 @@ mod inner {
             Ok(())
         }
 
+        /// Plan the proxy-association reconciliation for a proxy-scoped plugin
+        /// config write (issue #4611).
+        ///
+        /// `scope: "proxy"` + `proxy_id` is the operator's attachment intent,
+        /// but the runtime only applies a config the proxy lists in its
+        /// `plugins` array (`docs/plugins.md`), so both sides must move
+        /// together. Validity drives the plan, which also re-homes a moved
+        /// `proxy_id`:
+        /// - `proxy` — the only valid association is `proxy_id`; any other is
+        ///   config `GatewayConfig::validate` rejects, so it is pulled.
+        /// - `global` — a global config must not be associated with a proxy.
+        /// - `proxy_group` — associations are operator-managed via
+        ///   `proxy.plugins` and any proxy may reference the config, so
+        ///   existing ones are left alone.
+        ///
+        /// The plan is computed before the mutation so the transaction (or the
+        /// standalone sequence) has the exact set of proxies to touch and to
+        /// record `config_changes` rows for.
+        async fn plan_proxy_scoped_plugin_association(
+            &self,
+            pc: &PluginConfig,
+        ) -> Result<ProxyAssociationPlan, anyhow::Error> {
+            if pc.scope == PluginScope::ProxyGroup {
+                return Ok(ProxyAssociationPlan::default());
+            }
+            let desired = match pc.scope {
+                PluginScope::Proxy => pc.proxy_id.clone(),
+                _ => None,
+            };
+
+            let mut attached = Vec::new();
+            let mut cursor = self
+                .proxies()
+                .find(doc! {
+                    "namespace": &pc.namespace,
+                    "plugins.plugin_config_id": &pc.id,
+                })
+                // `_id` is the composite "{namespace}:{id}" (issue #4627), so
+                // the bare proxy id is read from the `id` field.
+                .projection(doc! { "_id": 0, "id": 1 })
+                .await?;
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                // Every association-bearing proxy must decode: silently
+                // skipping one would leave an invalid association behind while
+                // the write reported success.
+                let proxy_id = doc.get_str("id").map_err(|error| {
+                    anyhow::anyhow!(
+                        "operation=plan_proxy_scoped_plugin_association resource=proxies field=id: failed to decode proxy holding the plugin association: {error}"
+                    )
+                })?;
+                attached.push(proxy_id.to_string());
+            }
+
+            let detach: Vec<String> = attached
+                .iter()
+                .filter(|proxy_id| desired.as_deref() != Some(proxy_id.as_str()))
+                .cloned()
+                .collect();
+            let attach = desired.filter(|desired| {
+                !attached
+                    .iter()
+                    .any(|current| current.as_str() == desired.as_str())
+            });
+            let mut touched = detach.clone();
+            touched.extend(attach.clone());
+            Ok(ProxyAssociationPlan {
+                attach,
+                detach,
+                touched,
+            })
+        }
+
+        /// Apply a [`ProxyAssociationPlan`] inside a replica-set transaction.
+        async fn apply_proxy_association_plan_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+            plugin_config_id: &str,
+            plan: &ProxyAssociationPlan,
+        ) -> mongodb::error::Result<()> {
+            if !plan.detach.is_empty() {
+                self.proxies()
+                    .update_many(
+                        doc! {
+                            "_id": { "$in": namespaced_doc_ids(namespace, &plan.detach) },
+                            "namespace": namespace,
+                        },
+                        doc! {
+                            "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await?;
+            }
+            if let Some(attach) = plan.attach.as_deref() {
+                self.proxies()
+                    .update_one(
+                        doc! {
+                            "_id": namespaced_doc_id(namespace, attach),
+                            "namespace": namespace,
+                        },
+                        doc! {
+                            "$push": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .session(&mut *session)
+                    .await?;
+            }
+            Ok(())
+        }
+
+        /// Apply a [`ProxyAssociationPlan`] on a standalone deployment, where
+        /// no multi-document transaction is available; the caller compensates
+        /// the plugin-config document if this fails, matching the surrounding
+        /// standalone write paths.
+        async fn apply_proxy_association_plan(
+            &self,
+            namespace: &str,
+            plugin_config_id: &str,
+            plan: &ProxyAssociationPlan,
+        ) -> Result<(), anyhow::Error> {
+            if !plan.detach.is_empty() {
+                self.proxies()
+                    .update_many(
+                        doc! {
+                            "_id": { "$in": namespaced_doc_ids(namespace, &plan.detach) },
+                            "namespace": namespace,
+                        },
+                        doc! {
+                            "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await?;
+            }
+            if let Some(attach) = plan.attach.as_deref() {
+                self.proxies()
+                    .update_one(
+                        doc! {
+                            "_id": namespaced_doc_id(namespace, attach),
+                            "namespace": namespace,
+                        },
+                        doc! {
+                            "$push": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+
+        /// Best-effort inverse of [`Self::apply_proxy_association_plan`] for a
+        /// standalone deployment whose follow-up failed after the plan was
+        /// applied (issue #4611). The caller rolls the plugin-config document
+        /// back; this puts the junction back to match it, so a loader never
+        /// sees a proxy referencing a config that no longer exists or no
+        /// longer targets it. Failures are logged, not returned: the original
+        /// error is what the caller reports, and the association is then a
+        /// hand repair like every other standalone partial write.
+        async fn compensate_proxy_association_plan(
+            &self,
+            namespace: &str,
+            plugin_config_id: &str,
+            plan: &ProxyAssociationPlan,
+        ) {
+            if let Some(attach) = plan.attach.as_deref() {
+                let result = self
+                    .proxies()
+                    .update_one(
+                        doc! {
+                            "_id": namespaced_doc_id(namespace, attach),
+                            "namespace": namespace,
+                        },
+                        doc! {
+                            "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await;
+                if let Err(error) = result {
+                    warn!(
+                        "standalone plugin-config write failed after attaching the proxy association and the compensating detach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxy_id={attach}): {error}; repair the proxy's `plugins` array by hand"
+                    );
+                }
+            }
+            if !plan.detach.is_empty() {
+                let result = self
+                    .proxies()
+                    .update_many(
+                        doc! {
+                            "_id": { "$in": namespaced_doc_ids(namespace, &plan.detach) },
+                            "namespace": namespace,
+                        },
+                        doc! {
+                            "$addToSet": { "plugins": { "plugin_config_id": plugin_config_id } },
+                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        },
+                    )
+                    .await;
+                if let Err(error) = result {
+                    warn!(
+                        "standalone plugin-config write failed after detaching proxy associations and the compensating re-attach also failed (namespace={namespace} plugin_config_id={plugin_config_id} proxies={:?}): {error}; repair those proxies' `plugins` arrays by hand",
+                        plan.detach
+                    );
+                }
+            }
+        }
+
         async fn record_config_change_in_session(
             &self,
             session: &mut ClientSession,
@@ -3408,6 +3692,9 @@ mod inner {
             }
         }
 
+        /// Undo one standalone insert. `resource_id` is the BARE id; the
+        /// durable key is composed here so the delete can never reach another
+        /// tenant's same-id document (issue #4627).
         async fn rollback_standalone_created_document(
             &self,
             collection_name: &str,
@@ -3418,7 +3705,7 @@ mod inner {
         ) -> bool {
             match self
                 .collection(collection_name)
-                .delete_one(doc! { "_id": resource_id })
+                .delete_one(doc! { "_id": namespaced_doc_id(namespace, resource_id) })
                 .await
             {
                 Ok(result) if result.deleted_count > 0 => {
@@ -3538,9 +3825,12 @@ mod inner {
             Self::resource_ids_without_failed_insert_indices(resource_ids, &failed_indices)
         }
 
+        /// Restore one standalone replace. `resource_id` is the BARE id; the
+        /// durable key is composed here (issue #4627).
         async fn rollback_standalone_updated_document(
             &self,
             collection_name: &str,
+            namespace: &str,
             resource_type: &str,
             resource_id: &str,
             previous_doc: Option<Document>,
@@ -3556,7 +3846,10 @@ mod inner {
             };
             match self
                 .collection(collection_name)
-                .replace_one(doc! { "_id": resource_id }, previous_doc)
+                .replace_one(
+                    doc! { "_id": namespaced_doc_id(namespace, resource_id) },
+                    previous_doc,
+                )
                 .await
             {
                 Ok(result) if result.matched_count > 0 => {
@@ -3755,13 +4048,15 @@ mod inner {
                 let plugin_configs = self.plugin_configs();
                 let mut cursor = plugin_configs
                     .find(doc! { "scope": "proxy_group", "namespace": namespace })
-                    .projection(doc! { "_id": 1, "namespace": 1 })
+                    // `_id` is composite (issue #4627); the bare plugin
+                    // config id lives in `id`.
+                    .projection(doc! { "_id": 0, "id": 1, "namespace": 1 })
                     .session(&mut *s)
                     .await?;
                 let mut group_plugins: Vec<(String, String)> = Vec::new();
                 while cursor.advance(&mut *s).await? {
                     let doc = cursor.deserialize_current()?;
-                    if let Ok(id) = doc.get_str("_id") {
+                    if let Ok(id) = doc.get_str("id") {
                         let namespace = doc
                             .get_str("namespace")
                             .map(str::to_string)
@@ -3785,7 +4080,10 @@ mod inner {
                         info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
                         let result = self
                             .plugin_configs()
-                            .delete_one(doc! { "_id": id, "namespace": namespace })
+                            .delete_one(doc! {
+                                "_id": namespaced_doc_id(namespace, id),
+                                "namespace": namespace,
+                            })
                             .session(&mut *s)
                             .await?;
                         if result.deleted_count > 0 {
@@ -3800,12 +4098,14 @@ mod inner {
             let plugin_configs = self.plugin_configs();
             let mut cursor = plugin_configs
                 .find(doc! { "scope": "proxy_group", "namespace": namespace })
-                .projection(doc! { "_id": 1, "namespace": 1 })
+                // `_id` is composite (issue #4627); the bare plugin config id
+                // lives in `id`.
+                .projection(doc! { "_id": 0, "id": 1, "namespace": 1 })
                 .await?;
             let mut group_plugins: Vec<(String, String)> = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                if let Ok(id) = doc.get_str("_id") {
+                if let Ok(id) = doc.get_str("id") {
                     let namespace = doc
                         .get_str("namespace")
                         .map(str::to_string)
@@ -3828,7 +4128,10 @@ mod inner {
                     info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
                     let result = self
                         .plugin_configs()
-                        .delete_one(doc! { "_id": id, "namespace": namespace })
+                        .delete_one(doc! {
+                            "_id": namespaced_doc_id(namespace, id),
+                            "namespace": namespace,
+                        })
                         .await?;
                     if result.deleted_count > 0 {
                         deleted.push((id.clone(), namespace.clone()));
@@ -3979,12 +4282,12 @@ mod inner {
                 doc! { "$nin": ["tcp", "tcps", "udp", "dtls"] },
             );
             if let Some(id) = exclude_proxy_id {
-                filter.insert("_id", doc! { "$ne": id });
+                filter.insert("_id", doc! { "$ne": namespaced_doc_id(namespace, id) });
             }
             let proxies = self.proxies();
             let mut cursor = proxies
                 .find(filter)
-                .projection(doc! { "_id": 1, "hosts": 1 })
+                .projection(doc! { "_id": 0, "hosts": 1 })
                 .session(&mut *session)
                 .await?;
             while cursor.advance(&mut *session).await? {
@@ -4065,7 +4368,7 @@ mod inner {
                 let exists = self
                     .upstreams()
                     .find_one(doc! {
-                        "_id": upstream_id.as_str(),
+                        "_id": namespaced_doc_id(&params.namespace, upstream_id),
                         "namespace": params.namespace.as_str(),
                     })
                     .projection(doc! { "_id": 1 })
@@ -4090,7 +4393,10 @@ mod inner {
         ) -> Result<bool, anyhow::Error> {
             let existing = self
                 .upstreams()
-                .find_one(doc! { "_id": upstream_id, "namespace": namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, upstream_id),
+                    "namespace": namespace,
+                })
                 .projection(doc! { "_id": 1 })
                 .await?;
             Ok(existing.is_some())
@@ -4116,12 +4422,13 @@ mod inner {
             let proxies = self.proxies();
             let mut cursor = proxies
                 .find(filter)
-                .projection(doc! { "_id": 1, "hosts": 1, "created_at": 1 })
+                // `_id` is composite (issue #4627); the bare proxy id is `id`.
+                .projection(doc! { "_id": 0, "id": 1, "hosts": 1, "created_at": 1 })
                 .await?;
             let mut candidates = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                let Ok(id) = doc.get_str("_id") else {
+                let Ok(id) = doc.get_str("id") else {
                     continue;
                 };
                 let hosts: Vec<String> = doc
@@ -4748,9 +5055,11 @@ mod inner {
 
             let proxy_doc = self
                 .proxies()
-                .find_one(
-                    doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace, "api_spec_id": &spec.id },
-                )
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(&spec.namespace, &spec.proxy_id),
+                    "namespace": &spec.namespace,
+                    "api_spec_id": &spec.id,
+                })
                 .await?;
             let Some(proxy_doc) = proxy_doc else {
                 return Ok(None);
@@ -4828,15 +5137,16 @@ mod inner {
                 let upstreams_collection = self.upstreams();
                 let mut upstream_cursor = upstreams_collection
                     .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
-                    .projection(doc! { "_id": 1 })
+                    // `_id` is composite (issue #4627); the bare upstream id is `id`.
+                    .projection(doc! { "_id": 0, "id": 1 })
                     .session(&mut *s)
                     .await?;
                 while upstream_cursor.advance(&mut *s).await? {
                     let doc = upstream_cursor.deserialize_current()?;
-                    let id = doc.get_str("_id").map_err(|error| {
+                    let id = doc.get_str("id").map_err(|error| {
                         anyhow::Error::new(error).context(format!(
                             "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
-                             namespace={namespace} api_spec_id={spec_id} column=_id: \
+                             namespace={namespace} api_spec_id={spec_id} column=id: \
                              failed to decode spec-owned upstream id required for external reference checks"
                         ))
                     })?;
@@ -4848,18 +5158,22 @@ mod inner {
                     return Ok(());
                 }
 
+                // The namespace predicate is load-bearing since issue #4627:
+                // upstream ids are only unique per tenant, so a same-id
+                // upstream elsewhere is not a reference to this spec's.
                 let filter = doc! {
+                    "namespace": namespace,
                     "upstream_id": { "$in": &upstream_ids },
-                    "_id": { "$ne": spec_proxy_id },
+                    "_id": { "$ne": namespaced_doc_id(namespace, spec_proxy_id) },
                 };
                 let external = self
                     .proxies()
                     .find_one(filter)
-                    .projection(doc! { "_id": 1, "upstream_id": 1 })
+                    .projection(doc! { "_id": 0, "id": 1, "upstream_id": 1 })
                     .session(&mut *s)
                     .await?;
                 if let Some(doc) = external {
-                    let proxy_id = doc.get_str("_id").unwrap_or("<unknown>");
+                    let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
                     anyhow::bail!(
                         "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
@@ -4873,7 +5187,11 @@ mod inner {
                 let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
                 let plugin_configs = self.plugin_configs();
                 let mut plugin_cursor = plugin_configs
-                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .find(doc! {
+                        "namespace": namespace,
+                        "plugin_name": "mesh_route_dispatch",
+                        "enabled": true,
+                    })
                     .session(&mut *s)
                     .await?;
                 while plugin_cursor.advance(&mut *s).await? {
@@ -4898,14 +5216,15 @@ mod inner {
                 let upstreams_collection = self.upstreams();
                 let mut upstream_cursor = upstreams_collection
                     .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
-                    .projection(doc! { "_id": 1 })
+                    // `_id` is composite (issue #4627); the bare upstream id is `id`.
+                    .projection(doc! { "_id": 0, "id": 1 })
                     .await?;
                 while upstream_cursor.advance().await? {
                     let doc = upstream_cursor.deserialize_current()?;
-                    let id = doc.get_str("_id").map_err(|error| {
+                    let id = doc.get_str("id").map_err(|error| {
                         anyhow::Error::new(error).context(format!(
                             "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
-                             namespace={namespace} api_spec_id={spec_id} column=_id: \
+                             namespace={namespace} api_spec_id={spec_id} column=id: \
                              failed to decode spec-owned upstream id required for external reference checks"
                         ))
                     })?;
@@ -4916,17 +5235,21 @@ mod inner {
                     return Ok(());
                 }
 
+                // The namespace predicate is load-bearing since issue #4627:
+                // upstream ids are only unique per tenant, so a same-id
+                // upstream elsewhere is not a reference to this spec's.
                 let filter = doc! {
+                    "namespace": namespace,
                     "upstream_id": { "$in": &upstream_ids },
-                    "_id": { "$ne": spec_proxy_id },
+                    "_id": { "$ne": namespaced_doc_id(namespace, spec_proxy_id) },
                 };
                 let external = self
                     .proxies()
                     .find_one(filter)
-                    .projection(doc! { "_id": 1, "upstream_id": 1 })
+                    .projection(doc! { "_id": 0, "id": 1, "upstream_id": 1 })
                     .await?;
                 if let Some(doc) = external {
-                    let proxy_id = doc.get_str("_id").unwrap_or("<unknown>");
+                    let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
                     anyhow::bail!(
                         "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
@@ -4940,7 +5263,11 @@ mod inner {
                 let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
                 let plugin_configs = self.plugin_configs();
                 let mut plugin_cursor = plugin_configs
-                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .find(doc! {
+                        "namespace": namespace,
+                        "plugin_name": "mesh_route_dispatch",
+                        "enabled": true,
+                    })
                     .await?;
                 while plugin_cursor.advance().await? {
                     let plugin = doc_to_plugin_config(plugin_cursor.deserialize_current()?)?;
@@ -5010,7 +5337,10 @@ mod inner {
         ) -> Result<Option<Document>, anyhow::Error> {
             let proxy_doc = self
                 .proxies()
-                .find_one(doc! { "_id": id, "namespace": namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
                 .await?;
             let Some(proxy_doc) = proxy_doc else {
                 return Ok(None);
@@ -6181,16 +6511,19 @@ mod inner {
                 .session(&mut *session)
                 .await?;
 
-            // Collections whose `_id` is independent of the namespace: rewrite
-            // the field in place.
+            // Since issue #4627 these four collections carry the composite
+            // `_id` `"{namespace}:{id}"` as well, so an in-place `$set` of the
+            // `namespace` field would leave the durable key under the old
+            // tenant. They move the same way consumers do, with the same
+            // fail-closed split-identity validation.
             for collection in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
-                self.collection(collection)
-                    .update_many(
-                        doc! { "namespace": current_name },
-                        doc! { "$set": { "namespace": new_name } },
-                    )
-                    .session(&mut *session)
-                    .await?;
+                self.rewrite_namespace_prefixed_ids_in_session(
+                    &mut *session,
+                    collection,
+                    current_name,
+                    new_name,
+                )
+                .await?;
             }
             // Audit history follows the tenant so it cannot be disclosed to a
             // caller authorized for a later reuse of the old namespace name.
@@ -6350,8 +6683,9 @@ mod inner {
         /// by [`Self::delete_namespace_guard_docs_in_session`].
         ///
         /// A nonempty suffix is not enough: it must exactly equal the
-        /// collection's identity field (`id` on `consumers`, `identity_value`
-        /// on `consumer_identity_index`), and the embedded `namespace` string
+        /// collection's identity field (`id` on `consumers`, `proxies`,
+        /// `upstreams`, `plugin_configs`, and `api_specs`; `identity_value` on
+        /// `consumer_identity_index`), and the embedded `namespace` string
         /// must equal `current_name`. Any other shape aborts as typed
         /// corruption before delete/insert, so a split identity cannot move.
         async fn rewrite_namespace_prefixed_ids_in_session(
@@ -6604,8 +6938,9 @@ mod inner {
     /// Convert a domain `Proxy` into a BSON `Document` for storage.
     fn proxy_to_doc(proxy: &Proxy) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(proxy)?;
-        // Use the proxy's id as the MongoDB _id
-        doc.insert("_id", proxy.id.as_str());
+        // Composite `_id` ("{namespace}:{id}") — proxy ids are unique per
+        // namespace, not globally (issue #4627). See `namespaced_doc_id`.
+        doc.insert("_id", namespaced_doc_id(&proxy.namespace, &proxy.id));
         // `name` participates in a unique+partial compound index;
         // `listen_port` participates in a non-unique partial routing index.
         // Omit null optionals so neither index contains meaningless null keys.
@@ -6637,15 +6972,36 @@ mod inner {
         Ok(proxy)
     }
 
-    /// Composite MongoDB `_id` for consumer documents: `"{namespace}:{id}"`.
+    /// Composite MongoDB `_id` for every namespaced resource document:
+    /// `"{namespace}:{id}"`.
     ///
     /// The namespace charset forbids `':'`, so the first `':'` is an
-    /// unambiguous delimiter between namespace and id. Using a composite key
-    /// makes consumer ids unique per namespace instead of globally (issue
-    /// #2121). The serde-serialized `id` and `namespace` fields remain in the
-    /// document — all reads strip `_id` before deserializing.
-    fn consumer_doc_id(namespace: &str, id: &str) -> String {
+    /// unambiguous delimiter between namespace and id — no namespace/id pair
+    /// can collide with a different pair. Using a composite key makes resource
+    /// ids unique per namespace instead of globally, matching the SQL
+    /// `PRIMARY KEY (namespace, id)`: consumers first (issue #2121), then
+    /// proxies, upstreams, plugin configs, and API specs (issue #4627).
+    ///
+    /// The serde-serialized `id` and `namespace` fields remain in the document
+    /// — all reads strip `_id` before deserializing, and every projection that
+    /// needs the bare resource id must ask for `id`, never `_id`.
+    fn namespaced_doc_id(namespace: &str, id: &str) -> String {
         format!("{namespace}:{id}")
+    }
+
+    /// [`namespaced_doc_id`] for a whole batch of bare ids in one namespace.
+    fn namespaced_doc_ids(namespace: &str, ids: &[String]) -> Vec<String> {
+        ids.iter()
+            .map(|id| namespaced_doc_id(namespace, id))
+            .collect()
+    }
+
+    /// Composite MongoDB `_id` for consumer documents.
+    ///
+    /// Retained as a named alias for [`namespaced_doc_id`] because the
+    /// consumer paths and their tests refer to it by name (issue #2121).
+    fn consumer_doc_id(namespace: &str, id: &str) -> String {
+        namespaced_doc_id(namespace, id)
     }
 
     /// Composite `_id` for `consumer_identity_index` documents:
@@ -6857,7 +7213,8 @@ mod inner {
     /// Convert a domain `PluginConfig` into a BSON `Document`.
     fn plugin_config_to_doc(pc: &PluginConfig) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(pc)?;
-        doc.insert("_id", pc.id.as_str());
+        // Composite `_id` ("{namespace}:{id}") — issue #4627.
+        doc.insert("_id", namespaced_doc_id(&pc.namespace, &pc.id));
         Ok(doc)
     }
 
@@ -6869,7 +7226,8 @@ mod inner {
     /// Convert a domain `Upstream` into a BSON `Document`.
     fn upstream_to_doc(upstream: &Upstream) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(upstream)?;
-        doc.insert("_id", upstream.id.as_str());
+        // Composite `_id` ("{namespace}:{id}") — issue #4627.
+        doc.insert("_id", namespaced_doc_id(&upstream.namespace, &upstream.id));
         // `name` participates in the `{namespace, name}` unique+sparse index.
         // Upstreams without a name must omit the field so multiple nameless
         // upstreams in the same namespace don't collide on a shared null key.
@@ -7021,7 +7379,8 @@ mod inner {
             anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
         })?;
         let mut doc = mongodb::bson::to_document(spec)?;
-        doc.insert("_id", spec.id.as_str());
+        // Composite `_id` ("{namespace}:{id}") — issue #4627.
+        doc.insert("_id", namespaced_doc_id(&spec.namespace, &spec.id));
         doc.insert(
             "spec_content",
             Bson::Binary(Binary {
@@ -7881,6 +8240,33 @@ mod inner {
                 error!("MongoDB config: {}", message);
             }
 
+            // Serving-mode repairability (issue #4526), parity with the SQL
+            // loader: quarantine stored plugin rows the shared construction
+            // gate refuses so `database` mode still reaches its admin listener
+            // and the offending row stays deletable in-band. CP loads keep
+            // rejecting so an unconstructible row is never broadcast.
+            if matches!(purpose, FullConfigLoadPurpose::Runtime) {
+                let quarantined =
+                    crate::config::validation_pipeline::quarantine_unconstructible_plugin_configs(
+                        &mut config,
+                    );
+                for message in &quarantined {
+                    error!(
+                        "MongoDB config: quarantined unconstructible plugin config — {}",
+                        message
+                    );
+                }
+                if !quarantined.is_empty() {
+                    error!(
+                        "Quarantined {} plugin config(s) during full config load; serving \
+                         without them and publishing config_rejected so they can be repaired \
+                         through the admin API",
+                        quarantined.len()
+                    );
+                }
+                config.quarantined_plugin_configs = quarantined;
+            }
+
             // Mongo does not run the SQL-side `ValidationPipeline`, but full
             // runtime loads must still fail closed on the same rejecting
             // validation contract used by SQL loads and CP updates. This
@@ -8252,7 +8638,14 @@ mod inner {
 
             let mut added_or_modified_proxies = Vec::new();
             for doc in self
-                .load_change_ids(self.proxies(), namespace, &proxy_upserts)
+                .load_change_ids(
+                    self.proxies(),
+                    namespace,
+                    &proxy_upserts
+                        .iter()
+                        .map(|id| namespaced_doc_id(namespace, id))
+                        .collect::<Vec<_>>(),
+                )
                 .await?
             {
                 let mut proxy = doc_to_proxy(doc)?;
@@ -8274,6 +8667,9 @@ mod inner {
             );
 
             let mut added_or_modified_consumers = Vec::new();
+            // Every point-load below passes the composite `_id`
+            // (`"{namespace}:{id}"`, issue #4627) — change records carry bare
+            // resource ids, and a bare id matches no document.
             // Consumer point-loads use the composite `_id`
             // ("{namespace}:{id}"); change-log records carry plain ids and
             // the namespace is in scope, so construct the composite keys here
@@ -8307,7 +8703,14 @@ mod inner {
 
             let mut added_or_modified_plugin_configs = Vec::new();
             for doc in self
-                .load_change_ids(self.plugin_configs(), namespace, &plugin_config_upserts)
+                .load_change_ids(
+                    self.plugin_configs(),
+                    namespace,
+                    &plugin_config_upserts
+                        .iter()
+                        .map(|id| namespaced_doc_id(namespace, id))
+                        .collect::<Vec<_>>(),
+                )
                 .await?
             {
                 let mut plugin = doc_to_plugin_config(doc)?;
@@ -8328,7 +8731,14 @@ mod inner {
 
             let mut added_or_modified_upstreams = Vec::new();
             for doc in self
-                .load_change_ids(self.upstreams(), namespace, &upstream_upserts)
+                .load_change_ids(
+                    self.upstreams(),
+                    namespace,
+                    &upstream_upserts
+                        .iter()
+                        .map(|id| namespaced_doc_id(namespace, id))
+                        .collect::<Vec<_>>(),
+                )
                 .await?
             {
                 let mut upstream = doc_to_upstream(doc)?;
@@ -8475,7 +8885,10 @@ mod inner {
                     ) {
                         if let Err(err) = self
                             .proxies()
-                            .delete_one(doc! { "_id": &proxy.id, "namespace": &proxy.namespace })
+                            .delete_one(doc! {
+                                "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
+                                "namespace": &proxy.namespace,
+                            })
                             .await
                         {
                             warn!(
@@ -8494,7 +8907,10 @@ mod inner {
                 {
                     if let Err(err) = self
                         .proxies()
-                        .delete_one(doc! { "_id": &proxy.id, "namespace": &proxy.namespace })
+                        .delete_one(doc! {
+                            "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
+                            "namespace": &proxy.namespace,
+                        })
                         .await
                     {
                         warn!(
@@ -8576,7 +8992,7 @@ mod inner {
                                 if this
                                     .proxies()
                                     .find_one(doc! {
-                                        "_id": *id,
+                                        "_id": namespaced_doc_id(namespace.as_str(), id),
                                         "namespace": namespace.as_str(),
                                     })
                                     .session(&mut *s)
@@ -8597,13 +9013,16 @@ mod inner {
                                 let mut doc = doc.clone();
                                 if let Some(spec_doc) = this
                                     .api_specs()
-                                    .find_one(mongodb::bson::doc! { "proxy_id": *id })
+                                    .find_one(mongodb::bson::doc! {
+                                        "proxy_id": *id,
+                                        "namespace": namespace.as_str(),
+                                    })
                                     .session(&mut *s)
                                     .await?
                                 {
-                                    let sid = spec_doc.get_str("_id").map_err(|e| {
+                                    let sid = spec_doc.get_str("id").map_err(|e| {
                                         mongodb::error::Error::custom(format!(
-                                            "api_spec for proxy {} is missing _id: {}",
+                                            "api_spec for proxy {} is missing id: {}",
                                             *id, e
                                         ))
                                     })?;
@@ -8613,7 +9032,7 @@ mod inner {
                                     .proxies()
                                     .replace_one(
                                         mongodb::bson::doc! {
-                                            "_id": *id,
+                                            "_id": namespaced_doc_id(namespace.as_str(), id),
                                             "namespace": namespace.as_str(),
                                         },
                                         doc,
@@ -8679,7 +9098,10 @@ mod inner {
             // FERRUM_MONGO_REPLICA_SET.
             let previous_doc = self
                 .proxies()
-                .find_one(doc! { "_id": &proxy.id, "namespace": &proxy.namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
+                    "namespace": &proxy.namespace,
+                })
                 .await?;
             let Some(previous_doc) = previous_doc else {
                 return Ok(false);
@@ -8701,18 +9123,21 @@ mod inner {
             }
             if let Some(spec_doc) = self
                 .api_specs()
-                .find_one(doc! { "proxy_id": &proxy.id })
+                .find_one(doc! { "proxy_id": &proxy.id, "namespace": &proxy.namespace })
                 .await?
             {
-                let sid = spec_doc.get_str("_id").map_err(|e| {
-                    anyhow::anyhow!("api_spec for proxy {} is missing _id: {}", proxy.id, e)
+                let sid = spec_doc.get_str("id").map_err(|e| {
+                    anyhow::anyhow!("api_spec for proxy {} is missing id: {}", proxy.id, e)
                 })?;
                 doc.insert("api_spec_id", sid);
             }
             let replace_result = self
                 .proxies()
                 .replace_one(
-                    doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                    doc! {
+                        "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
+                        "namespace": &proxy.namespace,
+                    },
                     doc,
                 )
                 .await?;
@@ -8733,7 +9158,10 @@ mod inner {
                     if let Err(err) = self
                         .proxies()
                         .replace_one(
-                            doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                            doc! {
+                                "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
+                                "namespace": &proxy.namespace,
+                            },
                             previous_doc.clone(),
                         )
                         .await
@@ -8755,7 +9183,10 @@ mod inner {
                 if let Err(err) = self
                     .proxies()
                     .replace_one(
-                        doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                        doc! {
+                            "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
+                            "namespace": &proxy.namespace,
+                        },
                         previous_doc.clone(),
                     )
                     .await
@@ -8777,6 +9208,7 @@ mod inner {
             {
                 self.rollback_standalone_updated_document(
                     "proxies",
+                    &proxy.namespace,
                     "proxy",
                     &proxy.id,
                     Some(previous_doc),
@@ -8856,7 +9288,7 @@ mod inner {
                                 let proxy_doc = this
                                     .proxies()
                                     .find_one(mongodb::bson::doc! {
-                                        "_id": id.as_str(),
+                                        "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
                                         "namespace": namespace.as_str(),
                                     })
                                     .session(&mut *s)
@@ -8876,7 +9308,10 @@ mod inner {
                                     .load_collection_ids_filtered_in_session(
                                         &mut *s,
                                         "plugin_configs",
-                                        mongodb::bson::doc! { "proxy_id": id.as_str() },
+                                        mongodb::bson::doc! {
+                                            "proxy_id": id.as_str(),
+                                            "namespace": namespace.as_str(),
+                                        },
                                     )
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
@@ -8893,10 +9328,10 @@ mod inner {
                                     .session(&mut *s)
                                     .await?
                                     .map(|doc| {
-                                        let sid = doc.get_str("_id").map(str::to_string).map_err(
+                                        let sid = doc.get_str("id").map(str::to_string).map_err(
                                             |e| {
                                                 mongodb::error::Error::custom(format!(
-                                                    "api_spec for proxy {} is missing _id: {}",
+                                                    "api_spec for proxy {} is missing id: {}",
                                                     id, e
                                                 ))
                                             },
@@ -8937,13 +9372,16 @@ mod inner {
                                     };
 
                                 this.plugin_configs()
-                                    .delete_many(mongodb::bson::doc! { "proxy_id": id.as_str() })
+                                    .delete_many(mongodb::bson::doc! {
+                                        "proxy_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
                                     .session(&mut *s)
                                     .await?;
                                 let result = this
                                     .proxies()
                                     .delete_one(mongodb::bson::doc! {
-                                        "_id": id.as_str(),
+                                        "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
                                         "namespace": namespace.as_str(),
                                     })
                                     .session(&mut *s)
@@ -8955,7 +9393,7 @@ mod inner {
                                     if let Some((ref sid, ref namespace)) = spec_owner {
                                         this.api_specs()
                                             .delete_one(mongodb::bson::doc! {
-                                                "_id": sid.as_str(),
+                                                "_id": namespaced_doc_id(namespace.as_str(), sid.as_str()),
                                                 "namespace": namespace.as_str(),
                                             })
                                             .session(&mut *s)
@@ -8981,7 +9419,7 @@ mod inner {
                                         let spec_owned = this
                                             .upstreams()
                                             .find_one(mongodb::bson::doc! {
-                                                "_id": uid.as_str(),
+                                                "_id": namespaced_doc_id(namespace.as_str(), uid.as_str()),
                                                 "namespace": namespace.as_str(),
                                             })
                                             .session(&mut *s)
@@ -9015,7 +9453,7 @@ mod inner {
                                                 let upstream_delete = this
                                                     .upstreams()
                                                     .delete_one(mongodb::bson::doc! {
-                                                        "_id": uid.as_str(),
+                                                        "_id": namespaced_doc_id(namespace.as_str(), uid.as_str()),
                                                         "namespace": namespace.as_str(),
                                                     })
                                                     .session(&mut *s)
@@ -9130,7 +9568,10 @@ mod inner {
 
             let proxy_namespace_for_changes = namespace.to_string();
             let proxy_scoped_plugin_ids_for_changes = self
-                .load_collection_ids_filtered("plugin_configs", doc! { "proxy_id": id })
+                .load_collection_ids_filtered(
+                    "plugin_configs",
+                    doc! { "proxy_id": id, "namespace": namespace },
+                )
                 .await?;
 
             // Non-replica-set best-effort path.
@@ -9145,12 +9586,15 @@ mod inner {
 
             let result = self
                 .proxies()
-                .delete_one(doc! { "_id": id, "namespace": namespace })
+                .delete_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
                 .await?;
             let mut deleted_orphaned_upstream_id_for_changes = None;
             if result.deleted_count > 0 {
                 self.plugin_configs()
-                    .delete_many(doc! { "proxy_id": id })
+                    .delete_many(doc! { "proxy_id": id, "namespace": namespace })
                     .await?;
                 if cleanup_orphaned_upstream
                     && let Some(ref uid) = upstream_id_to_check
@@ -9158,7 +9602,7 @@ mod inner {
                     let spec_owned = self
                         .upstreams()
                         .find_one(doc! {
-                            "_id": uid.as_str(),
+                            "_id": namespaced_doc_id(namespace, uid.as_str()),
                             "namespace": namespace,
                         })
                         .await?
@@ -9166,7 +9610,10 @@ mod inner {
                     if !spec_owned {
                         let still_referenced = self
                             .proxies()
-                            .count_documents(doc! { "upstream_id": uid })
+                            .count_documents(doc! {
+                                "upstream_id": uid,
+                                "namespace": namespace,
+                            })
                             .await?
                             > 0;
                         let dispatch_ref = if !still_referenced {
@@ -9184,7 +9631,7 @@ mod inner {
                             match self
                                 .upstreams()
                                 .delete_one(doc! {
-                                    "_id": uid,
+                                    "_id": namespaced_doc_id(namespace, uid),
                                     "namespace": namespace,
                                 })
                                 .await
@@ -9247,7 +9694,10 @@ mod inner {
             let start = std::time::Instant::now();
             let result = self
                 .proxies()
-                .find_one(doc! { "_id": id, "namespace": namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
                 .await?;
             self.check_slow_query("get_proxy", start);
             match result {
@@ -9273,7 +9723,10 @@ mod inner {
             // would admit a config that fails to resolve at runtime.
             let count = self
                 .proxies()
-                .count_documents(doc! { "_id": proxy_id, "namespace": namespace })
+                .count_documents(doc! {
+                    "_id": namespaced_doc_id(namespace, proxy_id),
+                    "namespace": namespace,
+                })
                 .await?;
             Ok(count > 0)
         }
@@ -9410,7 +9863,7 @@ mod inner {
                             "consumers",
                             &consumer.namespace,
                             "consumer",
-                            &consumer_doc_id(&consumer.namespace, &consumer.id),
+                            &consumer.id,
                             &err,
                         )
                         .await;
@@ -9638,8 +10091,9 @@ mod inner {
                             let rollback_confirmed = self
                                 .rollback_standalone_updated_document(
                                     "consumers",
+                                    &consumer.namespace,
                                     "consumer",
-                                    &composite_id,
+                                    &consumer.id,
                                     Some(previous_doc),
                                     &err,
                                 )
@@ -9883,29 +10337,43 @@ mod inner {
                 } else {
                     candidate.plugin_configs.push(pc.clone());
                 }
+                apply_proxy_association_to_candidate(candidate, pc);
             })
             .await?;
             let doc = plugin_config_to_doc(pc)?;
+            // The junction reconciliation is planned before the mutation so
+            // the transaction knows exactly which proxies move (issue #4611).
+            let plan = self.plan_proxy_scoped_plugin_association(pc).await?;
+            let touched_proxies = plugin_config_touched_proxies(pc, &plan);
             mtls_lease
                 .run_mutation(async {
                     if self.replica_set_configured() {
                         let connection = self.connection();
                         let mut session = connection.client.start_session().await?;
-                        let proxy_id = if pc.scope == PluginScope::Proxy {
-                            pc.proxy_id.clone()
-                        } else {
-                            None
-                        };
                         session
                             .start_transaction()
                             .and_run(
-                                (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
-                                |s, (this, doc, namespace, id, proxy_id)| {
+                                (
+                                    self,
+                                    doc,
+                                    pc.namespace.clone(),
+                                    pc.id.clone(),
+                                    plan.clone(),
+                                    touched_proxies.clone(),
+                                ),
+                                |s, (this, doc, namespace, id, plan, touched_proxies)| {
                                     Box::pin(async move {
                                         this.plugin_configs()
                                             .insert_one(doc.clone())
                                             .session(&mut *s)
                                             .await?;
+                                        this.apply_proxy_association_plan_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            id.as_str(),
+                                            plan,
+                                        )
+                                        .await?;
                                         this.record_config_change_in_session(
                                             &mut *s,
                                             namespace.as_str(),
@@ -9914,12 +10382,12 @@ mod inner {
                                             "upsert",
                                         )
                                         .await?;
-                                        if let Some(proxy_id) = proxy_id.as_deref() {
+                                        for proxy_id in touched_proxies.iter() {
                                             this.record_config_change_in_session(
                                                 &mut *s,
                                                 namespace.as_str(),
                                                 "proxy",
-                                                proxy_id,
+                                                proxy_id.as_str(),
                                                 "upsert",
                                             )
                                             .await?;
@@ -9934,26 +10402,36 @@ mod inner {
                         self.compact_config_changes_best_effort(&pc.namespace).await;
                     } else {
                         self.plugin_configs().insert_one(doc).await?;
-                        if let Err(err) = self
-                            .record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
-                            .await
-                        {
-                            self.rollback_standalone_created_document(
-                                "plugin_configs",
+                        let followup: Result<(), anyhow::Error> = async {
+                            // Attach before the change records: a standalone
+                            // deployment has no transaction, so the association
+                            // — the part the runtime reads — is written while
+                            // the plugin-config document can still be rolled
+                            // back.
+                            self.apply_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await?;
+                            self.record_config_change(
                                 &pc.namespace,
                                 "plugin_config",
                                 &pc.id,
-                                &err,
+                                "upsert",
                             )
-                            .await;
-                            return Err(err);
+                            .await?;
+                            for proxy_id in &touched_proxies {
+                                self.record_config_change(
+                                    &pc.namespace,
+                                    "proxy",
+                                    proxy_id.as_str(),
+                                    "upsert",
+                                )
+                                .await?;
+                            }
+                            Ok(())
                         }
-                        if pc.scope == PluginScope::Proxy
-                            && let Some(proxy_id) = pc.proxy_id.as_deref()
-                            && let Err(err) = self
-                                .record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
-                                .await
-                        {
+                        .await;
+                        if let Err(err) = followup {
+                            self.compensate_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await;
                             self.rollback_standalone_created_document(
                                 "plugin_configs",
                                 &pc.namespace,
@@ -9984,6 +10462,7 @@ mod inner {
                 {
                     *existing = pc.clone();
                 }
+                apply_proxy_association_to_candidate(candidate, pc);
             })
             .await?;
             // Preserve api_spec_id by carrying it into the replacement document.
@@ -9991,7 +10470,10 @@ mod inner {
             let mut doc = plugin_config_to_doc(pc)?;
             let existing_doc = self
                 .plugin_configs()
-                .find_one(doc! { "_id": &pc.id, "namespace": &pc.namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(&pc.namespace, &pc.id),
+                    "namespace": &pc.namespace,
+                })
                 .await?;
             if existing_doc.is_none() {
                 // No document in this namespace — phantom update, no
@@ -10014,27 +10496,35 @@ mod inner {
             if let Some(sid) = existing_spec_id {
                 doc.insert("api_spec_id", sid);
             }
+            // The junction reconciliation is planned before the mutation so the
+            // transaction knows exactly which proxies move (issue #4611). A
+            // `proxy_id` move detaches the old proxy and attaches the new one;
+            // a scope change away from `proxy` detaches the stale association.
+            let plan = self.plan_proxy_scoped_plugin_association(pc).await?;
+            let touched_proxies = plugin_config_touched_proxies(pc, &plan);
             let matched = mtls_lease
                 .run_mutation(async {
                     if self.replica_set_configured() {
                         let connection = self.connection();
                         let mut session = connection.client.start_session().await?;
-                        let proxy_id = if pc.scope == PluginScope::Proxy {
-                            pc.proxy_id.clone()
-                        } else {
-                            None
-                        };
                         let matched = session
                             .start_transaction()
                             .and_run(
-                                (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
-                                |s, (this, doc, namespace, id, proxy_id)| {
+                                (
+                                    self,
+                                    doc,
+                                    pc.namespace.clone(),
+                                    pc.id.clone(),
+                                    plan.clone(),
+                                    touched_proxies.clone(),
+                                ),
+                                |s, (this, doc, namespace, id, plan, touched_proxies)| {
                                     Box::pin(async move {
                                         let replace_result = this
                                             .plugin_configs()
                                             .replace_one(
                                                 doc! {
-                                                    "_id": id.as_str(),
+                                                    "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
                                                     "namespace": namespace.as_str(),
                                                 },
                                                 doc.clone(),
@@ -10046,6 +10536,13 @@ mod inner {
                                             // (DB-M4).
                                             return Ok(false);
                                         }
+                                        this.apply_proxy_association_plan_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            id.as_str(),
+                                            plan,
+                                        )
+                                        .await?;
                                         this.record_config_change_in_session(
                                             &mut *s,
                                             namespace.as_str(),
@@ -10054,12 +10551,12 @@ mod inner {
                                             "upsert",
                                         )
                                         .await?;
-                                        if let Some(proxy_id) = proxy_id.as_deref() {
+                                        for proxy_id in touched_proxies.iter() {
                                             this.record_config_change_in_session(
                                                 &mut *s,
                                                 namespace.as_str(),
                                                 "proxy",
-                                                proxy_id,
+                                                proxy_id.as_str(),
                                                 "upsert",
                                             )
                                             .await?;
@@ -10078,7 +10575,13 @@ mod inner {
                     } else {
                         let replace_result = self
                             .plugin_configs()
-                            .replace_one(doc! { "_id": &pc.id, "namespace": &pc.namespace }, doc)
+                            .replace_one(
+                                doc! {
+                                    "_id": namespaced_doc_id(&pc.namespace, &pc.id),
+                                    "namespace": &pc.namespace,
+                                },
+                                doc,
+                            )
                             .await?;
                         if replace_result.matched_count == 0 {
                             // Phantom update (concurrent delete): no config-change
@@ -10086,6 +10589,12 @@ mod inner {
                             return Ok(false);
                         }
                         let change_result: Result<(), anyhow::Error> = async {
+                            // Attach/detach before the change records: a
+                            // standalone deployment has no transaction, so the
+                            // association the runtime reads is written while the
+                            // plugin-config document can still be rolled back.
+                            self.apply_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await?;
                             self.record_config_change(
                                 &pc.namespace,
                                 "plugin_config",
@@ -10093,13 +10602,11 @@ mod inner {
                                 "upsert",
                             )
                             .await?;
-                            if pc.scope == PluginScope::Proxy
-                                && let Some(proxy_id) = pc.proxy_id.as_deref()
-                            {
+                            for proxy_id in &touched_proxies {
                                 self.record_config_change(
                                     &pc.namespace,
                                     "proxy",
-                                    proxy_id,
+                                    proxy_id.as_str(),
                                     "upsert",
                                 )
                                 .await?;
@@ -10108,8 +10615,11 @@ mod inner {
                         }
                         .await;
                         if let Err(err) = change_result {
+                            self.compensate_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await;
                             self.rollback_standalone_updated_document(
                                 "plugin_configs",
+                                &pc.namespace,
                                 "plugin_config",
                                 &pc.id,
                                 existing_doc,
@@ -10145,7 +10655,10 @@ mod inner {
             .await?;
             let existing = self
                 .plugin_configs()
-                .find_one(doc! { "_id": id, "namespace": namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
                 .await?;
             if existing.is_none() {
                 // No document in this namespace — nothing to delete, and no
@@ -10158,12 +10671,16 @@ mod inner {
             let mut affected_proxy_ids = Vec::new();
             let mut affected_cursor = self
                 .proxies()
-                .find(doc! { "plugins.plugin_config_id": id })
-                .projection(doc! { "_id": 1 })
+                .find(doc! {
+                    "plugins.plugin_config_id": id,
+                    "namespace": namespace.as_str(),
+                })
+                // `_id` is composite (issue #4627); the bare proxy id is `id`.
+                .projection(doc! { "_id": 0, "id": 1 })
                 .await?;
             while affected_cursor.advance().await? {
                 let doc = affected_cursor.deserialize_current()?;
-                if let Ok(proxy_id) = doc.get_str("_id") {
+                if let Ok(proxy_id) = doc.get_str("id") {
                     affected_proxy_ids.push(proxy_id.to_string());
                 }
             }
@@ -10185,7 +10702,10 @@ mod inner {
                                     Box::pin(async move {
                                         this.proxies()
                                     .update_many(
-                                        doc! { "plugins.plugin_config_id": id.as_str() },
+                                        doc! {
+                                            "plugins.plugin_config_id": id.as_str(),
+                                            "namespace": namespace.as_str(),
+                                        },
                                         doc! {
                                             "$pull": {
                                                 "plugins": { "plugin_config_id": id.as_str() }
@@ -10198,7 +10718,7 @@ mod inner {
                                         let result = this
                                             .plugin_configs()
                                             .delete_one(doc! {
-                                                "_id": id.as_str(),
+                                                "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
                                                 "namespace": namespace.as_str(),
                                             })
                                             .session(&mut *s)
@@ -10237,7 +10757,10 @@ mod inner {
                     } else {
                         self.proxies()
                             .update_many(
-                                doc! { "plugins.plugin_config_id": id },
+                                doc! {
+                                    "plugins.plugin_config_id": id,
+                                    "namespace": namespace.as_str(),
+                                },
                                 doc! {
                                     "$pull": { "plugins": { "plugin_config_id": id } },
                                     "$set": { "updated_at": Utc::now().to_rfc3339() },
@@ -10246,7 +10769,10 @@ mod inner {
                             .await?;
                         let result = self
                             .plugin_configs()
-                            .delete_one(doc! { "_id": id, "namespace": &namespace })
+                            .delete_one(doc! {
+                                "_id": namespaced_doc_id(&namespace, id),
+                                "namespace": &namespace,
+                            })
                             .await?;
                         if result.deleted_count > 0 {
                             self.record_config_change(&namespace, "plugin_config", id, "delete")
@@ -10274,7 +10800,10 @@ mod inner {
             let start = std::time::Instant::now();
             let result = self
                 .plugin_configs()
-                .find_one(doc! { "_id": id, "namespace": namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
                 .await?;
             self.check_slow_query("get_plugin_config", start);
             match result {
@@ -10393,7 +10922,10 @@ mod inner {
                 .await?;
             let existing_doc = self
                 .upstreams()
-                .find_one(doc! { "_id": &upstream.id, "namespace": &upstream.namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(&upstream.namespace, &upstream.id),
+                    "namespace": &upstream.namespace,
+                })
                 .await?;
             if existing_doc.is_none() {
                 // No document in this namespace — phantom update, no
@@ -10432,7 +10964,7 @@ mod inner {
                                             .upstreams()
                                             .replace_one(
                                                 doc! {
-                                                    "_id": id.as_str(),
+                                                    "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
                                                     "namespace": namespace.as_str(),
                                                 },
                                                 doc.clone(),
@@ -10468,7 +11000,10 @@ mod inner {
                         let replace_result = self
                             .upstreams()
                             .replace_one(
-                                doc! { "_id": &upstream.id, "namespace": &upstream.namespace },
+                                doc! {
+                                    "_id": namespaced_doc_id(&upstream.namespace, &upstream.id),
+                                    "namespace": &upstream.namespace,
+                                },
                                 doc,
                             )
                             .await?;
@@ -10488,6 +11023,7 @@ mod inner {
                         {
                             self.rollback_standalone_updated_document(
                                 "upstreams",
+                                &upstream.namespace,
                                 "upstream",
                                 &upstream.id,
                                 existing_doc,
@@ -10526,7 +11062,7 @@ mod inner {
                                 if this
                                     .upstreams()
                                     .find_one(doc! {
-                                        "_id": id.as_str(),
+                                        "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
                                         "namespace": namespace.as_str(),
                                     })
                                     .projection(doc! { "_id": 1 })
@@ -10562,7 +11098,10 @@ mod inner {
                                 // create-referencing transaction.
                                 let proxy_refs = this
                                     .proxies()
-                                    .count_documents(doc! { "upstream_id": id.as_str() })
+                                    .count_documents(doc! {
+                                        "upstream_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
                                     .session(&mut *s)
                                     .await?;
                                 if proxy_refs > 0 {
@@ -10588,7 +11127,7 @@ mod inner {
                                 let result = this
                                     .upstreams()
                                     .delete_one(doc! {
-                                        "_id": id.as_str(),
+                                        "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
                                         "namespace": namespace.as_str(),
                                     })
                                     .session(&mut *s)
@@ -10632,7 +11171,10 @@ mod inner {
                 // restore it.
                 let existing = self
                     .upstreams()
-                    .find_one(doc! { "_id": id, "namespace": namespace })
+                    .find_one(doc! {
+                        "_id": namespaced_doc_id(namespace, id),
+                        "namespace": namespace,
+                    })
                     .await?;
                 let Some(existing) = existing else {
                     self.check_slow_query("delete_upstream", start);
@@ -10640,7 +11182,7 @@ mod inner {
                 };
                 let proxy_refs = self
                     .proxies()
-                    .count_documents(doc! { "upstream_id": id })
+                    .count_documents(doc! { "upstream_id": id, "namespace": namespace })
                     .await?;
                 if proxy_refs > 0 {
                     anyhow::bail!(
@@ -10660,7 +11202,10 @@ mod inner {
                 }
                 let result = self
                     .upstreams()
-                    .delete_one(doc! { "_id": id, "namespace": namespace })
+                    .delete_one(doc! {
+                        "_id": namespaced_doc_id(namespace, id),
+                        "namespace": namespace,
+                    })
                     .await?;
                 if result.deleted_count == 0 {
                     self.check_slow_query("delete_upstream", start);
@@ -10677,7 +11222,7 @@ mod inner {
                 // FERRUM_MONGO_REPLICA_SET.
                 let proxy_refs_after = self
                     .proxies()
-                    .count_documents(doc! { "upstream_id": id })
+                    .count_documents(doc! { "upstream_id": id, "namespace": namespace })
                     .await?;
                 if proxy_refs_after > 0 {
                     if let Err(err) = self.upstreams().insert_one(existing).await {
@@ -10711,7 +11256,10 @@ mod inner {
             let start = std::time::Instant::now();
             let result = self
                 .upstreams()
-                .find_one(doc! { "_id": id, "namespace": namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
                 .await?;
             self.check_slow_query("get_upstream", start);
             match result {
@@ -10761,7 +11309,7 @@ mod inner {
                                                 let result = this
                                                     .upstreams()
                                                     .delete_one(doc! {
-                                                        "_id": upstream_id.as_str(),
+                                                        "_id": namespaced_doc_id(namespace.as_str(), upstream_id.as_str()),
                                                         "namespace": namespace.as_str(),
                                                     })
                                                     .session(&mut *s)
@@ -10789,7 +11337,10 @@ mod inner {
                     } else {
                         let count = self
                             .proxies()
-                            .count_documents(doc! { "upstream_id": upstream_id })
+                            .count_documents(doc! {
+                                "upstream_id": upstream_id,
+                                "namespace": namespace,
+                            })
                             .await?;
                         let dispatch_ref = if count == 0 {
                             self.find_mesh_route_dispatch_upstream_ref_opt_session(
@@ -10804,7 +11355,10 @@ mod inner {
                         if count == 0 && dispatch_ref.is_none() {
                             let result = self
                                 .upstreams()
-                                .delete_one(doc! { "_id": upstream_id, "namespace": namespace })
+                                .delete_one(doc! {
+                                    "_id": namespaced_doc_id(namespace, upstream_id),
+                                    "namespace": namespace,
+                                })
                                 .await?;
                             if result.deleted_count > 0 {
                                 self.record_config_change(
@@ -11367,7 +11921,7 @@ mod inner {
                 doc! { "$nin": ["tcp", "tcps", "udp", "dtls"] },
             );
             if let Some(id) = exclude_proxy_id {
-                filter.insert("_id", doc! { "$ne": id });
+                filter.insert("_id", doc! { "$ne": namespaced_doc_id(namespace, id) });
             }
 
             // `Some(path) + empty hosts` is a catch-all for the path — any
@@ -11383,7 +11937,7 @@ mod inner {
             let proxies = self.proxies();
             let mut cursor = proxies
                 .find(filter)
-                .projection(doc! { "_id": 1, "hosts": 1 })
+                .projection(doc! { "_id": 0, "hosts": 1 })
                 .await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -11411,7 +11965,7 @@ mod inner {
         ) -> Result<bool, anyhow::Error> {
             let mut filter = doc! { "namespace": namespace, "name": name };
             if let Some(id) = exclude_proxy_id {
-                filter.insert("_id", doc! { "$ne": id });
+                filter.insert("_id", doc! { "$ne": namespaced_doc_id(namespace, id) });
             }
             let count = self.proxies().count_documents(filter).await?;
             Ok(count == 0)
@@ -11425,7 +11979,7 @@ mod inner {
         ) -> Result<bool, anyhow::Error> {
             let mut filter = doc! { "namespace": namespace, "name": name };
             if let Some(id) = exclude_upstream_id {
-                filter.insert("_id", doc! { "$ne": id });
+                filter.insert("_id", doc! { "$ne": namespaced_doc_id(namespace, id) });
             }
             let count = self.upstreams().count_documents(filter).await?;
             Ok(count == 0)
@@ -11547,7 +12101,10 @@ mod inner {
             // Namespace filter is mandatory: see [`check_proxy_exists`].
             let count = self
                 .upstreams()
-                .count_documents(doc! { "_id": upstream_id, "namespace": namespace })
+                .count_documents(doc! {
+                    "_id": namespaced_doc_id(namespace, upstream_id),
+                    "namespace": namespace,
+                })
                 .await?;
             Ok(count > 0)
         }
@@ -11566,7 +12123,7 @@ mod inner {
                 let count = self
                     .plugin_configs()
                     .count_documents(doc! {
-                        "_id": &assoc.plugin_config_id,
+                        "_id": namespaced_doc_id(namespace, &assoc.plugin_config_id),
                         "namespace": namespace,
                     })
                     .await?;
@@ -11830,7 +12387,16 @@ mod inner {
                     }
                     count
                 } else {
-                    let ids: Vec<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+                    // Composite `_id`s ("{namespace}:{id}") for document-level
+                    // rollback; change-log records keep the plain resource ids
+                    // (issue #4627). The order must match `docs` so
+                    // `rollback_ids_for_unordered_insert_error` can map write
+                    // error indices back to documents.
+                    let doc_ids: Vec<String> = proxies
+                        .iter()
+                        .map(|proxy| namespaced_doc_id(&proxy.namespace, &proxy.id))
+                        .collect();
+                    let ids: Vec<&str> = doc_ids.iter().map(String::as_str).collect();
                     let result = match self.proxies().insert_many(docs).ordered(false).await {
                         Ok(result) => result,
                         Err(err) => {
@@ -12294,7 +12860,16 @@ mod inner {
                     }
                     count
                 } else {
-                    let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
+                    // Composite `_id`s ("{namespace}:{id}") for document-level
+                    // rollback; change-log records keep the plain resource ids
+                    // (issue #4627). The order must match `docs` so
+                    // `rollback_ids_for_unordered_insert_error` can map write
+                    // error indices back to documents.
+                    let doc_ids: Vec<String> = configs
+                        .iter()
+                        .map(|config| namespaced_doc_id(&config.namespace, &config.id))
+                        .collect();
+                    let ids: Vec<&str> = doc_ids.iter().map(String::as_str).collect();
                     let result = match self.plugin_configs().insert_many(docs).ordered(false).await
                     {
                         Ok(result) => result,
@@ -12401,10 +12976,16 @@ mod inner {
                     }
                     count
                 } else {
-                    let ids: Vec<&str> = upstreams
+                    // Composite `_id`s ("{namespace}:{id}") for document-level
+                    // rollback; change-log records keep the plain resource ids
+                    // (issue #4627). The order must match `docs` so
+                    // `rollback_ids_for_unordered_insert_error` can map write
+                    // error indices back to documents.
+                    let doc_ids: Vec<String> = upstreams
                         .iter()
-                        .map(|upstream| upstream.id.as_str())
+                        .map(|upstream| namespaced_doc_id(&upstream.namespace, &upstream.id))
                         .collect();
+                    let ids: Vec<&str> = doc_ids.iter().map(String::as_str).collect();
                     let result = match self.upstreams().insert_many(docs).ordered(false).await {
                         Ok(result) => result,
                         Err(err) => {
@@ -13323,6 +13904,7 @@ mod inner {
                     if let Err(e) = result {
                         // Compensating deletes — best-effort, log failures as warnings.
                         self.compensate_bundle_insert(
+                            &spec.namespace,
                             &inserted_upstream,
                             &inserted_proxy,
                             &inserted_plugins,
@@ -13475,7 +14057,7 @@ mod inner {
                                     let existing = this
                                         .upstreams()
                                         .find_one(mongodb::bson::doc! {
-                                            "_id": upstream_id.as_str(),
+                                            "_id": namespaced_doc_id(upstream_namespace, upstream_id.as_str()),
                                             "namespace": upstream_namespace,
                                         })
                                         .session(&mut *s)
@@ -13610,7 +14192,10 @@ mod inner {
 
             let existing_spec_doc = self
                 .api_specs()
-                .find_one(doc! { "_id": &spec.id, "namespace": &spec.namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(&spec.namespace, &spec.id),
+                    "namespace": &spec.namespace,
+                })
                 .await?;
             let existing_spec: Option<ApiSpec> = existing_spec_doc
                 .as_ref()
@@ -13641,7 +14226,10 @@ mod inner {
                     let replace_result = self
                         .api_specs()
                         .replace_one(
-                            doc! { "_id": &spec.id, "namespace": &spec.namespace },
+                            doc! {
+                                "_id": namespaced_doc_id(&spec.namespace, &spec.id),
+                                "namespace": &spec.namespace,
+                            },
                             spec_doc_check,
                         )
                         .await?;
@@ -13699,7 +14287,10 @@ mod inner {
                 // 2. Existing proxy doc (may be absent on first replace or orphaned).
                 let existing_proxy_doc = self
                     .proxies()
-                    .find_one(doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace })
+                    .find_one(doc! {
+                        "_id": namespaced_doc_id(&spec.namespace, &spec.proxy_id),
+                        "namespace": &spec.namespace,
+                    })
                     .await?;
 
                 if let Some(existing_doc) = existing_proxy_doc {
@@ -13865,7 +14456,7 @@ mod inner {
                                     .await?;
                                 this.proxies()
                                     .delete_one(doc! {
-                                        "_id": proxy_id.as_str(),
+                                        "_id": namespaced_doc_id(namespace.as_str(), proxy_id.as_str()),
                                         "namespace": namespace.as_str(),
                                     })
                                     .session(&mut *s)
@@ -13879,7 +14470,7 @@ mod inner {
                                     .await?;
                                 this.api_specs()
                                     .delete_one(doc! {
-                                        "_id": spec_id.as_str(),
+                                        "_id": namespaced_doc_id(namespace.as_str(), spec_id.as_str()),
                                         "namespace": namespace.as_str(),
                                     })
                                     .session(&mut *s)
@@ -13988,7 +14579,10 @@ mod inner {
                 // route will point at missing dependencies.
                 if let Err(e) = self
                     .proxies()
-                    .delete_one(doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace })
+                    .delete_one(doc! {
+                        "_id": namespaced_doc_id(&spec.namespace, &spec.proxy_id),
+                        "namespace": &spec.namespace,
+                    })
                     .await
                 {
                     return Err(anyhow::Error::new(e).context(format!(
@@ -14023,7 +14617,10 @@ mod inner {
                 }
                 if let Err(e) = self
                     .api_specs()
-                    .delete_one(doc! { "_id": &spec.id, "namespace": &spec.namespace })
+                    .delete_one(doc! {
+                        "_id": namespaced_doc_id(&spec.namespace, &spec.id),
+                        "namespace": &spec.namespace,
+                    })
                     .await
                 {
                     warn!(
@@ -14069,6 +14666,7 @@ mod inner {
                         spec.id, e
                     );
                     self.compensate_bundle_insert(
+                        &spec.namespace,
                         &inserted_upstream_id,
                         &inserted_proxy_id,
                         &inserted_plugin_ids,
@@ -14161,7 +14759,10 @@ mod inner {
             let start = std::time::Instant::now();
             let result = self
                 .api_specs()
-                .find_one(doc! { "_id": id, "namespace": namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
                 .await?;
             self.check_slow_query("get_api_spec", start);
             match result {
@@ -14418,7 +15019,10 @@ mod inner {
                 for spec in specs {
                     let proxy_doc = self
                         .proxies()
-                        .find_one(doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace })
+                        .find_one(doc! {
+                            "_id": namespaced_doc_id(&spec.namespace, &spec.proxy_id),
+                            "namespace": &spec.namespace,
+                        })
                         .await?;
                     if proxy_doc.is_none() {
                         anyhow::bail!(
@@ -14449,7 +15053,13 @@ mod inner {
                         .map_err(anyhow::Error::new)
                         .context("batch_insert_api_specs transaction failed")?
                 } else {
-                    let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
+                    // Composite `_id`s ("{namespace}:{id}") for document-level
+                    // rollback, in `docs` order (issue #4627).
+                    let doc_ids: Vec<String> = specs
+                        .iter()
+                        .map(|spec| namespaced_doc_id(&spec.namespace, &spec.id))
+                        .collect();
+                    let ids: Vec<&str> = doc_ids.iter().map(String::as_str).collect();
                     // MUST stay unordered, exactly like every sibling standalone
                     // batch insert. `rollback_ids_for_unordered_insert_error`
                     // derives "documents this call created" as *all ids minus
@@ -14457,9 +15067,10 @@ mod inner {
                     // an unordered insert. An ordered insert stops at the first
                     // write error, so every id after it would be reported as
                     // created and then deleted by the compensating
-                    // `delete_many({_id: {$in: ...}})` — and `api_specs._id` is
-                    // the bare spec id with no namespace qualifier, so that
-                    // delete would destroy another namespace's spec documents.
+                    // `delete_many({_id: {$in: ...}})`. Since issue #4627
+                    // `api_specs._id` is namespace-qualified, so such a delete
+                    // could no longer reach another namespace's spec — but the
+                    // over-deletion inside this tenant is still wrong.
                     match self.api_specs().insert_many(docs).ordered(false).await {
                         Ok(result) => result.inserted_ids.len(),
                         Err(err) => {
@@ -14509,7 +15120,10 @@ mod inner {
                         if let Some(spec_id) = proxy.api_spec_id.as_deref() {
                             self.proxies()
                                 .update_one(
-                                    doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                                    doc! {
+                                        "_id": namespaced_doc_id(&proxy.namespace, &proxy.id),
+                                        "namespace": &proxy.namespace,
+                                    },
                                     doc! { "$set": { "api_spec_id": spec_id } },
                                 )
                                 .await?;
@@ -14519,7 +15133,10 @@ mod inner {
                         if let Some(spec_id) = upstream.api_spec_id.as_deref() {
                             self.upstreams()
                                 .update_one(
-                                    doc! { "_id": &upstream.id, "namespace": &upstream.namespace },
+                                    doc! {
+                                        "_id": namespaced_doc_id(&upstream.namespace, &upstream.id),
+                                        "namespace": &upstream.namespace,
+                                    },
                                     doc! { "$set": { "api_spec_id": spec_id } },
                                 )
                                 .await?;
@@ -14529,7 +15146,10 @@ mod inner {
                         if let Some(spec_id) = plugin.api_spec_id.as_deref() {
                             self.plugin_configs()
                                 .update_one(
-                                    doc! { "_id": &plugin.id, "namespace": &plugin.namespace },
+                                    doc! {
+                                        "_id": namespaced_doc_id(&plugin.namespace, &plugin.id),
+                                        "namespace": &plugin.namespace,
+                                    },
                                     doc! { "$set": { "api_spec_id": spec_id } },
                                 )
                                 .await?;
@@ -14542,44 +15162,71 @@ mod inner {
                     let mut session = connection.client.start_session().await?;
                     session
                         .start_transaction()
-                        .and_run((self, proxies, upstreams, plugin_configs), |s, (this, proxies, upstreams, plugin_configs)| {
-                            Box::pin(async move {
-                                for proxy in proxies.iter() {
-                                    if let Some(spec_id) = proxy.api_spec_id.as_deref() {
-                                        this.proxies()
-                                            .update_one(
-                                                doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
-                                                doc! { "$set": { "api_spec_id": spec_id } },
-                                            )
-                                            .session(&mut *s)
-                                            .await?;
+                        .and_run(
+                            (self, proxies, upstreams, plugin_configs),
+                            |s, (this, proxies, upstreams, plugin_configs)| {
+                                Box::pin(async move {
+                                    for proxy in proxies.iter() {
+                                        if let Some(spec_id) = proxy.api_spec_id.as_deref() {
+                                            this.proxies()
+                                                .update_one(
+                                                    doc! {
+                                                        "_id": namespaced_doc_id(
+                                                            &proxy.namespace,
+                                                            &proxy.id,
+                                                        ),
+                                                        "namespace": &proxy.namespace,
+                                                    },
+                                                    doc! {
+                                                        "$set": { "api_spec_id": spec_id }
+                                                    },
+                                                )
+                                                .session(&mut *s)
+                                                .await?;
+                                        }
                                     }
-                                }
-                                for upstream in upstreams.iter() {
-                                    if let Some(spec_id) = upstream.api_spec_id.as_deref() {
-                                        this.upstreams()
-                                            .update_one(
-                                                doc! { "_id": &upstream.id, "namespace": &upstream.namespace },
-                                                doc! { "$set": { "api_spec_id": spec_id } },
-                                            )
-                                            .session(&mut *s)
-                                            .await?;
+                                    for upstream in upstreams.iter() {
+                                        if let Some(spec_id) = upstream.api_spec_id.as_deref() {
+                                            this.upstreams()
+                                                .update_one(
+                                                    doc! {
+                                                        "_id": namespaced_doc_id(
+                                                            &upstream.namespace,
+                                                            &upstream.id,
+                                                        ),
+                                                        "namespace": &upstream.namespace,
+                                                    },
+                                                    doc! {
+                                                        "$set": { "api_spec_id": spec_id }
+                                                    },
+                                                )
+                                                .session(&mut *s)
+                                                .await?;
+                                        }
                                     }
-                                }
-                                for plugin in plugin_configs.iter() {
-                                    if let Some(spec_id) = plugin.api_spec_id.as_deref() {
-                                        this.plugin_configs()
-                                            .update_one(
-                                                doc! { "_id": &plugin.id, "namespace": &plugin.namespace },
-                                                doc! { "$set": { "api_spec_id": spec_id } },
-                                            )
-                                            .session(&mut *s)
-                                            .await?;
+                                    for plugin in plugin_configs.iter() {
+                                        if let Some(spec_id) = plugin.api_spec_id.as_deref() {
+                                            this.plugin_configs()
+                                                .update_one(
+                                                    doc! {
+                                                        "_id": namespaced_doc_id(
+                                                            &plugin.namespace,
+                                                            &plugin.id,
+                                                        ),
+                                                        "namespace": &plugin.namespace,
+                                                    },
+                                                    doc! {
+                                                        "$set": { "api_spec_id": spec_id }
+                                                    },
+                                                )
+                                                .session(&mut *s)
+                                                .await?;
+                                        }
                                     }
-                                }
-                                Ok(())
-                            })
-                        })
+                                    Ok(())
+                                })
+                            },
+                        )
                         .await
                         .map_err(anyhow::Error::new)
                         .context("apply_api_spec_ownership_from_resources transaction failed")?;
@@ -14664,7 +15311,10 @@ mod inner {
             // Check existence first (namespace-scoped).
             let existing = self
                 .api_specs()
-                .find_one(doc! { "_id": id, "namespace": namespace })
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
                 .await?;
 
             if existing.is_none() {
@@ -14833,7 +15483,7 @@ mod inner {
                                         .await?;
                                     this.proxies()
                                         .delete_one(doc! {
-                                            "_id": pid,
+                                            "_id": namespaced_doc_id(namespace.as_str(), pid),
                                             "namespace": namespace.as_str(),
                                         })
                                         .session(&mut *s)
@@ -14855,7 +15505,7 @@ mod inner {
                                     .await?;
                                 this.api_specs()
                                     .delete_one(doc! {
-                                        "_id": id.as_str(),
+                                        "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
                                         "namespace": namespace.as_str(),
                                     })
                                     .session(&mut *s)
@@ -14924,7 +15574,10 @@ mod inner {
                 // replica set (see FERRUM_MONGO_REPLICA_SET).
                 if let Some(ref pid) = proxy_id {
                     self.proxies()
-                        .delete_one(doc! { "_id": pid, "namespace": namespace })
+                        .delete_one(doc! {
+                            "_id": namespaced_doc_id(namespace, pid),
+                            "namespace": namespace,
+                        })
                         .await
                         .map_err(anyhow::Error::new)
                         .with_context(|| {
@@ -14991,7 +15644,10 @@ mod inner {
                 // The spec row deletion is the one we must succeed on — if this fails
                 // the spec appears to still exist, which is worse than an orphan.
                 self.api_specs()
-                    .delete_one(doc! { "_id": id, "namespace": namespace })
+                    .delete_one(doc! {
+                        "_id": namespaced_doc_id(namespace, id),
+                        "namespace": namespace,
+                    })
                     .await?;
             }
 
@@ -15529,19 +16185,27 @@ mod inner {
                 .await
         }
 
-        /// Load `_id` values from a collection matching a cold-path filter.
+        /// Load plain resource `id` values from a collection matching a
+        /// cold-path filter.
+        ///
+        /// Every caller passes one of the namespaced resource collections,
+        /// whose `_id` is the composite `"{namespace}:{id}"` since issue
+        /// #4627. Change records, tombstones, and admin responses all speak the
+        /// bare id, so the projection asks for `id` and drops `_id`.
         async fn load_collection_ids_filtered(
             &self,
             collection_name: &str,
             filter: Document,
         ) -> Result<HashSet<String>, anyhow::Error> {
             let collection = self.collection(collection_name);
-            let options = FindOptions::builder().projection(doc! { "_id": 1 }).build();
+            let options = FindOptions::builder()
+                .projection(doc! { "_id": 0, "id": 1 })
+                .build();
             let mut cursor = collection.find(filter).with_options(options).await?;
             let mut ids = HashSet::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                if let Ok(id) = doc.get_str("_id") {
+                if let Ok(id) = doc.get_str("id") {
                     ids.insert(id.to_string());
                 }
             }
@@ -15557,13 +16221,14 @@ mod inner {
             let collection = self.collection(collection_name);
             let mut cursor = collection
                 .find(filter)
-                .projection(doc! { "_id": 1 })
+                // Plain resource id — `_id` is composite (issue #4627).
+                .projection(doc! { "_id": 0, "id": 1 })
                 .session(&mut *session)
                 .await?;
             let mut ids = HashSet::new();
             while cursor.advance(&mut *session).await? {
                 let doc = cursor.deserialize_current()?;
-                if let Ok(id) = doc.get_str("_id") {
+                if let Ok(id) = doc.get_str("id") {
                     ids.insert(id.to_string());
                 }
             }
@@ -16074,8 +16739,12 @@ mod inner {
             namespace: &str,
             spec_id: &str,
         ) -> Result<(), anyhow::Error> {
+            // The durable key is `"{namespace}:{id}"` (issue #4627), so this
+            // preflight only reports a collision inside the caller's own
+            // tenant — a same-id resource in another namespace is no longer a
+            // duplicate key and must not block the replace.
             let existing = collection
-                .find_one(doc! { "_id": id })
+                .find_one(doc! { "_id": namespaced_doc_id(namespace, id) })
                 .projection(doc! { "api_spec_id": 1, "namespace": 1 })
                 .await?;
             if let Some(doc) = existing {
@@ -16102,13 +16771,17 @@ mod inner {
         /// insert error is what the caller returns).
         async fn compensate_bundle_insert(
             &self,
+            namespace: &str,
             upstream_id: &Option<String>,
             proxy_id: &Option<String>,
             plugin_ids: &[String],
             spec_id: Option<&str>,
         ) {
             if let Some(sid) = spec_id
-                && let Err(e) = self.api_specs().delete_one(doc! { "_id": sid }).await
+                && let Err(e) = self
+                    .api_specs()
+                    .delete_one(doc! { "_id": namespaced_doc_id(namespace, sid) })
+                    .await
             {
                 warn!(
                     "compensate_bundle_insert: failed to delete api_spec {}: {}",
@@ -16116,7 +16789,10 @@ mod inner {
                 );
             }
             if let Some(pid) = proxy_id
-                && let Err(e) = self.proxies().delete_one(doc! { "_id": pid }).await
+                && let Err(e) = self
+                    .proxies()
+                    .delete_one(doc! { "_id": namespaced_doc_id(namespace, pid) })
+                    .await
             {
                 warn!(
                     "compensate_bundle_insert: failed to delete proxy {}; \
@@ -16127,7 +16803,11 @@ mod inner {
                 return;
             }
             for pid in plugin_ids {
-                if let Err(e) = self.plugin_configs().delete_one(doc! { "_id": pid }).await {
+                if let Err(e) = self
+                    .plugin_configs()
+                    .delete_one(doc! { "_id": namespaced_doc_id(namespace, pid) })
+                    .await
+                {
                     warn!(
                         "compensate_bundle_insert: failed to delete plugin_config {}: {}",
                         pid, e
@@ -16135,7 +16815,10 @@ mod inner {
                 }
             }
             if let Some(uid) = upstream_id
-                && let Err(e) = self.upstreams().delete_one(doc! { "_id": uid }).await
+                && let Err(e) = self
+                    .upstreams()
+                    .delete_one(doc! { "_id": namespaced_doc_id(namespace, uid) })
+                    .await
             {
                 warn!(
                     "compensate_bundle_insert: failed to delete upstream {}: {}",
@@ -16624,8 +17307,12 @@ mod inner {
             };
 
             let doc = proxy_to_doc(&proxy).expect("proxy_to_doc should succeed");
-            // Verify _id was set
-            assert_eq!(doc.get_str("_id").unwrap(), "test-proxy");
+            // `_id` is the composite "{namespace}:{id}" (issue #4627).
+            assert_eq!(
+                doc.get_str("_id").unwrap(),
+                namespaced_doc_id(&proxy.namespace, &proxy.id)
+            );
+            assert_eq!(doc.get_str("id").unwrap(), "test-proxy");
 
             let restored = doc_to_proxy(doc).expect("doc_to_proxy should succeed");
             assert_eq!(restored.id, proxy.id);
@@ -16688,7 +17375,11 @@ mod inner {
             };
 
             let doc = plugin_config_to_doc(&pc).expect("plugin_config_to_doc should succeed");
-            assert_eq!(doc.get_str("_id").unwrap(), "plugin-1");
+            assert_eq!(
+                doc.get_str("_id").unwrap(),
+                namespaced_doc_id(&pc.namespace, &pc.id)
+            );
+            assert_eq!(doc.get_str("id").unwrap(), "plugin-1");
 
             let restored = doc_to_plugin_config(doc).expect("doc_to_plugin_config should succeed");
             assert_eq!(restored.id, pc.id);
@@ -16744,7 +17435,11 @@ mod inner {
             };
 
             let doc = upstream_to_doc(&upstream).expect("upstream_to_doc should succeed");
-            assert_eq!(doc.get_str("_id").unwrap(), "upstream-1");
+            assert_eq!(
+                doc.get_str("_id").unwrap(),
+                namespaced_doc_id(&upstream.namespace, &upstream.id)
+            );
+            assert_eq!(doc.get_str("id").unwrap(), "upstream-1");
 
             let restored = doc_to_upstream(doc).expect("doc_to_upstream should succeed");
             assert_eq!(restored.id, upstream.id);
@@ -16837,8 +17532,16 @@ mod inner {
                 pending_limit_scope: None,
             };
             let doc = proxy_to_doc(&proxy).unwrap();
-            // The _id should be set to the proxy id
-            assert_eq!(doc.get_str("_id").unwrap(), "unique-id-123");
+            // `_id` is the namespace-qualified durable key (issue #4627), so the
+            // same bare id in another namespace is a different document.
+            assert_eq!(
+                doc.get_str("_id").unwrap(),
+                namespaced_doc_id(&proxy.namespace, "unique-id-123")
+            );
+            assert_ne!(
+                namespaced_doc_id(&proxy.namespace, "unique-id-123"),
+                namespaced_doc_id("other-tenant", "unique-id-123")
+            );
             // The original id field should also be present (BSON serialization includes it)
             assert_eq!(doc.get_str("id").unwrap(), "unique-id-123");
         }
@@ -17677,7 +18380,7 @@ mod inner {
                 .expect("standalone delete_proxy marker");
             let standalone_path = &source[standalone_start..];
             let proxy_delete = standalone_path
-                .find(".delete_one(doc! { \"_id\": id, \"namespace\": namespace })")
+                .find("\"_id\": namespaced_doc_id(namespace, id),")
                 .expect("standalone proxy delete call");
             let plugin_cleanup = standalone_path
                 .find("self.plugin_configs()")
@@ -17992,10 +18695,10 @@ mod inner {
                 .expect("delete_upstream standalone marker");
             let standalone_path = &delete_body[standalone_start..];
             let target_lookup = standalone_path
-                .find(".find_one(doc! { \"_id\": id, \"namespace\": namespace })")
+                .find("\"_id\": namespaced_doc_id(namespace, id),")
                 .expect("namespace-scoped upstream existence lookup");
             let proxy_refs = standalone_path
-                .find(".count_documents(doc! { \"upstream_id\": id })")
+                .find(".count_documents(doc! { \"upstream_id\": id, \"namespace\": namespace })")
                 .expect("proxy reference check");
             let plugin_refs = standalone_path
                 .find(".find_mesh_route_dispatch_upstream_ref_opt_session(None, namespace, id)")

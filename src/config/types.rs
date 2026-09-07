@@ -3194,6 +3194,21 @@ pub struct GatewayConfig {
     /// comparisons and checksums are stable.
     #[serde(skip)]
     pub gateway_trust_bundles: Vec<crate::config::gateway_trust::GatewayTrustBundleRecord>,
+    /// Enabled plugin configs a serving-mode full load quarantined because the
+    /// shared plugin-construction gate refused them (issue #4526).
+    ///
+    /// DERIVED, PROCESS-LOCAL ONLY: `#[serde(skip)]`. It is never persisted and
+    /// never rides the ConfigSync `config_json` wire — both peers are
+    /// `deny_unknown_fields`. CP admission *rejects* an unconstructible plugin
+    /// config instead of quarantining it, so a broadcast snapshot is always
+    /// empty here; only `FullConfigLoadPurpose::Runtime` loads populate it, so
+    /// `database` mode can still reach its admin listener with the offending
+    /// row omitted and repairable in-band.
+    ///
+    /// Each entry is the same operator-facing message the admin API returns for
+    /// a rejected `POST /plugins`, prefixed with the plugin name and config id.
+    #[serde(skip)]
+    pub quarantined_plugin_configs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
     /// `(namespace, listen_port)` pairs whose Gateway API listener terminates

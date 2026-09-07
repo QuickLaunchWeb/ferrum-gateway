@@ -1360,3 +1360,196 @@ async fn proxy_frontend_with_client_auth_arms_its_scope() {
         watcher.abort();
     }
 }
+
+// ── Runtime stapled-OCSP re-check (issue #4505, item 4) ────────────────────
+
+/// A client certificate verifier that accepts anything and records the stapled
+/// OCSP response rustls handed it. An absent staple arrives as an empty slice,
+/// which is the state this test is ultimately asserting.
+#[derive(Debug)]
+struct StapleRecordingVerifier {
+    observed: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for StapleRecordingVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self.observed.lock().expect("staple slot") = Some(ocsp_response.to_vec());
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Handshake against the live listener and return the staple it presented.
+async fn fetch_served_staple(addr: SocketAddr) -> Vec<u8> {
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut client_config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    client_config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(StapleRecordingVerifier {
+            observed: Arc::clone(&observed),
+            provider,
+        }));
+
+    let connector = TlsConnector::from(Arc::new(client_config));
+    let stream = TcpStream::connect(addr).await.expect("connect TCP");
+    let server_name = ServerName::try_from("localhost").expect("server name");
+    let mut tls = connector
+        .connect(server_name, stream)
+        .await
+        .expect("tls handshake");
+    let _ = tls
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await;
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(500), tls.read_to_end(&mut buf)).await;
+
+    observed
+        .lock()
+        .expect("staple slot")
+        .clone()
+        .expect("the client verifier must have run")
+}
+
+/// End to end on the real HTTPS listener: a short-lived staple is presented
+/// before its `nextUpdate` and gone after the periodic re-check, and a
+/// refreshed response published the way live reload publishes one re-attaches
+/// it.
+///
+/// The re-check is driven directly rather than by waiting out
+/// [`ferrum_edge::tls::ocsp_recheck::STAPLE_RECHECK_INTERVAL`], and it is
+/// scoped to this test's own source so a concurrent test's staple is not
+/// retired by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_listener_stops_serving_a_staple_once_the_recheck_retires_it() {
+    use crate::scaffolding::ocsp::StapledPki;
+
+    ensure_crypto_provider();
+    let state = test_proxy_state(test_env_config());
+
+    let pki = StapledPki::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cert_path = dir.path().join("server.crt");
+    let key_path = dir.path().join("server.key");
+    let ocsp_path = dir.path().join("staple.der");
+    std::fs::write(&cert_path, &pki.chain_pem).expect("write chain");
+    std::fs::write(&key_path, &pki.leaf_key_pem).expect("write key");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs() as i64;
+    let expires_at = now + 3_600;
+    let staple = pki.ocsp_response(now - 60, expires_at);
+    std::fs::write(&ocsp_path, &staple).expect("write staple");
+
+    let cert_path = cert_path.to_string_lossy().into_owned();
+    let key_path = key_path.to_string_lossy().into_owned();
+    let ocsp_path = ocsp_path.to_string_lossy().into_owned();
+
+    let policy =
+        ferrum_edge::tls::TlsPolicy::from_env_config(&EnvConfig::default()).expect("tls policy");
+    let load = || {
+        ferrum_edge::tls::load_frontend_tls_candidate_from_paths(
+            &cert_path,
+            &key_path,
+            None,
+            Some(&ocsp_path),
+            false,
+            &policy,
+            30,
+            0,
+            &[],
+            None,
+        )
+        .expect("a staple inside its window is admitted")
+    };
+
+    let candidate = load();
+    let slot: ferrum_edge::tls::SharedFrontendTls =
+        Arc::new(ArcSwap::new(Arc::new(Some(Arc::clone(&candidate.config)))));
+    let (addr, shutdown_tx, listener) =
+        start_dynamic_tls_listener_with_retry(&state, slot.clone()).await;
+
+    assert_eq!(
+        fetch_served_staple(addr).await,
+        staple,
+        "the listener must present the validated staple before its nextUpdate"
+    );
+
+    // The re-check retires it in place. Nothing rebuilt the `ServerConfig` and
+    // nothing swapped the slot, which is exactly the posture a deployment
+    // without FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED is in.
+    let outcome =
+        ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(expires_at, Some(ocsp_path.as_str()));
+    assert_eq!(outcome.dropped, 1, "the expired staple is retired");
+    assert!(
+        fetch_served_staple(addr).await.is_empty(),
+        "the listener must present no staple after the re-check"
+    );
+
+    // Live reload's own path re-attaches a refreshed response: the rebuild
+    // closure is this same load, and publishing it into the slot is what the
+    // watcher does on an accepted candidate.
+    let refreshed = pki.ocsp_response(now, expires_at + 7_200);
+    assert_ne!(refreshed, staple, "the refreshed response must differ");
+    std::fs::write(&ocsp_path, &refreshed).expect("rewrite staple");
+    slot.store(Arc::new(Some(load().config)));
+    assert_eq!(
+        fetch_served_staple(addr).await,
+        refreshed,
+        "a refreshed staple adopted through the ordinary reload path is served again"
+    );
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), listener)
+        .await
+        .expect("listener should stop")
+        .expect("listener task should join")
+        .expect("listener should return cleanly");
+}

@@ -366,6 +366,24 @@ impl InventoryEntryBuilder {
 /// watcher/rebuild failure for the same configured source identity downgrades
 /// the entry without re-reading a single byte.
 fn populate_entry_from_reload_state(entry: &mut TlsInventoryEntry) {
+    // A staple retired at runtime is a serving-state fact, not a source-read
+    // fact, so the metrics scope — which never materializes OCSP bytes — must
+    // report it here too (issue #4505). There is no loaded `nextUpdate` to
+    // compare against on this path, so any recorded drop for this configured
+    // source applies until a later accepted load clears it.
+    if entry.material_kind == "ocsp"
+        && crate::tls::ocsp_recheck::dropped_staple_next_update(&entry.source.identifier).is_some()
+    {
+        entry.state = TlsInventoryState::Invalid;
+        entry.error = Some(
+            "stapled OCSP response reached its nextUpdate and was dropped at runtime; this \
+             listener serves no staple until the source is refreshed"
+                .to_string(),
+        );
+        entry.next_update = None;
+        entry.days_until_next_update = None;
+        return;
+    }
     let Some(failure) = crate::tls::events::latest_source_failure(&entry.source.identifier) else {
         return;
     };
@@ -975,9 +993,47 @@ fn populate_ocsp_metadata(
 ) -> Result<(), String> {
     let structure = crate::tls::ocsp::validate_structure(bytes.expose_secret())?;
     if let Some(next_update) = structure.earliest_next_update {
+        if apply_dropped_staple_state(entry, next_update) {
+            return Ok(());
+        }
         set_next_update(entry, next_update);
     }
     Ok(())
+}
+
+/// Report a staple this process retired at runtime (issue #4505, item 4).
+///
+/// The source's bytes are unchanged after a drop — the operator's stale
+/// response is still on disk — so reading them would keep advertising a
+/// deadline for material no listener serves any more. Returns whether the entry
+/// was rewritten as retired.
+///
+/// The entry deliberately keeps **no** `next_update`: the revocation gauge is
+/// derived from that field, so leaving it set would keep emitting
+/// `ferrum_tls_revocation_expiry_seconds{kind="ocsp"}` with an ever more
+/// negative countdown for a staple that is not being stapled. Clearing it makes
+/// the row disappear on the next refresh, which is the same thing that happens
+/// when the source is removed — one meaning for "no row": nothing to alert on.
+fn apply_dropped_staple_state(entry: &mut TlsInventoryEntry, next_update_unix: i64) -> bool {
+    let Some(dropped_next_update) =
+        crate::tls::ocsp_recheck::dropped_staple_next_update(&entry.source.identifier)
+    else {
+        return false;
+    };
+    // A source whose bytes now carry a *different* deadline has been refreshed
+    // since the drop, even if nothing has reloaded it yet. Report what it holds
+    // rather than a retirement that no longer describes it.
+    if dropped_next_update != next_update_unix {
+        return false;
+    }
+    entry.state = TlsInventoryState::Invalid;
+    entry.error = Some(
+        "stapled OCSP response reached its nextUpdate and was dropped at runtime; this listener          serves no staple until the source is refreshed"
+            .to_string(),
+    );
+    entry.next_update = None;
+    entry.days_until_next_update = None;
+    true
 }
 
 /// Store `next_update` and its whole-day countdown on `entry`.

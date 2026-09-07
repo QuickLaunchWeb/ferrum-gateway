@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-09-06
+
+Patch release replacing `v0.9.2`, whose release workflow was retracted after
+its SBOM check rejected syft's SPDX 2.3 output (no `documentDescribes`); the
+check now accepts the `SPDXRef-DOCUMENT` `DESCRIBES` relationship. Also carries
+the 2026-09-05 backlog wave: OIDC refresh coalescing, response-caching
+conditional and `Expires` freshness fixes, bodyless-response handling under
+whole-body SSE policies, `Max-Forwards` on proxied `OPTIONS`, Kubernetes watch
+backoff with relist divergence detection, quote-aware `ferrum.conf` comments,
+positional SPIFFE service-account parsing, writable `/data` in the runtime
+images, and the CI reliability fixes (fuzz-smoke deadline, macOS deployment
+target, FIPS clippy headroom, cache-lane diet).
+
+## [0.9.2] - 2026-09-04
+
+Patch release replacing `v0.9.1`, whose tag commit can never satisfy the
+release publication gate: the main push run at that commit was cancelled by the
+next merge, and the gate blocks on any non-successful check run in a canonical
+push suite. Beyond the 0.9.1 content, this release carries the database-mode
+startup-backup namespace filter (#4629), connection admission on the mesh
+application-probe and NodeWaypoint capture listeners (#4631), `(namespace, id)`
+resource identity in every durable schema (#4632), and end-to-end proof that a
+malformed fail-closed plugin row never serves fail-open (#4630).
+
+## [0.9.1] - 2026-09-03
+
+Patch release cut so that an immutable `v0.9.1` release and matching multi-arch
+images exist for the Helm charts' default `appVersion`. The from-source arm64
+eBPF image now builds with thin LTO and 16 codegen units (#4602); the release
+also carries the launch-readiness fixes merged since 0.9.0.
+
 ## [0.9.0] - 2026-09-02
 
 Ferrum Edge 0.9.0 represents the current build-out baseline: a multi-protocol

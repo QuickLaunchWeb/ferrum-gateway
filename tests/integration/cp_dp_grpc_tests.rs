@@ -7119,3 +7119,115 @@ async fn test_xds_simultaneous_client_disconnect_releases_every_permit() {
     assert_eq!(admission.active_nodes(), 0);
     assert_eq!(admission.tracked_principals(), 0);
 }
+
+/// Issue #4526: a `plugin_configs` row no serving mode can construct must be
+/// refused by CP admission — and, if one ever reaches a data plane anyway, the
+/// DP must report the rejection instead of silently freezing on
+/// last-known-good with the CP still showing the fleet in sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_refuses_unconstructible_plugin_config_and_dp_reports_rejection() {
+    let mut unconstructible = create_test_config(1);
+    unconstructible.plugin_configs = vec![PluginConfig {
+        id: "rsl-typo".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "request_size_limiting".to_string(),
+        // Closed config object: `max_bytez` is a typo the constructor rejects.
+        // Plugin construction — not the JSON schema — is the real gate.
+        config: serde_json::json!({"max_bytes": 1024, "max_bytez": 1}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+
+    // 1) CP admission: the shared rejecting contract now runs the same
+    //    construction gate the data plane runs, so this snapshot can never be
+    //    accepted or broadcast in the first place.
+    let admission_errors =
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(
+            &unconstructible,
+        );
+    assert!(
+        admission_errors
+            .iter()
+            .any(|error| error.contains("request_size_limiting") && error.contains("rsl-typo")),
+        "CP admission must refuse an unconstructible plugin config, naming the plugin and its \
+         config id: {admission_errors:?}"
+    );
+
+    // 2) Defence in depth: push it to a live DP anyway (a CP running older
+    //    code, or a direct broadcast). The DP must keep serving last-known-good
+    //    AND raise sticky divergence — `ConfigSync.Subscribe` has no client
+    //    acknowledgement, so this DP-side signal is the only in-band evidence
+    //    that the data plane is frozen.
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(cp_config, 16).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&cp_url),
+    )));
+    let client_connection_state = connection_state.clone();
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            Some(client_connection_state),
+            None,
+        )
+        .await;
+    });
+
+    let received_initial = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received_initial.is_ok(), "DP should receive initial config");
+    assert!(
+        wait_for_connected(&connection_state, Duration::from_secs(5)).await,
+        "DP should establish a ConfigSync stream"
+    );
+
+    CpGrpcServer::broadcast_update(&update_tx, &unconstructible);
+
+    let reported = timeout(Duration::from_secs(10), async {
+        loop {
+            if delta_rejection_recorded(&connection_state) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        reported.is_ok(),
+        "an admitted FULL_SNAPSHOT that fails to apply must raise sticky config_diverged on \
+         GET /cluster rather than freezing the DP silently"
+    );
+    assert_eq!(
+        proxy_state.config.load().plugin_configs.len(),
+        0,
+        "the unconstructible plugin config must never reach the live generation"
+    );
+
+    client_handle.abort();
+}

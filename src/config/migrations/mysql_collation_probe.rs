@@ -210,6 +210,10 @@ pub fn identity_bearing_columns() -> &'static [IdentityBearingColumn] {
         // proxy_plugins
         IdentityBearingColumn {
             table: "proxy_plugins",
+            column: "namespace",
+        },
+        IdentityBearingColumn {
+            table: "proxy_plugins",
             column: "proxy_id",
         },
         IdentityBearingColumn {

@@ -38,6 +38,12 @@ from ci_runtime_plan import (
     self_test as plan_self_test,
 )
 from ci_runtime_telemetry import self_test as telemetry_self_test
+from verify_cross_build_policy import (
+    AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
+    AMBIENT_REGISTRY_IMAGE_READ_JOB,
+    AMBIENT_REGISTRY_IMAGE_WRITE_JOB,
+    extract_job_contract_block,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -56,6 +62,19 @@ CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+# Only the PR-editable direct sites; frozen composites/FIPS/fuzz/perf retain
+# their separately governed contracts. True means compiler-cache-only reuse.
+DIRECT_CACHE_DIET_JOBS = (
+    ("ci.yml", "build-binaries", False),
+    ("ci.yml", "build-ebpf", False),
+    ("perf-benchmark.yml", "benchmark", False),
+    ("payload-size-benchmark.yml", "benchmark", False),
+    ("scale-benchmark.yml", "scale-benchmark", False),
+    ("comparison-benchmark.yml", "comparison", True),
+    ("connection-saturation-benchmark.yml", "saturation", True),
+    ("gateways-protocol-benchmark.yml", "benchmark", True),
+)
 
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
@@ -164,8 +183,8 @@ NODE_WAYPOINT_PLANNER_OUTPUT = (
     "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
 )
 NODE_WAYPOINT_LIVE_IF = (
-    "always() && "
-    "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+    "${{ !cancelled() && "
+    "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' }}"
 )
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 USES = re.compile(
@@ -620,12 +639,12 @@ def check_node_waypoint_live_job(
     require(
         live_condition == NODE_WAYPOINT_LIVE_IF,
         f"{source} live job must skip only on exact {NODE_WAYPOINT_PLANNER_OUTPUT} "
-        f"!= 'false' under always(); found: {live_condition}",
+        f"!= 'false' under !cancelled(); found: {live_condition}",
         failures,
     )
     require(
-        "always()" in live_condition,
-        f"{source} live job must use always() so a planner failure cannot skip",
+        "!cancelled()" in live_condition and "always()" not in live_condition,
+        f"{source} live job must use !cancelled() to stop superseded runs and fail closed on planner failure",
         failures,
     )
     require(
@@ -3355,11 +3374,37 @@ def check_rust_cache_trusted_main_save_if(
             "refs/heads/main so pull requests and merge groups restore only",
             failures,
         )
+
+
+def check_direct_rust_cache_diet(
+    job: str,
+    source: str,
+    failures: list[str],
+    *,
+    compiler_only: bool,
+) -> None:
+    blocks = rust_cache_with_blocks(job)
+    require(len(blocks) == 1, f"{source} must keep one pinned rust-cache site", failures)
+    for block in blocks:
+        saves = re.findall(r"(?m)^\s*save-if:([^\n]*)$", block)
         require(
-            "cache-on-failure:" in block and "true" in block,
-            f"{source} rust-cache site {index} must keep cache-on-failure true",
+            [value.strip() for value in saves]
+            == ["${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"],
+            f"{source} must save only on pushes to main",
             failures,
         )
+        if compiler_only:
+            require(
+                re.findall(r"(?m)^\s*cache-targets:([^\n]*)$", block) == [' "false"'],
+                f"{source} must not archive the unused root target",
+                failures,
+            )
+        else:
+            require(
+                not with_has_key(block, "cache-directories"),
+                f"{source} must not duplicate sccache alongside target dependencies",
+                failures,
+            )
 
 
 def buildkit_cache_key(scope: str) -> str:
@@ -3527,6 +3572,34 @@ def with_scalar(with_block: str, key: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
         return value[1:-1]
     return value
+
+
+def check_ambient_workflow_cache_budget(workflow: str, failures: list[str]) -> None:
+    """Keep the complete reader/writer generation tied to the trusted contract."""
+    image, extraction_errors = extract_job_contract_block(
+        workflow, "Ambient registry cache", "ambient-host-udp-image", required=True
+    )
+    failures.extend(extraction_errors)
+    if image == AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB:
+        for name, expected in (
+            ("ambient-host-udp-image-read", AMBIENT_REGISTRY_IMAGE_READ_JOB),
+            ("ambient-host-udp-image-write", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
+        ):
+            actual, extraction_errors = extract_job_contract_block(
+                workflow, "Ambient registry cache", name, required=True
+            )
+            failures.extend(extraction_errors)
+            require(
+                actual == expected,
+                f"{name} must preserve the complete registry cache contract",
+                failures,
+            )
+    else:
+        check_ambient_image_cache_budget(
+            extract_job(workflow, "ambient-host-udp-image"),
+            "ambient-host-udp-image",
+            failures,
+        )
 
 
 def check_ambient_image_cache_budget(
@@ -4437,6 +4510,47 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     )
 
 
+# The eBPF image has the same target/profile/features as Ambient's trusted
+# GHCR writer. NodeWaypoint imports that cache anonymously on every event.
+NODE_EBPF_REGISTRY_REF = "type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:ambient-v1-linux-amd64-runtime-ebpf"
+NODE_EBPF_BUILD_WITH = """          context: .
+          file: Dockerfile
+          target: runtime-ebpf
+          build-args: |
+            CARGO_PROFILE=pr-build
+            FEATURES=cloud-secrets,ebpf
+          load: true
+          tags: ferrum-edge:production-ebpf-smoke
+          provenance: false
+"""
+
+
+def check_node_ebpf_registry_reader(job: str, failures: list[str]) -> None:
+    steps = job_steps(job)
+    actions = [step_uses(step) for step in steps if step_uses(step)]
+    require(actions == [CHECKOUT, BUILDX, BUILD_PUSH, BUILD_PUSH],
+            "Node eBPF reader must use only checkout, buildx and two pinned builds", failures)
+    require("persist-credentials: false" in job and "permissions:" not in job,
+            "Node eBPF reader must inherit read-only permissions and disable checkout credentials", failures)
+    require(not any(token in job for token in ("cache-to:", "actions/cache", "docker login", "secrets.")),
+            "Node eBPF reader must not authenticate or export/cache an archive", failures)
+    builds = [step for step in steps if step_uses(step) == BUILD_PUSH]
+    require(len(builds) == 2, "Node eBPF reader must retain warm and cold builds", failures)
+    for index, step in enumerate(builds):
+        cold = index == 1
+        condition = COLD_IS_TRUE if cold else COLD_NOT_TRUE
+        expected = NODE_EBPF_BUILD_WITH
+        if not cold:
+            expected += f"          cache-from: {NODE_EBPF_REGISTRY_REF}\n"
+        require(step_if(step) == condition and step_with(step).strip() == expected.strip(),
+                "Node eBPF build must preserve exact inputs and exclusive warm/cold import policy", failures)
+    require("--phase image-build" in job and "--phase ebpf-inventory" in job
+            and "policy=anonymous-restore-only" in job and "policy=force-cold" in job,
+            "Node eBPF reader must retain image/inventory timing and cache policy telemetry", failures)
+    require("--hit true" not in job and "classify-restore" not in job,
+            "Node eBPF registry telemetry must not invent an Actions cache hit", failures)
+
+
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
     require(
         re.search(r"(?m)^    name: Production Dockerfile eBPF image smoke$", workflow)
@@ -4479,16 +4593,10 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "production-dockerfile-smoke-default",
         failures,
     )
-    check_buildkit_cache_boundary(
-        ebpf_job,
-        "production-dockerfile-smoke-ebpf",
-        failures,
-    )
+    check_node_ebpf_registry_reader(ebpf_job, failures)
     require(
         "trusted-publish" in default_job
-        and "fork-restore-only" in default_job
-        and "trusted-publish" in ebpf_job
-        and "fork-restore-only" in ebpf_job,
+        and "fork-restore-only" in default_job,
         "production-image telemetry must name the trusted-publish and "
         "fork-restore-only cache-to policies",
         failures,
@@ -4500,24 +4608,11 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "local BuildKit cache",
         failures,
     )
-    require(
-        "type=local" in ebpf_job
-        and buildkit_cache_key("production-dockerfile-smoke-ebpf") in ebpf_job,
-        "eBPF production-image job must restore a schema- and architecture-scoped "
-        "local BuildKit cache",
-        failures,
-    )
     check_local_cache_actions(
         default_job,
         "production-dockerfile-smoke-default",
         failures,
         scope="production-dockerfile-smoke-default",
-    )
-    check_local_cache_actions(
-        ebpf_job,
-        "production-dockerfile-smoke-ebpf",
-        failures,
-        scope="production-dockerfile-smoke-ebpf",
     )
     check_cache_save_preparation(
         default_job,
@@ -4525,20 +4620,9 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         failures,
         scope="production-dockerfile-smoke-default",
     )
-    check_cache_save_preparation(
-        ebpf_job,
-        "production-dockerfile-smoke-ebpf",
-        failures,
-        scope="production-dockerfile-smoke-ebpf",
-    )
     check_cache_telemetry_evidence(
         default_job,
         "production-dockerfile-smoke-default",
-        failures,
-    )
-    check_cache_telemetry_evidence(
-        ebpf_job,
-        "production-dockerfile-smoke-ebpf",
         failures,
     )
     plan_job = extract_job(workflow, "production-dockerfile-plan")
@@ -4608,14 +4692,22 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
     )
 
 
+def check_completed_rust_cache_save(action: str, failures: list[str]) -> None:
+    blocks = rust_cache_with_blocks(action)
+    require(len(blocks) == 1, "setup-rust-ci must have one Rust cache step", failures)
+    for block in blocks:
+        values = re.findall(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", block)
+        require(
+            values == ['"false"'],
+            "setup-rust-ci must publish Rust caches only after successful jobs",
+            failures,
+        )
+
+
 def check_shared_actions(failures: list[str]) -> None:
     rust_ci = SETUP_RUST.read_text(encoding="utf-8")
     sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
-    require(
-        "cache-on-failure:" in rust_ci and "true" in rust_ci,
-        "setup-rust-ci must save rust-cache after ordinary failures when post-job cleanup still runs",
-        failures,
-    )
+    check_completed_rust_cache_save(rust_ci, failures)
     require(
         "cache-hit:" in rust_ci,
         "setup-rust-ci must expose rust-cache hit/miss as an action output",
@@ -4870,8 +4962,8 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "node_waypoint_relevant" in ci_cd and "always()" in ci_cd,
-        "docs/ci_cd.md must document the NodeWaypoint job-level always() exact-false skip",
+        "node_waypoint_relevant" in ci_cd and "!cancelled()" in ci_cd,
+        "docs/ci_cd.md must document the NodeWaypoint cancellable job-level exact-false skip",
         failures,
     )
     require(
@@ -5021,6 +5113,108 @@ def check_dockerfile(failures: list[str]) -> None:
 
 def self_test() -> int:
     failures: list[str] = []
+    completed_cache = SETUP_RUST.read_text(encoding="utf-8")
+    cache_errors: list[str] = []
+    check_completed_rust_cache_save(completed_cache, cache_errors)
+    require(not cache_errors, "self-test: completed-cache action must pass", failures)
+    for replacement in (
+        'cache-on-failure: "true"',
+        '# cache-on-failure: "false"',
+        "cache-on-failure: ${{ always() }}",
+        'cache-on-failure: "false"\n        cache-on-failure: "true"',
+    ):
+        mutated = completed_cache.replace('cache-on-failure: "false"', replacement)
+        cache_errors = []
+        require(mutated != completed_cache, "self-test: cache mutation must apply", failures)
+        check_completed_rust_cache_save(mutated, cache_errors)
+        require(bool(cache_errors), "self-test: incomplete cache save must fail", failures)
+    node_reader = NODE_WORKFLOW.read_text(encoding="utf-8")
+    node_reader = extract_job(node_reader, "production-dockerfile-smoke-ebpf")
+    reader_errors: list[str] = []
+    check_node_ebpf_registry_reader(node_reader, reader_errors)
+    require(not reader_errors, "self-test: Node registry reader must pass", failures)
+    for before, after in (
+        (NODE_EBPF_REGISTRY_REF, "type=registry,ref=ghcr.io/untrusted/cache:latest"),
+        ("target: runtime-ebpf", "target: runtime"),
+        ("FEATURES=cloud-secrets,ebpf", "FEATURES=cloud-secrets"),
+        ("CARGO_PROFILE=pr-build", "CARGO_PROFILE=release"),
+        ("load: true", "load: false"),
+        (COLD_IS_TRUE, COLD_NOT_TRUE),
+        ("persist-credentials: false", "persist-credentials: true"),
+        ("          cache-from:", "          cache-to:"),
+        ("--phase ebpf-inventory", "--phase removed-inventory"),
+    ):
+        mutated = node_reader.replace(before, after)
+        require(mutated != node_reader, "self-test: Node reader mutation must apply", failures)
+        reader_errors = []
+        check_node_ebpf_registry_reader(mutated, reader_errors)
+        require(bool(reader_errors), "self-test: Node reader regression must fail", failures)
+    registry_fixture = (
+        "jobs:\n" + AMBIENT_REGISTRY_IMAGE_READ_JOB + "\n"
+        + AMBIENT_REGISTRY_IMAGE_WRITE_JOB + "\n"
+        + AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB
+    )
+    registry_errors: list[str] = []
+    check_ambient_workflow_cache_budget(registry_fixture, registry_errors)
+    if registry_errors:
+        failures.append("complete Ambient registry-cache fixture was rejected")
+    for label, removed in (
+        ("reader", AMBIENT_REGISTRY_IMAGE_READ_JOB),
+        ("writer", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
+        ("aggregate", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB),
+    ):
+        registry_errors = []
+        check_ambient_workflow_cache_budget(
+            registry_fixture.replace(removed, "", 1), registry_errors
+        )
+        if not registry_errors:
+            failures.append(f"registry-cache fixture without {label} was accepted")
+    direct_cache = (
+        f"      - uses: {RUST_CACHE}\n"
+        "        with:\n"
+        "          shared-key: diet-test\n"
+        "          save-if: ${{ github.event_name == 'push' && "
+        "github.ref == 'refs/heads/main' }}\n"
+    )
+    for compiler_only in (False, True):
+        good_cache = direct_cache
+        if compiler_only:
+            good_cache += (
+                '          cache-targets: "false"\n'
+                "          cache-directories: ${{ github.workspace }}/.cache/sccache\n"
+            )
+        good_failures: list[str] = []
+        check_direct_rust_cache_diet(
+            good_cache, "self-test-direct-diet", good_failures, compiler_only=compiler_only
+        )
+        require(not good_failures, "self-test: valid direct cache diet must pass", failures)
+        mutations = [
+            good_cache.replace("github.event_name == 'push'", "github.event_name != 'push'"),
+            good_cache.replace("refs/heads/main", "refs/heads/feature"),
+            good_cache + "          save-if: true\n",
+            good_cache.replace(f"      - uses: {RUST_CACHE}\n", ""),
+        ]
+        if compiler_only:
+            mutations.append(
+                good_cache.replace('cache-targets: "false"', 'cache-targets: "true"')
+            )
+        else:
+            mutations.append(
+                good_cache + "          cache-directories: ${{ github.workspace }}/.cache/sccache\n"
+            )
+        for mutation in mutations:
+            mutation_failures: list[str] = []
+            check_direct_rust_cache_diet(
+                mutation,
+                "self-test-direct-diet-mutation",
+                mutation_failures,
+                compiler_only=compiler_only,
+            )
+            require(
+                bool(mutation_failures),
+                "self-test: direct cache save/archive regression must fail",
+                failures,
+            )
     require(
         builder_arg_features_is_after_apt(
             "FROM rust:latest AS builder\n"
@@ -8141,17 +8335,31 @@ def self_test() -> int:
         failures,
     )
 
-    no_always_failures: list[str] = []
+    no_cancelled_failures: list[str] = []
     check_node_waypoint_live_job(
         _live_workflow(
             "needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
         ),
-        "self-test-live-no-always",
-        no_always_failures,
+        "self-test-live-no-cancelled",
+        no_cancelled_failures,
     )
     require(
-        any("always()" in item for item in no_always_failures),
-        "self-test: NodeWaypoint live job without always() must fail",
+        any("!cancelled()" in item for item in no_cancelled_failures),
+        "self-test: NodeWaypoint live job without !cancelled() must fail",
+        failures,
+    )
+
+    uncancellable_failures: list[str] = []
+    check_node_waypoint_live_job(
+        _live_workflow(
+            "always() && needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'"
+        ),
+        "self-test-live-uncancellable",
+        uncancellable_failures,
+    )
+    require(
+        any("!cancelled()" in item for item in uncancellable_failures),
+        "self-test: NodeWaypoint live job with always() must fail cancellation policy",
         failures,
     )
 
@@ -8515,13 +8723,17 @@ def main(argv: list[str] | None = None) -> int:
     check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
     check_fips(fips, failures)
     check_production_smoke(node, failures)
-    check_ambient_image_cache_budget(
-        extract_job(ambient, "ambient-host-udp-image"),
-        "ambient-host-udp-image",
-        failures,
-    )
+    check_ambient_workflow_cache_budget(ambient, failures)
     check_shared_actions(failures)
     check_performance_cache_wrapper_key(ci, "ci.yml", failures)
+    for filename, job_name, compiler_only in DIRECT_CACHE_DIET_JOBS:
+        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        check_direct_rust_cache_diet(
+            extract_job(workflow, job_name),
+            f"{filename}/{job_name}",
+            failures,
+            compiler_only=compiler_only,
+        )
     check_docs_and_coverage(failures)
     check_dockerfile(failures)
     for failure in failures:

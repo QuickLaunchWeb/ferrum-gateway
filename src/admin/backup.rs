@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::db_backend::validate_api_spec_proxy_plugin_association;
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
+use crate::config::namespace_filter::{NamespaceRetention, retain_namespace};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, Proxy, SpecFormat, Upstream,
 };
@@ -471,43 +472,24 @@ pub(crate) struct RestorePayload {
     pub gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
 }
 
+/// Project a cached multi-namespace snapshot onto one namespace for a
+/// namespace-scoped administrative export.
+///
+/// Delegates to the shared configuration-layer filter
+/// ([`crate::config::namespace_filter::retain_namespace`]) so there is exactly
+/// one definition of which `GatewayConfig` fields are namespace-owned: that
+/// helper destructures the struct exhaustively, so a new namespace-owned field
+/// cannot silently escape either this export or the database-mode startup
+/// backup projection.
+///
+/// [`NamespaceRetention::EXPORT`] is the right policy here because this is data
+/// at rest for a later restore rather than a snapshot about to be served: the
+/// discovered `known_namespaces` list and the mesh model are carried through,
+/// while every namespace-owned resource collection — proxies, consumers, plugin
+/// configs, upstreams, trust records, Gateway TLS material and the
+/// namespace-qualified TLS listener classification — is filtered.
 pub(crate) fn filter_config_by_namespace(config: &GatewayConfig, namespace: &str) -> GatewayConfig {
-    GatewayConfig {
-        version: config.version.clone(),
-        proxies: config
-            .proxies
-            .iter()
-            .filter(|proxy| proxy.namespace == namespace)
-            .cloned()
-            .collect(),
-        consumers: config
-            .consumers
-            .iter()
-            .filter(|consumer| consumer.namespace == namespace)
-            .cloned()
-            .collect(),
-        plugin_configs: config
-            .plugin_configs
-            .iter()
-            .filter(|plugin_config| plugin_config.namespace == namespace)
-            .cloned()
-            .collect(),
-        upstreams: config
-            .upstreams
-            .iter()
-            .filter(|upstream| upstream.namespace == namespace)
-            .cloned()
-            .collect(),
-        // Namespace-keyed trust bundles are tenant material: a namespace-scoped
-        // backup must carry its own record and nothing else (issue #3727).
-        gateway_trust_bundles: config
-            .gateway_trust_bundles
-            .iter()
-            .filter(|record| record.namespace == namespace)
-            .cloned()
-            .collect(),
-        ..config.clone()
-    }
+    retain_namespace(config.clone(), namespace, NamespaceRetention::EXPORT).0
 }
 
 /// Validate the versioned `api_specs` backup section without logging document

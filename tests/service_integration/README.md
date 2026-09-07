@@ -93,6 +93,33 @@ The allocator therefore:
 Do not pin a single fixed host port (that trades a race for a hard collision
 under parallel jobs) and do not blanket-retry unrelated container errors.
 
+## Per-phase deadlines (issue #4600)
+
+Every fixture phase that talks to Docker or to the service over the network is
+bounded, and a breached bound names the phase and the elapsed time. Without
+that, a stalled registry pull or a request the server never answers hangs the
+case until nextest's `terminate-after` kill — and that kill message names only
+the test, so the log says nothing about which phase was stuck. (Observed on
+`clickhouse::clickhouse_ddl_jsoneachrow_round_trip`: 90+ minutes of
+`SLOW [>5400s]` while sibling runs finished the job in 18.)
+
+The shared bounds live in `common/containers.rs`:
+
+- `fixture_http_client()` / `fixture_http_client_builder()` —
+  `reqwest::Client` with `FIXTURE_HTTP_TIMEOUT` (10s per request) and
+  `FIXTURE_HTTP_CONNECT_TIMEOUT` (5s). Never use `reqwest::Client::new()` in a
+  fixture: its default is no request timeout at all.
+- `start_within_deadline()` / `CONTAINER_START_TIMEOUT` — 5 minutes for one
+  `start()` (image pull + create + start). The retry-on-collision behaviour
+  above is unchanged; the deadline only stops an attempt hanging forever.
+- `with_phase_deadline()` — the general form, for any other phase that needs a
+  named bound (e.g. `docker exec`, `CONTAINER_EXEC_TIMEOUT`).
+
+These are in addition to, not a replacement for, each fixture's readiness and
+poll loops, and in addition to the job-level `timeout-minutes` and the nextest
+`slow-timeout`/`terminate-after` override from issue #4601, which bound the
+blast radius but cannot say what stalled.
+
 ## Container images (free / OSS)
 
 | Backend | Image | Notes |
