@@ -1456,13 +1456,19 @@ async fn functional_mesh_mode_starts_after_native_mesh_subscribe() {
                 config_protocol: "native",
                 topology: "sidecar",
                 waypoint_name: None,
-                env_overrides: Vec::new(),
+                env_overrides: vec![("FERRUM_POOL_SHARD_AMOUNT", "1".to_string())],
             },
         );
 
         let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
-        let inbound_listening = wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await;
-        let outbound_listening = wait_for_tcp_port(outbound_port, Duration::from_secs(5)).await;
+        let inbound_listening =
+            wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT)
+                .await
+                .is_ready();
+        let outbound_listening =
+            wait_for_gateway_listener(&mut child, outbound_port, Duration::from_secs(5))
+                .await
+                .is_ready();
 
         kill_child(&mut child);
         let subscribe_count = cp.subscribe_count.load(Ordering::Relaxed);
