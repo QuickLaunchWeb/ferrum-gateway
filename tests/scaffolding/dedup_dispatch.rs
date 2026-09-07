@@ -1,6 +1,6 @@
 //! Shared local and two-process Redis dispatch-provenance acceptance cases.
 
-use super::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+use super::backends::{Http1Request, HttpStep, RequestMatcher, ScriptedHttp1Backend};
 use super::harness::GatewayHarness;
 use super::ports::{reserve_port, reserve_refused_tcp_port};
 use serde_json::{Value, json};
@@ -81,6 +81,33 @@ fn assert_not_replayed(response: &reqwest::Response) {
     assert!(response.headers().get("x-idempotent-replayed").is_none());
 }
 
+fn is_operation(request: &Http1Request) -> bool {
+    request.method == "POST" && request.path == "/operation"
+}
+
+fn is_capability_probe(request: &Http1Request) -> bool {
+    // Binary gateways perform an initial h2c capability probe even when pool
+    // warmup is disabled. Its connection preface is not an application write.
+    request.method == "PRI" && request.path == "*" && request.version == "HTTP/2.0"
+}
+
+fn operation_or_capability_probe() -> RequestMatcher {
+    RequestMatcher::custom(|request| is_operation(request) || is_capability_probe(request))
+}
+
+async fn assert_one_operation(backend: &ScriptedHttp1Backend) {
+    backend.assert_no_matcher_mismatches().await;
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| is_operation(request))
+            .count(),
+        1,
+        "exactly one application write; observed requests: {requests:?}"
+    );
+}
+
 pub async fn assert_dispatch_provenance(redis: Option<Value>) {
     let distributed = redis.is_some();
 
@@ -93,10 +120,7 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
     assert_not_replayed(&failed);
     let _ = failed.bytes().await.expect("consume gateway failure");
     let backend = ScriptedHttp1Backend::builder(refused.into_listener().expect("activate backend"))
-        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
-            "POST",
-            "/operation",
-        )))
+        .step(HttpStep::ExpectRequest(operation_or_capability_probe()))
         .step(HttpStep::RespondStatus {
             status: 200,
             reason: "OK".into(),
@@ -117,8 +141,7 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
     assert_eq!(replay.status(), reqwest::StatusCode::OK);
     assert_eq!(replay.headers()["x-idempotent-replayed"], "true");
     assert_eq!(replay.text().await.unwrap(), "done");
-    backend.assert_no_matcher_mismatches().await;
-    assert_eq!(backend.received_requests().await.len(), 1);
+    assert_one_operation(&backend).await;
     drop((first, peer, backend));
 
     // The backend commits its operation before withholding response headers.
@@ -130,8 +153,12 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
     let backend = ScriptedHttp1Backend::builder(reserved.into_listener())
         .step(HttpStep::ExpectRequest(RequestMatcher::custom(
             move |request| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                request.method == "POST" && request.path == "/operation"
+                if is_operation(request) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    true
+                } else {
+                    is_capability_probe(request)
+                }
             },
         )))
         .step(HttpStep::Sleep(Duration::from_secs(3)))
@@ -164,7 +191,7 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
         let _ = retry.bytes().await.unwrap();
     }
     assert_eq!(completed.load(Ordering::SeqCst), 1);
-    backend.assert_no_matcher_mismatches().await;
+    assert_one_operation(&backend).await;
     drop((first, peer, backend));
 
     // Equal HTTP statuses have different provenance. Backend 500/502/504 must
@@ -173,10 +200,7 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
         let reserved = reserve_port().await.expect("reserve status backend");
         let port = reserved.port;
         let backend = ScriptedHttp1Backend::builder(reserved.into_listener())
-            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
-                "POST",
-                "/operation",
-            )))
+            .step(HttpStep::ExpectRequest(operation_or_capability_probe()))
             .step(HttpStep::RespondStatus {
                 status,
                 reason: "Backend Result".into(),
@@ -199,7 +223,6 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
         assert_eq!(replay.status().as_u16(), status);
         assert_eq!(replay.headers()["x-idempotent-replayed"], "true");
         assert_eq!(replay.text().await.unwrap(), "real");
-        backend.assert_no_matcher_mismatches().await;
-        assert_eq!(backend.received_requests().await.len(), 1);
+        assert_one_operation(&backend).await;
     }
 }
