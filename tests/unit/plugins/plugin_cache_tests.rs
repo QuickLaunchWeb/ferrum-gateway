@@ -1912,8 +1912,9 @@ fn test_workload_metrics_effective_plan_budget_retains_earlier_plan_when_trigger
         )],
         vec![earlier, conditional_replacement, other_family],
     );
-    let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
-        .expect_err("a skipped replacement must preserve the earlier plan at admission");
+    let admission =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect_err("a skipped replacement must preserve the earlier plan at admission");
     assert!(admission.contains("exceed 16384 encoded bytes across surviving families"));
     let error = PluginCache::new(&config)
         .err()
@@ -13453,9 +13454,7 @@ fn disabled_size_limiting_instance_publishes_no_ceiling() {
 
 #[test]
 fn candidate_and_runtime_reject_every_runtime_composition_rule() {
-    let scoped = |id, name| {
-        make_plugin_config(id, name, PluginScope::Proxy, Some("p1"), true)
-    };
+    let scoped = |id, name| make_plugin_config(id, name, PluginScope::Proxy, Some("p1"), true);
     let pair = |name| vec![scoped("a", name), scoped("b", name)];
     let interleaved = |name: &str| {
         let config = if name == "cors" {
@@ -13464,12 +13463,9 @@ fn candidate_and_runtime_reject_every_runtime_composition_rule() {
             json!({"rules": [{"match": {"methods": ["GET"]},
                 "destination": {"upstream_id": "target"}}], "reject_unmatched": true})
         };
-        let mut a = make_plugin_config_with_json(
-            "a", name, config.clone(), PluginScope::Proxy, Some("p1"),
-        );
-        let mut b = make_plugin_config_with_json(
-            "b", name, config, PluginScope::Proxy, Some("p1"),
-        );
+        let mut a =
+            make_plugin_config_with_json("a", name, config.clone(), PluginScope::Proxy, Some("p1"));
+        let mut b = make_plugin_config_with_json("b", name, config, PluginScope::Proxy, Some("p1"));
         a.priority_override = Some(100);
         b.priority_override = Some(200);
         let mut middle = scoped("middle", "ip_restriction");
@@ -13478,31 +13474,63 @@ fn candidate_and_runtime_reject_every_runtime_composition_rule() {
     };
     let budget = vec![
         make_plugin_config_with_json(
-            "a", "workload_metrics",
+            "a",
+            "workload_metrics",
             workload_metrics_family_set_overrides("REQUEST_COUNT", 62),
-            PluginScope::Proxy, Some("p1"),
+            PluginScope::Proxy,
+            Some("p1"),
         ),
         make_plugin_config_with_json(
-            "b", "workload_metrics",
+            "b",
+            "workload_metrics",
             workload_metrics_family_set_overrides("REQUEST_DURATION", 62),
-            PluginScope::Proxy, Some("p1"),
+            PluginScope::Proxy,
+            Some("p1"),
         ),
     ];
     let cases = [
-        ("exclusive load testing", pair("load_testing"), "at most one effective instance"),
-        ("exclusive chargeback", pair("api_chargeback"), "at most one effective instance"),
-        ("CORS contiguity", interleaved("cors"), "cors instances must remain contiguous"),
-        ("mesh contiguity", interleaved("mesh_route_dispatch"), "mesh_route_dispatch instances must remain contiguous"),
-        ("metric budget", budget, "exceed 16384 encoded bytes across surviving families"),
-        ("prometheus owner", vec![scoped("a", "prometheus_metrics")], "must have scope 'global'"),
-        ("BPF owner", vec![scoped("a", "__mesh_bpf_metrics")], "must have scope 'global'"),
+        (
+            "exclusive load testing",
+            pair("load_testing"),
+            "at most one effective instance",
+        ),
+        (
+            "exclusive chargeback",
+            pair("api_chargeback"),
+            "at most one effective instance",
+        ),
+        (
+            "CORS contiguity",
+            interleaved("cors"),
+            "cors instances must remain contiguous",
+        ),
+        (
+            "mesh contiguity",
+            interleaved("mesh_route_dispatch"),
+            "mesh_route_dispatch instances must remain contiguous",
+        ),
+        (
+            "metric budget",
+            budget,
+            "exceed 16384 encoded bytes across surviving families",
+        ),
+        (
+            "prometheus owner",
+            vec![scoped("a", "prometheus_metrics")],
+            "must have scope 'global'",
+        ),
+        (
+            "BPF owner",
+            vec![scoped("a", "__mesh_bpf_metrics")],
+            "must have scope 'global'",
+        ),
     ];
     for (case, configs, diagnostic) in cases {
         let ids = configs.iter().map(|pc| pc.id.as_str()).collect();
         let config = make_config(vec![make_proxy("p1", "/api", ids)], configs);
-        let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(
-            &config, None,
-        ).expect_err(case);
+        let admission =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                .expect_err(case);
         assert!(admission.contains(diagnostic), "{case}: {admission}");
         let full = PluginCache::new(&config).err().expect(case);
         assert!(full.contains(diagnostic), "{case}: {full}");
@@ -13511,10 +13539,14 @@ fn candidate_and_runtime_reject_every_runtime_composition_rule() {
         let cache = PluginCache::new(&baseline).unwrap();
         let before = cache.get_plugins("ferrum", "p1");
         let changed = HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
-        let incremental = cache.apply_delta(&config, &changed, &[], true).expect_err(case);
+        let incremental = cache
+            .apply_delta(&config, &changed, &[], true)
+            .expect_err(case);
         assert!(incremental.contains(diagnostic), "{case}: {incremental}");
-        assert!(Arc::ptr_eq(&before, &cache.get_plugins("ferrum", "p1")),
-            "{case}: rejected incremental candidate replaced the published chain");
+        assert!(
+            Arc::ptr_eq(&before, &cache.get_plugins("ferrum", "p1")),
+            "{case}: rejected incremental candidate replaced the published chain"
+        );
     }
 }
 
@@ -13526,9 +13558,19 @@ fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interloper
         let mut first = cors_config("a", &["GET"], &["X-Test"], Some(100), None);
         let mut last = cors_config("b", &["GET"], &["X-Test"], Some(100), None);
         let mut middle = make_plugin_config_with_priority(
-            "middle", middle_name, PluginScope::Proxy, Some("p1"), true, Some(100), None,
+            "middle",
+            middle_name,
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(100),
+            None,
         );
-        for scope in [PluginScope::Proxy, PluginScope::ProxyGroup, PluginScope::Global] {
+        for scope in [
+            PluginScope::Proxy,
+            PluginScope::ProxyGroup,
+            PluginScope::Global,
+        ] {
             for pc in [&mut first, &mut middle, &mut last] {
                 pc.scope = scope.clone();
                 pc.proxy_id = (scope == PluginScope::Proxy).then(|| "p1".to_string());
@@ -13542,13 +13584,19 @@ fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interloper
                 vec![make_proxy("p1", "/api", associations)],
                 vec![first.clone(), middle.clone(), last.clone()],
             );
-            let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(
-                &config, None,
-            );
+            let admission =
+                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None);
             let runtime = PluginCache::new(&config);
-            assert_eq!(admission.is_ok(), middle_name == "udp_rate_limiting",
-                "{middle_name}/{scope:?}: {admission:?}");
-            assert_eq!(runtime.is_ok(), admission.is_ok(), "{middle_name}/{scope:?}");
+            assert_eq!(
+                admission.is_ok(),
+                middle_name == "udp_rate_limiting",
+                "{middle_name}/{scope:?}: {admission:?}"
+            );
+            assert_eq!(
+                runtime.is_ok(),
+                admission.is_ok(),
+                "{middle_name}/{scope:?}"
+            );
         }
     }
 }
@@ -13556,14 +13604,24 @@ fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interloper
 #[test]
 fn candidate_topology_does_not_open_node_local_geo_database() {
     let mut geo = make_plugin_config_with_priority(
-        "geo", "geo_restriction", PluginScope::Proxy, Some("p1"), true, Some(150), None,
+        "geo",
+        "geo_restriction",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+        Some(150),
+        None,
     );
     for triggered in [false, true] {
-        geo.trigger = triggered.then(|| serde_json::from_value(json!({
-            "when": {"match": {"method": ["GET"]}}
-        })).unwrap());
+        geo.trigger = triggered.then(|| {
+            serde_json::from_value(json!({
+                "when": {"match": {"method": ["GET"]}}
+            }))
+            .unwrap()
+        });
         let config = make_config(
-            vec![make_proxy("p1", "/api", vec!["geo"])], vec![geo.clone()],
+            vec![make_proxy("p1", "/api", vec!["geo"])],
+            vec![geo.clone()],
         );
         validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
             .expect("CP admission must not open the deliberately absent MMDB");
@@ -13575,8 +13633,12 @@ fn candidate_topology_does_not_open_node_local_geo_database() {
                 cors_config("b", &["GET"], &["X-Test"], Some(200), None),
             ],
         );
-        let error = validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
-            .expect_err("the pure geo view must still participate in ordering");
-        assert!(error.contains("cors instances must remain contiguous"), "{error}");
+        let error =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                .expect_err("the pure geo view must still participate in ordering");
+        assert!(
+            error.contains("cors instances must remain contiguous"),
+            "{error}"
+        );
     }
 }

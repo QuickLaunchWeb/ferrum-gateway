@@ -4444,10 +4444,9 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             (pc.scope == PluginScope::ProxyGroup && pc.proxy_id.is_none()).then_some(*pc)
         });
         for plugin_config in local_configs.chain(group_configs) {
-            let Some((_, plugin)) = scoped_plugins.get(&(
-                plugin_config.namespace.as_str(),
-                plugin_config.id.as_str(),
-            )) else {
+            let Some((_, plugin)) =
+                scoped_plugins.get(&(plugin_config.namespace.as_str(), plugin_config.id.as_str()))
+            else {
                 continue;
             };
             if !is_istio_route_transform_consumer(plugin_config, &proxy.id) {
