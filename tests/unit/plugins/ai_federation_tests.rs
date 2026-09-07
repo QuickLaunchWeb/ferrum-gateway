@@ -5840,7 +5840,7 @@ async fn normalized_size_failure_preserves_original_provider_status() {
 }
 
 #[tokio::test]
-async fn invalid_json_sse_and_native_schema_protocol_failures_use_fallback() {
+async fn completed_invalid_json_sse_and_native_schema_failures_never_replay() {
     for (provider_type, malformed_body) in [
         ("openai", "not-json"),
         (
@@ -5883,18 +5883,21 @@ async fn invalid_json_sse_and_native_schema_protocol_failures_use_fallback() {
         });
         let mut ctx = post_json_ctx(&request);
         let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
-        assert!(
-            matches!(
-                result,
-                PluginResult::RejectBinary {
-                    status_code: 200,
-                    ..
-                }
-            ),
-            "{provider_type} malformed protocol response should use fallback"
-        );
+        match result {
+            PluginResult::RejectBinary {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502, "{provider_type}");
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["error"]["code"], "response_normalization_failed");
+            }
+            other => panic!("{provider_type}: expected normalization error, got {other:?}"),
+        }
+        assert_eq!(ctx.metadata["ai_federation_provider"], "primary");
+        assert_eq!(ctx.metadata["ai_federation_status"], "200");
+        assert_eq!(ctx.metadata["ferrum:external_operation_completed"], "true");
         assert_eq!(primary.received_requests().await.unwrap().len(), 1);
-        assert_eq!(secondary.received_requests().await.unwrap().len(), 1);
+        assert!(secondary.received_requests().await.unwrap().is_empty());
     }
 }
 
