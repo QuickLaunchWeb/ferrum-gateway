@@ -2031,7 +2031,10 @@ async fn assert_direct_h2_host_and_authority(h2_frontend: bool) {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        sender.send_request(request).await.expect("gateway response")
+        sender
+            .send_request(request)
+            .await
+            .expect("gateway response")
     } else {
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
             .await
@@ -2039,7 +2042,10 @@ async fn assert_direct_h2_host_and_authority(h2_frontend: bool) {
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        sender.send_request(request).await.expect("gateway response")
+        sender
+            .send_request(request)
+            .await
+            .expect("gateway response")
     };
     assert_eq!(response.status(), 200, "direct-H2 dispatch should succeed");
     let headers = response.headers();
