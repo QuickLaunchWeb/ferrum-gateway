@@ -2197,20 +2197,30 @@ fn paginate_db_response<T: Serialize>(
     })
 }
 
-/// Extract namespace from the X-Ferrum-Namespace header, defaulting to "ferrum".
+/// Only an absent namespace header selects the default. A present value must
+/// decode as visible ASCII and satisfy the namespace identifier rules.
+fn validated_namespace_header(headers: &hyper::HeaderMap) -> Result<&str, String> {
+    let ns = match headers.get("x-ferrum-namespace") {
+        None => crate::config::types::DEFAULT_NAMESPACE,
+        Some(value) => value
+            .to_str()
+            .map_err(|_| "header must contain only visible ASCII characters".to_string())?,
+    };
+    crate::config::types::validate_namespace(ns)?;
+    Ok(ns)
+}
+
+/// Extract the validated namespace or return the documented client error.
 #[allow(clippy::result_large_err)]
 fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full<Bytes>>> {
-    let ns = headers
-        .get("x-ferrum-namespace")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(crate::config::types::DEFAULT_NAMESPACE);
-    if let Err(e) = crate::config::types::validate_namespace(ns) {
-        return Err(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Invalid X-Ferrum-Namespace: {}", e)}),
-        ));
-    }
-    Ok(ns.to_string())
+    validated_namespace_header(headers)
+        .map(str::to_string)
+        .map_err(|error| {
+            json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid X-Ferrum-Namespace: {}", error)}),
+            )
+        })
 }
 
 /// Canonical audit bucket for fleet-global mutations, invalid
@@ -2375,11 +2385,10 @@ pub async fn handle_admin_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let request_path = req.uri().path();
     let request_segments: Vec<&str> = request_path.trim_start_matches('/').split('/').collect();
-    let header_namespace = req
-        .headers()
-        .get("x-ferrum-namespace")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or(crate::config::types::DEFAULT_NAMESPACE);
+    // Invalid headers use the canonical audit bucket; the dispatcher still
+    // rejects them and records backup namespace_status=invalid without raw bytes.
+    let header_namespace = validated_namespace_header(req.headers())
+        .unwrap_or_else(|_| canonical_global_audit_namespace());
     let slot = audit::new_request_slot(
         req.method().as_str(),
         request_path,
