@@ -4709,6 +4709,8 @@ async fn functional_mesh_sidecar_egress_rejects_untrusted_client_gateway() {
 #[derive(Debug, Default)]
 struct GrpcEgressResponse {
     status: u16,
+    initial_headers_end_stream: bool,
+    data_frames: usize,
     headers: HashMap<String, String>,
     body: Vec<u8>,
     trailers: HashMap<String, String>,
@@ -5131,9 +5133,12 @@ async fn grpc_mesh_retry_request(
     )
     .await
     .map_err(|_| "mesh retry client connect timed out")??;
+    let framing = Arc::new(crate::scaffolding::clients::grpc::InboundResponseFraming::default());
+    let observed =
+        crate::scaffolding::clients::grpc::FrameObservingIo::new(stream, Arc::clone(&framing));
     let (mut sender, connection) = tokio::time::timeout(
         Duration::from_secs(5),
-        http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
+        http2::handshake(TokioExecutor::new(), TokioIo::new(observed)),
     )
     .await
     .map_err(|_| "mesh retry client HTTP/2 handshake timed out")??;
@@ -5187,6 +5192,7 @@ async fn grpc_mesh_retry_request(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect();
+    let mut data_frames = 0;
     let mut response_body = Vec::new();
     let mut response_trailers = HashMap::new();
     let mut incoming = response.into_body();
@@ -5198,6 +5204,7 @@ async fn grpc_mesh_retry_request(
             Err(_) => return Err("mesh retry response body timed out".into()),
         };
         if frame.is_data() {
+            data_frames += 1;
             if let Ok(data) = frame.into_data() {
                 response_body.extend_from_slice(&data);
             }
@@ -5215,6 +5222,8 @@ async fn grpc_mesh_retry_request(
     let _ = connection_task.await;
     Ok(GrpcEgressResponse {
         status,
+        initial_headers_end_stream: framing.initial_headers_end_stream(),
+        data_frames,
         headers,
         body: response_body,
         trailers: response_trailers,
@@ -5467,6 +5476,23 @@ async fn start_grpc_trailers_echo_backend_on(addr: SocketAddr) -> u16 {
                         .map(|c| c.to_bytes())
                         .unwrap_or_default();
 
+                    if path == "/echo.Mesh/TrailersOnly" {
+                        let body = http_body_util::Empty::<Bytes>::new()
+                            .map_err(|never| -> std::io::Error { match never {} })
+                            .boxed();
+                        return Ok::<_, hyper::Error>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .header("grpc-status", "7")
+                                .header("grpc-message", "denied")
+                                .header("grpc-status-details-bin", "CAc=")
+                                .header("x-mesh-trailers-only", "backend")
+                                .body(body)
+                                .expect("build terminal gRPC response"),
+                        );
+                    }
+
                     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
                     let _ = tx.send(Ok(Frame::data(body_bytes))).await;
                     let mut trailers = hyper::HeaderMap::new();
@@ -5482,7 +5508,7 @@ async fn start_grpc_trailers_echo_backend_on(addr: SocketAddr) -> u16 {
                         .status(200)
                         .header("content-type", "application/grpc")
                         .header("x-echo-path", &path)
-                        .body(StreamBody::new(ReceiverStream::new(rx)))
+                        .body(BodyExt::boxed(StreamBody::new(ReceiverStream::new(rx))))
                         .expect("build gRPC trailers echo response");
                     Ok::<_, hyper::Error>(response)
                 });
@@ -5529,7 +5555,10 @@ async fn grpc_egress_request_to(
         .await
         .map_err(|_| "connect timed out")??;
     let _ = stream.set_nodelay(true);
-    let io = TokioIo::new(stream);
+    let framing = Arc::new(crate::scaffolding::clients::grpc::InboundResponseFraming::default());
+    let observed =
+        crate::scaffolding::clients::grpc::FrameObservingIo::new(stream, Arc::clone(&framing));
+    let io = TokioIo::new(observed);
     let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
     let conn_task = tokio::spawn(async move {
         let _ = conn.await;
@@ -5553,6 +5582,7 @@ async fn grpc_egress_request_to(
         }
     }
 
+    let mut data_frames = 0;
     let mut body_bytes = Vec::new();
     let mut trailers = HashMap::new();
     let mut body = response.into_body();
@@ -5564,6 +5594,7 @@ async fn grpc_egress_request_to(
             Err(_) => return Err("gRPC response body timed out".into()),
         };
         if frame.is_data() {
+            data_frames += 1;
             if let Ok(data) = frame.into_data() {
                 body_bytes.extend_from_slice(&data);
             }
@@ -5581,6 +5612,8 @@ async fn grpc_egress_request_to(
 
     Ok(GrpcEgressResponse {
         status,
+        initial_headers_end_stream: framing.initial_headers_end_stream(),
+        data_frames,
         headers,
         body: body_bytes,
         trailers,
@@ -5596,6 +5629,15 @@ async fn grpc_egress_request_to(
 async fn drive_grpc_egress_a_to_b(
     topology: &str,
     client_trusted: bool,
+    converged: fn(&GrpcEgressResponse) -> bool,
+) -> Result<(GrpcEgressResponse, String), String> {
+    drive_grpc_egress_a_to_b_at_path(topology, client_trusted, "/echo.Mesh/Call", converged).await
+}
+
+async fn drive_grpc_egress_a_to_b_at_path(
+    topology: &str,
+    client_trusted: bool,
+    path: &str,
     converged: fn(&GrpcEgressResponse) -> bool,
 ) -> Result<(GrpcEgressResponse, String), String> {
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
@@ -5754,7 +5796,7 @@ async fn drive_grpc_egress_a_to_b(
             let observed = grpc_egress_request(
                 a_outbound_port,
                 "svc-b.ferrum.svc.cluster.local",
-                "/echo.Mesh/Call",
+                path,
                 &framed,
             )
             .await
@@ -5934,6 +5976,46 @@ async fn functional_mesh_ambient_egress_grpc_routes_a_to_b_over_hbone_with_trail
             .any(|w| w == b"ferrum-mesh-grpc-payload"),
         "the echoed gRPC payload must ride the relayed DATA frames: {resp:?}\n{logs}"
     );
+}
+
+/// Both secured egress transports must preserve the backend's initial HEADERS
+/// END_STREAM, not merely forward grpc-status as non-terminal metadata.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_grpc_trailers_only_preserves_wire_end_stream() {
+    for topology in ["sidecar", "ambient"] {
+        let (resp, logs) = drive_grpc_egress_a_to_b_at_path(
+            topology,
+            true,
+            "/echo.Mesh/TrailersOnly",
+            // Stop on the first backend-authored response, even if malformed.
+            // A successful framing assertion must never be a convergence filter.
+            |resp| {
+                resp.headers.get("x-mesh-trailers-only").map(String::as_str) == Some("backend")
+            },
+        )
+        .await
+        .expect("secured trailers-only drive");
+        assert_eq!(resp.status, 200, "{topology}: {resp:?}\n{logs}");
+        assert!(
+            resp.initial_headers_end_stream,
+            "{topology}: {resp:?}\n{logs}"
+        );
+        assert_eq!(resp.data_frames, 0, "{topology}: {resp:?}\n{logs}");
+        assert!(resp.body.is_empty(), "{topology}: {resp:?}\n{logs}");
+        assert!(resp.trailers.is_empty(), "{topology}: {resp:?}\n{logs}");
+        for (name, expected) in [
+            ("grpc-status", "7"),
+            ("grpc-message", "denied"),
+            ("grpc-status-details-bin", "CAc="),
+        ] {
+            assert_eq!(
+                resp.headers.get(name).map(String::as_str),
+                Some(expected),
+                "{topology}: {resp:?}\n{logs}"
+            );
+        }
+    }
 }
 
 /// gRPC fail-closed negative (Ambient, issue #3728): an UNTRUSTED gateway A —
