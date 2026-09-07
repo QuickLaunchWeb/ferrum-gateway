@@ -10894,11 +10894,8 @@ async fn collect_h3_open_response_body(
     // it from (`GHSA-xrfj-852f-645j`).
     effective_max_response_body_size_bytes: usize,
 ) -> H3BufferedDispatchResult {
-    if crate::http3::client::cancel_bodyless_h3_response(
-        &mut recv_stream,
-        method,
-        response_status,
-    ) {
+    if crate::http3::client::cancel_bodyless_h3_response(&mut recv_stream, method, response_status)
+    {
         return H3BufferedDispatchResult {
             status: response_status,
             body: Bytes::new(),

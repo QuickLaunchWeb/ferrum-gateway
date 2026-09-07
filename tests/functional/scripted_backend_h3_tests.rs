@@ -163,7 +163,10 @@ async fn assert_h3_forbidden_data_cancelled(body_mode: &str, waf: bool) {
                 .await
                 .expect("same-connection follow-up");
             let (status, headers) = follow.recv_response().await.expect("follow-up headers");
-            let body = follow.recv_body().await.expect("follow-up body and clean FIN");
+            let body = follow
+                .recv_body()
+                .await
+                .expect("follow-up body and clean FIN");
             let trailers = follow.recv_trailers().await.expect("follow-up trailers");
             (status, headers, body, trailers)
         })
