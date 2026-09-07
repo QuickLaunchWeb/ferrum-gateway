@@ -93,7 +93,10 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
     assert_not_replayed(&failed);
     let _ = failed.bytes().await.expect("consume gateway failure");
     let backend = ScriptedHttp1Backend::builder(refused.into_listener().expect("activate backend"))
-        .step(HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/operation")))
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "POST",
+            "/operation",
+        )))
         .step(HttpStep::RespondStatus {
             status: 200,
             reason: "OK".into(),
@@ -125,10 +128,12 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
     let completed = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&completed);
     let backend = ScriptedHttp1Backend::builder(reserved.into_listener())
-        .step(HttpStep::ExpectRequest(RequestMatcher::custom(move |request| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            request.method == "POST" && request.path == "/operation"
-        })))
+        .step(HttpStep::ExpectRequest(RequestMatcher::custom(
+            move |request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                request.method == "POST" && request.path == "/operation"
+            },
+        )))
         .step(HttpStep::Sleep(Duration::from_secs(3)))
         .step(HttpStep::RespondStatus {
             status: 200,
@@ -168,12 +173,18 @@ pub async fn assert_dispatch_provenance(redis: Option<Value>) {
         let reserved = reserve_port().await.expect("reserve status backend");
         let port = reserved.port;
         let backend = ScriptedHttp1Backend::builder(reserved.into_listener())
-            .step(HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/operation")))
-            .step(HttpStep::RespondStatus { status, reason: "Backend Result".into() })
+            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+                "POST",
+                "/operation",
+            )))
+            .step(HttpStep::RespondStatus {
+                status,
+                reason: "Backend Result".into(),
+            })
             .step(HttpStep::RespondHeader {
-            name: "Content-Length".into(),
-            value: "4".into(),
-        })
+                name: "Content-Length".into(),
+                value: "4".into(),
+            })
             .step(HttpStep::RespondBodyChunk(b"real".to_vec()))
             .step(HttpStep::RespondBodyEnd)
             .spawn()
