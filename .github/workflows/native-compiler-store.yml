@@ -32,14 +32,14 @@ jobs:
       - run: python .github/scripts/native_compiler_store.py self-test
 
   produce:
-    name: Capture only the existing main compiler store as data
+    name: Build the property suite and capture its completed compiler store
     needs: contracts
     if: >-
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       github.repository == 'ferrum-edge/ferrum-edge'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     outputs:
       archive-sha256: ${{ steps.capture.outputs.sha256 }}
       artifact-id: ${{ steps.handoff.outputs.artifact-id }}
@@ -50,20 +50,25 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.13'
-      # Exact existing archive only. This is a measurement input, not a
-      # production publisher dependency. Never start any restored executable.
-      - uses: actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae # v4.2.4
+      - name: Install the pinned property-suite toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          key: v0-rust-fuzz-smoke-Linux-x64-cf8601f0-5e0ec017
-          fail-on-cache-miss: true
-          path: |
-            /home/runner/.cargo/bin
-            /home/runner/.cargo/.crates.toml
-            /home/runner/.cargo/.crates2.json
-            /home/runner/.cargo/registry
-            /home/runner/.cargo/git
-            ${{ github.workspace }}/fuzz/target
-            ${{ github.workspace }}/.cache/sccache
+          toolchain: nightly-2025-07-01
+      - name: Install the required property-suite build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - uses: ./.github/actions/setup-sccache
+      # No Actions cache restore/save: the source is this successful build,
+      # so another lane cannot evict the producer's input before capture.
+      - name: Build and run the actual locked property suite
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          cargo test --locked
+          "$RUSTC_WRAPPER" --show-stats
+          "$RUSTC_WRAPPER" --stop-server
       - name: Export the quiescent compiler store with bounded streaming
         id: capture
         run: |

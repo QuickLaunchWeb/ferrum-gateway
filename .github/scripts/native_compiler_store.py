@@ -15,8 +15,8 @@ MAX_MANIFEST = 8 * 1024 * 1024
 MAX_PAYLOAD = 3 * 1024 * 1024 * 1024
 MAX_FILES = 32768
 CHUNK = 1024 * 1024
-CACHE_KEY = "v0-rust-fuzz-smoke-Linux-x64-cf8601f0-5e0ec017"
-IDENTITY_KEYS = {"snapshot_sha", "run_id", "run_attempt", "platform", "source_cache_key"}
+BUILD_SPEC = "fuzz-properties-nightly-2025-07-01-locked-v1"
+IDENTITY_KEYS = {"snapshot_sha", "run_id", "run_attempt", "platform", "build_spec"}
 
 
 def unique_object(pairs):
@@ -34,7 +34,7 @@ def identity():
         "run_id": os.environ["GITHUB_RUN_ID"],
         "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
         "platform": os.environ["RUNNER_OS"] + "-" + os.environ["RUNNER_ARCH"],
-        "source_cache_key": CACHE_KEY,
+        "build_spec": BUILD_SPEC,
     }
     validate_identity(value)
     return value
@@ -46,7 +46,7 @@ def validate_identity(value):
             or not re.fullmatch(r"[0-9a-f]{40}", value["snapshot_sha"])
             or not re.fullmatch(r"[1-9][0-9]*", value["run_id"])
             or not re.fullmatch(r"[1-9][0-9]*", value["run_attempt"])
-            or value["platform"] != "Linux-X64" or value["source_cache_key"] != CACHE_KEY):
+            or value["platform"] != "Linux-X64" or value["build_spec"] != BUILD_SPEC):
         raise ValueError("incompatible snapshot identity")
 
 
@@ -239,7 +239,7 @@ def restore_store(archive, destination, expected, expected_digest):
 
 def self_test():
     expected = {"snapshot_sha": "a" * 40, "run_id": "1", "run_attempt": "1",
-                "platform": "Linux-X64", "source_cache_key": CACHE_KEY}
+                "platform": "Linux-X64", "build_spec": BUILD_SPEC}
     with tempfile.TemporaryDirectory(prefix="compiler-store-contracts-") as temporary:
         root = Path(temporary)
         source = root / "source"
