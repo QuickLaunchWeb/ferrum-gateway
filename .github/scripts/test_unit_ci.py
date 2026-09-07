@@ -37,18 +37,35 @@ STEPS = {
     "acme-dns": "Run ACME DNS-01 hook cancellation regressions",
     "acme-renewal": "Run ACME renewal crash-recovery regressions",
 }
+# The optional `acme` feature compiles the library a second time, so its four
+# phases live in their own path-gated job (`test-acme`) instead of extending
+# the monolithic Unit Tests critical path on every pull request.
+STEP_JOBS = {
+    "default-build": "test-unit",
+    "default-lib": "test-unit",
+    "default-unit": "test-unit",
+    "acme-build": "test-acme",
+    "acme-outbound": "test-acme",
+    "acme-dns": "test-acme",
+    "acme-renewal": "test-acme",
+}
 
 
 def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]:
     errors = []
-    job = re.search(r"(?ms)^  test-unit:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)
-    if job is None:
-        return ["missing test-unit job"]
+    jobs: dict[str, str] = {}
+    for job_name in sorted(set(STEP_JOBS.values())):
+        job = re.search(rf"(?ms)^  {re.escape(job_name)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)
+        if job is None:
+            return [f"missing {job_name} job"]
+        jobs[job_name] = job[1]
     # These steps have a deliberately small, literal shape. Comments cannot
     # satisfy a command, and conditions/continue-on-error/extra shell fail closed.
-    steps = re.split(r"(?m)^(?=      - )", job[1])
-    last_position = -1
+    last_position = {job_name: -1 for job_name in jobs}
     for phase, name in STEPS.items():
+        job_name = STEP_JOBS[phase]
+        job_body = jobs[job_name]
+        steps = re.split(r"(?m)^(?=      - )", job_body)
         candidates = [step for step in steps if step.startswith(f"      - name: {name}\n")]
         expected = [
             f"- name: {name}",
@@ -79,14 +96,23 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
             line.strip() for line in candidates[0].splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ] != expected:
-            errors.append(f"test-unit must run the unconditional, fail-closed {phase} command")
-        position = job[1].find(f"      - name: {name}\n")
-        if position <= last_position:
-            errors.append(f"test-unit phase missing or out of order: {phase}")
-        last_position = position
-    executable = "\n".join(line for line in job[1].splitlines() if not line.lstrip().startswith("#"))
+            errors.append(f"{job_name} must run the unconditional, fail-closed {phase} command")
+        position = job_body.find(f"      - name: {name}\n")
+        if position <= last_position[job_name]:
+            errors.append(f"{job_name} phase missing or out of order: {phase}")
+        last_position[job_name] = position
+    executable = "\n".join(
+        line
+        for body in jobs.values()
+        for line in body.splitlines()
+        if not line.lstrip().startswith("#")
+    )
     if re.search(r"cargo test[^\n]*--features acme[^\n]*--test unit_tests", executable):
         errors.append("ACME must not recompile the monolithic unit_tests target")
+    if re.search(r"(?m)^\s+cargo test[^\n]*--features acme", "\n".join(
+        line for line in jobs["test-unit"].splitlines() if not line.lstrip().startswith("#")
+    )):
+        errors.append("ACME phases must not run inside the monolithic Unit Tests job")
     try:
         cargo = tomllib.loads(manifest)
         targets = [target for target in cargo.get("test", []) if target.get("name") == "acme_dns01_tests"]

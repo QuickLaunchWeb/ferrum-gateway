@@ -17,7 +17,11 @@ permissions:
 
 concurrency:
   group: ci-publish-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: true
+  # Superseded pull-request and merge-group runs are cancelled. Pushes to
+  # main are never cancelled: a run in flight finishes and at most one newer
+  # push waits behind it, so main always converges on a complete, exact-SHA
+  # validation set instead of cancelling every run before it can finish.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,6 +49,17 @@ jobs:
       run_ebpf_build: ${{ steps.plan.outputs.run_ebpf_build }}
       run_secrets_backends: ${{ steps.plan.outputs.run_secrets_backends }}
       run_pkcs11: ${{ steps.plan.outputs.run_pkcs11 }}
+      run_rust: ${{ steps.plan.outputs.run_rust }}
+      run_artifacts: ${{ steps.plan.outputs.run_artifacts }}
+      run_acme: ${{ steps.plan.outputs.run_acme }}
+      run_conformance: ${{ steps.plan.outputs.run_conformance }}
+      run_service_integration: ${{ steps.plan.outputs.run_service_integration }}
+      run_ebpf_userspace: ${{ steps.plan.outputs.run_ebpf_userspace }}
+      run_fuzz_smoke: ${{ steps.plan.outputs.run_fuzz_smoke }}
+      run_platform_build: ${{ steps.plan.outputs.run_platform_build }}
+      run_vendor_patches: ${{ steps.plan.outputs.run_vendor_patches }}
+      run_dependency_audit: ${{ steps.plan.outputs.run_dependency_audit }}
+      run_perf: ${{ steps.plan.outputs.run_perf }}
       binary-matrix: ${{ steps.binary-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -260,7 +275,7 @@ jobs:
           # after the new planner proves the NUL stream classifiable.
           # Missing/invalid individual outputs still fail closed to true.
           gate_fallbacks=()
-          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11; do
+          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_perf; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
             if [ "$paths_classifiable" != "true" ]; then
               value=true
@@ -294,7 +309,7 @@ jobs:
             echo ""
             echo "| Gate | Scheduled |"
             echo "| --- | --- |"
-            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11; do
+            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_perf; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
               if [ "$paths_classifiable" != "true" ]; then
                 value=true
@@ -473,7 +488,6 @@ jobs:
           trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
           git show "${TRUSTED_BASE_SHA}:${policy}" > "$trusted_policy"
           python3 -I "$trusted_policy" \
-            --self-test \
             --config Cross.toml \
             --cargo-config Cargo.toml \
             --ci-workflow .github/workflows/ci.yml \
@@ -484,7 +498,7 @@ jobs:
   test-unit:
     name: Unit Tests
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     env:
       # Cold-cache full-workspace compiles repeatedly kill this hosted runner
@@ -515,7 +529,9 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-test"
+          shared-key: "ci-debug"
+          save: "true"
+          cache-on-failure: "true"
 
       - name: Precompile inline and hardening test binaries
         # Compile both targets in one Cargo invocation before running either.
@@ -641,6 +657,33 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Preserve unit compile diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unit-compile-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/unit-ci/
+          retention-days: 7
+          if-no-files-found: warn
+
+  test-acme:
+    name: ACME Feature Tests
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_acme == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible. The lane is produced by Unit Tests on main.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-debug"
+
       - name: Precompile ACME library and DNS hook test binaries
         # Keep inline ACME coverage, but compile only the two-test DNS target
         # alongside it: enabling ACME must not rebuild monolithic unit_tests.
@@ -694,11 +737,11 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
-      - name: Preserve unit compile diagnostics
+      - name: Preserve ACME compile diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: unit-compile-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          name: acme-compile-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unit-ci/
           retention-days: 7
           if-no-files-found: warn
@@ -708,12 +751,18 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_secrets_backends == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible. The lane is produced by Unit Tests on main.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-test-secrets"
+          shared-key: "ci-debug"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
@@ -754,8 +803,14 @@ jobs:
   test-service-integration:
     name: Service Integration
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_service_integration == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible. The lane is produced by Unit Tests on main.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     # Issue #4600: the job normally finishes in 16-19 minutes. Without a bound a
     # single hung testcontainers case (a stalled image pull or a ClickHouse HTTP
     # call with no deadline) held the job for the 6-hour default and, inside the
@@ -766,7 +821,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-test-service-integration"
+          shared-key: "ci-debug"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
@@ -813,7 +868,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-test-pkcs11"
+          shared-key: "ci-debug"
 
       - name: Install SoftHSM and OpenSC tools
         run: |
@@ -887,18 +942,24 @@ jobs:
   build-test-artifacts:
     name: Build Test Artifacts
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_artifacts == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     # The gateway binary is packaged into a distroless Debian 13 image by
     # conformance consumers. Pin the build host so its glibc stays no newer
     # than the runtime image glibc; all native archive consumers use the same
     # Linux architecture.
     runs-on: ubuntu-24.04
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible. The lane is produced by Unit Tests on main.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-test-artifacts"
+          shared-key: "ci-debug"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
@@ -910,7 +971,7 @@ jobs:
         # directory compiles the dependency graph again before shards can run.
         # This binary is used only for tests; release producers keep their
         # shipping profile and all consumers keep the target/debug contract.
-        run: cargo build --config profile.dev.debug=0 --bin ferrum-edge
+        run: cargo build --bin ferrum-edge
 
       - name: Build ferrum-cni binary
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
@@ -921,7 +982,7 @@ jobs:
         #
         # This debug-path binary is transferred to every integration shard;
         # omit DWARF from the transfer-only build to keep the artifact small.
-        run: cargo build --config profile.dev.debug=0 --bin ferrum-cni
+        run: cargo build --bin ferrum-cni
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
@@ -930,8 +991,6 @@ jobs:
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
-            --config profile.test.debug=0 \
-            --config profile.dev.debug=0 \
             --test integration_tests \
             --archive-file "$archive_file"
 
@@ -941,8 +1000,6 @@ jobs:
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
-            --config profile.test.debug=0 \
-            --config profile.dev.debug=0 \
             --test functional_tests \
             --archive-file "$archive_file"
 
@@ -988,8 +1045,8 @@ jobs:
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
     name: Integration Tests (${{ matrix.shard }})
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    needs: build-test-artifacts
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1230,7 +1287,7 @@ jobs:
   test-conformance:
     name: Mesh Conformance Tests
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_conformance == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     env:
       # Shares the `ci-test` rust-cache key with test-unit: keep the same
@@ -1243,7 +1300,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-test"
+          shared-key: "ci-debug"
 
       - name: Run mesh conformance tests
         # Covers the Istio/xDS compatibility matrix under tests/conformance.
@@ -1271,7 +1328,7 @@ jobs:
   dependency-audit:
     name: Dependency Audit (cargo-deny)
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_dependency_audit == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     # cargo-deny only runs `cargo metadata` (no compilation), so this job does
     # not install sccache. Clear the checked-in sccache rustc-wrapper
@@ -1359,8 +1416,8 @@ jobs:
 
   test-vendor-patches:
     name: Vendored Patch Regressions
-    needs: build-test-artifacts
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [ci-plan, build-test-artifacts]
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_vendor_patches == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -1412,8 +1469,8 @@ jobs:
 
   test-functional:
     name: Functional Tests (${{ matrix.shard }})
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    needs: build-test-artifacts
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -2164,8 +2221,8 @@ jobs:
 
   plugin-hardening-redis-regression:
     name: Plugin Hardening Redis Regression
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    needs: build-test-artifacts
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -5636,6 +5693,7 @@ jobs:
       - ci-plan
       - ci-policy
       - test-unit
+      - test-acme
       - test-secrets
       - test-service-integration
       - test-pkcs11-softhsm
@@ -5708,6 +5766,7 @@ jobs:
           add_row "CI plan, format, and shard coverage (${CI_MODE})" "${{ needs.ci-plan.result }}"
           add_row "Trusted policy validation" "${{ needs.ci-policy.result }}"
           add_row "Unit and inline lib" "${{ needs.test-unit.result }}"
+          add_row "ACME feature tests" "${{ needs.test-acme.result }}"
           add_row "Secret backends" "${{ needs.test-secrets.result }}"
           add_row "Service integration" "${{ needs.test-service-integration.result }}"
           add_row "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}"
@@ -5736,27 +5795,28 @@ jobs:
             failures=1
           fi
           require_success "CI plan" "${{ needs.ci-plan.result }}"
-          require_success "Unit and inline lib" "${{ needs.test-unit.result }}"
+          require_planned_gate "Unit and inline lib" "${{ needs.test-unit.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
+          require_planned_gate "ACME feature tests" "${{ needs.test-acme.result }}" "${{ needs.ci-plan.outputs.run_acme }}"
           require_planned_gate "Secret backends" "${{ needs.test-secrets.result }}" "${{ needs.ci-plan.outputs.run_secrets_backends }}"
-          require_success "Service integration" "${{ needs.test-service-integration.result }}"
+          require_planned_gate "Service integration" "${{ needs.test-service-integration.result }}" "${{ needs.ci-plan.outputs.run_service_integration }}"
           require_planned_gate "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}" "${{ needs.ci-plan.outputs.run_pkcs11 }}"
-          require_success "Test artifact build" "${{ needs.build-test-artifacts.result }}"
-          require_success "Integration" "${{ needs.test-integration.result }}"
-          require_success "Mesh conformance" "${{ needs.test-conformance.result }}"
-          require_success "Dependency audit" "${{ needs.dependency-audit.result }}"
-          require_success "Vendored patch regressions" "${{ needs.test-vendor-patches.result }}"
-          require_success "Functional shards" "${{ needs.test-functional.result }}"
-          require_success "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}"
+          require_planned_gate "Test artifact build" "${{ needs.build-test-artifacts.result }}" "${{ needs.ci-plan.outputs.run_artifacts }}"
+          require_planned_gate "Integration" "${{ needs.test-integration.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
+          require_planned_gate "Mesh conformance" "${{ needs.test-conformance.result }}" "${{ needs.ci-plan.outputs.run_conformance }}"
+          require_planned_gate "Dependency audit" "${{ needs.dependency-audit.result }}" "${{ needs.ci-plan.outputs.run_dependency_audit }}"
+          require_planned_gate "Vendored patch regressions" "${{ needs.test-vendor-patches.result }}" "${{ needs.ci-plan.outputs.run_vendor_patches }}"
+          require_planned_gate "Functional shards" "${{ needs.test-functional.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
+          require_planned_gate "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
           require_planned_gate "Helm chart" "${{ needs.helm-chart.result }}" "${{ needs.ci-plan.outputs.run_helm }}"
-          require_success "Lint" "${{ needs.lint.result }}"
-          require_success "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"
+          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
+          require_planned_gate "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}" "${{ needs.ci-plan.outputs.run_fuzz_smoke }}"
           require_planned_gate "eBPF programs" "${{ needs.build-ebpf.result }}" "${{ needs.ci-plan.outputs.run_ebpf_build }}"
-          require_success "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}"
+          require_planned_gate "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}" "${{ needs.ci-plan.outputs.run_ebpf_userspace }}"
           require_planned_gate "eBPF live-kernel" "${{ needs.ebpf-live.result }}" "${{ needs.ci-plan.outputs.run_ebpf_kernel_live }}"
           require_planned_gate "Netns capture live" "${{ needs.netns-capture-live.result }}" "${{ needs.ci-plan.outputs.run_netns_capture_live }}"
           require_planned_gate "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}" "${{ needs.ci-plan.outputs.run_two_cluster_live }}"
-          require_success "Performance regression" "${{ needs.performance-regression.result }}"
-          require_success "Native platform binaries" "${{ needs.build-binaries.result }}"
+          require_planned_gate "Performance regression" "${{ needs.performance-regression.result }}" "${{ needs.ci-plan.outputs.run_perf }}"
+          require_planned_gate "Native platform binaries" "${{ needs.build-binaries.result }}" "${{ needs.ci-plan.outputs.run_platform_build }}"
 
           if [ "$failures" -ne 0 ]; then
             exit 1
@@ -5771,7 +5831,7 @@ jobs:
   lint:
     name: Lint
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -5779,6 +5839,8 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-lint"
+          save: "true"
+          cache-on-failure: "true"
           components: clippy
 
       - name: Run clippy
@@ -5831,7 +5893,7 @@ jobs:
     # the loop's.
     name: Fuzz Smoke
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -5891,7 +5953,6 @@ jobs:
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
-          cache-directories: ${{ github.workspace }}/.cache/sccache
           # Only a push to `main` may write this lane's cache. GitHub already
           # scopes a pull request's cache writes to its own ref; writing
           # nothing at all from an untrusted ref is the stronger statement,
@@ -6149,14 +6210,20 @@ jobs:
   build-ebpf-userspace:
     name: Build eBPF Userspace Loader
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_userspace == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible. The lane is produced by Unit Tests on main.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-ebpf-userspace"
+          shared-key: "ci-debug"
 
       - name: Build userspace aya loader (--features ebpf)
         # The aya userspace loader (src/ebpf/loader.rs, src/ebpf/maps.rs) only
@@ -6176,6 +6243,12 @@ jobs:
     # but it adds several minutes to every PR when run unconditionally.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_kernel_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible. The lane is produced by Unit Tests on main.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -6187,7 +6260,7 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-ebpf-live"
+          shared-key: "ci-debug"
 
       - name: Install bpf-linker
         uses: ./.github/actions/setup-bpf-linker
@@ -6278,12 +6351,18 @@ jobs:
     # capture/netns/UDP surfaces.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_netns_capture_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible. The lane is produced by Unit Tests on main.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-netns-capture-live"
+          shared-key: "ci-debug"
 
       - name: Build and locate live test binary
         id: build_test_bin
@@ -6409,7 +6488,13 @@ jobs:
     # real SPIRE control planes and runs the full cross-cluster protocol matrix.
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_two_cluster_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    env:
+      # Shared `ci-debug` rust-cache lane: every member must compile with
+      # identical profile settings so restored dependency artifacts stay
+      # fingerprint-compatible. The lane is produced by Unit Tests on main.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -6419,7 +6504,7 @@ jobs:
           # That job also builds the functional target; either completed archive
           # supplies this lane's dependencies. Cargo still builds this checkout's
           # workspace binaries and every live assertion runs independently.
-          shared-key: "ci-netns-capture-live"
+          shared-key: "ci-debug"
 
       - name: Install pinned SPIRE server and agent
         env:
@@ -6497,7 +6582,7 @@ jobs:
   performance-regression:
     name: Performance Regression Check
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_perf == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -6898,7 +6983,7 @@ jobs:
   build-binaries:
     name: Build (${{ matrix.asset_name }})
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_platform_build == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -6959,7 +7044,9 @@ jobs:
         continue-on-error: true
         with:
           shared-key: "build-${{ matrix.target }}-prbuild"
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Restore-only: the repository cache quota is reserved for the
+          # PR-facing `ci-debug` / `ci-lint` lanes and the main-only fuzz lane.
+          save-if: "false"
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
