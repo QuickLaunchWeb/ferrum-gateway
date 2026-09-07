@@ -1073,7 +1073,7 @@ const MESH_MODE_TEST_SOURCE: &str = include_str!(concat!(
 const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "drive_dr_live_visibility",
     "drive_egress_a_to_b",
-    "drive_grpc_egress_a_to_b",
+    "drive_grpc_egress_a_to_b_at_path",
     "drive_websocket_egress_a_to_b",
     "drive_cross_cluster_egress",
     "drive_ambient_cross_cluster_egress",
@@ -1089,7 +1089,7 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
 const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
     "drive_dr_live_visibility",
     "drive_egress_a_to_b",
-    "drive_grpc_egress_a_to_b",
+    "drive_grpc_egress_a_to_b_at_path",
     "drive_websocket_egress_a_to_b",
     "drive_cross_cluster_egress",
     "drive_ambient_cross_cluster_egress",
