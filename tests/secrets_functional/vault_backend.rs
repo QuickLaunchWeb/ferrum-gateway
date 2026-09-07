@@ -158,6 +158,10 @@ async fn vault_valid_address_cli_fetches_secret_and_validates() {
         .and(path("/v1/secret/data/app"))
         .and(header("X-Vault-Token", "address-token-sentinel"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "request_id": "vault-address-positive-control",
+            "lease_id": "",
+            "lease_duration": 0,
+            "renewable": false,
             "data": {
                 "data": { "field": SECRET },
                 "metadata": {
