@@ -16,7 +16,8 @@ on:
 
 concurrency:
   group: coverage-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: true
+  # Pushes to main are never cancelled (see ci.yml); superseded PR runs are.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 permissions:
   actions: read

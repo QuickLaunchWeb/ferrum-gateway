@@ -88,6 +88,7 @@ REQUIRED_JOBS = {
     "ci-plan",
     "ci-policy",
     "test-unit",
+    "test-acme",
     "test-secrets",
     "test-service-integration",
     "test-pkcs11-softhsm",
@@ -110,22 +111,14 @@ REQUIRED_JOBS = {
     "build-binaries",
 }
 
-# These jobs do not depend on another full-CI validation job, so each must
-# directly depend on the planner and enforce full mode. Other required jobs are
-# downstream of one of these roots and are skipped transitively in light mode.
-DIRECT_FULL_CI_JOBS = {
-    "test-unit",
-    "test-service-integration",
-    "build-test-artifacts",
-    "test-conformance",
-    "dependency-audit",
-    "lint",
-    "fuzz-smoke",
-    "build-ebpf-userspace",
-    "performance-regression",
-    "build-binaries",
-}
+# Every compile-based job is now path-gated by the PR planner: a job runs on
+# a pull request only when the planner proves a path it owns changed, and on
+# every push to `main` (the planner force-schedules every gate there). No job
+# remains that requires full mode without also naming its gate.
+DIRECT_FULL_CI_JOBS: set[str] = set()
 
+# Job -> planner output that schedules it. Several jobs share the broad
+# `run_rust` compile-and-test gate; the rest carry a narrow owner-path gate.
 PATH_GATED_JOBS = {
     "helm-chart": "run_helm",
     "build-ebpf": "run_ebpf_build",
@@ -134,6 +127,21 @@ PATH_GATED_JOBS = {
     "two-cluster-mesh-live": "run_two_cluster_live",
     "test-secrets": "run_secrets_backends",
     "test-pkcs11-softhsm": "run_pkcs11",
+    "test-unit": "run_rust",
+    "build-test-artifacts": "run_artifacts",
+    "test-integration": "run_rust",
+    "test-functional": "run_rust",
+    "plugin-hardening-redis-regression": "run_rust",
+    "lint": "run_rust",
+    "test-acme": "run_acme",
+    "test-conformance": "run_conformance",
+    "test-service-integration": "run_service_integration",
+    "build-ebpf-userspace": "run_ebpf_userspace",
+    "fuzz-smoke": "run_fuzz_smoke",
+    "build-binaries": "run_platform_build",
+    "test-vendor-patches": "run_vendor_patches",
+    "dependency-audit": "run_dependency_audit",
+    "performance-regression": "run_perf",
 }
 
 # Every path-gated job keeps this exact event set: PRs, merge-queue checks,
@@ -830,20 +838,23 @@ def merge_group_self_test() -> list[str]:
     mode, _ = coverage_select_mode("merge_group", ["docs/configuration.md"])
     if mode != "skip":
         failures.append("irrelevant merge_group coverage paths should skip")
+    # Instrumented coverage is main-only: source changes skip on merge_group
+    # and pull_request alike, controller edits and unavailable diffs still
+    # fail closed to the full matrix, and every push runs the full matrix.
     admin_plan = coverage_select_plan("merge_group", ["src/admin/mod.rs"])
-    if admin_plan.mode != "shards" or "lib-unit" not in admin_plan.shards:
-        failures.append("merge_group admin coverage must be shard-scoped with lib-unit")
-    if any(
-        shard in admin_plan.shards
-        for shard in ("mesh-routing", "mesh-platform", "protocols-data-plane")
-    ):
-        failures.append("merge_group admin coverage must not select unrelated shards")
+    if admin_plan.mode != "skip" or admin_plan.shards:
+        failures.append("merge_group source coverage must skip the instrumented shards")
     plugin_plan = coverage_select_plan("merge_group", ["src/plugins/cors.rs"])
-    if plugin_plan.mode != "plugin" or plugin_plan.shards != ("lib-unit",):
-        failures.append("merge_group plugin coverage must reuse lib-unit only")
-    unknown_plan = coverage_select_plan("merge_group", ["src/cli.rs"])
-    if unknown_plan.mode != "full":
-        failures.append("unknown merge_group coverage paths must fail closed to full")
+    if plugin_plan.mode != "skip":
+        failures.append("merge_group plugin coverage must skip the instrumented shards")
+    controller_plan = coverage_select_plan(
+        "merge_group", [".github/scripts/coverage_plan.py"]
+    )
+    if controller_plan.mode != "full":
+        failures.append("merge_group coverage controller edits must run the full matrix")
+    hostile_plan = coverage_select_plan("merge_group", ["src/admin/../cli.rs"])
+    if hostile_plan.mode != "full":
+        failures.append("hostile merge_group coverage paths must fail closed to full")
     main_plan = coverage_select_plan("push", ["src/admin/mod.rs"])
     if main_plan.mode != "full":
         failures.append("push coverage must stay on the full shard matrix")
@@ -2256,11 +2267,10 @@ def main() -> int:
         for pattern in CI_RUNTIME_SUITE_PATTERNS["node-waypoint-ebpf-live"]
         if pattern.startswith("^docs/") and pattern.endswith("$")
     }
-    if not node_waypoint_doc_paths:
-        planner_errors.append(
-            "ci_runtime_plan.py node-waypoint-ebpf-live suite must keep exact "
-            "documentation trigger patterns"
-        )
+    # Documentation no longer schedules the NodeWaypoint suite on a pull
+    # request (it runs on every push to main), so an empty set is the
+    # expected state; the parity checks below still bind any future doc
+    # trigger to the PR planner's full-CI documentation set.
     required_full_ci_docs = LIVE_SUITE_DOCUMENTATION_PATHS | node_waypoint_doc_paths
     configured_live_doc_patterns = {
         pattern

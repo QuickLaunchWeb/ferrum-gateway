@@ -342,6 +342,8 @@ def production_dockerfile_probe_paths() -> list[str]:
             probes.append("custom_plugins/foo.rs")
         elif pattern == r"^ebpf/":
             probes.append("ebpf/src/lib.rs")
+        elif pattern == r"^\.github/actions/package-ferrum-runtime-image/":
+            probes.append(".github/actions/package-ferrum-runtime-image/action.yml")
         elif pattern == r"^\.github/scripts/stage_iproute2_runtime\.sh$":
             probes.append(".github/scripts/stage_iproute2_runtime.sh")
         elif pattern == r"^\.github/workflows/node-waypoint-ebpf-live\.yml$":
@@ -720,9 +722,12 @@ def check_node_waypoint_live_job(
             f"{source} production-only path {probe} must skip the NodeWaypoint live job",
             failures,
         )
+        # Ordinary compile inputs no longer schedule the image smoke on a pull
+        # request either: the ordinary CI lane proves they compile, and the
+        # smoke runs on every push to main.
         require(
-            prod_relevant,
-            f"{source} production-only path {probe} must still trigger production-image smoke",
+            not prod_relevant,
+            f"{source} ordinary compile path {probe} must skip production-image smoke on a PR",
             failures,
         )
     empty_relevant, _, _ = decide_relevance("node-waypoint-ebpf-live", [])
@@ -946,6 +951,14 @@ SAVE_IF_NON_FORK = re.compile(
     r"github\.event\.pull_request\.head\.repo\.fork\s*!=\s*true"
     r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
 )
+# A save gated to a push on `refs/heads/main` can never fire on a fork PR
+# (or any PR), so it satisfies the fork guard with a stricter shape.
+SAVE_IF_MAIN_PUSH = re.compile(
+    r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?"
+    r"github\.event_name\s*==\s*'push'\s*&&\s*"
+    r"github\.ref\s*==\s*'refs/heads/main'"
+    r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
+)
 SAVE_IF_FALSE = re.compile(
     r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?false"
     r"(?:\s*\}\})?(?:['\"]?)\s*(?:#.*)?$"
@@ -960,6 +973,7 @@ SAVE_IF_FALSE = re.compile(
 # same defense in depth.
 SAVE_IF_TRUSTED_MAIN = re.compile(
     r"(?m)^[ \t]*save-if:\s*(?:['\"]?)(?:\$\{\{\s*)?"
+    r"(?:inputs\.save\s*==\s*'true'\s*&&\s*)?"
     r"github\.event_name\s*!=\s*'pull_request'\s*&&\s*"
     r"github\.event_name\s*!=\s*'merge_group'\s*&&\s*"
     r"github\.ref\s*==\s*'refs/heads/main'\s*&&\s*"
@@ -3334,7 +3348,8 @@ def check_rust_cache_fork_save_if(
     )
     for index, block in enumerate(blocks, 1):
         require(
-            SAVE_IF_NON_FORK.search(block) is not None,
+            SAVE_IF_NON_FORK.search(block) is not None
+            or SAVE_IF_MAIN_PUSH.search(block) is not None,
             f"{source} rust-cache site {index} must set save-if so fork PRs "
             "restore only",
             failures,
@@ -3389,8 +3404,11 @@ def check_direct_rust_cache_diet(
         saves = re.findall(r"(?m)^\s*save-if:([^\n]*)$", block)
         require(
             [value.strip() for value in saves]
-            == ["${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"],
-            f"{source} must save only on pushes to main",
+            in (
+                ["${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"],
+                ['"false"'],
+            ),
+            f"{source} must save only on pushes to main, or never",
             failures,
         )
         if compiler_only:
@@ -4692,14 +4710,24 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
     )
 
 
+# Only a lane's designated producer (`save: "true"`) may publish, and only
+# that producer may opt into publishing after a failed job (a completed
+# dependency compile is still deterministic and useful). Every other consumer
+# is restore-only regardless of outcome.
+COMPLETED_CACHE_ON_FAILURE = (
+    "${{ inputs.save == 'true' && inputs.cache-on-failure == 'true' }}"
+)
+
+
 def check_completed_rust_cache_save(action: str, failures: list[str]) -> None:
     blocks = rust_cache_with_blocks(action)
     require(len(blocks) == 1, "setup-rust-ci must have one Rust cache step", failures)
     for block in blocks:
         values = re.findall(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", block)
         require(
-            values == ['"false"'],
-            "setup-rust-ci must publish Rust caches only after successful jobs",
+            values == [COMPLETED_CACHE_ON_FAILURE],
+            "setup-rust-ci must publish Rust caches only from a lane producer, "
+            "and after a failed job only when that producer opts in",
             failures,
         )
 
@@ -5119,11 +5147,13 @@ def self_test() -> int:
     require(not cache_errors, "self-test: completed-cache action must pass", failures)
     for replacement in (
         'cache-on-failure: "true"',
-        '# cache-on-failure: "false"',
+        'cache-on-failure: "false"',
+        f"# cache-on-failure: {COMPLETED_CACHE_ON_FAILURE}",
         "cache-on-failure: ${{ always() }}",
-        'cache-on-failure: "false"\n        cache-on-failure: "true"',
+        "cache-on-failure: ${{ inputs.cache-on-failure == 'true' }}",
+        f'cache-on-failure: {COMPLETED_CACHE_ON_FAILURE}\n        cache-on-failure: "true"',
     ):
-        mutated = completed_cache.replace('cache-on-failure: "false"', replacement)
+        mutated = completed_cache.replace(f"cache-on-failure: {COMPLETED_CACHE_ON_FAILURE}", replacement)
         cache_errors = []
         require(mutated != completed_cache, "self-test: cache mutation must apply", failures)
         check_completed_rust_cache_save(mutated, cache_errors)

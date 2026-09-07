@@ -574,10 +574,13 @@ the live datapath compiled without re-running it.
 
 The CI workflow is triggered by every pull request, every merge-queue
 `merge_group` check request, and every push to `main`.
-The independent, read-only `CI Policy` job runs the complete trusted Cross
-verifier self-tests and workflow scan on every CI event, including light-mode
-PRs. It starts alongside `CI Plan`, so policy validation overlaps application
-compilation instead of adding its full runtime before compilation can begin.
+The independent, read-only `CI Policy` job runs the trusted Cross verifier's
+workflow scan on every CI event, including light-mode PRs. It starts alongside
+`CI Plan`, so policy validation overlaps application compilation instead of
+adding its full runtime before compilation can begin. The verifier's own
+static self-tests are not repeated on every event: they run in
+`trusted-policy-candidate.yml` whenever the verifier or a workflow changes,
+which is the only time their verdict can move.
 `Tests` directly needs both jobs and unconditionally rejects failed, cancelled,
 skipped, or missing policy results and missing/invalid completion output. The
 `verified=true` output is written only after the complete verifier succeeds;
@@ -608,13 +611,75 @@ by suppressing checks or synthesizing successful release proof. See
 [policy performance measurement](ci_policy_performance.md) for the rollout
 measurements, whose hosted results remain pending until collected.
 
-The `CI Plan` job selects `full` or `light` mode. Pull requests and
-merge-group runs whose entire diff is limited to ordinary documentation,
-`.agents/**`, `.claude/**`, Markdown outside `vendor/`, or license files use
-light mode and preserve a fast `Tests` aggregate without starting the Rust/build
-matrix. Documentation that
-deliberately triggers a live datapath suite (including the mesh, SPIRE,
-configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
+The `CI Plan` job selects `full` or `light` mode and, inside full mode, a
+per-job gate for every compile-based job. Pull requests and merge-group runs
+whose entire diff is limited to ordinary documentation, `.agents/**`,
+`.claude/**`, Markdown outside `vendor/`, or license files use light mode and
+preserve a fast `Tests` aggregate without starting the Rust/build matrix.
+Documentation never schedules a live datapath suite on a pull request any more.
+
+### Pull-request gating and main-only validation
+
+A pull request runs only the validation its diff can affect; every push to
+`main` runs everything. The planner (`pr_ci_plan.py`, executed from the
+trusted base) emits one `run_*` output per job group and the `Tests`
+aggregate accepts a skipped job only when its gate was `false`:
+
+| Gate | Schedules | Pull-request trigger surface |
+|---|---|---|
+| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/`), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions |
+| `run_artifacts` | Build Test Artifacts | `run_rust` or `run_helm` |
+| `run_acme` | ACME Feature Tests (`--features acme`, own job) | `src/tls/`, `tests/acme_dns01/`, `tests/unit/tls/`, build graph |
+| `run_conformance` | Mesh Conformance Tests | `tests/conformance/`, mesh/xDS/k8s translation modules, build graph |
+| `run_service_integration` | Service Integration (testcontainers) | `tests/service_integration/`, service discovery, the LDAP/Kafka/OIDC/introspection/chargeback plugins, DB loaders, build graph |
+| `run_ebpf_userspace` | Build eBPF Userspace Loader | `src/ebpf/`, `src/capture/`, node-agent modes, `ebpf/`, build graph |
+| `run_fuzz_smoke` | Fuzz Smoke (property tests) | `fuzz/`, `src/fuzz_support.rs`, the parsers it links, `Cargo.*`, `vendor/` |
+| `run_platform_build` | Build (`pr-build` profile, `cloud-secrets`) | build graph, `src/secrets/`, the binary entry points |
+| `run_vendor_patches` | Vendored Patch Regressions | `vendor/`, `Cargo.*`, toolchain |
+| `run_dependency_audit` | Dependency Audit (cargo-deny) | `Cargo.*`, `deny.toml`, `vendor/`, `ebpf/`, the dependency-policy and vendored-patch lifecycle docs, the advisory/lifecycle scripts |
+| `run_perf` | Performance Regression Check (which then applies its own benchmark classifier) | `src/`, `tests/performance/`, benchmark verifiers, build graph |
+| `run_helm` | Helm Chart | `charts/`, Dockerfiles, the Kubernetes-facing runtime modules, chart lint scripts |
+| `run_secrets_backends`, `run_pkcs11` | Secret Backends, PKCS#11 SoftHSM | unchanged feature-scoped surfaces |
+| `run_ebpf_kernel_live`, `run_netns_capture_live`, `run_two_cluster_live` | the three privileged ci.yml live suites | only their owner modules and harnesses; never the Cargo build graph |
+
+The same principle governs the dedicated workflows. `fips-build.yml` compiles
+the FIPS profile on a pull request only when FIPS-specific logic changes
+(`src/fips/`, `src/tls/`, `src/dtls/`, the provider-installing listeners, the
+FIPS-aware tests, the Cargo feature graph, `docs/fips.md`, and the gate's own
+workflow/scripts); `coverage.yml` skips every instrumented shard on a pull
+request unless the coverage controllers themselves change; the Kind live
+suites (`live_suite_path_filter.py`, `ci_runtime_plan.py`) fire only for their
+own harness, tooling, and the Kubernetes-facing modules they exist to test.
+A regression in any of these on an ordinary source change turns `main` red
+for that commit, which makes the commit ineligible for a production release
+(see [Publish-blocking required checks](#publish-blocking-required-checks));
+it does not cost every unrelated pull request a Kind cluster or a FIPS build.
+
+### Main-push concurrency
+
+Every workflow that runs on `push` to `main` keys its concurrency group on
+the ref with `cancel-in-progress` **false** for pushes (superseded
+`pull_request` / `merge_group` runs are still cancelled). A run in flight
+finishes and at most one newer push waits behind it, so `main` converges on a
+complete exact-SHA validation set instead of cancelling almost every run
+before it can finish. Intermediate SHAs skipped by that coalescing carry no
+evidence and are simply not releasable; after a burst of merges the tip is
+validated by every workflow. Dispatch **Start Production Release** from a
+quiet `main` and, if the gate reports a pending run, let it complete.
+
+### Rust cache lanes
+
+The repository cache is a 10 GB LRU quota, so lanes are few and owned.
+`setup-rust-ci` restores for every job but saves only from the designated
+lane producer (`save: "true"`) on a trusted push to `refs/heads/main`; the
+sccache local store is no longer persisted (the restored `target/` already
+skips dependency compilation). Lanes: `ci-debug` (produced by Unit Tests;
+shared by every debug-profile job through identical `CARGO_BUILD_JOBS` /
+`CARGO_PROFILE_DEV_DEBUG` job env), `ci-lint` (produced by Lint), the
+main-only `fuzz-smoke` lane, `ci-coverage`, and the FIPS contract lane. Every
+other rust-cache site is restore-only (`save-if: "false"`) so it cannot evict
+the PR-facing lanes.
+
 The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
 rename detection when classifying paths, so both the source and destination of a
 rename are checked. `CI Plan` collects those paths as a NUL-delimited
@@ -627,13 +692,13 @@ every job gate on, and are omitted from the step summary rather than
 interpolated into Markdown. The same `--no-renames` fail-closed classification applies
 to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
 filtering, and the `performance-regression` path classifier on both
-`pull_request` and `merge_group` diffs. Coverage planning is shard-scoped on
-classifiable pull-request and merge-group diffs: `lib-unit` always runs with the
-affected integration shards, plugin-only diffs keep the plugin gate but reuse
-the `lib-unit` profraw/artifacts, and push to `main`, schedule, dispatch, empty
-or unavailable diffs, controller edits, dependency/build-graph inputs, unknown
-paths, and malformed/hostile path transport fail closed to the full coverage
-matrix. The `Merge Coverage` aggregate verifies exact planned shard outcomes and
+`pull_request` and `merge_group` diffs. Coverage planning skips every
+instrumented shard on classifiable pull-request and merge-group diffs (the
+`Merge Coverage` check reports success in under a minute); controller edits,
+empty or unavailable diffs, and malformed/hostile path transport fail closed to
+the full matrix, and push to `main`, schedule, and dispatch always run the full
+matrix. The path-scoped shard classification is retained as
+`select_scoped_plan` for diagnostics. The `Merge Coverage` aggregate verifies exact planned shard outcomes and
 artifact presence so a skipped shard cannot false-green the required check.
 Merge-group planning diffs
 `merge_group.base_sha...HEAD` and executes the planner from that base SHA so a
@@ -943,6 +1008,10 @@ cargo test --lib
 FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
   proxy::ktls_live_kernel_tests
 cargo test --test unit_tests
+
+# test-acme (path-gated: src/tls/, tests/acme_dns01/, tests/unit/tls/, build
+# graph): the optional feature compiles the library a second time, so it has
+# its own job instead of extending the Unit Tests critical path.
 cargo test --features acme --lib --test acme_dns01_tests --no-run
 cargo test --features acme --lib tls::acme::client::tests
 cargo test --features acme --test acme_dns01_tests
@@ -963,8 +1032,8 @@ cargo nextest run --archive-file integration-tests-*.tar.zst \
   <shard filters>
 
 # build-test-artifacts (one job/cache for both archives and both binaries)
-cargo build --profile pr-build --bin ferrum-edge
-cargo build --config profile.dev.debug=0 --bin ferrum-cni
+cargo build --bin ferrum-edge
+cargo build --bin ferrum-cni
 cargo nextest archive --test integration_tests ...
 cargo nextest archive --test functional_tests ...
 
