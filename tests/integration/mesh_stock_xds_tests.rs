@@ -2915,32 +2915,50 @@ mod tls_lifecycle {
             })
             .await;
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            assert_eq!(
-                harness.services(),
-                None,
-                "{label}: no slice may be accepted over a session that failed TLS admission"
-            );
-            assert!(
-                !harness.state.has_first_slice(),
-                "{label}: startup must stay blocked"
-            );
-            assert_eq!(
-                endpoint.ads.stream_count(),
-                0,
-                "{label}: the ADS handler must never be reached"
-            );
-            assert!(
-                endpoint.ads.authorization_snapshot().is_empty(),
-                "{label}: the bearer must never reach a server whose identity was not established"
-            );
+            // A two-second sleep can end before the five-second connection
+            // attempt completes (#4744). Keep that minimum observation window,
+            // but require a real completed failure before accepting the case.
+            let started = tokio::time::Instant::now();
+            let observe_until = started + Duration::from_secs(2);
+            let deadline = started + Duration::from_secs(15);
+            loop {
+                assert_eq!(
+                    harness.services(),
+                    None,
+                    "{label}: no slice may be accepted over a session that failed TLS admission"
+                );
+                assert!(
+                    !harness.state.has_first_slice(),
+                    "{label}: startup must stay blocked"
+                );
+                assert_eq!(
+                    endpoint.ads.stream_count(),
+                    0,
+                    "{label}: the ADS handler must never be reached"
+                );
+                assert!(
+                    endpoint.ads.authorization_snapshot().is_empty(),
+                    "{label}: the bearer must never reach a server whose identity was not established"
+                );
 
-            // The failure is reported by a bounded, closed-set outcome — never
-            // a tonic transport error carrying the configured URI or host.
-            let outcome = harness
-                .status_field(|status| status.last_attempt_outcome)
-                .expect("an attempt was recorded");
-            assert_eq!(outcome, "transport_failure", "{label}");
+                // Check admission continuously, including while the outcome
+                // remains pending. Any other completed outcome fails at once.
+                let outcome = harness.status_field(|status| status.last_attempt_outcome);
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{label}: no completed transport failure within the observation bound; last={outcome:?}"
+                );
+                match outcome {
+                    Some("transport_failure") => {
+                        if tokio::time::Instant::now() >= observe_until {
+                            break;
+                        }
+                    }
+                    None | Some("none") => {}
+                    other => panic!("{label}: unexpected completed TLS attempt: {other:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
 
             harness.shutdown_and_join().await;
             endpoint.shutdown().await;
