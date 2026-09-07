@@ -1405,3 +1405,8 @@ async fn in_process_backend_refused_stays_502_connection_failure() {
         last_failure.unwrap_or_else(|| "unknown".into())
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deduplication_dispatch_failures_preserve_execution_provenance() {
+    crate::scaffolding::dedup_dispatch::assert_dispatch_provenance(None).await;
+}
