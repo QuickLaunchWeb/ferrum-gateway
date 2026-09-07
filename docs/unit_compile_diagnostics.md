@@ -132,11 +132,13 @@ The initial extraction in #4727 also put startup in the library. Its hidden
 `ferrum_edge::run_gateway_cli()` entry has been replaced by the binary's private
 entry function, retaining the same unsafe process-start contract. Startup still
 runs once before concurrent environment access or application thread startup.
-A narrow hidden `startup::initialize_gateway_buffer_budgets(&EnvConfig)` adapter
-keeps the three process-budget implementations private to the library. It
-publishes the same accepted fields, in the same order and at the same startup
-position, before listeners or request processing begin. Their existing
-first-initialization-wins and restart-to-change semantics are retained.
+Two narrow hidden startup adapters retain the private configuration seams:
+`startup::publish_gateway_stream_settings(&EnvConfig)` publishes the accepted
+stream settings, and `startup::initialize_gateway_buffer_budgets(&EnvConfig)`
+publishes the three process-buffer budgets. Both retain the same accepted
+fields, ordering and startup positions, before listeners or request processing
+begin. Configuration parsing and validation stay pure. The buffer budgets keep
+their existing first-initialization-wins and restart-to-change semantics.
 
 Both crate roots have the `ferrum_edge` tracing target, and crate-relative paths
 in startup resolve to the imported library modules. The version remains the

@@ -7,6 +7,15 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
+/// Publish stream settings from the executable's accepted startup configuration.
+///
+/// Call after `EnvConfig::from_env()` succeeds and before mode dispatch or any
+/// listener starts. The non-serving validation command must not call this seam.
+#[doc(hidden)]
+pub fn publish_gateway_stream_settings(env_config: &crate::config::EnvConfig) {
+    env_config.publish_process_wide_stream_settings();
+}
+
 /// Install the executable's process buffer budgets from its accepted configuration.
 ///
 /// Call once during startup, before listeners or request-processing tasks start.
