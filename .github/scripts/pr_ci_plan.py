@@ -1400,6 +1400,16 @@ def self_test() -> int:
                 "run_platform_build": False,
             },
         ),
+        (
+            "pull_request",
+            ["Dockerfile"],
+            {
+                "run_helm": True,
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
         ("pull_request", ["docs/prometheus_metric_contract.json"], {"run_helm": True}),
         ("pull_request", ["docs/prometheus_metrics.md"], {"run_helm": True}),
         (
@@ -1627,7 +1637,11 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/proxy/host_udp_capture.rs"],
-            src_only | {"run_netns_capture_live": True},
+            {
+                "run_ebpf_kernel_live": False,
+                "run_netns_capture_live": True,
+                "run_two_cluster_live": False,
+            },
         ),
         (
             "pull_request",
