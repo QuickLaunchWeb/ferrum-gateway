@@ -6432,7 +6432,7 @@ fn route_default_match_dispatch_rules(
         return (
             vec![gateway_api_dispatch_route_rule(
                 object,
-                default_match.clone(),
+                Value::Object(http_route_dispatch_match_criteria(&default_match)),
                 rule_index,
                 0,
                 route_destination,

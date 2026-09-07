@@ -163,7 +163,9 @@ checks translator/status agreement for both route kinds, all six reported gaps,
 future fields, and a supported RequestHeaderModifier control (issue #4816).
 `supported_gateway_request_headers_reach_backend_beside_rejected_route` also
 drives the translated HTTPRoute through the gateway to a real backend and
-checks header set/add/remove plus no traffic for the refused sibling.
+checks header set/add/remove plus no traffic for the refused sibling. Default
+HTTPRoute matches use the same internal predicate conversion as explicit
+matches, so supported actions do not emit an invalid raw Gateway API path field.
 The pinned [HTTPRoute v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go)
 marks response-header modification as Extended. The
 [GRPCRoute filter-type contract](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/grpcroute_types.go)

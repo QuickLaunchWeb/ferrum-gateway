@@ -2707,6 +2707,12 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
                         && plugin.config.to_string().contains("x-admission-control"))
             );
 
+            for plugin in &translation.config.plugin_configs {
+                ferrum_edge::plugins::validate_plugin_config(&plugin.plugin_name, &plugin.config)
+                    .unwrap_or_else(|error| {
+                        panic!("{kind} case {case_index}: {}: {error}", plugin.plugin_name)
+                    });
+            }
             let updates =
                 plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
             for (name, status) in [("bad", "False"), ("good", "True")] {
