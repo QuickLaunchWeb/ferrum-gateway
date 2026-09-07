@@ -1244,7 +1244,10 @@ impl TrustRetirementFixture {
         Self::try_new_with_crl(surfaces, GlobalCrlFixture::Baseline).await
     }
 
-    async fn try_new_with_crl(surfaces: FixtureSurfaces, crl_case: GlobalCrlFixture) -> Option<Self> {
+    async fn try_new_with_crl(
+        surfaces: FixtureSurfaces,
+        crl_case: GlobalCrlFixture,
+    ) -> Option<Self> {
         let dir = TempDir::new().unwrap();
         let server_ca = generate_ca("Retirement-Server-CA");
         let server = generate_signed_cert(&server_ca, "localhost", &["localhost", "127.0.0.1"]);
@@ -2460,7 +2463,8 @@ async fn test_global_crl_without_aki_allows_frontend_mtls_startup() {
         let mut started = None;
         for _ in 0..3 {
             started =
-                TrustRetirementFixture::try_new_with_crl(FixtureSurfaces::default(), crl_case).await;
+                TrustRetirementFixture::try_new_with_crl(FixtureSurfaces::default(), crl_case)
+                    .await;
             if started.is_some() {
                 break;
             }
