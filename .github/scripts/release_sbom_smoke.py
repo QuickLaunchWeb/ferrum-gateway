@@ -8,6 +8,7 @@ Ferrum images. Evidence is not publication authorization.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,9 @@ REPOSITORIES = {
     "docker": "ferrumedge/ferrum-edge",
     "ghcr": "ghcr.io/ferrum-edge/ferrum-edge",
 }
+# Exact predicate from release.yml at the failed run's source commit, before
+# c27e5e55eda97047a35af0bb0fd87fea760dcb82 accepted DESCRIBES relationships.
+HISTORICAL_PREDICATE = Path(".github/fixtures/release-sbom/require_sbom-af1bfcccc1c9.jq")
 
 
 def exactly_one(pattern: str, source: str) -> str:
@@ -57,14 +61,39 @@ def production_contract(workflow: str) -> tuple[str, str, str]:
         raise ValueError("production scanner must remain digest-pinned")
     if 'jq -e -f "$work/require_sbom.jq" "$output" >/dev/null' not in job:
         raise ValueError("production SPDX validation invocation changed")
+    # The policy must see executable code as literals. Compare the literal
+    # scanner invocation below with production as data; never execute extracted
+    # workflow text. Ignore only line indentation/continuation and shell exec;
+    # preserve quoting so a shell-semantics change cannot pass as equivalent.
+    tree = ast.parse(Path(__file__).read_text())
+    scans = [
+        ast.literal_eval(node.args[0])[-1]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess" and node.func.attr == "run"
+        and isinstance(node.args[0], ast.List)
+        and isinstance(node.args[0].elts[-1], ast.Constant)
+        and str(node.args[0].elts[-1].value).startswith("exec docker run")
+    ]
+    normalized_scan = " ".join(line.strip().removesuffix("\\").rstrip()
+                               for line in scan.splitlines())
+    if len(scans) != 1 or scans[0].removeprefix("exec ") != normalized_scan:
+        raise ValueError("literal scanner command differs from production")
     return predicate("require_manifest"), predicate("require_sbom"), scan
 
 
 def run_stage(
-    stage: str, command: list[str], work: Path, env: dict[str, str],
-    results: dict, timeout: float = 300,
+    stage: str, work: Path, env: dict[str, str],
+    results: dict, timeout: float = 300, expected_exit_code: int = 0,
 ) -> bool:
     """Persist an operation's status even on timeout; never swallow failure."""
+    if stage not in ("manifest", "manifest-validation", "syft-scan", "spdx-validation",
+                     "historical-spdx-validation"):
+        raise ValueError("unsupported diagnostic stage")
+    if expected_exit_code != 0 and (stage != "historical-spdx-validation" or expected_exit_code != 1):
+        raise ValueError("only the historical predicate may expect rejection")
     results[stage] = {"status": "running"}
     status_file = work / "status.json"
     status_file.write_text(json.dumps(results, indent=2) + "\n")
@@ -72,17 +101,50 @@ def run_stage(
         work / f"{stage}.stderr.txt"
     ).open("wb") as stderr:
         try:
-            result = subprocess.run(
-                command, env=env, stdout=stdout, stderr=stderr,
-                check=False, timeout=timeout,
-            )
+            options = dict(env=env, stdout=stdout, stderr=stderr,
+                           check=False, timeout=timeout)
+            # Literal shell programs with quoted environment data follow the
+            # existing hosted harness pattern. No variable selects a program.
+            if stage == "manifest":
+                result = subprocess.run([
+                    "bash", "-euo", "pipefail", "-c",
+                    'exec docker buildx imagetools inspect "$image_ref" --format "{{json .Manifest}}"',
+                ], **options)
+            elif stage == "manifest-validation":
+                result = subprocess.run([
+                    "bash", "-euo", "pipefail", "-c",
+                    'exec jq -e -f "$work/require_manifest.jq" "$work/manifest.stdout.txt"',
+                ], **options)
+            elif stage == "syft-scan":
+                result = subprocess.run([
+                    "bash", "-euo", "pipefail", "-c",
+                    'exec docker run --rm '
+                    '-e SYFT_CHECK_FOR_APP_UPDATE=false '
+                    '-e SYFT_REGISTRY_AUTH_USERNAME="$registry_username" '
+                    '-e SYFT_REGISTRY_AUTH_PASSWORD="$registry_password" '
+                    '-v "$work:/out" '
+                    'anchore/syft@sha256:9a9f85314017f1ea798fb012edfa7fe9259923910f82c8d4bc983ab5c765e60b '
+                    'scan "registry:${image_ref}" --platform "$platform" '
+                    '-o "spdx-json=/out/${family}_${registry}-${arch}.spdx.json"',
+                ], **options)
+            elif stage == "spdx-validation":
+                result = subprocess.run([
+                    "bash", "-euo", "pipefail", "-c",
+                    'exec jq -e -f "$work/require_sbom.jq" "$work/${family}_${registry}-${arch}.spdx.json"',
+                ], **options)
+            else:
+                result = subprocess.run([
+                    "bash", "-euo", "pipefail", "-c",
+                    'exec jq -e -f "$work/historical_require_sbom.jq" "$work/${family}_${registry}-${arch}.spdx.json"',
+                ], **options)
             results[stage] = {"exit_code": result.returncode}
         except subprocess.TimeoutExpired:
             results[stage] = {"status": "timeout", "timeout_seconds": timeout}
         except OSError as error:
             results[stage] = {"status": "launch_error", "errno": error.errno}
+    results[stage]["expected_exit_code"] = expected_exit_code
     status_file.write_text(json.dumps(results, indent=2) + "\n")
-    passed = results[stage].get("exit_code") == 0
+    passed = results[stage].get("exit_code") == expected_exit_code
     print(f"{stage}: {json.dumps(results[stage])}", flush=True)
     if not passed:
         print(f"::error::{stage} failed; inspect release-sbom evidence")
@@ -132,6 +194,7 @@ def main() -> int:
     )
     (work / "require_manifest.jq").write_text(manifest_filter)
     (work / "require_sbom.jq").write_text(sbom_filter)
+    (work / "historical_require_sbom.jq").write_text(HISTORICAL_PREDICATE.read_text())
     (work / "scan-command.txt").write_text(scan + "\n")
 
     # No job credentials, Docker credential helpers, registry secrets, or
@@ -145,12 +208,10 @@ def main() -> int:
                "work": str(work), "family": family, "registry": registry,
                "arch": arch, "platform": f"linux/{arch}", "image_ref": image_ref,
                "registry_username": "", "registry_password": ""}
-        if not run_stage("manifest", ["docker", "buildx", "imagetools", "inspect",
-                         image_ref, "--format", "{{json .Manifest}}"], work, env, results):
+        if not run_stage("manifest", work, env, results):
             return 1
         manifest = work / "manifest.stdout.txt"
-        if not run_stage("manifest-validation", ["jq", "-e", "-f",
-                         str(work / "require_manifest.jq"), str(manifest)], work, env, results):
+        if not run_stage("manifest-validation", work, env, results):
             return 1
         data = json.loads(manifest.read_text())
         if data["digest"] != f"sha256:{DIGESTS[family]}":
@@ -160,15 +221,15 @@ def main() -> int:
             if item["platform"].get("architecture") == arch
             and item["platform"].get("os") == "linux"
         )
-        scanned = run_stage("syft-scan", ["bash", "-e", "-u", "-o", "pipefail", "-c", scan],
-                            work, env, results, timeout=480)
+        scanned = run_stage("syft-scan", work, env, results, timeout=480)
         output = work / f"{family}_{registry}-{arch}.spdx.json"
         (work / "spdx-summary.json").write_text(json.dumps(describe_spdx(output), indent=2) + "\n")
         # Run jq even after scan failure: record missing/partial output, but a
         # valid leftover file must never turn a failed scan into success.
-        valid = run_stage("spdx-validation", ["jq", "-e", "-f",
-                          str(work / "require_sbom.jq"), str(output)], work, env, results)
-        return 0 if scanned and valid else 1
+        valid = run_stage("spdx-validation", work, env, results)
+        historical_rejection = run_stage("historical-spdx-validation", work, env, results,
+                                         expected_exit_code=1)
+        return 0 if scanned and valid and historical_rejection else 1
 
 
 if __name__ == "__main__":

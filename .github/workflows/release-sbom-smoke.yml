@@ -9,6 +9,7 @@ on:
       - .github/workflows/release-sbom-smoke.yml
       - .github/scripts/release_sbom_smoke.py
       - .github/scripts/test_release_sbom_smoke.py
+      - .github/fixtures/release-sbom/**
   push:
     branches: [main]
     paths:
@@ -16,6 +17,7 @@ on:
       - .github/workflows/release-sbom-smoke.yml
       - .github/scripts/release_sbom_smoke.py
       - .github/scripts/test_release_sbom_smoke.py
+      - .github/fixtures/release-sbom/**
 
 permissions:
   contents: read
@@ -30,7 +32,11 @@ jobs:
       max-parallel: 4
       matrix:
         family: [standard, ebpf, ebpftools]
-        registry: [docker, ghcr]
+        # Run 34162011344 proved these immutable Docker Hub images public.
+        # All six anonymous GHCR entries failed token discovery with HTTP 401,
+        # before Syft. Authenticated per-registry release verification remains
+        # required; this anonymous diagnostic lane cannot supply that evidence.
+        registry: [docker]
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
