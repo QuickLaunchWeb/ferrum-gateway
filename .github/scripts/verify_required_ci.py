@@ -107,7 +107,6 @@ REQUIRED_JOBS = {
     "ebpf-live",
     "netns-capture-live",
     "two-cluster-mesh-live",
-    "performance-regression",
     "build-binaries",
 }
 
@@ -141,7 +140,6 @@ PATH_GATED_JOBS = {
     "build-binaries": "run_platform_build",
     "test-vendor-patches": "run_vendor_patches",
     "dependency-audit": "run_dependency_audit",
-    "performance-regression": "run_perf",
 }
 
 # Every path-gated job keeps this exact event set: PRs, merge-queue checks,
@@ -1984,7 +1982,14 @@ def main() -> int:
             "commits with rename detection disabled"
         )
 
-    performance_regression_body = extract_job_body(ci_yml, "performance-regression")
+    # The performance regression check runs out of band (daily schedule and
+    # manual dispatch) in its own workflow; its static-contract steps stay pinned.
+    performance_regression_yml = Path(
+        ".github/workflows/performance-regression.yml"
+    ).read_text(encoding="utf-8")
+    performance_regression_body = extract_job_body(
+        performance_regression_yml, "performance-regression"
+    )
     if (
         'git diff --name-only --no-renames "${perf_base}...HEAD"'
         not in performance_regression_body

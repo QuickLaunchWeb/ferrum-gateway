@@ -59,6 +59,7 @@ adding, removing, or materially changing a workflow.
 | `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. A follow-on publisher upserts a `severity:high` issue when the matrix is red. Publisher jobs share `scaling-gate-publisher` with `queue: max` and `cancel-in-progress: false` so overlapping weekly/daily work stays queued; GitHub does not guarantee FIFO, so issue mutation is generation-aware and close is compare-and-set against the recorded run id. |
 | `scaling-gate-freshness.yml` | Scheduled Scaling Gate Freshness | Daily schedule, manual | Fail-closed freshness check of the latest scaling-regression run on `main`. Only a completed success within eight days may close that issue; a newer failure, cancel, timeout, skip, or in-progress run keeps it open, as does stale or missing history. The publish step runs even when static verification fails so a broken contract cannot stay silent. Shares the generation-aware publisher concurrency group (`queue: max`). |
+| `performance-regression.yml` | Performance Regression | Daily schedule on `main`, manual | Out-of-band self-relative overhead benchmark, Criterion microbenchmarks, and the protocol-perf / mesh-baseline static contracts. Not a PR or main-push check; a red run marks the daily `main` tip as regressed. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-24.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
 | `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
@@ -635,7 +636,6 @@ aggregate accepts a skipped job only when its gate was `false`:
 | `run_platform_build` | Build (`pr-build` profile, `cloud-secrets`) | build graph, `src/secrets/`, the binary entry points |
 | `run_vendor_patches` | Vendored Patch Regressions | `vendor/`, `Cargo.*`, toolchain |
 | `run_dependency_audit` | Dependency Audit (cargo-deny) | `Cargo.*`, `deny.toml`, `vendor/`, `ebpf/`, the dependency-policy and vendored-patch lifecycle docs, the advisory/lifecycle scripts |
-| `run_perf` | Performance Regression Check (which then applies its own benchmark classifier) | `src/`, `tests/performance/`, benchmark verifiers, build graph |
 | `run_helm` | Helm Chart | `charts/`, Dockerfiles, the Kubernetes-facing runtime modules, chart lint scripts |
 | `run_secrets_backends`, `run_pkcs11` | Secret Backends, PKCS#11 SoftHSM | unchanged feature-scoped surfaces |
 | `run_ebpf_kernel_live`, `run_netns_capture_live`, `run_two_cluster_live` | the three privileged ci.yml live suites | only their owner modules and harnesses; never the Cargo build graph |
@@ -648,6 +648,9 @@ workflow/scripts); `coverage.yml` skips every instrumented shard on a pull
 request unless the coverage controllers themselves change; the Kind live
 suites (`live_suite_path_filter.py`, `ci_runtime_plan.py`) fire only for their
 own harness, tooling, and the Kubernetes-facing modules they exist to test.
+The performance regression check is fully out of band: `performance-regression.yml`
+runs once a day against the tip of `main` (and on manual dispatch), never on a
+pull request or a main push.
 A regression in any of these on an ordinary source change turns `main` red
 for that commit, which makes the commit ineligible for a production release
 (see [Publish-blocking required checks](#publish-blocking-required-checks));
@@ -1521,27 +1524,23 @@ executes (`package-ferrum-runtime-image`, `setup-kubernetes-tools`,
 detection fails or returns a non-boolean verdict, reports green when relevance
 was proven `false`, and otherwise reports the live job's result.
 
-#### 6. Performance Regression Job
+#### 6. Performance Regression Job (`performance-regression.yml`)
 
-**Runs**: `ubuntu-latest`
-
-Runs on full-mode PRs, pushes to `main`, and manual dispatches. Immediately after
-checkout, the job always runs lightweight protocol-perf static validation (no
-benchmarks): workflow verifier `--self-test`, repository-contract verification,
-evaluator `--self-test`, and `python3 -m py_compile` on
-`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. PRs then
-apply a performance-sensitive path filter; unrelated PRs skip the expensive
-benchmark and report success. On pull requests and merge-queue groups, changed
-files are collected with `git diff --name-only --no-renames` so both sides of a
-rename are classified and a move into an irrelevant path cannot suppress the
-benchmark. The PR gate covers proxy and connection hot paths,
-the file-mode startup path used by this benchmark, performance fixtures, and
-dependency/build-graph inputs. Plugin-internal, admin, secrets, and unrelated
-operating-mode changes are excluded because this plain HTTP/1.1 file-mode route
-cannot observe them. If the PR diff cannot be computed, the benchmark runs to
-fail closed. Relevant PRs and all `main` pushes build the gateway in the
-`ci-release` profile, build `tests/performance/backend_server`, start both
-services, and run:
+**Runs**: `ubuntu-latest`, once a day (`schedule`, 06:17 UTC) against the tip
+of `main`, and on manual dispatch. It is not part of `ci.yml`, the `Tests`
+aggregate, or any pull-request or main-push validation: the ci-release build,
+the self-relative overhead benchmark, and the Criterion microbenchmarks are
+deliberately out of band so they never sit on the PR or merge critical path.
+A red daily run marks that `main` tip as performance-regressed for triage.
+Immediately after checkout, the job always runs lightweight protocol-perf static
+validation (no benchmarks): workflow verifier `--self-test`,
+repository-contract verification, evaluator `--self-test`, and
+`python3 -m py_compile` on
+`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. The
+change classifier is retained for manual dispatch parity; on the scheduled and
+dispatched events it schedules every benchmark. The job builds the gateway in
+the `ci-release` profile, builds `tests/performance/backend_server`, starts both
+services, and runs:
 
 ```bash
 python3 tests/performance/ci_overhead_bench.py \
