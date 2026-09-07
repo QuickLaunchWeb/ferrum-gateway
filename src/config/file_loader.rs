@@ -425,15 +425,12 @@ pub fn load_config_from_file(
             ValidationAction::FatalCount(
             "Configuration validation failed: {} plugin config error(s) found",
         ))
-        .validate_plugin_file_dependencies(ValidationAction::FatalCount(
-            "Configuration validation failed: {} plugin file dependency error(s) found",
-        ))
         .validate_stream_proxies(ValidationAction::FatalCount(
             "Configuration validation failed: {} stream proxy error(s) found",
         ))
         .run()?;
 
-    // File mode keeps its stricter field, identity and local-file checks above,
+    // File mode keeps its stricter field and identity checks above,
     // then runs the complete shared admission gate used by database/CP loads.
     // Do not duplicate that validator list here: newly added runtime rejection
     // rules must also fail `validate` and SIGHUP before publication.
@@ -444,6 +441,14 @@ pub fn load_config_from_file(
             runtime_errors.join("; ")
         );
     }
+
+    // Match SQL/Mongo admission ordering: only an accepted graph may commit
+    // the MMDB validation handoff consumed by the subsequent cache build.
+    ValidationPipeline::new(&mut config)
+        .validate_plugin_file_dependencies(ValidationAction::FatalCount(
+            "Configuration validation failed: {} plugin file dependency error(s) found",
+        ))
+        .run()?;
 
     info!(
         "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",

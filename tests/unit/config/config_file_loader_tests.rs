@@ -13,7 +13,9 @@ fn file_admission_rejects_runtime_invalid_graphs_at_load_and_reload() {
             serde_json::from_value(case["config"].clone()).unwrap();
         candidate.normalize_fields();
         let shared_errors =
-            ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&candidate);
+            ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(
+                &candidate,
+            );
         if let Some(expected) = case["expected_error"].as_str() {
             assert!(
                 shared_errors.iter().any(|error| error.contains(expected)),
@@ -34,7 +36,10 @@ fn file_admission_rejects_runtime_invalid_graphs_at_load_and_reload() {
             let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
             for (operation, result) in [
                 ("load", load_config_from_file(path, 30, &policy, "ferrum")),
-                ("reload", reload_config_from_file(path, 30, &policy, "ferrum")),
+                (
+                    "reload",
+                    reload_config_from_file(path, 30, &policy, "ferrum"),
+                ),
             ] {
                 if let Some(expected) = case["expected_error"].as_str() {
                     let error = result.expect_err(name).to_string();
@@ -43,9 +48,8 @@ fn file_admission_rejects_runtime_invalid_graphs_at_load_and_reload() {
                         "{name} {extension} {operation}: {error}"
                     );
                 } else {
-                    let config = result.unwrap_or_else(|error| {
-                        panic!("{name} {extension} {operation}: {error}")
-                    });
+                    let config = result
+                        .unwrap_or_else(|error| panic!("{name} {extension} {operation}: {error}"));
                     assert_eq!(config.proxies.len(), 1, "{name}");
                     assert_eq!(
                         config.plugin_configs.len(),
@@ -90,6 +94,16 @@ fn file_and_database_full_loads_keep_the_shared_rejecting_admission_gate() {
             body.contains("collect_rejecting_runtime_config_errors(&config)"),
             "{name} full load must inherit the shared rejecting-validator set"
         );
+        if name == "file" {
+            let rejecting = body
+                .find("collect_rejecting_runtime_config_errors(&config)")
+                .unwrap();
+            let local_files = body.find(".validate_plugin_file_dependencies(").unwrap();
+            assert!(
+                rejecting < local_files,
+                "a rejected graph must not publish an MMDB validation handoff"
+            );
+        }
     }
 }
 
