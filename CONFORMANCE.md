@@ -143,6 +143,28 @@ renamed, filtered out, or tagged GA without a manifest entry. The emitted
 `coverage.json` and `coverage.md` include the manifest-backed GA contract so
 reviewers can compare the generated matrix to the declared product promise.
 
+## Gateway API rule feature admission
+
+HTTPRoute and GRPCRoute support rule-level `RequestHeaderModifier`; HTTPRoute
+also supports `RequestRedirect`. ResponseHeaderModifier, URLRewrite,
+RequestMirror, ExtensionRef, CORS, ExternalAuth and backend-reference filters
+remain deferred. Translation rejects a route containing these unimplemented
+filter actions with `Accepted=False` / `IncompatibleFilters`; it does not emit
+partially interpreted rules. Unknown filter types and unimplemented rule fields,
+including timeouts and retry, report `UnsupportedValue`. Both cases report
+`Programmed=False`, while independently valid routes remain available.
+
+The field inventory admits rule name, matches, backendRefs, filters and
+sessionPersistence, each subject to its existing validation. Empty backend
+filter lists have no action and remain accepted. Extra fields on a supported
+filter or its payload are refused. The integration regression
+`unsupported_http_and_grpc_route_features_are_refused_before_materialization`
+checks translator/status agreement for both route kinds, all six reported gaps,
+future fields, and a supported RequestHeaderModifier control (issue #4816).
+ResponseHeaderModifier is Extended in the pinned
+[Gateway API v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go);
+Ferrum does not claim its implementation here.
+
 ## Status values
 
 The matrix tags each feature with one of three statuses:

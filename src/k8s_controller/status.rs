@@ -17,7 +17,7 @@ use crate::config_sources::k8s::{
     GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayClassAuthority, K8sObject,
     K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers, backend_lb_policy_status,
+    INCOMPATIBLE_FILTERS_MARKER, UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers, backend_lb_policy_status,
     gateway_api_route_conflict_keys_with_acc, gateway_api_section_name_is_valid,
     gateway_api_status_conflict_context, merge_backend_lb_policy_status,
     namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
@@ -2749,11 +2749,12 @@ fn route_status(
                         "ResolvedRefs",
                         format!("Ferrum rejected this route attachment: {error}"),
                     )
-                } else if error_is_unsupported_shape(error) {
+                } else if error_is_unsupported_shape(error) || error_is_incompatible_filters(error) {
                     // An object that is valid under the pinned Gateway API CRD
                     // but names a shape Ferrum does not implement is
-                    // `Accepted=False` / `UnsupportedValue` — the upstream
-                    // constant for exactly this — not the generic `Invalid`,
+                    // `Accepted=False` / `UnsupportedValue`, or the more
+                    // specific `IncompatibleFilters` for known filter actions,
+                    // rather than the generic `Invalid`,
                     // which would report a well-formed object as malformed.
                     // Reference resolution is independent of the unsupported
                     // field, so it is still reported on its own terms.
@@ -2765,7 +2766,7 @@ fn route_status(
                         false,
                         resolved_refs,
                         false,
-                        "UnsupportedValue",
+                        if error_is_incompatible_filters(error) { "IncompatibleFilters" } else { "UnsupportedValue" },
                         resolved_refs_reason,
                         format!("Ferrum does not implement this route shape: {error}"),
                     )
@@ -4071,6 +4072,11 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
         }
         K8sTranslateError::Unsupported(_) => false,
     }
+}
+
+fn error_is_incompatible_filters(error: &K8sTranslateError) -> bool {
+    matches!(error, K8sTranslateError::InvalidResource { message, .. }
+        if message.starts_with(INCOMPATIBLE_FILTERS_MARKER))
 }
 
 /// True when the translator rejected an object that is **valid** under the
