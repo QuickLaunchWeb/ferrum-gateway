@@ -349,6 +349,7 @@ fn a_missing_account_store_reads_empty_but_an_unreadable_one_fails_closed() {
 #[test]
 fn ca_invalid_order_write_requires_the_live_lease_fence_and_is_visible_to_peers() {
     use ferrum_edge::tls::lease::{FencedCommit, TlsLeaseStore, acme_renewal_lease_name};
+    use std::sync::Arc;
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
@@ -356,8 +357,8 @@ fn ca_invalid_order_write_requires_the_live_lease_fence_and_is_visible_to_peers(
     let peer = AcmeOrderStore::open(dir.path()).unwrap();
     create_order(&orders, "renew-terminal", "edge-cert", "terminal_token");
     let order = orders.get_order("renew-terminal").unwrap();
-    let leases_a = TlsLeaseStore::open_with_holder(dir.path(), "a".to_string()).unwrap();
-    let leases_b = TlsLeaseStore::open_with_holder(dir.path(), "b".to_string()).unwrap();
+    let leases_a = Arc::new(TlsLeaseStore::open_with_holder(dir.path(), "a".to_string()).unwrap());
+    let leases_b = Arc::new(TlsLeaseStore::open_with_holder(dir.path(), "b".to_string()).unwrap());
     let name = acme_renewal_lease_name("edge-cert");
     let first = leases_a
         .try_acquire(&name, Duration::from_secs(60))
