@@ -1008,6 +1008,8 @@ async fn coordinate_backend(flavor: CoordinateFlavor) -> RecordingBackend {
             let recorded = Arc::clone(&recorded);
             tokio::spawn(async move {
                 if flavor == CoordinateFlavor::WebSocket {
+                    // Tungstenite requires its unboxed ErrorResponse at this callback boundary.
+                    #[allow(clippy::result_large_err)]
                     let callback = move |req: &WsRequest, response: WsResponse| {
                         recorded.lock().unwrap().push(req.uri().path().to_string());
                         Ok(response)
