@@ -132,6 +132,15 @@ exceptions = [
 ]
 '
 
+  st_case "same-line second exception missing its own token" 1 \
+'[licenses]
+version = 2
+exceptions = [
+    # owner: platform - first [expires:2099-12-31]
+    { crate = "a", allow = ["Bar-1.0"] }, { crate = '\''b'\'', allow = ["Bar-1.0"] },
+]
+'
+
   if [ "$st_fail" -ne 0 ]; then
     echo ""
     echo "check_advisory_expiry.sh self-test FAILED."
@@ -224,8 +233,12 @@ license_entries="$(awk '
 
     # An entry opens at its crate spec key. Consume the pending token so a later
     # entry cannot inherit an earlier entry comment.
-    if (match(code, /(crate|name)[[:space:]]*=[[:space:]]*("[^"]*"|\047[^\047]*\047)/)) {
-      spec = substr(code, RSTART, RLENGTH)
+    # TOML permits several entries on one line. Check each of them; the
+    # first entry must not hide a later exception without its own token.
+    remaining = code
+    while (match(remaining, /(crate|name)[[:space:]]*=[[:space:]]*("[^"]*"|\047[^\047]*\047)/)) {
+      spec = substr(remaining, RSTART, RLENGTH)
+      remaining = substr(remaining, RSTART + RLENGTH)
       sub(/^[^=]*=[[:space:]]*/, "", spec)
       spec = substr(spec, 2, length(spec) - 2)
       printf "%s\t%s\n", spec, pending
