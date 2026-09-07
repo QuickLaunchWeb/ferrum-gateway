@@ -918,8 +918,10 @@ verified SubjectPublicKeyInfo from the accepted client-CA bundle (signature
 verified; matching a DN is not enough; identical SPKIs are deduplicated). When
 the signer is not in the accepted bundle, issuer DN and Authority Key
 Identifier cannot prove its key identity: distinct keys can deliberately reuse
-both. Ferrum therefore requires an unambiguous AKI but conservatively includes
-the complete signed CRL in that issuer identity. A reissue from such an
+both. Ferrum therefore conservatively includes the complete signed CRL in that
+issuer identity. A CRL without AKI can be summarized this way, including a CRL
+in the global list whose signer belongs only to a backend trust domain. A
+present malformed or duplicate AKI remains invalid. A reissue from such an
 outside-bundle signer retires established sessions; this availability cost
 prevents colliding issuer metadata from suppressing a new revocation. A CRL
 whose issuer cannot be identified conservatively is refused and the last-good
