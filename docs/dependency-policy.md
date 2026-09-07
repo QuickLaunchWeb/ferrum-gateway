@@ -487,6 +487,10 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   one, never changes an image or tag. The PR carries no gates of its own — normal
   required CI (multi-arch build, FIPS, eBPF, GNU ABI scan, chart smoke) is what
   proves a new base before merge.
+  The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
+  so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
+  `BASE_IMAGE` is supplied by the preceding local image build; the refresh changes
+  only the digest-pinned external tooling input.
 
 Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
 fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the
