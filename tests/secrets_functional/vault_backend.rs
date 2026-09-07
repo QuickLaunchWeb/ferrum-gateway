@@ -7,9 +7,7 @@
 
 use crate::common::containers::{VaultContainer, fail_in_ci_else_skip, start_vault_dev_container};
 use crate::common::env::{EnvGuard, assert_resolved_var};
-use ferrum_edge::secrets::{
-    resolve_all_env_secrets, resolve_external_reference, resolve_secret,
-};
+use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference, resolve_secret};
 use serial_test::serial;
 use std::time::Duration;
 use wiremock::matchers::{header, method, path};
