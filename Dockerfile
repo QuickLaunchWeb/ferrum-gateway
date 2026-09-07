@@ -20,7 +20,7 @@
 ARG FEATURES=cloud-secrets
 # Digest resolved 2026-08-31; the tag is kept for readability, the digest is authoritative.
 ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
-ARG IPROUTE2_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+ARG IPROUTE2_BASE=debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 ARG IPROUTE2_VERSION=6.15.0-1
 ARG BPF_LINKER_VERSION=0.11.0
 ARG BPF_LINKER_AMD64_SHA256=10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450
