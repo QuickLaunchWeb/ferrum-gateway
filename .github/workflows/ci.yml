@@ -2322,7 +2322,8 @@ jobs:
             test_request_deduplication_redis_blocks_concurrent_cross_instance \
             test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict \
             test_request_deduplication_redis_distinct_header_instances_complete_independently \
-            test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks
+            test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks \
+            test_request_deduplication_redis_dispatch_failures_preserve_execution_provenance
         env:
           FERRUM_SKIP_GATEWAY_BUILD: "1"
           FERRUM_REDIS_REQUIRED: "1"
@@ -2360,6 +2361,7 @@ jobs:
           echo "- test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_distinct_header_instances_complete_independently" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks" >> $GITHUB_STEP_SUMMARY
+          echo "- test_request_deduplication_redis_dispatch_failures_preserve_execution_provenance" >> $GITHUB_STEP_SUMMARY
           echo "- test_hmac_v2_shared_redis_admits_one_backend_mutation_across_replicas" >> $GITHUB_STEP_SUMMARY
           echo "- test_dpop_shared_redis_admits_one_proof_across_replicas" >> $GITHUB_STEP_SUMMARY
           echo "- test_shared_replay_authority_live_redis_admits_exactly_one_winner" >> $GITHUB_STEP_SUMMARY
