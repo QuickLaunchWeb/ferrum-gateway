@@ -680,13 +680,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
-      - name: Restore swap headroom for the standalone ACME compile
-        # This feature build previously ran inside Unit Tests, which adds 12 GiB
-        # of swap. Splitting the job must retain that memory headroom: three
-        # cold compiles lost the runner near 15 GiB RSS and 3 GiB swap (#4835).
-        # Keep compiler profiles, feature coverage and cache identities intact.
+      - name: Extend runner swap for the ACME feature compile
         run: |
           set -euo pipefail
+          # Same runner-loss mitigation as Unit Tests: a cold `--features acme`
+          # library compile can exceed hosted-runner RAM and the VM dies with
+          # "The runner has received a shutdown signal" (exit 143) before any
+          # diagnostic prints. Swap headroom turns that into paging.
           sudo fallocate -l 12G /mnt/ferrum-swapfile
           sudo chmod 600 /mnt/ferrum-swapfile
           sudo mkswap /mnt/ferrum-swapfile
