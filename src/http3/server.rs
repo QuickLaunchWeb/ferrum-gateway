@@ -7329,6 +7329,17 @@ async fn handle_h3_request(
         // Content-Length because the inspector transforms the body).
         let declared_content_length =
             preserved_response_content_length(&response_headers, response_status);
+        // Header framing alone cannot enforce HTTP's body-omission semantics:
+        // a non-compliant native-H3 backend can still send DATA for HEAD or a
+        // body-forbidden status. Keep draining those frames so the pooled
+        // connection remains usable, but never let them reach the downstream
+        // stream (or a response policy that legitimately declined buffering
+        // because no client-visible body can exist).
+        let response_omits_body =
+            crate::plugins::utils::synthetic_response::synthetic_response_omits_body(
+                &ctx.method,
+                response_status,
+            );
         if response_inspector.is_some() {
             // Ordinary Streaming framing removes the wire field anyway; this
             // case-insensitive omit additionally covers `HEAD`, where `Head`
@@ -7600,6 +7611,12 @@ async fn handle_h3_request(
                             // semantically complete, even when the body-size
                             // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
                             total_streamed += chunk_len;
+                            if response_omits_body {
+                                // Enforce the trusted request/status semantics at
+                                // the DATA sink. Header sanitization cannot stop
+                                // the vendored H3 writer from sending these bytes.
+                                continue;
+                            }
                             if effective_max_response_body_size_bytes > 0
                                 && total_streamed > effective_max_response_body_size_bytes
                             {

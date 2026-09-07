@@ -5495,3 +5495,41 @@ fn assert_plain_relay_authorization_first(relay: &str, recv_data: &str) {
         "a spent captured plan must abort before finish_h3_response_with_backend_trailers"
     );
 }
+
+#[test]
+fn native_h3_streaming_discards_forbidden_response_data_before_policy_or_wire() {
+    let server = std::fs::read_to_string("src/http3/server.rs").expect("read H3 server source");
+    let relay = server
+        .split("let response_omits_body =")
+        .nth(1)
+        .expect("native H3 response omission decision")
+        .split("finish_h3_response_with_backend_trailers(")
+        .next()
+        .expect("bounded native H3 streaming relay");
+    let data_arm = relay
+        .split("Ok(Some(mut chunk)) => {")
+        .nth(1)
+        .expect("native H3 backend DATA arm");
+    let discard = data_arm
+        .find("if response_omits_body {")
+        .expect("body-forbidden DATA discard");
+    let inspector = data_arm
+        .find("if let Some(inspector) = response_inspector.as_mut()")
+        .expect("streaming response inspector");
+    let downstream_send = data_arm
+        .find("stream.send_data(")
+        .expect("downstream DATA send");
+
+    assert!(
+        data_arm[..discard].contains("total_streamed += chunk_len;"),
+        "the relay must account for malicious upstream DATA before discarding it"
+    );
+    assert!(
+        discard < inspector && discard < downstream_send,
+        "body-forbidden DATA must be discarded before inspection or any downstream send"
+    );
+    assert!(
+        data_arm[discard..inspector].contains("continue;"),
+        "the body-forbidden branch must skip every downstream DATA path"
+    );
+}
