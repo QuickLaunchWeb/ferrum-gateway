@@ -1097,3 +1097,4 @@ mod tests {
 }
 
 // CI lane probe: exercises the gated pull-request plan (throwaway).
+// CI lane probe 2: warm dependency lane measurement (throwaway).
