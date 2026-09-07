@@ -996,7 +996,8 @@ fn endpoint_backend_port(
     // EndpointSlice port names correspond to Service port names, not named
     // targetPorts (which name container ports). The slice already resolved
     // the container number and is authoritative for direct endpoint dials.
-    let endpoint_port = if let Some(name) = service_port_spec.and_then(|port| port.name.as_deref()) {
+    let endpoint_port = if let Some(name) = service_port_spec.and_then(|port| port.name.as_deref())
+    {
         slice
             .ports
             .iter()
