@@ -302,6 +302,15 @@ impl TestGateway {
         }
     }
 
+    /// Poll the owned child without relinquishing teardown responsibility.
+    /// A shut-down harness is not a live transport peer.
+    pub fn is_running(&mut self) -> Result<bool, std::io::Error> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait().map(|status| status.is_none()),
+            None => Ok(false),
+        }
+    }
+
     /// Return the `Child` handle without dropping it (e.g. to send a signal).
     /// After this call, `Drop` will no longer clean up the process — the caller
     /// is responsible for termination.
