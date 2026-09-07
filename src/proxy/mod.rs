@@ -5958,10 +5958,15 @@ pub(crate) fn finalized_request_rejection_phase(rejected_by_egress: bool) -> &'s
 pub(crate) fn rebase_route_override_path(
     ctx: &mut RequestContext,
     original_path: String,
+    strip_len: &mut usize,
 ) -> String {
     let Some(rewritten) = ctx.route_override_path.clone() else {
         return original_path;
     };
+    // A replacement has its own coordinates, even when its bytes happen to
+    // equal the original path. Backend base-path composition is independent.
+    *strip_len = 0;
+    ctx.matched_path_strip_len = 0;
     ctx.path.clone_from(&rewritten);
     rewritten
 }
@@ -14277,7 +14282,7 @@ async fn handle_websocket_request_authenticated(
     } else {
         (proxy.backend_host.as_str(), proxy.backend_port)
     };
-    let backend_url = build_websocket_backend_url_with_target(
+    let backend_url = match build_websocket_backend_url_with_target(
         &proxy,
         &ctx.path,
         &query_string,
@@ -14285,7 +14290,22 @@ async fn handle_websocket_request_authenticated(
         effective_port,
         strip_len,
         upstream_target.as_ref().and_then(|t| t.path.as_deref()),
-    );
+    ) {
+        Ok(url) => url,
+        Err(_) => {
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                current_cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            return Ok(build_websocket_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"Invalid backend path coordinates"}"#,
+                &initial_response_header_policy_plugins,
+            ));
+        }
+    };
 
     // Get the upgrade parts from the request
     let (mut parts, _body) = req.into_parts();
@@ -14959,7 +14979,7 @@ async fn handle_websocket_request_authenticated(
                                 "Aborting WebSocket retry because the candidate exceeds its DestinationRule maxRetries cap"
                             );
                         } else {
-                            retry_backend_url = build_websocket_backend_url_with_target(
+                            retry_backend_url = match build_websocket_backend_url_with_target(
                                 &proxy,
                                 &ctx.path,
                                 &query_string,
@@ -14967,7 +14987,13 @@ async fn handle_websocket_request_authenticated(
                                 next.port,
                                 strip_len,
                                 next.path.as_deref(),
-                            );
+                            ) {
+                                Ok(url) => url,
+                                Err(_) => {
+                                    retry_path_mismatch = true;
+                                    current_backend_url.clone()
+                                }
+                            };
                             retry_cb_target_key =
                                 Some(crate::circuit_breaker::target_key(&next.host, next.port));
                             retry_target = Some(next);
@@ -16002,13 +16028,19 @@ fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str)
     url.push_str(remaining_path);
 }
 
+/// The router offset does not identify a UTF-8 boundary in this path.
+/// Refuse construction rather than clamp it or substitute another path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid backend path coordinates")]
+pub struct InvalidBackendPath;
+
 fn with_backend_path_parts<R>(
     proxy: &Proxy,
     incoming_path: &str,
     strip_len: usize,
     target_path: Option<&str>,
     use_parts: impl FnOnce(&str, &str) -> R,
-) -> R {
+) -> Result<R, InvalidBackendPath> {
     // `strip_len` is measured by the router after encoded-slash
     // normalization, so stripping must use the same coordinate system.
     let normalized_path = if proxy.strip_listen_path {
@@ -16019,11 +16051,11 @@ fn with_backend_path_parts<R>(
         None
     };
     let remaining_path = match &normalized_path {
-        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        Some(normalized) => normalized.get(strip_len..).ok_or(InvalidBackendPath)?,
         None => incoming_path,
     };
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
-    use_parts(backend_path, remaining_path)
+    Ok(use_parts(backend_path, remaining_path))
 }
 
 /// Assemble the exact path that URL construction will forward to the selected
@@ -16035,7 +16067,7 @@ pub fn build_backend_effective_path(
     incoming_path: &str,
     strip_len: usize,
     target_path: Option<&str>,
-) -> String {
+) -> Result<String, InvalidBackendPath> {
     with_backend_path_parts(
         proxy,
         incoming_path,
@@ -16070,9 +16102,16 @@ pub fn retry_target_preserves_backend_path(
     }
     let previous_path = previous.path.as_deref().or(proxy.backend_path.as_deref());
     let next_path = next.path.as_deref().or(proxy.backend_path.as_deref());
-    previous_path == next_path
-        || build_backend_effective_path(proxy, incoming_path, strip_len, previous.path.as_deref())
-            == build_backend_effective_path(proxy, incoming_path, strip_len, next.path.as_deref())
+    if previous_path == next_path {
+        return with_backend_path_parts(proxy, incoming_path, strip_len, None, |_, _| ()).is_ok();
+    }
+    match (
+        build_backend_effective_path(proxy, incoming_path, strip_len, previous.path.as_deref()),
+        build_backend_effective_path(proxy, incoming_path, strip_len, next.path.as_deref()),
+    ) {
+        (Ok(previous), Ok(next)) => previous == next,
+        _ => false,
+    }
 }
 
 fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
@@ -16357,7 +16396,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
     port: u16,
     strip_len: usize,
     target_path: Option<&str>,
-) -> String {
+) -> Result<String, InvalidBackendPath> {
     use std::fmt::Write;
 
     // WebSocket URL scheme: TLS intent comes from `backend_scheme`; the
@@ -16368,55 +16407,34 @@ pub(crate) fn build_websocket_backend_url_with_target(
         _ => "wss",
     };
 
-    // Host-only proxies (listen_path == None) have no prefix to strip.
-    // Exact listen_paths carry a leading '=' marker for routing; strip only
-    // the literal path part so WebSocket forwarding matches HTTP forwarding.
-    //
-    // `strip_len` is computed by the router against the encoded-slash
-    // NORMALIZED path, so slice the normalized path (not the raw one) to keep
-    // routing and forwarding in the same coordinate system; slicing the raw
-    // path mis-aligns by 2 bytes per %2f and can panic mid-UTF-8 codepoint.
-    // See `build_backend_url_with_target` for the full rationale. For paths
-    // without encoded slashes this is an allocation-free borrowed no-op.
-    let normalized_path = if proxy.strip_listen_path {
-        Some(crate::router_cache::normalize_encoded_slashes(
-            incoming_path,
-        ))
-    } else {
-        None
-    };
-    let remaining_path = match &normalized_path {
-        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
-        None => incoming_path,
-    };
-
-    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
-
-    let path_layout = backend_path_layout(backend_path, remaining_path);
-    let rendered_host = url_render_host(host);
-
-    // Pre-calculate capacity and build in a single buffer.
-    let capacity = scheme.len()
-        + 3 // "://"
-        + rendered_host.len()
-        + 6 // ":PORT" (max 5 digits + colon)
-        + path_layout.len
-        + if query_string.is_empty() {
-            0
-        } else {
-            1 + query_string.len()
-        };
-
-    let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
-    push_backend_path(&mut url, backend_path, remaining_path);
-
-    if !query_string.is_empty() {
-        url.push('?');
-        url.push_str(query_string);
-    }
-
-    url
+    with_backend_path_parts(
+        proxy,
+        incoming_path,
+        strip_len,
+        target_path,
+        |backend_path, remaining_path| {
+            let path_layout = backend_path_layout(backend_path, remaining_path);
+            let rendered_host = url_render_host(host);
+            let capacity = scheme.len()
+                + 3
+                + rendered_host.len()
+                + 6
+                + path_layout.len
+                + if query_string.is_empty() {
+                    0
+                } else {
+                    1 + query_string.len()
+                };
+            let mut url = String::with_capacity(capacity);
+            let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
+            push_backend_path(&mut url, backend_path, remaining_path);
+            if !query_string.is_empty() {
+                url.push('?');
+                url.push_str(query_string);
+            }
+            url
+        },
+    )
 }
 
 /// Whether `proxy`'s resolved backend TLS carries an SNI override the WebSocket
@@ -22073,6 +22091,23 @@ pub(crate) async fn log_rejected_request_with_path(
     .await;
 }
 
+fn rejected_request_backend_url(proxy: &Proxy, ctx: &RequestContext) -> Option<String> {
+    let (path, strip_len) = match ctx.route_override_path.as_deref() {
+        Some(path) => (path, 0),
+        None => (ctx.path.as_str(), ctx.matched_path_strip_len),
+    };
+    build_backend_url_with_target(
+        proxy,
+        path,
+        "",
+        &proxy.backend_host,
+        proxy.backend_port,
+        strip_len,
+        ctx.route_override_path_is_absolute.then_some(""),
+    )
+    .ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn log_rejected_request_with_path_and_backend_state(
     plugins: &[Arc<dyn Plugin>],
@@ -22133,14 +22168,11 @@ async fn log_rejected_request_with_path_and_backend_state(
         proxy_id: proxy.map(|p| p.id.clone()),
         proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target: if include_backend_target {
-            proxy.map(|p| {
-                // Host-only proxies (listen_path None) have no prefix to strip.
-                // `ctx.path` is intentionally used here (not the override) because
-                // `backend_target` should reflect the rewritten path that would
-                // have been sent to the backend.
-                let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
-                let url = build_backend_url(p, &ctx.path, "", strip_len);
-                strip_query_params(&url).to_string()
+            proxy.and_then(|p| {
+                // Recover the dispatch coordinate even when a finalized hook
+                // temporarily exposes the original client path in `ctx.path`.
+                let url = rejected_request_backend_url(p, ctx)?;
+                Some(strip_query_params(&url).to_string())
             })
         } else {
             None
@@ -30241,7 +30273,7 @@ async fn handle_proxy_request_inner(
         route_match
     };
 
-    let (proxy, strip_len) = match route_match {
+    let (proxy, mut strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,
             // and all subsequent code (plugins, backend dispatch) needs the HashMap.
@@ -30407,6 +30439,7 @@ async fn handle_proxy_request_inner(
         }
     };
 
+    ctx.matched_path_strip_len = strip_len;
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
@@ -31797,12 +31830,12 @@ async fn handle_proxy_request_inner(
     // used for backend URL building (reqwest / direct-H2 / gRPC paths read the
     // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
     // override onto `ctx.path` too). The original path was already used for
-    // route selection; VS-derived proxies never set `strip_listen_path`, so
-    // the rewritten value is the literal forwarded path. Preserve the private
+    // route selection; replacing it invalidates that route's strip offset.
+    // Ordinary rewrites retain backend base-path composition. Preserve the private
     // override so finalized-egress plugins can recover the selected backend
     // path while their public `ctx.path` view is temporarily restored to the
     // client path. No allocation when no rewrite is set.
-    let mut path = rebase_route_override_path(&mut ctx, path);
+    let mut path = rebase_route_override_path(&mut ctx, path, &mut strip_len);
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
@@ -31833,14 +31866,25 @@ async fn handle_proxy_request_inner(
     // external work. This also ensures an exhausted method rate limit rejects
     // before a pre-proxy serverless function is invoked.
     if backend_path_is_policy_bound {
-        let backend_path = build_backend_effective_path(
+        let backend_path = match build_backend_effective_path(
             &proxy,
             &path,
             strip_len,
             upstream_target
                 .as_ref()
                 .and_then(|target| target.path.as_deref()),
-        );
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(build_pre_plugin_reject_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"Invalid backend path coordinates",
+                    &HashMap::new(),
+                    request_uses_grpc_content_type,
+                    grpc_web_response_content_type,
+                ));
+            }
+        };
         if let Some(response) = run_backend_path_plugins_or_build_reject(
             backend_path_plugins,
             &plugins,
@@ -32048,9 +32092,9 @@ async fn handle_proxy_request_inner(
         let path_rebase_pending = ctx
             .route_override_path
             .as_deref()
-            .is_some_and(|rewrite| rewrite != path || rewrite != ctx.path);
+            .is_some_and(|rewrite| strip_len != 0 || rewrite != path || rewrite != ctx.path);
         if path_rebase_pending {
-            path = rebase_route_override_path(&mut ctx, path);
+            path = rebase_route_override_path(&mut ctx, path, &mut strip_len);
         }
         if destination_rebound {
             // Replace the whole selection rather than only the target:
@@ -33339,7 +33383,7 @@ async fn handle_proxy_request_inner(
         };
 
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
-        let mut grpc_backend_url = build_backend_url_with_target(
+        let mut grpc_backend_url = match build_backend_url_with_target(
             grpc_dispatch_proxy,
             &path,
             effective_query_string.as_ref(),
@@ -33347,7 +33391,18 @@ async fn handle_proxy_request_inner(
             grpc_effective_port,
             strip_len,
             upstream_target.as_ref().and_then(|t| t.path.as_deref()),
-        );
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(build_pre_plugin_reject_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"Invalid backend path coordinates",
+                    &HashMap::new(),
+                    request_uses_grpc_content_type,
+                    grpc_web_response_content_type,
+                ));
+            }
+        };
         let backend_start = Instant::now();
         // Adaptive-concurrency admission latency must be measured from the
         // backend dispatch point, not from here: `backend_start` precedes
@@ -34363,7 +34418,7 @@ async fn handle_proxy_request_inner(
 
                 // Try a different target on retry if load balancing is configured
                 if let Some(next) = next_retry_target {
-                    grpc_backend_url = build_backend_url_with_target(
+                    grpc_backend_url = match build_backend_url_with_target(
                         &proxy,
                         &path,
                         effective_query_string.as_ref(),
@@ -34371,7 +34426,10 @@ async fn handle_proxy_request_inner(
                         next.port,
                         strip_len,
                         next.path.as_deref(),
-                    );
+                    ) {
+                        Ok(url) => url,
+                        Err(_) => break,
+                    };
                     grpc_current_cb_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
@@ -36479,10 +36537,9 @@ async fn handle_proxy_request_inner(
                             request_path: original_request_path.clone(),
                             proxy_id: proxy_ref.map(|p| p.id.clone()),
                             proxy_name: proxy_ref.and_then(|p| p.name.clone()),
-                            backend_target: proxy_ref.map(|p| {
-                                let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
-                                let url = build_backend_url(p, &ctx.path, "", strip_len);
-                                strip_query_params(&url).to_string()
+                            backend_target: proxy_ref.and_then(|p| {
+                                let url = rejected_request_backend_url(p, &ctx)?;
+                                Some(strip_query_params(&url).to_string())
                             }),
                             response_status_code: 200, // gRPC errors use HTTP 200
                             latency_total_ms: total_ms,
@@ -36576,7 +36633,7 @@ async fn handle_proxy_request_inner(
         (proxy.backend_host.as_str(), proxy.backend_port)
     };
 
-    let backend_url = build_backend_url_with_target(
+    let backend_url = match build_backend_url_with_target(
         &proxy,
         &path,
         effective_query_string.as_ref(),
@@ -36584,7 +36641,18 @@ async fn handle_proxy_request_inner(
         effective_port,
         strip_len,
         upstream_target.as_ref().and_then(|t| t.path.as_deref()),
-    );
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(build_pre_plugin_reject_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                b"Invalid backend path coordinates",
+                &HashMap::new(),
+                request_uses_grpc_content_type,
+                grpc_web_response_content_type,
+            ));
+        }
+    };
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing. The guard calls
@@ -37148,7 +37216,7 @@ async fn handle_proxy_request_inner(
                 let target_changed = current_target.as_ref().is_some_and(|prev_target| {
                     next.host != prev_target.host || next.port != prev_target.port
                 });
-                current_url = build_backend_url_with_target(
+                current_url = match build_backend_url_with_target(
                     &proxy,
                     &path,
                     effective_query_string.as_ref(),
@@ -37156,7 +37224,10 @@ async fn handle_proxy_request_inner(
                     next.port,
                     strip_len,
                     next.path.as_deref(),
-                );
+                ) {
+                    Ok(url) => url,
+                    Err(_) => break,
+                };
                 current_cb_target_key =
                     Some(crate::circuit_breaker::target_key(&next.host, next.port));
                 current_target = Some(next);
@@ -39692,7 +39763,7 @@ pub fn build_backend_url(
     incoming_path: &str,
     query_string: &str,
     strip_len: usize,
-) -> String {
+) -> Result<String, InvalidBackendPath> {
     build_backend_url_with_target(
         proxy,
         incoming_path,
@@ -39739,7 +39810,7 @@ pub fn build_backend_url_with_target(
     port: u16,
     strip_len: usize,
     target_path: Option<&str>,
-) -> String {
+) -> Result<String, InvalidBackendPath> {
     use std::fmt::Write;
 
     let scheme = backend_url_scheme_for_dispatch(proxy);
@@ -54653,7 +54724,11 @@ mod tests {
         );
         ctx.route_override_path = Some("/internal/ping".to_string());
 
-        let backend_path = super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string());
+        let mut strip_len = "/shadow".len();
+        let backend_path =
+            super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string(), &mut strip_len);
+        assert_eq!(strip_len, 0);
+        assert_eq!(ctx.matched_path_strip_len, 0);
 
         assert_eq!(backend_path, "/internal/ping");
         assert_eq!(ctx.path, "/internal/ping");
@@ -59209,7 +59284,8 @@ mod tests {
             8080,
             "/ws".len(),
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(url, "ws://backend.local:8080/?token=1");
     }
@@ -59230,7 +59306,8 @@ mod tests {
             8080,
             incoming_path.len(),
             Some("/internal"),
-        );
+        )
+        .unwrap();
 
         assert_eq!(url, "ws://backend.local:8080/internal?token=1");
     }
@@ -59251,7 +59328,8 @@ mod tests {
             8080,
             "/ws".len(),
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(url, "ws://backend.local:8080/internal/chat");
     }
@@ -59271,7 +59349,8 @@ mod tests {
             8080,
             "/ws/".len(),
             Some("internal"),
-        );
+        )
+        .unwrap();
 
         assert_eq!(url, "ws://backend.local:8080/internal/chat");
     }
@@ -59303,7 +59382,8 @@ mod tests {
             8080,
             strip_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "http://backend.local:8080/");
     }
 
@@ -59331,7 +59411,8 @@ mod tests {
             8080,
             strip_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "http://backend.local:8080/");
     }
 
@@ -59361,7 +59442,8 @@ mod tests {
             8080,
             strip_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "http://backend.local:8080/c");
     }
 
@@ -59399,7 +59481,8 @@ mod tests {
             8080,
             rm.matched_prefix_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "http://backend.local:8080/files/a/b");
     }
 
@@ -59427,7 +59510,8 @@ mod tests {
             8080,
             strip_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "ws://backend.local:8080/a/b");
     }
 
@@ -59438,7 +59522,7 @@ mod tests {
         proxy.backend_path = None;
         proxy.strip_listen_path = false;
 
-        let url = build_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None);
+        let url = build_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None).unwrap();
         assert_eq!(url, "http://[::1]:8080/mcp");
     }
 
@@ -59448,7 +59532,8 @@ mod tests {
         proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.strip_listen_path = false;
 
-        let url = build_websocket_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None);
+        let url =
+            build_websocket_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None).unwrap();
         assert_eq!(url, "ws://[::1]:8080/mcp");
     }
 

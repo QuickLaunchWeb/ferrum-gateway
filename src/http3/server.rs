@@ -2996,7 +2996,7 @@ async fn handle_h3_request(
         other => other,
     };
 
-    let (proxy, strip_len) = match route_match {
+    let (proxy, mut strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,
             // and all subsequent code (plugins, backend dispatch) needs the HashMap.
@@ -3060,6 +3060,7 @@ async fn handle_h3_request(
         }
     };
 
+    ctx.matched_path_strip_len = strip_len;
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
@@ -4699,7 +4700,7 @@ async fn handle_h3_request(
     // helper also keeps H3 path selection in lockstep with H1/H2.
     // `path` stays mutable so a RemainingDeferred provider claim can rebase it
     // before query capture / dial (H1/H2 parity).
-    let mut path = crate::proxy::rebase_route_override_path(&mut ctx, path);
+    let mut path = crate::proxy::rebase_route_override_path(&mut ctx, path, &mut strip_len);
 
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.
@@ -4877,7 +4878,7 @@ async fn handle_h3_request(
             upstream_target
                 .as_ref()
                 .and_then(|target| target.path.as_deref()),
-        );
+        )?;
         if !run_h3_backend_path_plugins_or_send_reject(
             backend_path_plugins,
             &plugins,
@@ -5098,9 +5099,9 @@ async fn handle_h3_request(
         let path_rebase_pending = ctx
             .route_override_path
             .as_deref()
-            .is_some_and(|rewrite| rewrite != path || rewrite != ctx.path);
+            .is_some_and(|rewrite| strip_len != 0 || rewrite != path || rewrite != ctx.path);
         if path_rebase_pending {
-            path = crate::proxy::rebase_route_override_path(&mut ctx, path);
+            path = crate::proxy::rebase_route_override_path(&mut ctx, path, &mut strip_len);
         }
         if destination_rebound {
             // Replace the whole selection rather than only the target:
@@ -6043,7 +6044,7 @@ async fn handle_h3_request(
         effective_query_string.as_ref(),
         strip_len,
         upstream_target.as_deref(),
-    );
+    )?;
     let backend_start = std::time::Instant::now();
     let sticky_cookie_needed = selection.sticky_cookie_needed;
     ctx.h3_response_upstream_is_fallback = selection.is_fallback;
@@ -8865,7 +8866,7 @@ async fn handle_h3_request(
                         next.port,
                         strip_len,
                         next.path.as_deref(),
-                    );
+                    )?;
                     current_cb_target_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     current_target = Some(next);
@@ -10073,7 +10074,7 @@ fn build_h3_backend_url_for_flavor(
     query_string: &str,
     strip_len: usize,
     upstream_target: Option<&UpstreamTarget>,
-) -> String {
+) -> Result<String, crate::proxy::InvalidBackendPath> {
     if flavor == HttpFlavor::WebSocket {
         let (effective_host, effective_port, target_path) = if let Some(target) = upstream_target {
             (target.host.as_str(), target.port, target.path.as_deref())
@@ -18968,7 +18969,8 @@ mod h3_backend_url_tests {
             "token=1",
             0,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "wss://backend.example:8443/ws?token=1");
     }
 
@@ -18982,14 +18984,16 @@ mod h3_backend_url_tests {
             "token=1",
             0,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "ws://backend.example:8443/ws?token=1");
     }
 
     #[test]
     fn plain_backend_url_keeps_http_family_scheme() {
         let proxy = proxy_with_scheme(BackendScheme::Https);
-        let url = build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", 0, None);
+        let url =
+            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", 0, None).unwrap();
         assert_eq!(url, "https://backend.example:8443/api");
     }
 }

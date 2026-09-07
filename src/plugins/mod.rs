@@ -2259,6 +2259,8 @@ pub struct RequestContext {
     /// state without re-parsing the wire query.
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
+    /// Router offset in the current dispatch path; reset when a rewrite replaces it.
+    pub(crate) matched_path_strip_len: usize,
     pub identified_consumer: Option<Arc<Consumer>>,
     /// Identity string set by external auth plugins (e.g., `jwks_auth`) when no
     /// matching `Consumer` exists in the gateway. Used as the rate-limit key and
@@ -3185,8 +3187,8 @@ pub struct RequestContext {
     /// `before_proxy` phase (the original `ctx.path` stays intact for logging
     /// and route selection, which already happened). `None` keeps the
     /// request's own path. Honored on the H1/H2/gRPC/reqwest backend dispatch
-    /// path; VS-derived proxies never set `strip_listen_path`, so the override
-    /// is the literal forwarded path.
+    /// path. Replacing the path resets the router strip offset; ordinary
+    /// rewrites still compose with the selected backend base path.
     pub route_override_path: Option<String>,
     /// Backend-effective path that successfully passed the final route policy
     /// boundary. Not exposed through the public plugin API, so custom plugins
@@ -3194,7 +3196,8 @@ pub struct RequestContext {
     /// as request mirroring.
     authorized_backend_path: Option<String>,
     /// Treat `route_override_path` as an absolute backend path by disabling
-    /// `strip_listen_path` on the effective proxy. Used by direct upstream
+    /// `strip_listen_path` and clearing `backend_path` on the effective proxy.
+    /// Used by direct upstream
     /// routers when the override is already the final upstream URL path rather
     /// than a virtual-service rewrite relative to the selected public route.
     pub route_override_path_is_absolute: bool,
@@ -3403,6 +3406,7 @@ impl RequestContext {
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: None,
+            matched_path_strip_len: 0,
             identified_consumer: None,
             authenticated_identity: None,
             authenticated_identity_header: None,
@@ -4591,6 +4595,7 @@ impl RequestContext {
             query_params_materialized: self.query_params_materialized,
             query_params: self.query_params.clone(),
             matched_proxy: self.matched_proxy.clone(),
+            matched_path_strip_len: self.matched_path_strip_len,
             identified_consumer: self.identified_consumer.clone(),
             authenticated_identity: self.authenticated_identity.clone(),
             authenticated_identity_header: self.authenticated_identity_header.clone(),

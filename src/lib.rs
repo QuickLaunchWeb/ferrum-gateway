@@ -86,6 +86,34 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
+    pub fn rebase_backend_path_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        path: String,
+        strip_len: &mut usize,
+    ) -> (String, usize) {
+        ctx.matched_path_strip_len = *strip_len;
+        let path = crate::proxy::rebase_route_override_path(ctx, path, strip_len);
+        let cloned_offset = ctx.clone_for_final_request_body_hooks().matched_path_strip_len;
+        (path, cloned_offset)
+    }
+
+    pub fn websocket_backend_path_for_test(
+        proxy: &crate::config::types::Proxy,
+        path: &str,
+        strip_len: usize,
+    ) -> Result<String, crate::proxy::InvalidBackendPath> {
+        crate::proxy::build_websocket_backend_url_with_target(
+            proxy,
+            path,
+            "",
+            &proxy.backend_host,
+            proxy.backend_port,
+            strip_len,
+            None,
+        )
+    }
+
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};

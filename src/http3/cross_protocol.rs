@@ -811,7 +811,7 @@ fn select_next_cross_protocol_retry_target(
         return CrossProtocolRetryTarget::RetryBudgetExceeded;
     }
 
-    let next_url = crate::proxy::build_backend_url_with_target(
+    let Ok(next_url) = crate::proxy::build_backend_url_with_target(
         proxy,
         path,
         query_string,
@@ -819,7 +819,10 @@ fn select_next_cross_protocol_retry_target(
         next.port,
         strip_len,
         next.path.as_deref(),
-    );
+    ) else {
+        return CrossProtocolRetryTarget::BackendPathMismatch;
+    };
+
     let next_cb_target_key = crate::circuit_breaker::target_key(&next.host, next.port);
     CrossProtocolRetryTarget::Selected(next, next_cb_target_key, next_url)
 }
