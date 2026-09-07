@@ -42,6 +42,9 @@ from verify_cross_build_policy import (
     AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
     AMBIENT_REGISTRY_IMAGE_READ_JOB,
     AMBIENT_REGISTRY_IMAGE_WRITE_JOB,
+    NODE_DEFAULT_REGISTRY_READ_JOB,
+    NODE_DEFAULT_REGISTRY_WRITE_JOB,
+    NODE_WAYPOINT_IMAGE_GATE_JOB,
     extract_job_contract_block,
 )
 
@@ -4569,6 +4572,19 @@ def check_node_ebpf_registry_reader(job: str, failures: list[str]) -> None:
             "Node eBPF registry telemetry must not invent an Actions cache hit", failures)
 
 
+def check_node_default_registry_jobs(workflow: str, failures: list[str]) -> None:
+    # Exact recipes bind the write token to trusted main and preserve the
+    # same runtime checks on the mutually exclusive anonymous PR recipe.
+    for name, expected in (
+        ("production-dockerfile-smoke-default", NODE_DEFAULT_REGISTRY_READ_JOB),
+        ("production-dockerfile-smoke-default-write", NODE_DEFAULT_REGISTRY_WRITE_JOB),
+        ("production-dockerfile-smoke", NODE_WAYPOINT_IMAGE_GATE_JOB),
+    ):
+        actual, errors = extract_job_contract_block(workflow, "Node default registry", name, required=True)
+        failures.extend(errors)
+        require(actual == expected, f"Node default registry job {name} must preserve its complete contract", failures)
+
+
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
     require(
         re.search(r"(?m)^    name: Production Dockerfile eBPF image smoke$", workflow)
@@ -4606,43 +4622,8 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "eBPF production-image job must keep FEATURES=cloud-secrets,ebpf",
         failures,
     )
-    check_buildkit_cache_boundary(
-        default_job,
-        "production-dockerfile-smoke-default",
-        failures,
-    )
+    check_node_default_registry_jobs(workflow, failures)
     check_node_ebpf_registry_reader(ebpf_job, failures)
-    require(
-        "trusted-publish" in default_job
-        and "fork-restore-only" in default_job,
-        "production-image telemetry must name the trusted-publish and "
-        "fork-restore-only cache-to policies",
-        failures,
-    )
-    require(
-        "type=local" in default_job
-        and buildkit_cache_key("production-dockerfile-smoke-default") in default_job,
-        "default production-image job must restore a schema- and architecture-scoped "
-        "local BuildKit cache",
-        failures,
-    )
-    check_local_cache_actions(
-        default_job,
-        "production-dockerfile-smoke-default",
-        failures,
-        scope="production-dockerfile-smoke-default",
-    )
-    check_cache_save_preparation(
-        default_job,
-        "production-dockerfile-smoke-default",
-        failures,
-        scope="production-dockerfile-smoke-default",
-    )
-    check_cache_telemetry_evidence(
-        default_job,
-        "production-dockerfile-smoke-default",
-        failures,
-    )
     plan_job = extract_job(workflow, "production-dockerfile-plan")
     check_nul_delimited_plan(plan_job, "production-image planner", failures)
     require(
@@ -5179,6 +5160,35 @@ def self_test() -> int:
         reader_errors = []
         check_node_ebpf_registry_reader(mutated, reader_errors)
         require(bool(reader_errors), "self-test: Node reader regression must fail", failures)
+    default_registry = NODE_WORKFLOW.read_text(encoding="utf-8")
+    registry_errors: list[str] = []
+    check_node_default_registry_jobs(default_registry, registry_errors)
+    require(not registry_errors, "self-test: default registry recipes must pass", failures)
+    for before, after in (
+        ("github.ref == 'refs/heads/main'", "github.ref != 'refs/heads/main'"),
+        ("github.repository == 'ferrum-edge/ferrum-edge'", "true"),
+        ("      packages: write", "      packages: read"),
+        ("    name: Production Dockerfile default image (registry reader)",
+         "    permissions: write-all\n    name: Production Dockerfile default image (registry reader)"),
+        ("default-v1-linux-amd64-runtime", "untrusted-latest"),
+        ("target: runtime\n", "target: runtime-ebpf\n"),
+        ("CARGO_PROFILE=pr-build", "CARGO_PROFILE=release"),
+        ("provenance: false", "provenance: true"),
+        ("policy=anonymous-restore-only", "policy=trusted-main-publish"),
+        ("mode=max,image-manifest=true,oci-mediatypes=true", "mode=min"),
+        ("github.event.inputs.force_cold_cache != 'true'", "always()"),
+        ("github.event.inputs.force_cold_cache == 'true'", "false"),
+        ("ordinary runtime unexpectedly contains", "inventory omitted"),
+        ("needs.production-dockerfile-smoke-default-write.result != 'success'", "false"),
+        ("needs.production-dockerfile-smoke-default.result != 'skipped'", "false"),
+        ("needs.production-dockerfile-smoke-default-write.result != 'skipped'", "false"),
+        ("  production-dockerfile-smoke-default-write:", "  detached-writer:"),
+    ):
+        mutated = default_registry.replace(before, after)
+        require(mutated != default_registry, "self-test: default registry mutation must apply", failures)
+        registry_errors = []
+        check_node_default_registry_jobs(mutated, registry_errors)
+        require(bool(registry_errors), "self-test: default registry boundary regression must fail", failures)
     registry_fixture = (
         "jobs:\n" + AMBIENT_REGISTRY_IMAGE_READ_JOB + "\n"
         + AMBIENT_REGISTRY_IMAGE_WRITE_JOB + "\n"
