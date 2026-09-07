@@ -1886,6 +1886,44 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
     (state, temp_dir)
 }
 
+#[tokio::test]
+async fn file_admission_cases_match_admin_batch_and_sqlite_full_load() {
+    let cases: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/file_admission_cases.json")).unwrap();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let tc = TestConfig::default();
+        let (state, _dir) = create_db_admin_state(&tc).await;
+        let db = state.db.as_ref().unwrap().clone();
+        let (base_url, _shutdown) = start_test_admin(state).await;
+        let token = generate_test_token(&tc);
+        let mut batch = case["config"].clone();
+        batch.as_object_mut().unwrap().remove("version");
+        let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+        let loaded = db.load_full_config("ferrum").await.unwrap();
+        if let Some(expected) = case["expected_error"].as_str() {
+            assert_eq!(status, 400, "{name}: {body}");
+            assert!(body.to_string().contains(expected), "{name}: {body}");
+            assert!(
+                loaded.proxies.is_empty(),
+                "{name}: rejected batch persisted"
+            );
+            assert!(
+                loaded.plugin_configs.is_empty(),
+                "{name}: rejected plugins persisted"
+            );
+        } else {
+            assert_eq!(status, 201, "{name}: {body}");
+            assert_eq!(loaded.proxies.len(), 1, "{name}");
+            assert_eq!(
+                loaded.plugin_configs.len(),
+                batch["plugin_configs"].as_array().unwrap().len(),
+                "{name}"
+            );
+        }
+    }
+}
+
 fn db_admin_state(
     tc: &TestConfig,
     db: DatabaseStore,

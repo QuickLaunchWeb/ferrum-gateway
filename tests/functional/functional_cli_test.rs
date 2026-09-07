@@ -599,6 +599,95 @@ fn hermetic_validate_command(temp_dir: &TempDir, args: &[&str]) -> Command {
     cmd
 }
 
+#[ignore]
+#[tokio::test]
+async fn functional_cli_file_admission_validate_and_run_agree() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../fixtures/file_admission_cases.json")).unwrap();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let spec = temp_dir.path().join("resources.json");
+        std::fs::write(&spec, serde_json::to_vec(&case["config"]).unwrap()).unwrap();
+        let mut command = hermetic_validate_command(
+            &temp_dir,
+            &["--mode", "file", "--spec", spec.to_str().unwrap()],
+        );
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("file validate must terminate")
+        .expect("run file validate");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(expected) = case["expected_error"].as_str() {
+            assert_eq!(output.status.code(), Some(1), "{name}: {combined}");
+            assert!(combined.contains(expected), "{name}: {combined}");
+
+            let failed = crate::common::TestGateway::builder()
+                .skip_auto_build()
+                .clear_env()
+                .mode_file(serde_json::to_string(&case["config"]).unwrap())
+                .max_attempts(1)
+                .spawn_expect_failure(Duration::from_secs(30))
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let diagnostic = failed.combined_output();
+            assert_eq!(failed.status.and_then(|status| status.code()), Some(1));
+            assert!(diagnostic.contains(expected), "{name}: {diagnostic}");
+            assert!(
+                diagnostic.contains("Configuration validation failed:"),
+                "run must reject at file admission: {name}: {diagnostic}"
+            );
+        } else {
+            assert!(output.status.success(), "{name}: {combined}");
+            assert!(
+                combined.contains("Validation passed."),
+                "{name}: {combined}"
+            );
+
+            // TCP fixture ports are replaced on every attempt; only a reported
+            // listener bind race permits another spawn. The harness proves
+            // readiness with this child's authenticated health identity.
+            let attempts = crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS;
+            let mut started = false;
+            for attempt in 1..=attempts {
+                let mut config = case["config"].clone();
+                let reservation = reserve_port().await.unwrap();
+                let port = reservation.port;
+                if config["proxies"][0].get("listen_port").is_some() {
+                    config["proxies"][0]["listen_port"] = port.into();
+                }
+                let builder = crate::common::TestGateway::builder()
+                    .skip_auto_build()
+                    .clear_env()
+                    .mode_file(serde_json::to_string(&config).unwrap())
+                    .reserve_listener_port(port)
+                    .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+                drop(reservation);
+                match builder.spawn_classified().await {
+                    Ok(mut gateway) => {
+                        gateway.shutdown();
+                        started = true;
+                        break;
+                    }
+                    Err(error) if error.listener_addr_in_use && attempt < attempts => {}
+                    Err(error) => panic!("{name}: {error}"),
+                }
+            }
+            assert!(started, "{name}: valid file must reach owned readiness");
+        }
+    }
+}
+
 /// Database-mode `validate` in the hermetic environment.
 ///
 /// Database-mode validate requires *both* `FERRUM_DB_TYPE` and `FERRUM_DB_URL`

@@ -107,7 +107,6 @@ REQUIRED_JOBS = {
     "ebpf-live",
     "netns-capture-live",
     "two-cluster-mesh-live",
-    "performance-regression",
     "build-binaries",
 }
 
@@ -141,7 +140,6 @@ PATH_GATED_JOBS = {
     "build-binaries": "run_platform_build",
     "test-vendor-patches": "run_vendor_patches",
     "dependency-audit": "run_dependency_audit",
-    "performance-regression": "run_perf",
 }
 
 # Every path-gated job keeps this exact event set: PRs, merge-queue checks,
@@ -1590,14 +1588,15 @@ def main() -> int:
     unit_inline = "Run inline lib tests"
     unit_hardening = "Run cache accounting and reload safety regressions"
     if not (
-        unit_body.count("cargo test --lib --test unit_tests --no-run") == 1
+        unit_body.count("cargo test $UNIT_PRECOMPILE_TARGETS --no-run") == 1
+        and unit_body.count('precompile: "--lib --test unit_tests"') == 1
         and 0 <= unit_body.find(unit_precompile)
         < unit_body.find(unit_inline)
         < unit_body.find(unit_hardening)
     ):
         planner_errors.append(
-            "jobs.test-unit must precompile the lib and unit_tests binaries "
-            "together before running inline or plugin-hardening tests"
+            "jobs.test-unit must precompile each shard's targets (lib + unit_tests "
+            "for the core shard) before running inline or plugin-hardening tests"
         )
 
     # Optional ACME coverage must use the small DNS target and prove every
@@ -1984,7 +1983,14 @@ def main() -> int:
             "commits with rename detection disabled"
         )
 
-    performance_regression_body = extract_job_body(ci_yml, "performance-regression")
+    # The performance regression check runs out of band (daily schedule and
+    # manual dispatch) in its own workflow; its static-contract steps stay pinned.
+    performance_regression_yml = Path(
+        ".github/workflows/performance-regression.yml"
+    ).read_text(encoding="utf-8")
+    performance_regression_body = extract_job_body(
+        performance_regression_yml, "performance-regression"
+    )
     if (
         'git diff --name-only --no-renames "${perf_base}...HEAD"'
         not in performance_regression_body

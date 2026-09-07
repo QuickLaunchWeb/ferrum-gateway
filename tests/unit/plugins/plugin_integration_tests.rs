@@ -249,6 +249,7 @@ async fn test_all_plugins_available() {
 
 #[tokio::test]
 async fn test_plugin_creation_all_plugins() {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     for plugin_name in available_plugins() {
         // Some plugins now require specific config fields
         let config = match plugin_name {
@@ -526,6 +527,7 @@ async fn test_plugin_error_handling() {
 
 #[tokio::test]
 async fn test_plugin_configuration_validation() {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     // Test that plugins handle missing config gracefully
     let empty_config = json!({});
 

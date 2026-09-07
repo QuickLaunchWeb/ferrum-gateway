@@ -65,6 +65,7 @@ CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+PERFORMANCE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "performance-regression.yml"
 
 # Only the PR-editable direct sites; frozen composites/FIPS/fuzz/perf retain
 # their separately governed contracts. True means compiler-cache-only reuse.
@@ -8757,7 +8758,7 @@ def main(argv: list[str] | None = None) -> int:
     fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
     node = NODE_WORKFLOW.read_text(encoding="utf-8")
     ambient = AMBIENT_WORKFLOW.read_text(encoding="utf-8")
-    ci = CI_WORKFLOW.read_text(encoding="utf-8")
+    ci = PERFORMANCE_WORKFLOW.read_text(encoding="utf-8")
     check_common_trust(fips, "fips-build.yml", failures)
     check_common_trust(node, "node-waypoint-ebpf-live.yml", failures)
     check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
@@ -8765,7 +8766,7 @@ def main(argv: list[str] | None = None) -> int:
     check_production_smoke(node, failures)
     check_ambient_workflow_cache_budget(ambient, failures)
     check_shared_actions(failures)
-    check_performance_cache_wrapper_key(ci, "ci.yml", failures)
+    check_performance_cache_wrapper_key(ci, "performance-regression.yml", failures)
     for filename, job_name, compiler_only in DIRECT_CACHE_DIET_JOBS:
         workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
         check_direct_rust_cache_diet(

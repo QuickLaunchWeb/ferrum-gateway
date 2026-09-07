@@ -154,6 +154,7 @@ The report withholds externally sourced values, not just the ones that appear in
    - Unique `listen_path` enforcement
    - Stream proxy port conflict detection against gateway reserved ports
    - Plugin config validation (each plugin is instantiated to verify its config)
+   - Shared runtime admission, including plugin security composition (such as duplicate effective `correlation_id` headers) and `tcp_connection_throttle` attachment compatibility
    - TLS certificate path existence checks
    - Upstream reference validation
 3. **Startup security** (env-level TLS/CIDR/metrics surfaces shared with `run`) — side-effect-free loaders that `serve()` also uses, so `validate` cannot report success for configs that refuse to start. Mode-scoped:

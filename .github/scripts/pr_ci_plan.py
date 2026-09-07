@@ -923,19 +923,6 @@ DEPENDENCY_AUDIT_PATTERNS = [
     )
 ]
 
-# `run_perf`: the performance-regression job keeps its own content-sensitive
-# classifier for which benchmarks to execute; this gate only decides whether
-# the job is allocated a runner at all.
-PERF_PATTERNS = [
-    re.compile(pattern)
-    for pattern in (
-        *RUST_BUILD_GRAPH_PATTERNS,
-        r"^src/",
-        r"^tests/performance/",
-        r"^\.github/scripts/(?:verify_[a-z0-9_]*benchmark|run_rr_selection_comparison|verify_mesh_performance_baselines_workflow|verify_protocol_perf_regression_workflow)",
-    )
-]
-
 JOB_GATE_NAMES = (
     "run_helm",
     "run_ebpf_kernel_live",
@@ -954,7 +941,6 @@ JOB_GATE_NAMES = (
     "run_platform_build",
     "run_vendor_patches",
     "run_dependency_audit",
-    "run_perf",
 )
 
 # Scripts whose logic controls the gate decisions themselves. Changing either
@@ -1108,7 +1094,6 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
         "run_dependency_audit": any_path_matches(
             DEPENDENCY_AUDIT_PATTERNS, changed_files
         ),
-        "run_perf": any_path_matches(PERF_PATTERNS, changed_files),
     }
 
 
@@ -1364,9 +1349,8 @@ def self_test() -> int:
         "run_rust": True,
         "run_artifacts": True,
     }
-    # Source changes additionally allocate the perf-regression job, whose own
-    # classifier then decides which benchmarks (if any) execute.
-    src_only = rust_only | {"run_perf": True}
+    # Source changes: the same lane (performance regression is out of band).
+    src_only = rust_only
     gate_cases = [
         # Nothing Rust-related: only planning/policy run.
         (
@@ -1451,7 +1435,6 @@ def self_test() -> int:
                 "run_platform_build": True,
                 "run_vendor_patches": True,
                 "run_dependency_audit": True,
-                "run_perf": True,
                 "run_secrets_backends": True,
                 "run_pkcs11": True,
                 "run_ebpf_kernel_live": False,
@@ -1491,7 +1474,6 @@ def self_test() -> int:
                 "run_platform_build": True,
                 "run_vendor_patches": True,
                 "run_dependency_audit": True,
-                "run_perf": True,
                 "run_ebpf_build": False,
             },
         ),
@@ -1606,7 +1588,7 @@ def self_test() -> int:
         (
             "pull_request",
             ["deny.toml"],
-            {"run_dependency_audit": True, "run_rust": True, "run_perf": False},
+            {"run_dependency_audit": True, "run_rust": True},
         ),
         (
             "pull_request",
@@ -1621,7 +1603,7 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/performance/mesh/benches/rr_selection.rs"],
-            {"run_perf": True, "run_rust": True},
+            {"run_rust": True, "run_platform_build": False},
         ),
         # Live suites: only their owner paths schedule them on a PR.
         (

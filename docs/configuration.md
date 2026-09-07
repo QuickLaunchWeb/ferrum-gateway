@@ -387,6 +387,8 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 
 ### File Mode
 
+File loading, `ferrum-edge validate --mode file --spec <path>`, and SIGHUP reload run the shared rejecting runtime-config admission gate used by SQL and MongoDB full loads, in addition to file mode's stricter field, identity, and local-file checks. A `tcp_connection_throttle` attached to an HTTP proxy (or globally with one or more attached proxies, all using unsupported protocols) is rejected before runtime construction. Duplicate effective `correlation_id` header writers are also rejected at admission. Diagnostics identify the rejected rule; a rejected reload keeps the last known-good generation. A successful validation checks configuration admission, but does not promise that runtime resources such as listener ports will be available at startup.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
