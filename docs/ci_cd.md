@@ -262,33 +262,31 @@ cold-cache run still proves every live contract within the existing job
 timeouts.
 
 **Production images.** The ordinary `runtime` and distroless `runtime-ebpf`
-targets build in parallel with `docker/build-push-action`. The ordinary image
-restores a schema- and architecture-scoped local BuildKit cache (`type=local`)
-through pinned `actions/cache/restore`, using
-`production-dockerfile-smoke-default-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}`
-and its matching architecture prefix. The `v1` component is the local cache
-schema. The eBPF image instead reads Ambient's public, target-specific GHCR
-cache anonymously, with no export or Actions archive save. Ambient's trusted
-main writer maintains that shared cache. Both images preserve the explicit
-cold-cache dispatch path.
+targets build in parallel with `docker/build-push-action`. Both import public,
+target-specific GHCR BuildKit caches. The ordinary target uses
+`ghcr.io/ferrum-edge/ferrum-edge-buildcache:default-v1-linux-amd64-runtime`;
+the eBPF image shares Ambient's `ambient-v1-linux-amd64-runtime-ebpf` cache.
+Neither recipe restores or saves an Actions cache archive.
 
-For the ordinary image's local cache, `actions/cache/restore` v4 outputs are classified strictly: `cache-hit == 'true'`
-is an exact primary-key hit; `cache-hit == 'false'` is a restore-key partial
-match (still a hit); empty `cache-hit` plus empty `cache-matched-key` is an
-ordinary miss. Exact and partial hits require a nonempty matched key and an
-existing restored directory; contradictory tuples fail closed.
+Relevant pushes and manual dispatches on `refs/heads/main` in
+`ferrum-edge/ferrum-edge` select the ordinary image writer, with
+`contents: read` and `packages: write`. All other events select the anonymous
+reader with only `contents: read`. The aggregate requires the selected recipe
+to pass and the other to be skipped. Both recipes build the same Dockerfile,
+`runtime` target and `pr-build` profile, load the image locally and run the
+same executable and distroless inventory checks. They publish no production
+image. Only the warm main writer exports `mode=max` registry cache metadata;
+cache export failure fails that job. An absent registry cache can cold-build.
 
-Trusted same-repository pull requests and `workflow_dispatch` never export or
-save on an exact `${{ github.sha }}` hit: that path builds restore-only with
-`cache-from` and no `cache-to`/`actions/cache/save`, so it does not pay for a
-`mode=max` export or upload. Only a partial match or miss uses the publishing
-BuildKit step, exports a fresh `*-out` directory, and saves the new exact key.
-The cache-save preparation step requires that fresh export and fails rather than
-relabeling the restored/stale destination. Fork pull requests restore and must
-not have a save or cache-publication step. `force_cold_cache` skips restore and
-save. Job summaries time cache-restore, image-build/export, and cache-save
-separately, and record the restore action's classified hit kind plus the
-measured restored directory size; unknown is never rendered as a miss or `0 B`.
+`force_cold_cache` skips registry login, import and export. Image-build timing
+includes registry transfer; BuildKit logs establish actual layer reuse.
+Telemetry reports unknown registry hit/bytes, without inventing an Actions
+restore hit or measured size. Existing default-image Actions archives expire
+under LRU, with no further writes from this workflow. No cache limit, package
+visibility or spending setting is changed. The namespace is already public;
+activation still requires a successful trusted-main export followed by an
+anonymous reader with observed BuildKit reuse.
+
 The Dockerfile declares `ARG FEATURES` after the shared apt and manifest layers
 so those two feature sets reuse toolchain work. A trusted-base copy of
 `.github/scripts/ci_runtime_plan.py` reads a NUL-delimited
@@ -459,10 +457,10 @@ into its key, and a randomized root made every lane unrestorable (#4643). It per
 `SCCACHE_GHA_ENABLED` as empty so a later step cannot re-enable the
 credential-bearing GHA backend. Install failure clears the rustc wrapper and
 continues uncached. Compiler outputs use a 2 GiB local directory persisted by
-rust-cache / the FIPS producer archive. Production-image cache restore and save stay inside the
-pinned `actions/cache/*` actions; PR-controlled `run:` steps only measure the
-restored directory and move the BuildKit local export. Workflows stay
-`permissions: contents: read`. Static checks live in
+rust-cache / the FIPS producer archive. Production-image caches use pinned
+BuildKit registry imports and trusted-main exports. PR recipes remain
+`permissions: contents: read`; only the mutually exclusive trusted-main
+publisher receives `packages: write`. Static checks live in
 `.github/scripts/verify_ci_runtime_cache.py`. The cache-credential gate is
 structural: `fips-build.yml` may invoke only a closed allowlist of pinned
 actions and the two local shell-only composites (`setup-sccache`,
@@ -1275,10 +1273,9 @@ image from those cached host-built artifacts instead of recompiling inside
 Docker. A separate production-Dockerfile smoke builds the ordinary `runtime`
 target (which must omit `ip`) and the privileged `runtime-ebpf` target (which
 must contain `ip`) **in parallel** through BuildKit. The ordinary target
-uses its scoped local Actions archive; the eBPF target anonymously imports
-Ambient's matching GHCR cache without exporting or saving another archive.
-The ordinary cache records measured restored bytes and saves only on main
-pushes; pull requests restore without saving.
+uses its own public GHCR cache with a trusted-main writer; the eBPF target
+anonymously imports Ambient's matching GHCR cache. Pull requests do not export
+or save either cache.
 Each job then checks a normalized
 filesystem inventory for shells and package managers. A trusted-base path
 planner reads a NUL-delimited `git diff --name-only --no-renames -z` listing and
@@ -1423,8 +1420,8 @@ package must be public before anonymous imports can reuse it. Existing GHA
 entries expire under LRU. See the registry migration section below.
 
 The Fuzz Smoke lane's separate main-only save remains owned by PR #3918. The
-ordinary NodeWaypoint image retains its local BuildKit contract from PR #3889;
-the eBPF image now shares Ambient's registry cache. FIPS handoff is unchanged.
+ordinary NodeWaypoint image uses its dedicated GHCR registry cache; the eBPF
+image shares Ambient's registry cache. FIPS handoff is unchanged.
 
 The shared `setup-rust-ci` action applies the same restore-only policy to the
 Swatinem rust-cache: `save-if` is true only when the event is neither
@@ -1821,7 +1818,8 @@ Trusted policy therefore carries a second, additive contract —
 | `production-dockerfile-plan` | whole job |
 | `production-dockerfile-smoke` | whole job (aggregate) |
 | `node-waypoint-ebpf-live-gate` | whole job (aggregate) |
-| `production-dockerfile-smoke-default` | `needs` + `if` only |
+| `production-dockerfile-smoke-default` | whole anonymous-reader job |
+| `production-dockerfile-smoke-default-write` | whole trusted-main writer job |
 | `production-dockerfile-smoke-ebpf` | `needs` + `if` only |
 | `node-waypoint-ebpf-live` | `needs` + `if` only |
 
@@ -1830,7 +1828,7 @@ single object-id pin, blob type/mode/size checks, `python3 -I` isolation,
 `true|false` verdict guard, and both `emit_suite_verdict` calls are one
 fail-closed unit. The two aggregates are frozen whole because their condition
 chains are the entire difference between "skipped because the trusted base
-proved irrelevance" and "green because the live job never ran". The three
+proved irrelevance" and "green because the live job never ran". The remaining two
 consumer jobs keep only their binding frozen, because their bodies are ordinary
 build and live-test recipes that must stay editable. Deleting the workflow is
 rejected too: a contract a `git rm` retires is the same weaker-than-it-looks
@@ -3256,8 +3254,9 @@ the version, iproute2 and distroless inventory assertions, image timing and
 required aggregate. Registry import runs within image-build timing; BuildKit
 logs provide actual layer-reuse evidence. Telemetry records unknown hit/bytes
 for registry reads rather than claiming an Actions cache hit. A missing cache
-can still produce a correct cold build. The ordinary default image retains
-its separate local-cache contract. All package and billing settings stay as-is.
+can still produce a correct cold build. The ordinary default image uses its
+own `default-v1-linux-amd64-runtime` registry cache, maintained only by the
+trusted-main writer in this workflow. All package and billing settings stay as-is.
 
 ### Shared default-profile live dependency cache (#4643)
 

@@ -3176,8 +3176,10 @@ LIVE_SUITE_JOB_BINDING = {
 #     chains are the entire difference between "skipped because the trusted
 #     base proved irrelevance" and "green because the live job never ran", so
 #     a predicate about them is not enough.
-#   * `production-dockerfile-smoke-default`, `production-dockerfile-smoke-ebpf`
-#     and `node-waypoint-ebpf-live` -- `needs`/`if` ONLY. Their bodies are
+#   * The default registry reader/writer are complete frozen recipes to bind
+#     credentials, trusted-main publication and cold-path omission together.
+#   * `production-dockerfile-smoke-ebpf` and `node-waypoint-ebpf-live` --
+#     `needs`/`if` ONLY. Their bodies are
 #     ordinary build and live-test recipes that must stay editable; only the
 #     binding from the trusted verdict to the job is contractual.
 #
@@ -3340,12 +3342,247 @@ NODE_WAYPOINT_PLAN_JOB = r"""  production-dockerfile-plan:
           emit_suite_verdict node-waypoint-ebpf-live node_waypoint_relevant
 """
 
+NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
+    name: Production Dockerfile default image (registry reader)
+    needs: production-dockerfile-plan
+    if: needs.production-dockerfile-plan.outputs.relevant == 'true' && !(github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize runtime telemetry
+        run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Record registry cache policy
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-registry \
+            --note "scope=production-dockerfile-smoke-default policy=anonymous-restore-only; actual layer reuse is reported by BuildKit"
+
+      - name: Record cold-cache proof
+        if: github.event.inputs.force_cold_cache == 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-registry \
+            --hit false \
+            --bytes 0 \
+            --note "scope=production-dockerfile-smoke-default policy=force-cold skipped import and export"
+
+      - name: Time image build
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+
+      - name: Build ordinary production runtime with registry cache
+        if: github.event.inputs.force_cold_cache != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          provenance: false
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:default-v1-linux-amd64-runtime
+
+      - name: Build ordinary production runtime (cold cache)
+        if: github.event.inputs.force_cold_cache == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          provenance: false
+
+      - name: Finish image build timer
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Verify ordinary distroless runtime contract
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci_runtime_telemetry.py start --phase ordinary-inventory
+          ordinary_image=ferrum-edge:production-default-smoke
+          docker run --rm --entrypoint /app/ferrum-edge "$ordinary_image" version
+
+          inventory_image() {
+            image="$1"
+            output="$2"
+            container="$(docker create "$image")"
+            docker export "$container" | tar -tf - | sed -e 's#^\./##' -e 's#^/##' > "$output"
+            docker rm "$container" >/dev/null
+          }
+          inventory_image "$ordinary_image" ordinary-runtime-files.txt
+
+          grep -Fxq app/ferrum-edge ordinary-runtime-files.txt
+          if grep -Fxq usr/sbin/ip ordinary-runtime-files.txt; then
+            echo "ordinary runtime unexpectedly contains eBPF-only /usr/sbin/ip" >&2
+            exit 1
+          fi
+
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/ash usr/bin/ash bin/zsh usr/bin/zsh bin/ksh usr/bin/ksh \
+            bin/busybox usr/bin/busybox sbin/apk usr/sbin/apk usr/bin/apk \
+            usr/bin/apt usr/bin/apt-cache usr/bin/apt-get \
+            usr/bin/dpkg usr/bin/dpkg-query usr/bin/rpm usr/bin/yum \
+            usr/bin/dnf usr/bin/microdnf usr/sbin/iptables \
+            usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" ordinary-runtime-files.txt; then
+              echo "forbidden runtime tool is present: /$forbidden" >&2
+              exit 1
+            fi
+          done
+          python3 .github/scripts/ci_runtime_telemetry.py end --phase ordinary-inventory --status 0
+
+      - name: Summarize ordinary image runtime
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py summarize --title "Production Dockerfile default image"
+"""
+
+NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-write:
+    name: Production Dockerfile default image (registry writer)
+    needs: production-dockerfile-plan
+    if: needs.production-dockerfile-plan.outputs.relevant == 'true' && (github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize runtime telemetry
+        run: python3 .github/scripts/ci_runtime_telemetry.py init --quiet
+
+      - name: Log in to cache registry
+        if: github.event.inputs.force_cold_cache != 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Record registry cache policy
+        if: github.event.inputs.force_cold_cache != 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-registry \
+            --note "scope=production-dockerfile-smoke-default policy=trusted-main-publish; actual layer reuse is reported by BuildKit"
+
+      - name: Record cold-cache proof
+        if: github.event.inputs.force_cold_cache == 'true'
+        run: |
+          python3 .github/scripts/ci_runtime_telemetry.py cache \
+            --name buildkit-registry \
+            --hit false \
+            --bytes 0 \
+            --note "scope=production-dockerfile-smoke-default policy=force-cold skipped import and export"
+
+      - name: Time image build
+        run: python3 .github/scripts/ci_runtime_telemetry.py start --phase image-build
+
+      - name: Build ordinary production runtime with registry cache
+        if: github.event.inputs.force_cold_cache != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          provenance: false
+          cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:default-v1-linux-amd64-runtime
+          cache-to: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:default-v1-linux-amd64-runtime,mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Build ordinary production runtime (cold cache)
+        if: github.event.inputs.force_cold_cache == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          build-args: |
+            CARGO_PROFILE=pr-build
+          load: true
+          tags: ferrum-edge:production-default-smoke
+          provenance: false
+
+      - name: Finish image build timer
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py end --phase image-build --status ${{ job.status == 'success' && '0' || '1' }}
+
+      - name: Verify ordinary distroless runtime contract
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci_runtime_telemetry.py start --phase ordinary-inventory
+          ordinary_image=ferrum-edge:production-default-smoke
+          docker run --rm --entrypoint /app/ferrum-edge "$ordinary_image" version
+
+          inventory_image() {
+            image="$1"
+            output="$2"
+            container="$(docker create "$image")"
+            docker export "$container" | tar -tf - | sed -e 's#^\./##' -e 's#^/##' > "$output"
+            docker rm "$container" >/dev/null
+          }
+          inventory_image "$ordinary_image" ordinary-runtime-files.txt
+
+          grep -Fxq app/ferrum-edge ordinary-runtime-files.txt
+          if grep -Fxq usr/sbin/ip ordinary-runtime-files.txt; then
+            echo "ordinary runtime unexpectedly contains eBPF-only /usr/sbin/ip" >&2
+            exit 1
+          fi
+
+          for forbidden in \
+            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+            bin/ash usr/bin/ash bin/zsh usr/bin/zsh bin/ksh usr/bin/ksh \
+            bin/busybox usr/bin/busybox sbin/apk usr/sbin/apk usr/bin/apk \
+            usr/bin/apt usr/bin/apt-cache usr/bin/apt-get \
+            usr/bin/dpkg usr/bin/dpkg-query usr/bin/rpm usr/bin/yum \
+            usr/bin/dnf usr/bin/microdnf usr/sbin/iptables \
+            usr/sbin/ip6tables usr/sbin/nft; do
+            if grep -Fxq "$forbidden" ordinary-runtime-files.txt; then
+              echo "forbidden runtime tool is present: /$forbidden" >&2
+              exit 1
+            fi
+          done
+          python3 .github/scripts/ci_runtime_telemetry.py end --phase ordinary-inventory --status 0
+
+      - name: Summarize ordinary image runtime
+        if: always()
+        run: python3 .github/scripts/ci_runtime_telemetry.py summarize --title "Production Dockerfile default image"
+"""
+
 NODE_WAYPOINT_IMAGE_GATE_JOB = r"""  production-dockerfile-smoke:
     name: Production Dockerfile eBPF image smoke
     runs-on: ubuntu-latest
     needs:
       - production-dockerfile-plan
       - production-dockerfile-smoke-default
+      - production-dockerfile-smoke-default-write
       - production-dockerfile-smoke-ebpf
     if: always()
     steps:
@@ -3366,8 +3603,12 @@ NODE_WAYPOINT_IMAGE_GATE_JOB = r"""  production-dockerfile-smoke:
             echo "No Dockerfile/runtime-sensitive paths changed. Image smoke skipped."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail when the ordinary production image did not succeed
-        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && needs.production-dockerfile-smoke-default.result != 'success'
+      - name: Fail when the ordinary registry writer did not succeed exclusively
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && (github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && (needs.production-dockerfile-smoke-default-write.result != 'success' || needs.production-dockerfile-smoke-default.result != 'skipped')
+        run: exit 1
+
+      - name: Fail when the ordinary registry reader did not succeed exclusively
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && !(github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && (needs.production-dockerfile-smoke-default.result != 'success' || needs.production-dockerfile-smoke-default-write.result != 'skipped')
         run: exit 1
 
       - name: Fail when the eBPF production image did not succeed
@@ -3381,11 +3622,10 @@ NODE_WAYPOINT_IMAGE_GATE_JOB = r"""  production-dockerfile-smoke:
             echo "## Production Dockerfile eBPF image smoke"
             echo ""
             echo "Ordinary \`runtime\` and distroless \`runtime-ebpf\` images built in parallel"
-            echo "through BuildKit. Trusted exact \`${{ github.sha }}\` hits restore a scoped"
-            echo "local BuildKit cache and do not export or save. Trusted partial matches"
-            echo "and misses export \`mode=max\` and save the new exact key via pinned"
-            echo "\`actions/cache/restore\` and \`actions/cache/save\`; fork pull"
-            echo "requests restore that cache and do not save. Distroless inventories passed."
+            echo "through BuildKit with target-specific GHCR caches. Pull requests"
+            echo "import anonymously and never export. Only trusted main runs publish"
+            echo "the ordinary cache; the eBPF image reads Ambient's shared cache."
+            echo "Cold dispatch skips imports and exports. Distroless inventories passed."
             echo ""
             echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -3458,6 +3698,8 @@ NODE_WAYPOINT_LIVE_GATE_JOB = r"""  node-waypoint-ebpf-live-gate:
 # last field is.
 NODE_WAYPOINT_FROZEN_JOBS = (
     ("production-dockerfile-plan", NODE_WAYPOINT_PLAN_JOB),
+    ("production-dockerfile-smoke-default", NODE_DEFAULT_REGISTRY_READ_JOB),
+    ("production-dockerfile-smoke-default-write", NODE_DEFAULT_REGISTRY_WRITE_JOB),
     ("production-dockerfile-smoke", NODE_WAYPOINT_IMAGE_GATE_JOB),
     ("node-waypoint-ebpf-live-gate", NODE_WAYPOINT_LIVE_GATE_JOB),
 )
@@ -3477,13 +3719,6 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
             "    if: ${{ !cancelled() && "
             "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
             " != 'false' }}\n"
-        ),
-    },
-    "production-dockerfile-smoke-default": {
-        "needs": "    needs: production-dockerfile-plan\n",
-        "if": (
-            "    if: needs.production-dockerfile-plan.outputs.relevant"
-            " == 'true'\n"
         ),
     },
     "production-dockerfile-smoke-ebpf": {
@@ -12718,6 +12953,10 @@ def node_waypoint_relevance_workflow() -> str:
         + NODE_WAYPOINT_PLAN_JOB
         + "\n"
         + bound_jobs
+        + NODE_DEFAULT_REGISTRY_READ_JOB
+        + "\n"
+        + NODE_DEFAULT_REGISTRY_WRITE_JOB
+        + "\n"
         + NODE_WAYPOINT_IMAGE_GATE_JOB
         + "\n"
         + NODE_WAYPOINT_LIVE_GATE_JOB
@@ -29035,6 +29274,8 @@ pre_build = []
             failures.append(f"a {mutation_name} NodeWaypoint workflow was not rejected")
 
     for deleted_job, marker in (
+        ("production-dockerfile-smoke-default", NODE_DEFAULT_REGISTRY_READ_JOB),
+        ("production-dockerfile-smoke-default-write", NODE_DEFAULT_REGISTRY_WRITE_JOB),
         ("node-waypoint-ebpf-live-gate", NODE_WAYPOINT_LIVE_GATE_JOB),
         ("production-dockerfile-smoke", NODE_WAYPOINT_IMAGE_GATE_JOB),
     ):
