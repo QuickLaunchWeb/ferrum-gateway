@@ -3044,6 +3044,8 @@ jobs:
           grep -Fq 'kind: MutatingWebhookConfiguration' "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
           grep -Fq "caBundle: \"${INJECTOR_CA_BUNDLE}\"" "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
           grep -Fq 'failurePolicy: Fail' "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
+          # Render the shell-capable capture image contract, including overrides.
+          python3 -I .github/scripts/check_injector_capture_image.py --helm "$(command -v helm)"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set injector.enabled=true \
             --set-string injector.certManager.injectCaFrom=ferrum/ferrum-mesh-injector \

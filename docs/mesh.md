@@ -6613,7 +6613,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 |---|---|---|
 | `FERRUM_INJECTOR_LISTEN_ADDR` | `0.0.0.0:9443` | Webhook listen address |
 | `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` | `4` | Maximum AdmissionReview request body size, in MiB, accepted before JSON parsing. Values must be 1..64 |
-| `FERRUM_INJECTOR_SIDECAR_IMAGE` | `ferrum-edge:latest` | Sidecar container image |
+| `FERRUM_INJECTOR_SIDECAR_IMAGE` | `ferrum-edge:latest` | Sidecar and capture-init image; iptables capture requires a `-ebpf-tools` tag, optionally pinned with `@sha256:digest` |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | `true` | Require opt-in annotation |
 | `FERRUM_INJECTOR_TLS_CERT_PATH` | (none) | Webhook TLS certificate. Required (with the key) unless `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
 | `FERRUM_INJECTOR_TLS_KEY_PATH` | (none) | Webhook TLS private key. Required (with the cert) unless `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
@@ -6623,6 +6623,23 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_PROXY_UID` | `1337` | Proxy user ID in injected sidecars |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto`, `true` (required/all-or-nothing), or `false` |
 | `FERRUM_MESH_CAPTURE_IPV6_ENABLED` | derived | Whether the Sidecar TCP capture listeners must serve IPv6 captured traffic. Derived from `FERRUM_MESH_IP6TABLES_ENABLED` plus the include/exclude CIDR families when unset; set to `true` by the injector whenever the rendered init-container plan emits `ip6tables` rules |
+
+For iptables injection, the image must provide `/bin/sh`, `ip`, `iptables`, and
+`ip6tables`. The binary rejects a non-tools image at injector startup and at
+admission before emitting a patch. The `-ebpf-tools` tag is a deployment
+capability declaration, not a remote filesystem inspection: custom images must
+carry that tag and actually supply these tools. A tools tag may pin a digest
+(`registry/repository:version-ebpf-tools@sha256:...`); a bare digest cannot
+express this capability and is refused for iptables capture. Explicit and eBPF
+injection continue to accept ordinary distroless sidecar images.
+
+The Helm chart reads `injector.env.FERRUM_MESH_CAPTURE_MODE` (default
+`explicit`), independently of `ambient.captureMode`. For `iptables`, it promotes
+the chart's image tag to `-ebpf-tools`, including promotion from `-ebpf` without
+double suffixes. An explicit `injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE` is
+emitted once and preserved verbatim; a non-tools override fails rendering.
+The injector Deployment itself does not run the capture script and keeps the
+ordinary chart image.
 
 ### Kubernetes Controller
 
