@@ -1855,6 +1855,8 @@ fn test_workload_metrics_effective_plan_budget_measures_same_family_as_replaceme
             ),
         ],
     );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+        .expect("valid multi-instance metric plan must pass admission");
     let cache = PluginCache::new(&config)
         .expect("same-family later replacement must be measured as replacement, not addition");
     assert_eq!(
@@ -1910,6 +1912,9 @@ fn test_workload_metrics_effective_plan_budget_retains_earlier_plan_when_trigger
         )],
         vec![earlier, conditional_replacement, other_family],
     );
+    let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+        .expect_err("a skipped replacement must preserve the earlier plan at admission");
+    assert!(admission.contains("exceed 16384 encoded bytes across surviving families"));
     let error = PluginCache::new(&config)
         .err()
         .expect("a skipped replacement can leave the larger earlier plan effective");
@@ -1940,6 +1945,8 @@ fn test_workload_metrics_effective_plan_budget_admits_within_budget_chain() {
             ),
         ],
     );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+        .expect("valid multi-instance metric plan must pass admission");
     let cache = PluginCache::new(&config)
         .expect("within-budget multi-instance different-family chain must remain valid");
     assert_eq!(
@@ -4342,8 +4349,10 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
             && effective_chain.contains("plugin.is_auth_plugin()"),
         "effective-chain validation must derive authentication participation from constructed capabilities"
     );
-    assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
-    assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
+    assert!(candidate.contains("prepare_plugin_chain("));
+    let assembly_start = source.find("fn prepare_plugin_chain(").unwrap();
+    let assembly = &source[assembly_start..start];
+    assert!(assembly.contains("validate_plugin_security_composition(plugins)"));
 }
 
 fn enforces_finalized_request_policy_override_returns_true(source: &str, fn_offset: usize) -> bool {
@@ -13440,4 +13449,134 @@ fn disabled_size_limiting_instance_publishes_no_ceiling() {
     let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
 
     assert_eq!(view.enforced_request_body_limit(), None);
+}
+
+#[test]
+fn candidate_and_runtime_reject_every_runtime_composition_rule() {
+    let scoped = |id, name| {
+        make_plugin_config(id, name, PluginScope::Proxy, Some("p1"), true)
+    };
+    let pair = |name| vec![scoped("a", name), scoped("b", name)];
+    let interleaved = |name: &str| {
+        let config = if name == "cors" {
+            json!({"allowed_origins": ["*"]})
+        } else {
+            json!({"rules": [{"match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "target"}}], "reject_unmatched": true})
+        };
+        let mut a = make_plugin_config_with_json(
+            "a", name, config.clone(), PluginScope::Proxy, Some("p1"),
+        );
+        let mut b = make_plugin_config_with_json(
+            "b", name, config, PluginScope::Proxy, Some("p1"),
+        );
+        a.priority_override = Some(100);
+        b.priority_override = Some(200);
+        let mut middle = scoped("middle", "ip_restriction");
+        middle.priority_override = Some(150);
+        vec![a, middle, b]
+    };
+    let budget = vec![
+        make_plugin_config_with_json(
+            "a", "workload_metrics",
+            workload_metrics_family_set_overrides("REQUEST_COUNT", 62),
+            PluginScope::Proxy, Some("p1"),
+        ),
+        make_plugin_config_with_json(
+            "b", "workload_metrics",
+            workload_metrics_family_set_overrides("REQUEST_DURATION", 62),
+            PluginScope::Proxy, Some("p1"),
+        ),
+    ];
+    let cases = [
+        ("exclusive load testing", pair("load_testing"), "at most one effective instance"),
+        ("exclusive chargeback", pair("api_chargeback"), "at most one effective instance"),
+        ("CORS contiguity", interleaved("cors"), "cors instances must remain contiguous"),
+        ("mesh contiguity", interleaved("mesh_route_dispatch"), "mesh_route_dispatch instances must remain contiguous"),
+        ("metric budget", budget, "exceed 16384 encoded bytes across surviving families"),
+        ("prometheus owner", vec![scoped("a", "prometheus_metrics")], "must have scope 'global'"),
+        ("BPF owner", vec![scoped("a", "__mesh_bpf_metrics")], "must have scope 'global'"),
+    ];
+    for (case, configs, diagnostic) in cases {
+        let ids = configs.iter().map(|pc| pc.id.as_str()).collect();
+        let config = make_config(vec![make_proxy("p1", "/api", ids)], configs);
+        let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+            &config, None,
+        ).expect_err(case);
+        assert!(admission.contains(diagnostic), "{case}: {admission}");
+        let full = PluginCache::new(&config).err().expect(case);
+        assert!(full.contains(diagnostic), "{case}: {full}");
+
+        let baseline = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+        let cache = PluginCache::new(&baseline).unwrap();
+        let before = cache.get_plugins("ferrum", "p1");
+        let changed = HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
+        let incremental = cache.apply_delta(&config, &changed, &[], true).expect_err(case);
+        assert!(incremental.contains(diagnostic), "{case}: {incremental}");
+        assert!(Arc::ptr_eq(&before, &cache.get_plugins("ferrum", "p1")),
+            "{case}: rejected incremental candidate replaced the published chain");
+    }
+}
+
+#[test]
+fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interlopers() {
+    // Equal priorities follow config order for proxy instances, not association
+    // order. Put the interloper last in associations to expose that difference.
+    for middle_name in ["ip_restriction", "udp_rate_limiting"] {
+        let mut first = cors_config("a", &["GET"], &["X-Test"], Some(100), None);
+        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(100), None);
+        let mut middle = make_plugin_config_with_priority(
+            "middle", middle_name, PluginScope::Proxy, Some("p1"), true, Some(100), None,
+        );
+        for scope in [PluginScope::Proxy, PluginScope::ProxyGroup, PluginScope::Global] {
+            for pc in [&mut first, &mut middle, &mut last] {
+                pc.scope = scope.clone();
+                pc.proxy_id = (scope == PluginScope::Proxy).then(|| "p1".to_string());
+            }
+            let associations = if scope == PluginScope::ProxyGroup {
+                vec!["a", "middle", "b"]
+            } else {
+                vec!["a", "b", "middle"]
+            };
+            let config = make_config(
+                vec![make_proxy("p1", "/api", associations)],
+                vec![first.clone(), middle.clone(), last.clone()],
+            );
+            let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                &config, None,
+            );
+            let runtime = PluginCache::new(&config);
+            assert_eq!(admission.is_ok(), middle_name == "udp_rate_limiting",
+                "{middle_name}/{scope:?}: {admission:?}");
+            assert_eq!(runtime.is_ok(), admission.is_ok(), "{middle_name}/{scope:?}");
+        }
+    }
+}
+
+#[test]
+fn candidate_topology_does_not_open_node_local_geo_database() {
+    let mut geo = make_plugin_config_with_priority(
+        "geo", "geo_restriction", PluginScope::Proxy, Some("p1"), true, Some(150), None,
+    );
+    for triggered in [false, true] {
+        geo.trigger = triggered.then(|| serde_json::from_value(json!({
+            "when": {"match": {"method": ["GET"]}}
+        })).unwrap());
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["geo"])], vec![geo.clone()],
+        );
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect("CP admission must not open the deliberately absent MMDB");
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["a", "geo", "b"])],
+            vec![
+                cors_config("a", &["GET"], &["X-Test"], Some(100), None),
+                geo.clone(),
+                cors_config("b", &["GET"], &["X-Test"], Some(200), None),
+            ],
+        );
+        let error = validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect_err("the pure geo view must still participate in ordering");
+        assert!(error.contains("cors instances must remain contiguous"), "{error}");
+    }
 }

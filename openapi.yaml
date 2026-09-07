@@ -5575,6 +5575,11 @@ paths:
       description: |
         Creates the plugin configuration.
 
+        The complete prospective plugin chain is validated before persistence.
+        Invalid CORS/mesh-dispatch ordering, exclusive-instance conflicts,
+        effective metric-tag plan budgets or global registry ownership return
+        `400` without committing the plugin row or proxy association.
+
         **Proxy-scoped side effect (database mode).** A proxy-scoped plugin
         applies only when the target proxy lists it in `plugins` — `proxy_id`
         alone never attaches it. So a body with `scope: "proxy"` and

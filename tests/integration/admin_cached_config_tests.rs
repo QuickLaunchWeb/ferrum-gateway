@@ -9987,3 +9987,39 @@ async fn proxy_put_omitting_plugins_preserves_associations_and_empty_array_clear
         "an explicit `\"plugins\": []` must clear the associations: {stored:?}"
     );
 }
+
+#[tokio::test]
+async fn test_admin_rejects_second_effective_load_testing_before_persistence() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let db = Arc::clone(state.db.as_ref().unwrap());
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let proxy = json!({
+        "id": "load-owner", "listen_path": "/load-owner",
+        "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "proxy creation failed: {body}");
+    let plugin = |id| json!({
+        "id": id, "plugin_name": "load_testing", "scope": "proxy",
+        "proxy_id": "load-owner", "enabled": true,
+        "config": {"key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1, "duration_seconds": 1, "gateway_port": 8000}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin("load-first")).await;
+    assert_eq!(status, 201, "first valid instance must commit: {body}");
+    let before = db.get_proxy("ferrum", "load-owner").await.unwrap().unwrap();
+    assert_eq!(before.plugins.len(), 1);
+    assert_eq!(before.plugins[0].plugin_config_id, "load-first");
+
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin("load-second")).await;
+    assert_eq!(status, 400, "second effective instance was persisted: {body}");
+    assert!(body.to_string().contains("at most one effective instance"), "{body}");
+    assert!(db.get_plugin_config("ferrum", "load-second").await.unwrap().is_none());
+    assert!(db.get_plugin_config("ferrum", "load-first").await.unwrap().is_some());
+    let after = db.get_proxy("ferrum", "load-owner").await.unwrap().unwrap();
+    assert_eq!(after.plugins.len(), 1);
+    assert_eq!(after.plugins[0].plugin_config_id, "load-first");
+    assert_eq!(after.updated_at, before.updated_at, "rejected write touched the proxy");
+}

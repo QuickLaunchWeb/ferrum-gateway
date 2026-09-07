@@ -24,6 +24,19 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 16. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
 17. **WebSocket policy/hooks** — Parser-level size limits, then per-message rate limiting and logging
 
+## Composition admission
+
+Admin writes and file/database/control-plane admission validate the same effective
+plugin chains as full cache construction and incremental reloads. Scope merging,
+global shadowing and priority ordering happen before checking CORS/mesh-dispatch
+contiguity, exclusive `load_testing`/`api_chargeback` instances, the aggregate
+`workload_metrics` tag-plan budget, and global Prometheus/BPF registry ownership.
+A violating admin candidate returns `400` before either its plugin row or proxy
+association is persisted. Valid multi-instance configurations remain supported.
+Control-plane validation uses pure priority/protocol views for plugins that need
+node-local resources; it does not open a data-plane GeoIP database to check chain
+ordering.
+
 ## Custom Plugins
 
 Custom plugins are auto-discovered from the `custom_plugins/` directory at build time. They can also declare database migrations via `plugin_migrations()` for creating private tables. See [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md) for the full development guide and [migrations.md](migrations.md#custom-plugin-migrations) for migration details.
