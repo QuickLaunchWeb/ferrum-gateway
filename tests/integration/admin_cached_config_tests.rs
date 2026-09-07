@@ -1904,7 +1904,10 @@ async fn file_admission_cases_match_admin_batch_and_sqlite_full_load() {
         if let Some(expected) = case["expected_error"].as_str() {
             assert_eq!(status, 400, "{name}: {body}");
             assert!(body.to_string().contains(expected), "{name}: {body}");
-            assert!(loaded.proxies.is_empty(), "{name}: rejected batch persisted");
+            assert!(
+                loaded.proxies.is_empty(),
+                "{name}: rejected batch persisted"
+            );
             assert!(
                 loaded.plugin_configs.is_empty(),
                 "{name}: rejected plugins persisted"

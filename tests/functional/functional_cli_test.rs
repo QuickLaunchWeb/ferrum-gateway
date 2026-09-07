@@ -649,7 +649,10 @@ async fn functional_cli_file_admission_validate_and_run_agree() {
             );
         } else {
             assert!(output.status.success(), "{name}: {combined}");
-            assert!(combined.contains("Validation passed."), "{name}: {combined}");
+            assert!(
+                combined.contains("Validation passed."),
+                "{name}: {combined}"
+            );
 
             // TCP fixture ports are replaced on every attempt; only a reported
             // listener bind race permits another spawn. The harness proves
