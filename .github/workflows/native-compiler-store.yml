@@ -35,11 +35,16 @@ jobs:
     name: Build the property suite and capture its completed compiler store
     needs: contracts
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/main' &&
-      github.repository == 'ferrum-edge/ferrum-edge'
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main' &&
+       github.repository == 'ferrum-edge/ferrum-edge')
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Match the isolated production Fuzz lane: it installs no mold linker.
+    # An explicit empty RUSTFLAGS overrides root .cargo/config.toml flags.
+    env:
+      RUSTFLAGS: ""
     outputs:
       archive-sha256: ${{ steps.capture.outputs.sha256 }}
       artifact-id: ${{ steps.handoff.outputs.artifact-id }}
@@ -78,6 +83,7 @@ jobs:
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
       - name: Hand off data to a separate publishing runner
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ferrum-edge/ferrum-edge'
         id: handoff
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -90,6 +96,7 @@ jobs:
   publish:
     name: Validate the handoff and publish an inert compiler-store image
     needs: produce
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ferrum-edge/ferrum-edge'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -183,7 +190,7 @@ jobs:
   cleanup:
     name: Delete only this invocation's handoff and registry version
     needs: [produce, publish, anonymous-reader]
-    if: always() && needs.produce.result == 'success'
+    if: always() && needs.produce.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ferrum-edge/ferrum-edge'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
