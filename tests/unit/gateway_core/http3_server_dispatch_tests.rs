@@ -4815,8 +4815,8 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
         .expect("the guarded relay must end at its explicit settle");
     let disarms = relay.matches("stream.record_clean_finish();").count();
     assert_eq!(
-        disarms, 2,
-        "only the two FIN-success sites in the guarded relay may disarm the reset"
+        disarms, 3,
+        "only the three FIN-success sites (including a bodyless response) may disarm the reset"
     );
     assert_eq!(
         relay.matches("body_completed = true;").count(),
@@ -4844,14 +4844,10 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
 /// backstop for a task dropped while parked in `send_data`, and the same
 /// explicit settle after the relay loop.
 ///
-/// The structural invariant that makes the disarm safe in both relays is
-/// stronger than the native relay's: inside the committed region neither has an
-/// inline `finish()` at all. The ONLY client-facing FIN comes from
-/// `finish_h3_response_with_backend_trailers`, whose `Ok(())` is returned
-/// exactly when `h3_stream.finish()` produced `H3AuthorizedWrite::Written` — and
-/// that one match arm is also the relay's only `body_completed = true`. So one
-/// disarm per relay, coinciding with one clean-completion latch, is the whole
-/// set.
+/// Each relay has two authorized FIN-success sites: ordinary completion via
+/// `finish_h3_response_with_backend_trailers` and the bodyless response branch.
+/// Both must pair their successful finish with a clean-completion latch; all
+/// failure, expiry and cancellation exits retain the fail-closed reset.
 #[test]
 fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
     let stream_util = include_str!("../../../src/http3/stream_util.rs");
@@ -4952,8 +4948,8 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
             .expect("each guarded relay must end at its explicit settle");
         let disarms = guarded.matches("h3_stream.record_clean_finish();").count();
         assert_eq!(
-            disarms, 1,
-            "only the single FIN-success site in a borrowing relay may disarm the reset"
+            disarms, 2,
+            "only the ordinary and bodyless FIN-success sites may disarm the reset"
         );
         assert_eq!(
             guarded.matches("body_completed = true;").count(),
