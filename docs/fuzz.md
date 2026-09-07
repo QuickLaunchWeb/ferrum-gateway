@@ -149,8 +149,25 @@ in the `fuzz/` crate per `docs/dependency-policy.md`.
 The existing main/manual sanitizer smoke step emits `Fuzz build resources:`
 JSON records during compilation and its unchanged seven-target run. Samples
 are spaced 30 seconds apart, capped at 240 records and two hours, and written
-directly to the hosted log so runner loss does not depend on artifact cleanup.
+directly to the hosted log. Hard runner loss can prevent that log from being
+published: the first observer trial lost communication and left no retrievable
+Fuzz log or resource samples. Outer job status can also lag the actual failed
+step; compare step timestamps before inferring ongoing compilation.
 The observer stops with the owning shell and preserves its original exit code.
+
+A second, best-effort channel emits at most nine notice annotations: the initial
+sample, first available-memory crossings of 75/50/25/10/5 percent, first free-swap
+crossings of 25/5 percent when swap exists, and the first increase in exposed root
+cgroup OOM counters. Simultaneous reasons share one annotation. Notices carry
+only selected numeric counters, are forwarded through the runner's live timeline,
+and do not grant API credentials to the observer or compiler. They can also be
+lost if the runner stops before forwarding them; missing records do not prove
+absence of memory pressure. Validate retrieval on a hosted run before relying
+on this channel. Thresholds select diagnostic samples and do not stop the build.
+The [notice command](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-a-notice-message)
+and [runner issue handling](https://github.com/actions/runner/blob/0b0ac2fdabf53d69add6175026945b8afc8549a5/src/Runner.Worker/ExecutionContext.cs#L795)
+describe the annotation path and the ten-notice limit; these are not a delivery
+guarantee after runner loss.
 
 Records contain host available memory/swap, swap page counters, root cgroup
 memory limits/events when exposed, and an RSS summary of at most 1,024 visible

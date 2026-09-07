@@ -5908,8 +5908,9 @@ jobs:
           set -euo pipefail
 
           sanitizer_started=$SECONDS
-          # Emit bounded, non-payload snapshots while the compiler runs. Stdout
-          # survives runner loss even when post-job artifact upload cannot run.
+          # Logs and annotations are best effort: hard runner loss can prevent
+          # either upload. Send a few pressure transitions to the live timeline
+          # as well as the full log, without granting this process API access.
           python3 -u - <<'PYRES' &
           import json
           import os
@@ -5942,6 +5943,8 @@ jobs:
 
 
           started = time.monotonic()
+          reported_notices = set()
+          initial_oom = None
           for sample_index in range(240):
               rss_sum = 0
               rss_max = 0
@@ -5978,6 +5981,44 @@ jobs:
                   "largest_process_rss_kib": rss_max,
               }
               print("Fuzz build resources: " + json.dumps(snapshot, sort_keys=True), flush=True)
+              # At most nine distinct reasons, each emitted once. Group simultaneous
+              # transitions to stay below the runner's ten-notice limit per step.
+              reasons = {"initial"} if sample_index == 0 else set()
+              memory = snapshot["host_memory_kib"] or {}
+              total = memory.get("MemTotal", 0)
+              available = memory.get("MemAvailable")
+              if total > 0 and available is not None:
+                  for percent in (75, 50, 25, 10, 5):
+                      if available * 100 <= total * percent:
+                          reasons.add(f"available-memory-at-most-{percent}-percent")
+              swap_total = memory.get("SwapTotal", 0)
+              swap_free = memory.get("SwapFree")
+              if swap_total > 0 and swap_free is not None:
+                  for percent in (25, 5):
+                      if swap_free * 100 <= swap_total * percent:
+                          reasons.add(f"free-swap-at-most-{percent}-percent")
+              events = snapshot["root_cgroup_memory_events"] or {}
+              oom = {name: events[name] for name in ("oom", "oom_kill") if name in events}
+              if initial_oom is None and oom:
+                  initial_oom = oom
+              if initial_oom and any(oom.get(name, value) > value
+                                     for name, value in initial_oom.items()):
+                  reasons.add("root-cgroup-oom-counter-increased")
+              new_reasons = reasons - reported_notices
+              if new_reasons:
+                  notice = {
+                      "reasons": sorted(new_reasons),
+                      "sample": sample_index,
+                      "elapsed_seconds": snapshot["elapsed_seconds"],
+                      "host_memory_kib": memory,
+                      "host_swap_pages": snapshot["host_swap_pages"],
+                      "root_cgroup_oom_counters": oom,
+                      "largest_process_rss_kib": rss_max,
+                  }
+                  message = json.dumps(notice, sort_keys=True)
+                  message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print("::notice title=Fuzz build resource snapshot::" + message, flush=True)
+                  reported_notices.update(new_reasons)
               remaining = 7200.0 - (time.monotonic() - started)
               if remaining <= 0:
                   break
