@@ -3975,12 +3975,6 @@ async fn handle_tcp_connection_inner(
             client_local_addr,
         )?;
 
-        let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
-        let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
-            Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
-        } else {
-            None
-        };
         let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
             Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
         } else {
@@ -4166,6 +4160,16 @@ async fn handle_tcp_connection_inner(
                     }
                 };
 
+                // Target rotation can cross DestinationRule policy-port lanes.
+                // Resolve the connect budget for every attempt rather than
+                // retaining the failed target's per-port policy.
+                let (backend_connect_timeout_ms, _) = passthrough_timeout_policy(
+                    &params,
+                    proxy,
+                    global_tcp_idle_timeout,
+                );
+                let connect_timeout = Duration::from_millis(backend_connect_timeout_ms);
+
                 // Connect plain TCP to backend (no TLS origination — the client's encrypted
                 // stream passes through directly to the backend which terminates TLS).
                 let connect_attempt = crate::dns::connect_candidates(
@@ -4208,7 +4212,7 @@ async fn handle_tcp_connection_inner(
                         .map_err(|error| match error {
                             crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
                                 "Backend TCP connect budget exhausted after {}ms (last={})",
-                                params.backend_connect_timeout_ms,
+                                backend_connect_timeout_ms,
                                 last_addr
                             ),
                             crate::dns::CandidateConnectError::Failed { source, .. } => source,
@@ -4307,6 +4311,12 @@ async fn handle_tcp_connection_inner(
         };
         backend_info.backend_resolved_ip = Some(addr.ip().to_string());
         let passthrough_port_override = resolve_port_override(&params, params.backend_policy_port);
+        // The relay belongs to the target that ultimately connected, so its
+        // idle watchdog must use that target's policy lane as well.
+        let (_, tcp_idle_timeout_seconds) =
+            passthrough_timeout_policy(&params, proxy, global_tcp_idle_timeout);
+        let idle_timeout =
+            (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
         // backend socket. Best-effort: a `setsockopt` failure logs and
@@ -6222,6 +6232,48 @@ mod backend_target_selection_tests {
     }
 
     #[test]
+    fn passthrough_retry_timeouts_follow_current_policy_port() {
+        let mut proxy = proxy_with_subset(None);
+        proxy.backend_connect_timeout_ms = 5_000;
+        proxy.tcp_idle_timeout_seconds = Some(300);
+        proxy.dispatch_port_overrides = Some(HashMap::from([
+            (
+                6379,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(9_000),
+                    tcp_idle_timeout_seconds: Some(0),
+                    ..Default::default()
+                },
+            ),
+            (
+                6380,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(250),
+                    tcp_idle_timeout_seconds: Some(2),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        let mut params = retry_params();
+        params.backend_policy_port = 6379;
+        params.backend_connect_timeout_ms = 9_000;
+        params.tcp_idle_timeout_seconds = 0;
+        params.dispatch_port_overrides = proxy.dispatch_port_overrides.clone();
+
+        assert_eq!(passthrough_timeout_policy(&params, &proxy, 600), (9_000, 0));
+
+        params.backend_policy_port = 6380;
+        assert_eq!(passthrough_timeout_policy(&params, &proxy, 600), (250, 2));
+
+        params.backend_policy_port = 6381;
+        assert_eq!(
+            passthrough_timeout_policy(&params, &proxy, 600),
+            (5_000, 300),
+            "a lane without overrides must not inherit the initial target's values"
+        );
+    }
+
+    #[test]
     fn stream_lb_hash_key_canonicalizes_ipv4_mapped_clients() {
         let mapped: std::net::IpAddr = "::ffff:192.0.2.10".parse().expect("mapped IPv4");
         let plain: std::net::IpAddr = "192.0.2.10".parse().expect("plain IPv4");
@@ -7609,6 +7661,27 @@ fn resolve_port_override(
         .dispatch_port_overrides
         .as_ref()
         .and_then(|m| m.get(&port))
+}
+
+/// Resolve passthrough timeouts for the currently selected policy port.
+///
+/// `TcpConnParams` contains the effective values for the initially selected
+/// target. Passthrough retries can rotate to a different policy-port lane, so
+/// fallback must use the proxy/global defaults rather than those cached values.
+fn passthrough_timeout_policy(
+    params: &TcpConnParams,
+    proxy: &Proxy,
+    global_tcp_idle_timeout: u64,
+) -> (u64, u64) {
+    let port_override = resolve_port_override(params, params.backend_policy_port);
+    let connect_timeout_ms = port_override
+        .and_then(|override_config| override_config.connect_timeout_ms)
+        .unwrap_or(proxy.backend_connect_timeout_ms);
+    let idle_timeout_seconds = port_override
+        .and_then(|override_config| override_config.tcp_idle_timeout_seconds)
+        .or(proxy.tcp_idle_timeout_seconds)
+        .unwrap_or(global_tcp_idle_timeout);
+    (connect_timeout_ms, idle_timeout_seconds)
 }
 
 /// Try to acquire a per-target open-connection slot for DR
