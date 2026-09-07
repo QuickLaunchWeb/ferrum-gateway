@@ -121,6 +121,10 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/capture/",
         r"^src/modes/mesh/",
         r"^src/proxy/(host_udp_capture|host_udp_capture_live_tests|mesh_udp_capture|netns_capture|netns_udp_capture|udp_placement_cleanup|udp_placement_migration)\.rs$",
+        # The `ambient-udp-preflight` subcommand definition and dispatch are
+        # production entry points of this lifecycle, so the CLI/binary entry
+        # files stay sensitive even though they sit outside `src/proxy/`.
+        r"^src/(cli|main|gateway_entry)\.rs$",
         r"^src/modes/node_agent\.rs$",
         r"^src/ebpf/veth\.rs$",
         *exact_path_patterns(AMBIENT_HOST_UDP_DOCUMENTATION_PATHS),
@@ -1379,8 +1383,9 @@ def self_test() -> int:
         ("ambient-host-udp", ["src/proxy/udp_placement_cleanup.rs"], True),
         ("ambient-host-udp", ["src/modes/node_agent.rs"], True),
         ("ambient-host-udp", ["src/capture/mod.rs"], True),
-        ("ambient-host-udp", ["src/cli.rs"], False),
-        ("ambient-host-udp", ["src/main.rs"], False),
+        ("ambient-host-udp", ["src/cli.rs"], True),
+        ("ambient-host-udp", ["src/main.rs"], True),
+        ("ambient-host-udp", ["src/gateway_entry.rs"], True),
         ("ambient-host-udp", ["src/socket_opts.rs"], False),
         ("ambient-host-udp", ["src/proxy/mod.rs"], False),
         ("ambient-host-udp", ["docs/tcp_udp_proxy.md"], False),
