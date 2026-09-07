@@ -1581,6 +1581,15 @@ despite identical source inputs. This explains an uncontrolled compiler input;
 it does not by itself prove the cause of the measured performance disagreement.
 See [Cargo's source identity implementation](https://doc.rust-lang.org/stable/nightly-rustc/src/cargo/core/source_id.rs.html#545-571).
 
+The manual `RoundRobin Build Comparison` workflow runs the same script against
+an explicit immutable ancestor SHA supplied through its `baseline` input. It
+rejects malformed/non-ancestor revisions before installing build dependencies.
+This supports a controlled comparison of the original failing source pair;
+a same-source null comparison alone cannot rule out a real source regression.
+Only lightweight evidence self-tests run automatically for relevant PRs/pushes.
+The manual study uses one standard Ubuntu host, the same compiler-wrapper path,
+and read-only repository permissions, and uploads data without executables.
+
 The harness performs 50,000 operations per thread at one and eight threads.
 Its timer starts before the worker-release barrier. Three baseline and three
 candidate runs alternate order on the same hosted runner. At each thread count,
