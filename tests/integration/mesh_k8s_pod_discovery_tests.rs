@@ -1388,7 +1388,7 @@ fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn selectorless_defaulted_target_port_reaches_the_endpoint_slice_backend() {
+async fn selectorless_numeric_and_named_targets_reach_the_endpoint_slice_backend() {
     use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
     use crate::scaffolding::harness::GatewayHarness;
     use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
@@ -1416,66 +1416,71 @@ async fn selectorless_defaulted_target_port_reaches_the_endpoint_slice_backend()
         .step(HttpStep::RespondBodyEnd)
         .spawn()
         .expect("spawn endpoint backend");
-    let service = object(
-        "Service",
-        "default",
-        "manual",
-        json!({
-            "clusterIP": "10.96.0.10",
-            "ports": [{"name": "http", "port": service_port.port, "targetPort": service_port.port}]
-        }),
-    );
-    let mut slice = object(
-        "EndpointSlice",
-        "default",
-        "manual-ip4",
-        json!({
-            "addressType": "IPv4", "ports": [{"name": "http", "port": backend_port}],
-            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
-        }),
-    );
-    slice
-        .metadata
-        .labels
-        .insert("kubernetes.io/service-name".into(), "manual".into());
-    let mut route = object(
-        "HTTPRoute",
-        "default",
-        "manual",
-        json!({
-            "rules": [{"matches": [{"path": {"type": "Exact", "value": "/slice-port"}}],
-                "backendRefs": [{"name": "manual", "port": service_port.port}]}]
-        }),
-    );
-    route.api_version = "gateway.networking.k8s.io/v1".into();
-    let mut translated =
-        translate_k8s_objects(&[service, slice, route], options_for_namespace("default"))
-            .expect("translate manual endpoint route");
-    assert_eq!(translated.config.proxies.len(), 1);
-    assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");
-    assert_eq!(translated.config.proxies[0].backend_port, backend_port);
-    translated.config.proxies[0].listen_port = None;
-    translated.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
-    let yaml = serde_yaml::to_string(&translated.config).expect("serialize translated config");
-    let gateway = GatewayHarness::builder()
-        .mode_in_process()
-        .file_config(yaml)
-        .env("FERRUM_NAMESPACE", "default")
-        .pool_warmup_enabled(false)
-        .spawn()
-        .await
-        .expect("start translated gateway");
-    let response = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("client")
-        .get(gateway.proxy_url("/slice-port"))
-        .send()
-        .await
-        .expect("translated route response");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(response.text().await.unwrap(), "pong");
-    backend.assert_no_matcher_mismatches().await;
-    assert_eq!(backend.received_requests().await.len(), 1);
+    for (case_index, target_port) in [json!(service_port.port), json!("container-http")]
+        .into_iter()
+        .enumerate()
+    {
+        let service = object(
+            "Service",
+            "default",
+            "manual",
+            json!({
+                "clusterIP": "10.96.0.10",
+                "ports": [{"name": "http", "port": service_port.port, "targetPort": target_port}]
+            }),
+        );
+        let mut slice = object(
+            "EndpointSlice",
+            "default",
+            "manual-ip4",
+            json!({
+                "addressType": "IPv4", "ports": [{"name": "http", "port": backend_port}],
+                "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+            }),
+        );
+        slice
+            .metadata
+            .labels
+            .insert("kubernetes.io/service-name".into(), "manual".into());
+        let mut route = object(
+            "HTTPRoute",
+            "default",
+            "manual",
+            json!({
+                "rules": [{"matches": [{"path": {"type": "Exact", "value": "/slice-port"}}],
+                    "backendRefs": [{"name": "manual", "port": service_port.port}]}]
+            }),
+        );
+        route.api_version = "gateway.networking.k8s.io/v1".into();
+        let mut translated =
+            translate_k8s_objects(&[service, slice, route], options_for_namespace("default"))
+                .expect("translate manual endpoint route");
+        assert_eq!(translated.config.proxies.len(), 1);
+        assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");
+        assert_eq!(translated.config.proxies[0].backend_port, backend_port);
+        translated.config.proxies[0].listen_port = None;
+        translated.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
+        let yaml = serde_yaml::to_string(&translated.config).expect("serialize translated config");
+        let gateway = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(yaml)
+            .env("FERRUM_NAMESPACE", "default")
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("start translated gateway");
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client")
+            .get(gateway.proxy_url("/slice-port"))
+            .send()
+            .await
+            .expect("translated route response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "pong");
+        backend.assert_no_matcher_mismatches().await;
+        assert_eq!(backend.received_requests().await.len(), case_index + 1);
+    }
 }
