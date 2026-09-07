@@ -7278,10 +7278,9 @@ mod configsync_size_bounds {
     fn authenticated<T>(body: T) -> tonic::Request<T> {
         let mut request = tonic::Request::new(body);
         let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "size-bound-dp").unwrap();
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {token}").parse().unwrap(),
-        );
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
         request
     }
 
@@ -7362,7 +7361,8 @@ mod configsync_size_bounds {
         assert_eq!(registry.snapshot()[0].last_update_at, before);
         let logs = logs.contents();
         assert_eq!(
-            logs.matches("Refusing oversized ConfigSync message").count(),
+            logs.matches("Refusing oversized ConfigSync message")
+                .count(),
             2
         );
         assert!(logs.contains("namespace=\"ferrum\""));
@@ -7430,7 +7430,8 @@ mod configsync_size_bounds {
         assert!(registry.is_empty());
         let logs = logs.contents();
         assert_eq!(
-            logs.matches("Refusing oversized ConfigSync message").count(),
+            logs.matches("Refusing oversized ConfigSync message")
+                .count(),
             3
         );
         assert!(logs.contains("namespace=\"ferrum\""));
@@ -7478,18 +7479,16 @@ mod configsync_size_bounds {
         use hyper::service::service_fn;
         use hyper_util::rt::{TokioExecutor, TokioIo};
 
-        let backend = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend.local_addr().unwrap();
         let backend_task = tokio::spawn(async move {
             loop {
                 let (socket, _) = backend.accept().await.unwrap();
                 tokio::spawn(async move {
                     let service = service_fn(|_request| async {
-                        Ok::<_, std::convert::Infallible>(hyper::Response::new(
-                            Full::new(Bytes::from_static(b"configsync-size-proof")),
-                        ))
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                            Bytes::from_static(b"configsync-size-proof"),
+                        )))
                     });
                     let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                         .serve_connection(TokioIo::new(socket), service)
@@ -7552,9 +7551,7 @@ mod configsync_size_bounds {
         assert_eq!(state.config.load().proxies.len(), count);
         assert!(connection.load().last_config_received_at.is_some());
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let proxy_task = tokio::spawn(
