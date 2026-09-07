@@ -566,7 +566,11 @@ fn resolved_reqwest_key_partitions_every_consumed_pool_setting() {
                 $field: $value,
                 ..baseline.clone()
             };
-            assert_ne!(baseline_key, resolved_reqwest_key(&changed), stringify!($field));
+            assert_ne!(
+                baseline_key,
+                resolved_reqwest_key(&changed),
+                stringify!($field)
+            );
         };
     }
     partitions!(idle_timeout_seconds, 30);

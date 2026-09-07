@@ -550,16 +550,72 @@ async fn test_resolved_window_matrix_creates_one_pool_per_effective_configuratio
     let cases = [
         ("default", None, None, None, None, 0),
         ("implicit-small-stream", None, Some(65_535), None, None, 1),
-        ("explicit-small-stream", Some(false), Some(65_535), None, None, 1),
-        ("implicit-large-stream", None, Some(1_048_576), None, None, 2),
-        ("explicit-large-stream", Some(false), Some(1_048_576), None, None, 2),
-        ("implicit-small-connection", None, None, Some(65_535), None, 3),
-        ("explicit-small-connection", Some(false), None, Some(65_535), None, 3),
-        ("adaptive-stream-ignored", Some(true), Some(65_535), None, None, 0),
-        ("adaptive-connection-ignored", Some(true), None, Some(65_535), None, 0),
+        (
+            "explicit-small-stream",
+            Some(false),
+            Some(65_535),
+            None,
+            None,
+            1,
+        ),
+        (
+            "implicit-large-stream",
+            None,
+            Some(1_048_576),
+            None,
+            None,
+            2,
+        ),
+        (
+            "explicit-large-stream",
+            Some(false),
+            Some(1_048_576),
+            None,
+            None,
+            2,
+        ),
+        (
+            "implicit-small-connection",
+            None,
+            None,
+            Some(65_535),
+            None,
+            3,
+        ),
+        (
+            "explicit-small-connection",
+            Some(false),
+            None,
+            Some(65_535),
+            None,
+            3,
+        ),
+        (
+            "adaptive-stream-ignored",
+            Some(true),
+            Some(65_535),
+            None,
+            None,
+            0,
+        ),
+        (
+            "adaptive-connection-ignored",
+            Some(true),
+            None,
+            Some(65_535),
+            None,
+            0,
+        ),
         ("both-fixed", None, Some(65_535), Some(65_535), None, 4),
         ("h1", None, None, None, Some(false), 5),
-        ("h1-windows-ignored", Some(false), Some(65_535), Some(65_535), Some(false), 5),
+        (
+            "h1-windows-ignored",
+            Some(false),
+            Some(65_535),
+            Some(65_535),
+            Some(false),
+            5,
+        ),
     ];
     for reverse in [false, true] {
         let pool = ConnectionPool::new(
@@ -572,7 +628,11 @@ async fn test_resolved_window_matrix_creates_one_pool_per_effective_configuratio
         let mut observed = Vec::new();
         let mut expected_groups = std::collections::HashSet::new();
         for position in 0..cases.len() {
-            let index = if reverse { cases.len() - 1 - position } else { position };
+            let index = if reverse {
+                cases.len() - 1 - position
+            } else {
+                position
+            };
             let (name, adaptive, stream, connection, h2, group) = cases[index];
             let mut proxy = create_test_proxy();
             proxy.id = name.to_string();
@@ -584,7 +644,11 @@ async fn test_resolved_window_matrix_creates_one_pool_per_effective_configuratio
             for (prior_group, prior_key) in &observed {
                 assert_eq!(group == *prior_group, key == *prior_key, "{name}");
             }
-            drop(pool.get_client(&proxy).await.expect("construct reqwest client"));
+            drop(
+                pool.get_client(&proxy)
+                    .await
+                    .expect("construct reqwest client"),
+            );
             expected_groups.insert(group);
             observed.push((group, key));
             let stats = pool.get_stats();
