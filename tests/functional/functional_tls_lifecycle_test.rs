@@ -1423,14 +1423,11 @@ impl TrustRetirementFixture {
     /// child has not exited turns "the connection failed" into "the running
     /// gateway closed the connection".
     fn assert_still_running(&mut self, context: &str) {
-        match self.gateway.is_running() {
-            Ok(true) => {}
-            Ok(false) => panic!(
-                "{context}: the gateway exited rather than refusing on a live transport; output:\n{}",
-                self.gateway.diagnostic_captured_output()
-            ),
-            Err(e) => panic!("{context}: could not poll the gateway process: {e}"),
-        }
+        assert!(
+            self.gateway.is_running(),
+            "{context}: the gateway is not confirmed alive after transport refusal; output:\n{}",
+            self.gateway.diagnostic_captured_output()
+        );
     }
 
     fn h1_config(&self) -> rustls::ClientConfig {
