@@ -2792,10 +2792,10 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
             "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
         }),
     );
-    endpoints.metadata.labels.insert(
-        "kubernetes.io/service-name".to_string(),
-        "api".to_string(),
-    );
+    endpoints
+        .metadata
+        .labels
+        .insert("kubernetes.io/service-name".to_string(), "api".to_string());
     let supported_rule = json!({
         "backendRefs": [{"name": "api", "port": 8080}],
         "filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {
@@ -2805,9 +2805,12 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
         }}]
     });
     let mut unsupported_rule = supported_rule.clone();
-    unsupported_rule["filters"].as_array_mut().unwrap().push(json!({
-        "type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}
-    }));
+    unsupported_rule["filters"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}
+        }));
     let objects = vec![
         gateway_class(),
         cross_kind_gateway(json!([{"name": "web", "port": 80, "protocol": "HTTP"}])),
