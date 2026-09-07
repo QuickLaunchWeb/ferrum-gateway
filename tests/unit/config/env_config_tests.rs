@@ -7378,6 +7378,7 @@ fn unix_ingress_max_connections_rejects_an_unreachable_ceiling() {
 fn test_stream_lifetime_is_published_only_from_the_accepted_startup_config() {
     const ENV_CONFIG_SOURCE: &str = include_str!("../../../src/config/env_config.rs");
     const MAIN_SOURCE: &str = include_str!("../../../src/gateway_entry.rs");
+    const STARTUP_SOURCE: &str = include_str!("../../../src/startup.rs");
     const PUBLISH_CALL: &str = "publish_authenticated_stream_max_lifetime_seconds(";
 
     let validate = ENV_CONFIG_SOURCE
@@ -7403,10 +7404,25 @@ fn test_stream_lifetime_is_published_only_from_the_accepted_startup_config() {
         .expect("the accepted-startup publication seam");
     assert!(publisher.contains(PUBLISH_CALL));
 
-    // `main.rs` calls it on the serving path, after `EnvConfig::from_env()`
-    // succeeded and before mode dispatch.
+    // The binary reaches the private EnvConfig publisher only through the
+    // library startup adapter; validation remains unable to publish it.
+    assert_eq!(
+        STARTUP_SOURCE
+            .matches("env_config.publish_process_wide_stream_settings();")
+            .count(),
+        1
+    );
+    let adapter = STARTUP_SOURCE
+        .split("pub fn publish_gateway_stream_settings(env_config: &crate::config::EnvConfig) {")
+        .nth(1)
+        .and_then(|body| body.split('}').next())
+        .expect("the library startup adapter");
+    assert!(adapter.contains("env_config.publish_process_wide_stream_settings();"));
+
+    // `main.rs` calls the adapter on the serving path, after
+    // `EnvConfig::from_env()` succeeded and before mode dispatch.
     let accepted_at = MAIN_SOURCE
-        .find("env_config.publish_process_wide_stream_settings();")
+        .find("crate::startup::publish_gateway_stream_settings(&env_config);")
         .expect("main.rs must publish the accepted startup stream settings");
     let from_env_at = MAIN_SOURCE
         .find("let env_config = match EnvConfig::from_env() {")
