@@ -68,6 +68,14 @@ exceptions = [
 ]
 '
 
+  st_case "literal-string license exception with no [expires:] token" 1 \
+'[licenses]
+version = 2
+exceptions = [
+    { crate = '\''some-crate'\'', allow = ["Bar-1.0"] },
+]
+'
+
   st_case "license exception with a past [expires:] date" 1 \
 '[licenses]
 version = 2
@@ -216,9 +224,10 @@ license_entries="$(awk '
 
     # An entry opens at its crate spec key. Consume the pending token so a later
     # entry cannot inherit an earlier entry comment.
-    if (match(code, /(crate|name)[[:space:]]*=[[:space:]]*"[^"]*"/)) {
+    if (match(code, /(crate|name)[[:space:]]*=[[:space:]]*("[^"]*"|\047[^\047]*\047)/)) {
       spec = substr(code, RSTART, RLENGTH)
-      sub(/^[^"]*"/, "", spec); sub(/"$/, "", spec)
+      sub(/^[^=]*=[[:space:]]*/, "", spec)
+      spec = substr(spec, 2, length(spec) - 2)
       printf "%s\t%s\n", spec, pending
       pending = ""
     }
