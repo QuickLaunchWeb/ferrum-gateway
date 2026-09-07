@@ -5995,7 +5995,7 @@ Multimodal capability is provider-specific, so a per-provider multimodal rejecti
 
 **Priority:** 4060
 
-**Provider result and fallback contract.** Provider and OAuth response bodies are collected with explicit bounds (8 MiB per provider by default, 64 KiB for OAuth); provider-native request serialization is capped at 64 MiB, and normalized JSON serialization is held to the per-provider response limit so translation/escaping cannot create an unbounded body. Redirects are never followed, and provider `3xx` status codes are preserved when final. Successful `2xx` bodies must match the selected provider's documented shape; malformed success responses fail with `502` and may fall through when `fallback_on_protocol_errors` is enabled. Safe `Retry-After`, request-ID, and rate-limit headers are forwarded within count/value bounds; cookie, credential, location, hop-by-hop, and unrecognized headers are removed.
+**Provider result and fallback contract.** Provider and OAuth response bodies are collected with explicit bounds (8 MiB per provider by default, 64 KiB for OAuth); provider-native request serialization is capped at 64 MiB, and normalized JSON serialization is held to the per-provider response limit so translation/escaping cannot create an unbounded body. Redirects are never followed, and provider `3xx` status codes are preserved when final. Successful `2xx` bodies must match the selected provider's documented shape; a fully received success that cannot be normalized fails with `502` (`response_normalization_failed`) without calling another provider. That generation has already committed, so its original provider/status and non-replayable idempotency tombstone are retained. Neither `fallback_on_protocol_errors` nor the ambiguous-outcome opt-in permits replay of this completed operation, and `2xx` values are rejected in `fallback_on_status_codes`. Safe `Retry-After`, request-ID, and rate-limit headers are forwarded within count/value bounds; cookie, credential, location, hop-by-hop, and unrecognized headers are removed.
 
 Transport fallback is replay-safe by default. DNS, connect, and TLS failures proven to occur before the POST reached the wire may fall through. Timeouts, resets, and response-stream failures are ambiguous and return `502` without another model invocation. `fallback_on_ambiguous_errors: true` is an explicit duplicate-call/duplicate-charge opt-in. Oversized responses are never retried.
 
@@ -6022,9 +6022,9 @@ Gemini function calls do not carry an OpenAI call ID in the native response shap
 |---|---|---|---|
 | `providers` | Array | _(required)_ | Array of provider configurations (see below; maximum 128) |
 | `fallback_enabled` | Boolean | `true` | Try next provider on failure |
-| `fallback_on_status_codes` | Array | `[429, 500, 502, 503]` | HTTP status codes that trigger fallback |
+| `fallback_on_status_codes` | Array | `[429, 500, 502, 503]` | Non-2xx HTTP status codes that trigger fallback; success codes are rejected at configuration admission |
 | `fallback_on_network_errors` | Boolean | `true` | Proven pre-wire DNS/connect/TLS failures trigger fallback |
-| `fallback_on_protocol_errors` | Boolean | `true` | Malformed success responses and redirects may fall through |
+| `fallback_on_protocol_errors` | Boolean | `true` | Redirect responses may fall through; completed 2xx normalization failures never replay |
 | `fallback_on_ambiguous_errors` | Boolean | `false` | Explicitly allow duplicate-prone replay after an ambiguous POST outcome |
 | `fail_on_missing_model` | Boolean | `true` | Reject JSON POST requests whose body cannot be inspected as JSON or lacks a top-level string `model` field. Set to `false` only to explicitly pass such requests through to the normal backend |
 | `fail_on_no_matching_provider` | Boolean | `true` | Reject requests whose `model` does not match any provider. Set to `false` only to explicitly pass unsupported models through to the normal backend |

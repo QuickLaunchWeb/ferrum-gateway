@@ -1752,6 +1752,11 @@ fn optional_status_code_set(
                 "ai_federation: '{field}' contains invalid HTTP status code {status}"
             ));
         }
+        if (200..300).contains(&status) {
+            return Err(format!(
+                "ai_federation: '{field}' cannot replay committed success status {status}"
+            ));
+        }
         out.insert(status);
     }
     Ok(Some(out))
@@ -7936,20 +7941,10 @@ impl Plugin for AiFederation {
                         error = %e,
                         "ai_federation: response normalization failed"
                     );
-                    if self.fallback_enabled
-                        && self.fallback_on_protocol_errors
-                        && has_later_provider
-                    {
-                        last_failure_result = Some(self.openai_error_response_with_headers(
-                            502,
-                            "Provider returned a malformed success response",
-                            "server_error",
-                            None,
-                            Some("response_normalization_failed"),
-                            response.headers,
-                        ));
-                        continue;
-                    }
+                    // Only a completed 2xx can fail success normalization.
+                    // The provider already performed the billable operation:
+                    // keep its provenance and dedup tombstone, and never send
+                    // another generation, even with ambiguous replay enabled.
                     return self.openai_error_response_with_headers(
                         502,
                         "Provider returned a malformed success response",

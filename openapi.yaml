@@ -28844,8 +28844,11 @@ components:
             type: integer
             minimum: 100
             maximum: 599
+            not:
+              minimum: 200
+              maximum: 299
           default: [429, 500, 502, 503]
-          description: HTTP status codes from a provider that trigger fallback to the next provider.
+          description: Non-2xx HTTP status codes from a provider that trigger fallback to the next provider. Success codes are rejected because the generation has already committed.
         fallback_on_network_errors:
           type: boolean
           default: true
@@ -28853,7 +28856,7 @@ components:
         fallback_on_protocol_errors:
           type: boolean
           default: true
-          description: Try the next provider when a 2xx response is malformed or cannot be losslessly normalized, or when a redirect is returned.
+          description: Try the next provider when a redirect is returned. A completed 2xx that cannot be normalized returns 502 without replay, even when ambiguous-outcome fallback is enabled.
         fallback_on_ambiguous_errors:
           type: boolean
           default: false
