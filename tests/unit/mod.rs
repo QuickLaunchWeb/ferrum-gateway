@@ -18,6 +18,7 @@ mod openapi_yaml_tests;
 mod plugins {
     #[allow(dead_code)]
     pub(crate) mod plugin_utils;
+
     mod jwks_auth_tests;
     mod jwks_cache_tests;
     mod plugin_cache_tests;
