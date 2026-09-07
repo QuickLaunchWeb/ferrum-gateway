@@ -1561,15 +1561,25 @@ not a representative scaling control for snapshot loads, reference counts and
 selection together; their costs need not inflate proportionally on a busy
 runner. The old 0.50 multiplier could reject unchanged selection code.
 
-`run_rr_selection_comparison.sh` builds candidate and baseline binaries using
-the same candidate benchmark harness and locked dependency graphs. Only that
-harness is overlaid on the baseline checkout. The PR base SHA, merge-group base
-SHA, or main push's before SHA selects the baseline; manual dispatch defaults
-to the preceding commit. Both binaries are preserved before measurements start,
-so rebuilding the shared target directory cannot replace one with the other.
-Compiler work finishes before timing starts. Both commands use the runner-root
-Cargo configuration and toolchain; the baseline manifest resolves its own source
-and locked dependencies from the separate checkout.
+`run_rr_selection_comparison.sh` builds candidate and immutable baseline with
+only the candidate benchmark harness overlaid. The PR base SHA, merge-group
+base SHA, or main push before SHA selects the baseline; manual dispatch defaults
+to the preceding commit. Both compilations use the same
+deterministic runner-temporary source path and target directory, with the
+runner-root Cargo configuration and toolchain. The completed binary is copied
+immediately, then its newly created source worktree is moved aside; the next
+revision gets a fresh checkout at that identical path. Existing temporary
+comparison directories cause failure rather than being reused or deleted.
+
+This controls a build-identity confound found in #4742: the standalone mesh
+workspace depends on the root crate and patched crates outside its directory.
+Cargo's stable source hash strips the workspace prefix only for paths beneath
+that workspace. A random baseline directory therefore changes metadata for
+those outside path dependencies, while the original candidate path stayed
+fixed. Observed baseline artifacts had different library and executable hashes
+despite identical source inputs. This explains an uncontrolled compiler input;
+it does not by itself prove the cause of the measured performance disagreement.
+See [Cargo's source identity implementation](https://doc.rust-lang.org/stable/nightly-rustc/src/cargo/core/source_id.rs.html#545-571).
 
 The harness performs 50,000 operations per thread at one and eight threads.
 Its timer starts before the worker-release barrier. Three baseline and three
@@ -1582,8 +1592,9 @@ interval or proof of equivalence; noise can hide small regressions. Missing,
 incomplete, non-finite, or invalid interval evidence fails.
 
 The artifact includes exact source revisions, the shared harness hash, binary
-hashes, compilation durations, run order, raw Criterion samples and intervals,
-and `rr-comparison/comparison.json`. The temporary baseline checkout and large
+hashes, checked source paths and package identities, compiler/Cargo versions,
+CPU topology, compilation durations, run order, raw Criterion samples and intervals,
+and `rr-comparison/comparison.json`. The temporary source checkouts and large
 executables stay outside the artifact. The additional baseline compilation
 cost is reported separately and must be assessed with hosted readiness time.
 
