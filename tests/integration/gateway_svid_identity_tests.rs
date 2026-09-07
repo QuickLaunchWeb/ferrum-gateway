@@ -145,7 +145,13 @@ async fn reqwest_rotation_timer_retires_old_generation_and_keeps_current_and_sta
     static_proxy.resolved_tls.client_key_path = Some(static_files.key_path.clone());
     let static_key = state.connection_pool.pool_key_for_warmup(&static_proxy);
     assert!(static_key.contains("|svidg=static|rcfg="));
-    drop(state.connection_pool.get_client(&static_proxy).await.unwrap());
+    drop(
+        state
+            .connection_pool
+            .get_client(&static_proxy)
+            .await
+            .unwrap(),
+    );
     let before = state.connection_pool.get_stats().entries_per_host;
     assert_eq!(before.len(), 2);
     assert!(before.contains_key(&old_key) && before.contains_key(&static_key));
