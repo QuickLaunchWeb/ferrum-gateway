@@ -215,6 +215,18 @@ RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Fer
 
 **Operator action:** any HTTP/1.1 client that omitted Host (non-conformant scanners, some raw sockets, misconfigured health probes) will start seeing `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that is the intended protocol.
 
+### Retired reqwest SVID generations honor the drain window (issue #4768)
+
+Reqwest-backed pool entries now leave the pool when their retired SVID
+generation's `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` window expires, just as
+H2, gRPC and H3 entries do. Previously the reqwest key's configuration suffix
+prevented the drain matcher from finding these entries, leaving them until
+idle eviction. Current-generation and operator-supplied static identities are
+retained. The default drain value of `0` still disables timed forced drains;
+committed trust withdrawal continues to retire outgoing generations immediately.
+New requests already used the current generation, so this correction concerns
+prompt retirement of pooled clients rather than a change to request admission.
+
 ### EndpointSlice ports take precedence for direct endpoint routing (issue #4817)
 
 For selectorless and headless Services that expand onto EndpointSlice addresses,
