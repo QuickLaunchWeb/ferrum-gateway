@@ -8238,11 +8238,14 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
     .execute(&pool)
     .await
     .expect("proxy insert must succeed");
+    // Only the proxy association is corrupt. The global CORS configuration
+    // itself must be valid so clearing that association repairs the candidate.
     sqlx::query(
         "INSERT INTO plugin_configs \
          (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
-         VALUES ('global-invalid', 'ferrum', 'cors', '{}', 'global', NULL, 1, ?, ?)",
+         VALUES ('global-invalid', 'ferrum', 'cors', ?, 'global', NULL, 1, ?, ?)",
     )
+    .bind(json!({"allowed_origins": ["*"]}).to_string())
     .bind(&ts)
     .bind(&ts)
     .execute(&pool)
