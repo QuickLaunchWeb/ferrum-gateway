@@ -19,12 +19,13 @@ use super::{
     GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
     GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayApiRouteSlot,
-    GatewaySessionPersistence, K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError,
-    K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
-    INCOMPATIBLE_FILTERS_MARKER, UNSUPPORTED_SHAPE_MARKER, attach_route_plugins_to_proxy, exact_path_listen_path,
-    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
-    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
-    proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
+    GatewaySessionPersistence, INCOMPATIBLE_FILTERS_MARKER, K8sAccumulator, K8sObject,
+    K8sResourceKey, K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination,
+    RouteBackend, RouteProxySpec, SourceKind, UNSUPPORTED_SHAPE_MARKER,
+    attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
+    mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
+    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    resource_id, route_backends_require_node_waypoint_authz,
     route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
     upstream_for_route, upstream_for_route_with_session,
 };
@@ -5513,28 +5514,37 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
     let Some(rules) = object.spec.get("rules") else {
         return Ok(());
     };
-    let rules = rules.as_array().ok_or_else(|| {
-        invalid_resource(object, "spec.rules must be an array".to_string())
-    })?;
+    let rules = rules
+        .as_array()
+        .ok_or_else(|| invalid_resource(object, "spec.rules must be an array".to_string()))?;
     for (rule_index, rule) in rules.iter().enumerate() {
         let rule = rule.as_object().ok_or_else(|| {
             invalid_resource(object, format!("rules[{rule_index}] must be an object"))
         })?;
-        if rule.keys().any(|key| !matches!(key.as_str(),
-            "name" | "matches" | "backendRefs" | "filters" | "sessionPersistence"))
-        {
-            return Err(invalid_resource(object, format!(
-                "rules[{rule_index}] contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are name, matches, backendRefs, filters and sessionPersistence"
-            )));
+        if rule.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "name" | "matches" | "backendRefs" | "filters" | "sessionPersistence"
+            )
+        }) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "rules[{rule_index}] contains a field that {UNSUPPORTED_SHAPE_MARKER}; supported fields are name, matches, backendRefs, filters and sessionPersistence"
+                ),
+            ));
         }
         if let Some(backends) = rule.get("backendRefs").and_then(Value::as_array) {
             for (backend_index, backend) in backends.iter().enumerate() {
                 if let Some(filters) = backend.get("filters")
                     && !filters.as_array().is_some_and(Vec::is_empty)
                 {
-                    return Err(invalid_resource(object, format!(
-                        "{INCOMPATIBLE_FILTERS_MARKER}: rules[{rule_index}].backendRefs[{backend_index}].filters cannot be honored"
-                    )));
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "{INCOMPATIBLE_FILTERS_MARKER}: rules[{rule_index}].backendRefs[{backend_index}].filters cannot be honored"
+                        ),
+                    ));
                 }
             }
         }
@@ -5542,35 +5552,69 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
             continue;
         };
         let filters = filters.as_array().ok_or_else(|| {
-            invalid_resource(object, format!("rules[{rule_index}].filters must be an array"))
+            invalid_resource(
+                object,
+                format!("rules[{rule_index}].filters must be an array"),
+            )
         })?;
         for (filter_index, filter) in filters.iter().enumerate() {
             let location = format!("rules[{rule_index}].filters[{filter_index}]");
             let (payload, supported_fields): (&str, &[&str]) = match string_field(filter, "type") {
-                Some("RequestHeaderModifier") => ("requestHeaderModifier", &["set", "add", "remove"]),
-                Some("RequestRedirect") if object.kind == "HTTPRoute" =>
-                    ("requestRedirect", &["scheme", "hostname", "path", "port", "statusCode"]),
-                Some("ResponseHeaderModifier" | "URLRewrite" | "ExtensionRef" | "RequestMirror" | "CORS" | "ExternalAuth" | "RequestRedirect") => {
-                    return Err(invalid_resource(object, format!(
-                        "{INCOMPATIBLE_FILTERS_MARKER}: {location} requests an unimplemented filter action"
-                    )));
+                Some("RequestHeaderModifier") => {
+                    ("requestHeaderModifier", &["set", "add", "remove"])
                 }
-                _ => return Err(invalid_resource(object, format!(
-                    "{location}.type {UNSUPPORTED_SHAPE_MARKER}: unsupported filter type"
-                ))),
+                Some("RequestRedirect") if object.kind == "HTTPRoute" => (
+                    "requestRedirect",
+                    &["scheme", "hostname", "path", "port", "statusCode"],
+                ),
+                Some(
+                    "ResponseHeaderModifier"
+                    | "URLRewrite"
+                    | "ExtensionRef"
+                    | "RequestMirror"
+                    | "CORS"
+                    | "ExternalAuth"
+                    | "RequestRedirect",
+                ) => {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "{INCOMPATIBLE_FILTERS_MARKER}: {location} requests an unimplemented filter action"
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "{location}.type {UNSUPPORTED_SHAPE_MARKER}: unsupported filter type"
+                        ),
+                    ));
+                }
             };
-            let filter_object = filter.as_object().ok_or_else(|| {
-                invalid_resource(object, format!("{location} must be an object"))
-            })?;
-            let payload_object = filter.get(payload).and_then(Value::as_object).ok_or_else(|| {
-                invalid_resource(object, format!("{location}.{payload} must be an object"))
-            })?;
-            if filter_object.keys().any(|key| key != "type" && key != payload)
-                || payload_object.keys().any(|key| !supported_fields.contains(&key.as_str()))
+            let filter_object = filter
+                .as_object()
+                .ok_or_else(|| invalid_resource(object, format!("{location} must be an object")))?;
+            let payload_object =
+                filter
+                    .get(payload)
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        invalid_resource(object, format!("{location}.{payload} must be an object"))
+                    })?;
+            if filter_object
+                .keys()
+                .any(|key| key != "type" && key != payload)
+                || payload_object
+                    .keys()
+                    .any(|key| !supported_fields.contains(&key.as_str()))
             {
-                return Err(invalid_resource(object, format!(
-                    "{INCOMPATIBLE_FILTERS_MARKER}: {location} contains unhandled filter fields"
-                )));
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{INCOMPATIBLE_FILTERS_MARKER}: {location} contains unhandled filter fields"
+                    ),
+                ));
             }
         }
     }

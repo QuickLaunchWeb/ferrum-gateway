@@ -2609,55 +2609,131 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
         }}]
     });
     let unsupported = [
-        (json!({"filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}}]}), "IncompatibleFilters"),
-        (json!({"filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.test"}}]}), "IncompatibleFilters"),
-        (json!({"filters": [{"type": "ExtensionRef", "extensionRef": {"group": "example.test", "kind": "Filter", "name": "missing"}}]}), "IncompatibleFilters"),
-        (json!({"filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "mirror", "port": 8080}}}]}), "IncompatibleFilters"),
-        (json!({"backendRefs": [{"name": "api", "port": 8080, "filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {"remove": ["x-secret"]}}]}]}), "IncompatibleFilters"),
+        (
+            json!({"filters": [{"type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}}]}),
+            "IncompatibleFilters",
+        ),
+        (
+            json!({"filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": "rewritten.test"}}]}),
+            "IncompatibleFilters",
+        ),
+        (
+            json!({"filters": [{"type": "ExtensionRef", "extensionRef": {"group": "example.test", "kind": "Filter", "name": "missing"}}]}),
+            "IncompatibleFilters",
+        ),
+        (
+            json!({"filters": [{"type": "RequestMirror", "requestMirror": {"backendRef": {"name": "mirror", "port": 8080}}}]}),
+            "IncompatibleFilters",
+        ),
+        (
+            json!({"backendRefs": [{"name": "api", "port": 8080, "filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {"remove": ["x-secret"]}}]}]}),
+            "IncompatibleFilters",
+        ),
         (json!({"timeouts": {"request": "1s"}}), "UnsupportedValue"),
         (json!({"retry": {"attempts": 2}}), "UnsupportedValue"),
-        (json!({"futureRuleAction": {"enabled": true}}), "UnsupportedValue"),
-        (json!({"filters": [{"type": "FutureFilter", "futureFilter": {}}]}), "UnsupportedValue"),
-        (json!({"filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {"futureAction": ["x-secret"]}}]}), "IncompatibleFilters"),
-        (json!({"filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {}, "responseHeaderModifier": {"remove": ["x-secret"]}}]}), "IncompatibleFilters"),
+        (
+            json!({"futureRuleAction": {"enabled": true}}),
+            "UnsupportedValue",
+        ),
+        (
+            json!({"filters": [{"type": "FutureFilter", "futureFilter": {}}]}),
+            "UnsupportedValue",
+        ),
+        (
+            json!({"filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {"futureAction": ["x-secret"]}}]}),
+            "IncompatibleFilters",
+        ),
+        (
+            json!({"filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {}, "responseHeaderModifier": {"remove": ["x-secret"]}}]}),
+            "IncompatibleFilters",
+        ),
     ];
     for kind in ["HTTPRoute", "GRPCRoute"] {
         for (case_index, (patch, reason)) in unsupported.iter().enumerate() {
             let mut bad_rule = supported_rule.clone();
-            bad_rule.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
-            let mut objects = vec![gateway_class(), cross_kind_gateway(json!([
-                {"name": "web", "port": 80, "protocol": "HTTP"}
-            ]))];
+            bad_rule
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let mut objects = vec![
+                gateway_class(),
+                cross_kind_gateway(json!([
+                    {"name": "web", "port": 80, "protocol": "HTTP"}
+                ])),
+            ];
             for (name, hostname, rules) in [
                 ("good", "good.test", json!([supported_rule.clone()])),
                 ("bad", "bad.test", json!([supported_rule.clone(), bad_rule])),
             ] {
                 objects.push(object(
-                    "gateway.networking.k8s.io/v1", kind, name, "default",
+                    "gateway.networking.k8s.io/v1",
+                    kind,
+                    name,
+                    "default",
                     json!({"parentRefs": [{"name": "edge", "sectionName": "web"}],
                         "hostnames": [hostname], "rules": rules}),
                 ));
             }
-            let (translation, skipped) = translate_k8s_objects_collecting_skips(&objects, options())
-                .expect("valid sibling must survive a rejected route");
+            let (translation, skipped) =
+                translate_k8s_objects_collecting_skips(&objects, options())
+                    .expect("valid sibling must survive a rejected route");
             assert_eq!(skipped.len(), 1, "{kind} case {case_index}: {skipped:?}");
             assert_eq!(skipped.keys().next().unwrap().name, "bad");
-            assert!(translation.materialized_route_parents.iter().all(|entry| entry.route.name != "bad"));
-            assert!(translation.materialized_route_parents.iter().any(|entry| entry.route.name == "good"));
-            assert!(translation.config.proxies.iter().all(|proxy| !proxy.hosts.contains(&"bad.test".to_string())));
-            assert!(translation.config.plugin_configs.iter().any(|plugin|
-                plugin.plugin_name == "mesh_route_dispatch"
-                    && plugin.config.to_string().contains("x-admission-control")));
+            assert!(
+                translation
+                    .materialized_route_parents
+                    .iter()
+                    .all(|entry| entry.route.name != "bad")
+            );
+            assert!(
+                translation
+                    .materialized_route_parents
+                    .iter()
+                    .any(|entry| entry.route.name == "good")
+            );
+            assert!(
+                translation
+                    .config
+                    .proxies
+                    .iter()
+                    .all(|proxy| !proxy.hosts.contains(&"bad.test".to_string()))
+            );
+            assert!(
+                translation
+                    .config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"
+                        && plugin.config.to_string().contains("x-admission-control"))
+            );
 
-            let updates = plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+            let updates =
+                plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
             for (name, status) in [("bad", "False"), ("good", "True")] {
-                let update = updates.iter().find(|update| update.kind == kind && update.name == name).unwrap();
+                let update = updates
+                    .iter()
+                    .find(|update| update.kind == kind && update.name == name)
+                    .unwrap();
                 let accepted = accepted_condition(update);
-                assert_eq!(accepted["status"], status, "{kind} case {case_index}: {update:?}");
-                assert_eq!(accepted["reason"], if name == "bad" { *reason } else { "Accepted" });
-                let conditions = update.status["parents"][0]["conditions"].as_array().unwrap();
-                let programmed = conditions.iter().find(|condition| condition["type"] == "Programmed").unwrap();
-                assert_eq!(programmed["status"], status, "{kind} case {case_index}: {update:?}");
+                assert_eq!(
+                    accepted["status"], status,
+                    "{kind} case {case_index}: {update:?}"
+                );
+                assert_eq!(
+                    accepted["reason"],
+                    if name == "bad" { *reason } else { "Accepted" }
+                );
+                let conditions = update.status["parents"][0]["conditions"]
+                    .as_array()
+                    .unwrap();
+                let programmed = conditions
+                    .iter()
+                    .find(|condition| condition["type"] == "Programmed")
+                    .unwrap();
+                assert_eq!(
+                    programmed["status"], status,
+                    "{kind} case {case_index}: {update:?}"
+                );
             }
         }
     }

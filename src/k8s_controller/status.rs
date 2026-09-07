@@ -15,15 +15,15 @@ use crate::config_sources::k8s::udp_amplification_policy::lookup_route_posture;
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus, GatewayApiListenerKey,
     GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
-    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayClassAuthority, K8sObject,
-    K8sResourceKey, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    INCOMPATIBLE_FILTERS_MARKER, UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers, backend_lb_policy_status,
-    gateway_api_route_conflict_keys_with_acc, gateway_api_section_name_is_valid,
-    gateway_api_status_conflict_context, merge_backend_lb_policy_status,
-    namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
-    parse_reference_grant_permissions, secret_object_is_valid_tls_certificate,
-    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
-    validate_listenerset_listener_entry,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayClassAuthority,
+    INCOMPATIBLE_FILTERS_MARKER, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
+    K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers,
+    backend_lb_policy_status, gateway_api_route_conflict_keys_with_acc,
+    gateway_api_section_name_is_valid, gateway_api_status_conflict_context,
+    merge_backend_lb_policy_status, namespace_selector_matches,
+    parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
+    secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
+    validate_gateway_listener_allowed_routes, validate_listenerset_listener_entry,
 };
 use crate::k8s_controller::convert::k8s_time_to_rfc3339;
 use crate::k8s_controller::metrics::{
@@ -2749,7 +2749,8 @@ fn route_status(
                         "ResolvedRefs",
                         format!("Ferrum rejected this route attachment: {error}"),
                     )
-                } else if error_is_unsupported_shape(error) || error_is_incompatible_filters(error) {
+                } else if error_is_unsupported_shape(error) || error_is_incompatible_filters(error)
+                {
                     // An object that is valid under the pinned Gateway API CRD
                     // but names a shape Ferrum does not implement is
                     // `Accepted=False` / `UnsupportedValue`, or the more
@@ -2766,7 +2767,11 @@ fn route_status(
                         false,
                         resolved_refs,
                         false,
-                        if error_is_incompatible_filters(error) { "IncompatibleFilters" } else { "UnsupportedValue" },
+                        if error_is_incompatible_filters(error) {
+                            "IncompatibleFilters"
+                        } else {
+                            "UnsupportedValue"
+                        },
                         resolved_refs_reason,
                         format!("Ferrum does not implement this route shape: {error}"),
                     )
