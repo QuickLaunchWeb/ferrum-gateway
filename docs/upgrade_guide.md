@@ -232,7 +232,8 @@ required behavior. RequestHeaderModifier and HTTPRoute RequestRedirect remain
 supported. A valid rule does not partially rescue an unsupported sibling in the
 same route; independently valid routes continue to be programmed. Gateway API
 response-header modification remains deferred; the earlier support claim in
-this guide was incorrect. Gateway API v1.5.1 classifies it as Extended support.
+this guide was incorrect. This remains a documented conformance gap, including
+the GRPCRoute filter-type contract that lists response-header modification as Core.
 
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
 

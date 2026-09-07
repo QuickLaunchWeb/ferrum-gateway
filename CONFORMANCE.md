@@ -161,9 +161,11 @@ filter or its payload are refused. The integration regression
 `unsupported_http_and_grpc_route_features_are_refused_before_materialization`
 checks translator/status agreement for both route kinds, all six reported gaps,
 future fields, and a supported RequestHeaderModifier control (issue #4816).
-ResponseHeaderModifier is Extended in the pinned
-[Gateway API v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go);
-Ferrum does not claim its implementation here.
+The pinned [HTTPRoute v1.5.1 schema](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/httproute_types.go)
+marks response-header modification as Extended. The
+[GRPCRoute filter-type contract](https://github.com/kubernetes-sigs/gateway-api/blob/v1.5.1/apis/v1/grpcroute_types.go)
+lists it as Core. Ferrum records the missing implementation as a conformance
+gap for both kinds; refusing it visibly does not establish full conformance.
 
 ## Status values
 
