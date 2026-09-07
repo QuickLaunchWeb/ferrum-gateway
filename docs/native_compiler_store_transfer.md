@@ -5,22 +5,27 @@ compiler-cache bytes. It builds the actual locked Fuzz property suite on main,
 hands data from a read-only runner to a separate publisher, then restores
 the immutable GHCR digest anonymously on another fresh runner.
 
-Only main in ferrum-edge/ferrum-edge may run the producer. PR and path-filtered
-main events run the streaming format contracts only. The existing public
-ferrum-edge-buildcache package is reused; package visibility, the 10 GB Actions
+Path-filtered PRs run the read-only producer through successful compilation and
+bounded export, so its real build environment is checked before merge. PRs do
+not upload the handoff or run the publisher, reader or cleanup. Only manual main
+runs in ferrum-edge/ferrum-edge may hand off and publish compiler-store data.
+Path-filtered main pushes run the streaming format contracts only. The existing
+public ferrum-edge-buildcache package is reused; package visibility, the 10 GB Actions
 cache limit and the zero-dollar spending budget remain unchanged.
 
 ## Data boundary
 
 The producer installs nightly-2025-07-01 and the existing checksum-pinned
 sccache wrapper, runs cargo test --locked in fuzz, then stops its compiler-cache
-server before snapshotting only .cache/sccache. It restores and saves no Actions
-cache. Capture and handoff happen only after this actual property suite passes;
+server before snapshotting only .cache/sccache. Its explicit empty RUSTFLAGS
+matches the production Fuzz lane and clears the root Cargo configuration's mold
+linker flags; this isolated producer does not install that optional linker.
+It restores and saves no Actions cache. Capture and handoff happen only after this actual property suite passes;
 a competing lane cannot evict the source between a build and a later restore.
 
-This is a separate manual transfer validation, not an additional required
-production test lane. It preserves the production sanitizer suite and does not
-substitute the property suite for AddressSanitizer coverage.
+This is a separate transfer validation, with its producer exercised on relevant
+PRs rather than every production change. It preserves the production sanitizer
+suite and does not substitute the property suite for AddressSanitizer coverage.
 
 The format is a bounded binary frame, not a tar archive: a fixed magic/version,
 an eight-byte manifest length, strict JSON metadata and ordered file bytes.
