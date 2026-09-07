@@ -7,6 +7,44 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
+/// Install the executable's process buffer budgets from its accepted configuration.
+///
+/// Call once during startup, before listeners or request-processing tasks start.
+/// The three budgets retain their existing first-initialization-wins behavior;
+/// changing a running process's limits requires a restart. Keeping this narrow
+/// adapter in the library leaves the budget implementation private while the
+/// executable owns CLI parsing, runtime construction and mode dispatch.
+#[doc(hidden)]
+pub fn initialize_gateway_buffer_budgets(env_config: &crate::config::EnvConfig) {
+    // Publish the buffered-response bounds before any listener accepts traffic,
+    // so the very first retained response is already charged against the
+    // aggregate budget and can never fall back to an unlimited ceiling
+    // (GHSA-pwcm-6rh8-f2gh).
+    crate::proxy::response_buffer_budget::init(
+        env_config.response_buffer_fallback_max_bytes,
+        env_config.response_buffer_max_total_bytes,
+    );
+
+    // Same rule for the aggregate budget that bounds governed REQUEST decodes
+    // (GHSA-3973-47g5-4mcx + GHSA-pwcm-6rh8-f2gh): published before the first
+    // listener binds, so no governed compressed upload can ever be decoded
+    // against a budget the operator did not configure.
+    crate::proxy::response_buffer_budget::init_request_decode(
+        env_config.request_decode_max_total_bytes,
+    );
+
+    // Same rule for the aggregate budget that bounds buffered client REQUEST
+    // bodies (issue #4153). Published before the first listener binds, so the
+    // very first prebuffered upload — which `waf` request-body inspection
+    // reaches in the `authenticate` phase, before any principal is admitted —
+    // is already collected under a finite ceiling and charged against the
+    // aggregate budget.
+    crate::proxy::response_buffer_budget::init_request_buffer(
+        env_config.request_buffer_fallback_max_bytes,
+        env_config.request_buffer_max_total_bytes,
+    );
+}
+
 const SANITIZED_LISTENER_FAILURE: &str = "listener serve task exited after successful bind";
 
 /// Durable, lock-free snapshot of serving listeners that exited after bind.
