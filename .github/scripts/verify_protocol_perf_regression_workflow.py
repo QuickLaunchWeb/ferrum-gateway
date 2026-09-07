@@ -64,10 +64,10 @@ SETUP_RUST_CI_WORKSPACES_PASSTHROUGH = "workspaces: ${{ inputs.workspaces }}"
 RUST_CACHE_WITH_KEYS = (
     "shared-key",
     "workspaces",
-    "cache-directories",
     # Required by the CI runtime-cache contract (verify_ci_runtime_cache):
-    # cache-on-failure keeps post-job saves on ordinary failures, and save-if
-    # gates publication to trusted refs/heads/main runs. Still a closed set —
+    # cache-on-failure is honored only for a lane producer, and save-if gates
+    # publication to a producer on a trusted refs/heads/main run. The sccache
+    # store is no longer persisted (no cache-directories). Still a closed set —
     # any other key remains a trust-broadening extra.
     "cache-on-failure",
     "save-if",
@@ -279,7 +279,7 @@ def validate_setup_rust_ci_workspaces(text: str, failures: list[str]) -> None:
     require(
         mapping_keys(with_block, indent=8) == list(RUST_CACHE_WITH_KEYS),
         "setup-rust-ci rust-cache with: keys must stay shared-key, workspaces, "
-        "and cache-directories (no trust-broadening extras)",
+        "cache-on-failure, and save-if (no trust-broadening extras)",
         failures,
     )
     require(
@@ -957,9 +957,8 @@ runs:
       with:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}
-        cache-directories: ${{ github.workspace }}/.cache/sccache
-        cache-on-failure: "true"
-        save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
+        cache-on-failure: ${{ inputs.save == 'true' && inputs.cache-on-failure == 'true' }}
+        save-if: ${{ inputs.save == 'true' && github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
 """
     setup_ok: list[str] = []
     validate_setup_rust_ci_workspaces(good_setup_rust_ci, setup_ok)
@@ -1021,8 +1020,8 @@ runs:
     extra_cache_keys: list[str] = []
     validate_setup_rust_ci_workspaces(
         good_setup_rust_ci.replace(
-            "        cache-directories: ${{ github.workspace }}/.cache/sccache\n",
-            "        cache-directories: ${{ github.workspace }}/.cache/sccache\n"
+            "        workspaces: ${{ inputs.workspaces }}\n",
+            "        workspaces: ${{ inputs.workspaces }}\n"
             "        cache-all-crates: true\n",
         ),
         extra_cache_keys,
