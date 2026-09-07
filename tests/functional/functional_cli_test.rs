@@ -3450,6 +3450,9 @@ async fn functional_cli_validate_migration_reads_without_mutation() {
     }));
 }
 
+const EMPTY_POOL_SHARD_CONFIG: &str =
+    "version: '1'\nproxies: []\nconsumers: []\nplugin_configs: []\nupstreams: []\n";
+
 async fn start_gateway_with_one_pool_shard(
     mode: &str,
     cp_address: Option<&str>,
@@ -3464,7 +3467,7 @@ async fn start_gateway_with_one_pool_shard(
         let mut reservation = None;
         let mut address = None;
         builder = match mode {
-            "file" => builder.mode_file("version: '1'\nproxies: []\n"),
+            "file" => builder.mode_file(EMPTY_POOL_SHARD_CONFIG),
             "database" => builder.mode_database_sqlite(),
             "cp" => {
                 let held = reserve_port().await.unwrap();
@@ -3494,7 +3497,7 @@ async fn start_gateway_with_one_pool_shard(
 async fn functional_cli_pool_shard_one_validates_and_starts_file_database_cp_and_dp() {
     let temp_dir = TempDir::new().unwrap();
     let spec = temp_dir.path().join("resources.yaml");
-    std::fs::write(&spec, "version: '1'\nproxies: []\n").unwrap();
+    std::fs::write(&spec, EMPTY_POOL_SHARD_CONFIG).unwrap();
     for value in [0usize, 1, 2, 3, 64, 1 << 30] {
         let mut command = hermetic_validate_command(
             &temp_dir,
