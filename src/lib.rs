@@ -94,7 +94,9 @@ pub mod _test_support {
     ) -> (String, usize) {
         ctx.matched_path_strip_len = *strip_len;
         let path = crate::proxy::rebase_route_override_path(ctx, path, strip_len);
-        let cloned_offset = ctx.clone_for_final_request_body_hooks().matched_path_strip_len;
+        let cloned_offset = ctx
+            .clone_for_final_request_body_hooks()
+            .matched_path_strip_len;
         (path, cloned_offset)
     }
 

@@ -5410,11 +5410,8 @@ fn route_rebase_invalidates_offsets_but_preserves_base_path_semantics() {
     let mut unchanged =
         RequestContext::new("127.0.0.1".into(), "GET".into(), "/entry/users".into());
     let mut original_offset = "/entry".len();
-    let (path, cloned_offset) = rebase_backend_path_for_test(
-        &mut unchanged,
-        "/entry/users".into(),
-        &mut original_offset,
-    );
+    let (path, cloned_offset) =
+        rebase_backend_path_for_test(&mut unchanged, "/entry/users".into(), &mut original_offset);
     assert_eq!(path, "/entry/users");
     assert_eq!(original_offset, "/entry".len());
     assert_eq!(cloned_offset, original_offset);

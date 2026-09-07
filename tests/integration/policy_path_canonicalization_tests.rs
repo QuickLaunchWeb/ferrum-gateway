@@ -373,8 +373,8 @@ async fn routing_and_backend_forwarding_use_the_same_canonical_path() {
             // The backend request line is built from the same canonical
             // coordinate the router measured `matched_prefix_len` in, so the
             // stripped remainder can never desync from the routing decision.
-            let url =
-                build_backend_url(&matched.proxy, &canonical, "", matched.matched_prefix_len).unwrap();
+            let url = build_backend_url(&matched.proxy, &canonical, "", matched.matched_prefix_len)
+                .unwrap();
             assert_eq!(
                 url, expected,
                 "spelling {raw:?} (strip={strip_listen_path}) forwarded {url}"

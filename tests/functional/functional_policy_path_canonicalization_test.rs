@@ -1202,12 +1202,10 @@ async fn coordinate_send(
         });
         (sender.send_request(request).await.unwrap(), task)
     } else {
-        let (mut sender, conn) = hyper::client::conn::http2::handshake(
-            TokioExecutor::new(),
-            TokioIo::new(stream),
-        )
-        .await
-        .unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .unwrap();
         let task = tokio::spawn(async move {
             let _ = conn.await;
         });
@@ -1270,10 +1268,7 @@ async fn coordinate_matrix(flavor: CoordinateFlavor) {
             let rpc = matches!(flavor, CoordinateFlavor::Grpc | CoordinateFlavor::GrpcWeb);
             let status = if expected.is_none() && !rpc {
                 401
-            } else if expected.is_some()
-                && flavor == CoordinateFlavor::WebSocket
-                && protocol == 1
-            {
+            } else if expected.is_some() && flavor == CoordinateFlavor::WebSocket && protocol == 1 {
                 101
             } else {
                 200
@@ -1281,7 +1276,10 @@ async fn coordinate_matrix(flavor: CoordinateFlavor) {
             assert_eq!(response.status.as_u16(), status, "{label}");
             if expected.is_none() && flavor == CoordinateFlavor::Http {
                 let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-                assert!(body["error"].is_string(), "{label}: authentication refusal body");
+                assert!(
+                    body["error"].is_string(),
+                    "{label}: authentication refusal body"
+                );
             }
             if flavor == CoordinateFlavor::Grpc {
                 let expected_status = if expected.is_some() { "0" } else { "16" };

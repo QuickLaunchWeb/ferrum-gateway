@@ -18992,8 +18992,8 @@ mod h3_backend_url_tests {
     #[test]
     fn plain_backend_url_keeps_http_family_scheme() {
         let proxy = proxy_with_scheme(BackendScheme::Https);
-        let url =
-            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", 0, None).unwrap();
+        let url = build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", 0, None)
+            .unwrap();
         assert_eq!(url, "https://backend.example:8443/api");
     }
 }

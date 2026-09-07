@@ -59532,8 +59532,8 @@ mod tests {
         proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.strip_listen_path = false;
 
-        let url =
-            build_websocket_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None).unwrap();
+        let url = build_websocket_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None)
+            .unwrap();
         assert_eq!(url, "ws://[::1]:8080/mcp");
     }
 
