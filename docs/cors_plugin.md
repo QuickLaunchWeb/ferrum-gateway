@@ -410,10 +410,10 @@ Browser                    Gateway (CORS Plugin)
 
 ```bash
 # Run all CORS tests
-cargo test --test unit_tests -- cors_tests
+cargo test --test unit_plugins_a_tests -- cors_tests
 
 # Run a specific test
-cargo test --test unit_tests -- cors_tests::test_preflight_with_allowed_origin -- --nocapture
+cargo test --test unit_plugins_a_tests -- cors_tests::test_preflight_with_allowed_origin -- --nocapture
 ```
 
 ### Manual Testing with curl

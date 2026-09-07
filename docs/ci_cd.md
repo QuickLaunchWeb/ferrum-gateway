@@ -1000,15 +1000,21 @@ pushes to `main`. The commands below are grouped by job, not run as one
 sequential shell script:
 
 ```bash
-# test-unit: compile the inline and external targets together, then run the
-# inline lib, unchanged four-test plugin-hardening exact gate, kTLS live-kernel
-# proof, and complete external unit suite in the same job. The joint no-run
-# step prevents a runner-loss window between two full target compilations.
-cargo test --lib --test unit_tests --no-run
-cargo test --lib
+# test-unit: a four-shard matrix (core / plugins-a / plugins-b / gateway-core).
+# The former 642k-line `unit_tests` crate is four targets compiled in
+# parallel: `unit_tests` (config, admin, tls, identity, secrets, cli, ...),
+# `unit_plugins_a_tests` (plugin test files a–j), `unit_plugins_b_tests`
+# (k–z), and `unit_gateway_core_tests`. Each shard precompiles its targets in
+# one Cargo invocation (the core shard together with the inline lib harness)
+# before running anything, so a runner loss cannot land between two
+# compilations. The core shard also runs the inline lib tests and the kTLS
+# live-kernel proof; the plugins-b shard hosts the four-test plugin-hardening
+# exact gate. Per-shard passing floors live in run_unit_ci.py.
+cargo test $UNIT_PRECOMPILE_TARGETS --no-run      # "--lib --test unit_tests" on core
+cargo test --lib                                   # core shard
 FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
-  proxy::ktls_live_kernel_tests
-cargo test --test unit_tests
+  proxy::ktls_live_kernel_tests                    # core shard
+cargo test --test "$UNIT_TARGET"                   # every shard
 
 # test-acme (path-gated: src/tls/, tests/acme_dns01/, tests/unit/tls/, build
 # graph): the optional feature compiles the library a second time, so it has
