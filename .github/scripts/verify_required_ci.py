@@ -1588,14 +1588,15 @@ def main() -> int:
     unit_inline = "Run inline lib tests"
     unit_hardening = "Run cache accounting and reload safety regressions"
     if not (
-        unit_body.count("cargo test --lib --test unit_tests --no-run") == 1
+        unit_body.count("cargo test $UNIT_PRECOMPILE_TARGETS --no-run") == 1
+        and unit_body.count('precompile: "--lib --test unit_tests"') == 1
         and 0 <= unit_body.find(unit_precompile)
         < unit_body.find(unit_inline)
         < unit_body.find(unit_hardening)
     ):
         planner_errors.append(
-            "jobs.test-unit must precompile the lib and unit_tests binaries "
-            "together before running inline or plugin-hardening tests"
+            "jobs.test-unit must precompile each shard's targets (lib + unit_tests "
+            "for the core shard) before running inline or plugin-hardening tests"
         )
 
     # Optional ACME coverage must use the small DNS target and prove every

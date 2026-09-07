@@ -48,7 +48,7 @@ paths:
 ## Targeted Commands
 
 - Existing inline source test: `cargo test --lib <module>::tests`
-- Public API: `cargo test --test unit_tests <filter>`
+- Public API: `cargo test --test <unit target> <filter>` — four unit targets: `unit_tests` (config, admin, tls, identity, secrets, cli, notifications, util), `unit_plugins_a_tests` (plugin test files a–j), `unit_plugins_b_tests` (plugin test files k–z), `unit_gateway_core_tests` (core runtime)
 - Cross-module behavior: `cargo test --test integration_tests <filter>`
 - Proxy hot path: `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`
 - Multi-protocol perf: build once with `cargo build --release`, then `bash tests/performance/multi_protocol/run_protocol_test.sh {http1|http1-tls|http2|http3|ws|grpc|tcp|tcp-tls|udp|udp-dtls|all} [--duration N] [--concurrency N] [--skip-build]`

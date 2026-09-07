@@ -495,31 +495,55 @@ jobs:
           echo "verified=true" >> "$GITHUB_OUTPUT"
 
   test-unit:
-    name: Unit Tests
+    name: Unit Tests (${{ matrix.shard }})
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The unit suite is four test targets compiled in parallel instead of
+          # one 642k-line rustc frontend (tests/unit_tests.rs documents the
+          # split). `core` also runs the inline `--lib` tests and the kTLS
+          # live-kernel proof, and is the producer of the shared `ci-debug`
+          # dependency lane on main; `plugins-b` hosts the plugin-hardening
+          # exact gate because both of its modules live in the k–z half.
+          - shard: core
+            precompile: "--lib --test unit_tests"
+            target: unit_tests
+          - shard: plugins-a
+            precompile: "--test unit_plugins_a_tests"
+            target: unit_plugins_a_tests
+          - shard: plugins-b
+            precompile: "--test unit_plugins_b_tests"
+            target: unit_plugins_b_tests
+          - shard: gateway-core
+            precompile: "--test unit_gateway_core_tests"
+            target: unit_gateway_core_tests
     env:
       # Cold-cache full-workspace compiles repeatedly kill this hosted runner
-      # ("The runner has received a shutdown signal" + exit 143) while the
-      # combined lib + unit_tests precompile lets two full-debuginfo link jobs
-      # overlap. Cap cargo's parallelism and shrink debuginfo to line tables
-      # (backtraces keep file:line) so a cold compile fits the runner's
-      # memory/disk. Same values on every job sharing this rust-cache key so
-      # cached artifact fingerprints stay uniform.
+      # ("The runner has received a shutdown signal" + exit 143) when several
+      # full-debuginfo link jobs overlap. Cap cargo's parallelism and shrink
+      # debuginfo to line tables (backtraces keep file:line) so a cold compile
+      # fits the runner's memory/disk. Same values on every job sharing the
+      # `ci-debug` rust-cache lane so cached artifact fingerprints stay uniform.
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      UNIT_SHARD: ${{ matrix.shard }}
+      UNIT_TARGET: ${{ matrix.target }}
+      UNIT_PRECOMPILE_TARGETS: ${{ matrix.precompile }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
-      - name: Extend runner swap for the aggregated unit_tests compile
+      - name: Extend runner swap for the unit target compile
         run: |
           set -euo pipefail
-          # The single-crate rustc frontend for the aggregated tests/unit_tests
-          # binary exceeds hosted-runner RAM on cold compiles: the VM dies with
-          # "The runner has received a shutdown signal" / exit 143 before any
-          # compiler diagnostic can print. Give the VM swap headroom so memory
-          # pressure degrades to paging instead of killing the runner agent.
+          # A cold single-crate rustc frontend for a large test target can
+          # exceed hosted-runner RAM: the VM dies with "The runner has received
+          # a shutdown signal" / exit 143 before any compiler diagnostic can
+          # print. Give the VM swap headroom so memory pressure degrades to
+          # paging instead of killing the runner agent.
           sudo fallocate -l 12G /mnt/ferrum-swapfile
           sudo chmod 600 /mnt/ferrum-swapfile
           sudo mkswap /mnt/ferrum-swapfile
@@ -529,20 +553,22 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-debug"
-          save: "true"
+          # Only the `core` shard publishes the shared dependency lane; the
+          # other shards compile the same dependency graph and restore only.
+          save: ${{ matrix.shard == 'core' && 'true' || 'false' }}
           cache-on-failure: "true"
 
       - name: Precompile inline and hardening test binaries
-        # Compile both targets in one Cargo invocation before running either.
-        # Otherwise a hosted runner can pass all inline tests, then lose the
-        # entire job while compiling the separate four-test hardening binary.
+        # Compile this shard's targets in one Cargo invocation before running
+        # any of them. Otherwise a hosted runner can pass one target's tests,
+        # then lose the entire job while compiling the next binary.
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/unit-ci"
           python3 .github/scripts/run_unit_ci.py default-build --sample-parent "$$" &
           unit_sampler_pid=$!
           trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
-          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test --lib --test unit_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test $UNIT_PRECOMPILE_TARGETS --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
           kill "$unit_sampler_pid"
           wait "$unit_sampler_pid"
           trap - EXIT
@@ -552,6 +578,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Run inline lib tests
+        if: matrix.shard == 'core'
         # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
         # private fns/structs that the separate tests/ binaries can't see).
         run: |
@@ -563,7 +590,8 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Run cache accounting and reload safety regressions
-        # These tests are also part of the complete unit suite below. Run the
+        if: matrix.shard == 'plugins-b'
+        # These tests are also part of the complete plugin suite below. Run the
         # explicit contract first so test deletion/renaming cannot silently
         # weaken the hardening gate, while reusing the same compiled test
         # binary instead of paying for a second cold Rust job.
@@ -577,7 +605,7 @@ jobs:
           )
 
           set +e
-          test_output="$(cargo test --test unit_tests -- --exact "${hardening_tests[@]}" 2>&1)"
+          test_output="$(cargo test --test unit_plugins_b_tests -- --exact "${hardening_tests[@]}" 2>&1)"
           test_status=$?
           set -e
 
@@ -594,7 +622,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Summarize plugin hardening unit regressions
-        if: always()
+        if: always() && matrix.shard == 'plugins-b'
         run: |
           echo "## Plugin Hardening Unit Regressions" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -604,6 +632,7 @@ jobs:
           echo "- test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
 
       - name: Run kTLS live-kernel handoff proof
+        if: matrix.shard == 'core'
         # Issue #3619 re-enabled a handoff that had been INERT, so classifier
         # unit tests are not sufficient evidence. These tests drive a real
         # rustls TLS 1.2 client against the real `try_ktls_accept`, install
@@ -651,7 +680,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/unit-ci"
-          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-unit.time" cargo test --test unit_tests 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-unit.log"
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-unit.time" cargo test --test "$UNIT_TARGET" 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-unit.log"
           python3 .github/scripts/run_unit_ci.py default-unit
         env:
           RUST_BACKTRACE: 1
@@ -660,7 +689,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: unit-compile-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          name: unit-compile-diagnostics-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/unit-ci/
           retention-days: 7
           if-no-files-found: warn
