@@ -974,7 +974,10 @@ impl AcmeOrderStore {
     /// snapshot. Callers must also hold the certificate's renewal lease fence.
     /// Never recreate a deleted order, overwrite an operator update, or make an
     /// older failed order hide a newer order from the renewal planner.
-    pub fn fail_ca_invalid_order_if_current(&self, expected: &AcmeOrderRecord) -> Result<bool, AcmeError> {
+    pub fn fail_ca_invalid_order_if_current(
+        &self,
+        expected: &AcmeOrderRecord,
+    ) -> Result<bool, AcmeError> {
         validate_acme_id(&expected.id)?;
         let expected = expected.clone();
         let terminal_history = self.terminal_history;
@@ -1006,7 +1009,8 @@ impl AcmeOrderStore {
                 return Ok((false, (false, 0)));
             };
             current.status = AcmeOrderStatus::Failed;
-            current.error = Some("CA reports that the ACME order is terminally invalid".to_string());
+            current.error =
+                Some("CA reports that the ACME order is terminally invalid".to_string());
             current.updated_at = Utc::now();
             let pruned = prune_terminal_order_history(document, terminal_history);
             Ok((true, (true, pruned)))
@@ -4641,12 +4645,13 @@ pub mod client {
                 AcmeCompletionAction::RetrieveCertificate => {
                     let certificate = order.certificate().await;
                     cert_pem = Some(
-                        completion_call_result(certificate, order.state().status)?
-                            .ok_or_else(|| {
+                        completion_call_result(certificate, order.state().status)?.ok_or_else(
+                            || {
                                 AcmeClientError::Client(
                                     "ACME order is valid but returned no certificate".to_string(),
                                 )
-                            })?,
+                            },
+                        )?,
                     );
                 }
             }
