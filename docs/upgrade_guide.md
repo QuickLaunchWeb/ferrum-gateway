@@ -218,12 +218,15 @@ RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Fer
 ### EndpointSlice ports take precedence for direct endpoint routing (issue #4817)
 
 For selectorless and headless Services that expand onto EndpointSlice addresses,
-a matching slice port now takes precedence over a numeric Service `targetPort`.
+a matching slice port now takes precedence over the Service `targetPort`.
 This includes `targetPort` defaulted by Kubernetes to the Service port and an
 explicitly different numeric value: the served object cannot distinguish them.
 Named Service ports match the slice port name; an unnamed Service port matches
 only a sole unnamed slice port. If no matching slice port is available, the
-numeric target remains the fallback. Named target resolution is unchanged.
+numeric target remains the fallback. Named targets also match the Service port
+name first; the prior target-name lookup remains a fallback for manual slices
+that do not publish a matching Service port name. Without a targetPort, a
+matching unnamed slice port also takes precedence over the Service port.
 Selector-based ClusterIP routing still uses the Service DNS name and port.
 
 **Operator action:** verify manually managed EndpointSlices carry the intended

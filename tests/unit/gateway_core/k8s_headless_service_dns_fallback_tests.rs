@@ -334,6 +334,18 @@ fn endpoint_slice_ports_override_numeric_targets_without_changing_silent_slice_f
             3000,
         ),
         (
+            "named-service-port",
+            Some(json!("app-http")),
+            json!([{"name": "first-port", "port": 3000}]),
+            3000,
+        ),
+        (
+            "service-name-before-target-name",
+            Some(json!("app-http")),
+            json!([{"name": "app-http", "port": 4000}, {"name": "first-port", "port": 3000}]),
+            3000,
+        ),
+        (
             "matching",
             Some(json!(3000)),
             json!([{"name": "first-port", "port": 3000}]),
@@ -458,4 +470,21 @@ fn selector_based_headless_service_and_empty_slice_use_the_matching_slice_port()
             }
         );
     }
+}
+
+#[test]
+fn unnamed_service_without_target_port_uses_the_unnamed_slice_port() {
+    let mut service = headless_service("backend", json!(8080));
+    let port = service.spec["ports"][0].as_object_mut().unwrap();
+    port.remove("name");
+    port.remove("targetPort");
+    let mut slice = ready_manual_slice("backend", "10.1.0.10");
+    slice.spec["ports"] = json!([{"port": 3000}]);
+    let translated = translate_k8s_objects(
+        &[service, slice, http_route("/slice", "backend")],
+        options(),
+    )
+    .expect("translate unnamed default Service port");
+    assert_eq!(translated.config.proxies[0].backend_host, "10.1.0.10");
+    assert_eq!(translated.config.proxies[0].backend_port, 3000);
 }
