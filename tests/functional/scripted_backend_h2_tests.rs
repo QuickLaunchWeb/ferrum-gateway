@@ -2149,8 +2149,7 @@ async fn bodyless_h2_probe_filter_distinguishes_eof_from_invalid_preface() {
         )
         .await
         .expect("bounded fixture handshake")
-        .err()
-        .expect("an incomplete or invalid preface must fail");
+        .expect_err("an incomplete or invalid preface must fail");
         format!("h2 handshake failed: {error}")
     }
 
