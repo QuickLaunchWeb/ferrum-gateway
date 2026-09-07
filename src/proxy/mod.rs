@@ -34183,6 +34183,14 @@ async fn handle_proxy_request_inner(
             let mut grpc_current_cb_key = cb_target_key.clone();
 
             loop {
+                let dispatch_error = grpc_result
+                    .as_ref()
+                    .err()
+                    .map(retry::classify_grpc_proxy_error);
+                ctx.record_backend_dispatch_outcome(
+                    dispatch_error,
+                    dispatch_error.is_none_or(retry::request_reached_wire),
+                );
                 // Classify the error and determine if retryable. Narrow to
                 // the connect-class kinds via `is_connect_class()` so
                 // `retry_on_connect_failure` cannot replay non-idempotent
@@ -34778,6 +34786,14 @@ async fn handle_proxy_request_inner(
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
+        let dispatch_error = grpc_result
+            .as_ref()
+            .err()
+            .map(retry::classify_grpc_proxy_error);
+        ctx.record_backend_dispatch_outcome(
+            dispatch_error,
+            dispatch_error.is_none_or(retry::request_reached_wire),
+        );
         match grpc_result {
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
                 let grpc_backend_admission_elapsed = grpc_backend_admission_started_at.elapsed();
@@ -36960,6 +36976,7 @@ async fn handle_proxy_request_inner(
         };
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            ctx.record_backend_dispatch_outcome(result.error_class, !result.connection_error);
             // Re-check the CURRENT target's DestinationRule maxRetries before
             // authorizing another retry. Use the original route ceiling (not a
             // permanently lowered initial-port projection) so a looser rotated
@@ -37681,6 +37698,7 @@ async fn handle_proxy_request_inner(
         sticky_served_target,
     )
     .is_some();
+    ctx.record_backend_dispatch_outcome(backend_resp.error_class, !backend_resp.connection_error);
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
