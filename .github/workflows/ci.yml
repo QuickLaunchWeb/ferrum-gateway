@@ -3044,6 +3044,94 @@ jobs:
           grep -Fq 'kind: MutatingWebhookConfiguration' "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
           grep -Fq "caBundle: \"${INJECTOR_CA_BUNDLE}\"" "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
           grep -Fq 'failurePolicy: Fail' "$RUNNER_TEMP/ferrum-helm-results/injector-with-ca.yaml"
+          # Explicit Helm commands keep executable provenance visible to CI policy.
+          # Case indices match check_injector_capture_image.py; retain failed renders.
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-0.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-0.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-0.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_MESH_CAPTURE_MODE=iptables' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-1.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-1.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-1.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_MESH_CAPTURE_MODE=iptables' \
+            --set-string 'image.tag=test-ebpf' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-2.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-2.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-2.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_MESH_CAPTURE_MODE=iptables' \
+            --set-string 'image.tag=test-ebpf-tools' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-3.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-3.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-3.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_MESH_CAPTURE_MODE=ebpf' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-4.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-4.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-4.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_MESH_CAPTURE_MODE=iptables' \
+            --set-string 'injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE=registry:5000/team/custom:v1-ebpf-tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-5.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-5.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-5.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE=registry:5000/team/custom@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-6.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-6.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-6.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_MESH_CAPTURE_MODE=iptables' \
+            --set-string 'injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE=ferrumedge/ferrum-edge:test' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-7.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-7.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-7.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_MESH_CAPTURE_MODE=iptables' \
+            --set-string 'injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE=ferrumedge/ferrum-edge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-8.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-8.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-8.status"
+          render_status=0
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.32.0 --show-only templates/injector-deployment.yaml \
+            --set injector.enabled=true --set-string "injector.caBundle=${INJECTOR_CA_BUNDLE}" \
+            --set-string 'injector.env.FERRUM_MESH_CAPTURE_MODE=iptables' \
+            --set-string 'injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE=ferrumedge/ferrum-edge:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-image-9.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/injector-image-9.err" || render_status=$?
+          printf '%s\n' "$render_status" > "$RUNNER_TEMP/ferrum-helm-results/injector-image-9.status"
+          python3 -I .github/scripts/check_injector_capture_image.py --results "$RUNNER_TEMP/ferrum-helm-results"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set injector.enabled=true \
             --set-string injector.certManager.injectCaFrom=ferrum/ferrum-mesh-injector \
