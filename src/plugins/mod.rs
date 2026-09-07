@@ -2110,6 +2110,17 @@ pub(crate) enum A2aGrpcCardSchema {
     Undeclared,
 }
 
+/// Trusted dispatch provenance, separate from plugin-writable metadata and
+/// HTTP status. A real backend 502 is a response; a gateway 502 is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BackendDispatchState {
+    #[default]
+    NotDispatched,
+    BackendResponse,
+    PreWireFailure,
+    AmbiguousFailure,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2357,6 +2368,9 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Latest dispatch outcome, retaining possible execution across retries.
+    /// Only trusted transport code may set this; it is not serialized.
+    backend_dispatch_state: BackendDispatchState,
     /// Whether the gateway selected the health-neutral retained-response
     /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) for this request.
     /// Once set, later body hooks, transforms, final validators, cache stores,
@@ -3336,6 +3350,31 @@ fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value
 }
 
 impl RequestContext {
+    /// Record every completed attempt before response hooks or another retry.
+    /// A later connect failure cannot erase an earlier possible execution.
+    pub(crate) fn record_backend_dispatch_outcome(
+        &mut self,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+    ) {
+        self.backend_dispatch_state = if error_class.is_none() {
+            BackendDispatchState::BackendResponse
+        } else if request_on_wire
+            || matches!(
+                self.backend_dispatch_state,
+                BackendDispatchState::BackendResponse | BackendDispatchState::AmbiguousFailure
+            )
+        {
+            BackendDispatchState::AmbiguousFailure
+        } else {
+            BackendDispatchState::PreWireFailure
+        };
+    }
+
+    pub(crate) fn backend_dispatch_state(&self) -> BackendDispatchState {
+        self.backend_dispatch_state
+    }
+
     pub fn new(client_ip: String, method: String, path: String) -> Self {
         Self {
             direct_client_ip: client_ip.clone(),
@@ -3386,6 +3425,7 @@ impl RequestContext {
             grpc_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            backend_dispatch_state: BackendDispatchState::NotDispatched,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
@@ -4575,6 +4615,7 @@ impl RequestContext {
             grpc_deadline_at: self.grpc_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            backend_dispatch_state: self.backend_dispatch_state,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
             final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,

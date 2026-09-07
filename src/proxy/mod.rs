@@ -11845,18 +11845,17 @@ impl ProxyState {
         }
     }
 
-    /// Keys HTTP dispatch currently mints for live circuit breakers.
+    /// Prune target health against one live load-balancer snapshot.
     ///
     /// Direct-backend proxies contribute `namespace|id::backend_host:backend_port`.
     /// Upstream-backed proxies contribute one key per target in the live
     /// load-balancer set (static plus service-discovery), falling back to the
     /// authored config only when the upstream is not yet in the LB cache.
-    /// Callers pass this set to [`CircuitBreakerCache::prune_stale_targets`] so
-    /// a config delta cannot reclaim still-routable breakers.
-    fn collect_active_circuit_breaker_target_keys(
-        &self,
-        config: &GatewayConfig,
-    ) -> HashSet<String> {
+    /// Passive ejections and failure counters use that same target set: the
+    /// authored static seed must not erase health state for discovered targets.
+    /// An installed empty set is authoritative (including discovery withdrawal);
+    /// do not substitute old targets or retain their stale health indefinitely.
+    fn prune_stale_target_health(&self, config: &GatewayConfig) {
         let mut active_keys = HashSet::new();
         let lb_snapshot = self.load_balancer_cache.load();
         for proxy in &config.proxies {
@@ -11866,6 +11865,11 @@ impl ProxyState {
                     &proxy.namespace,
                     upstream_id,
                 ) {
+                    self.health_checker.remove_stale_passive_targets_for_proxy(
+                        &proxy.namespace,
+                        &proxy.id,
+                        &live_upstream.targets,
+                    );
                     for target in &live_upstream.targets {
                         active_keys.insert(scoped_cache_key(
                             &proxy.namespace,
@@ -11877,6 +11881,15 @@ impl ProxyState {
                 } else if let Some(upstream) = config.upstreams.iter().find(|upstream| {
                     upstream.id == *upstream_id && upstream.namespace == proxy.namespace
                 }) {
+                    // Without a live snapshot, a discovery-backed static seed
+                    // cannot establish that a previously discovered target left.
+                    if upstream.service_discovery.is_none() {
+                        self.health_checker.remove_stale_passive_targets_for_proxy(
+                            &proxy.namespace,
+                            &proxy.id,
+                            &upstream.targets,
+                        );
+                    }
                     for target in &upstream.targets {
                         active_keys.insert(scoped_cache_key(
                             &proxy.namespace,
@@ -11895,7 +11908,7 @@ impl ProxyState {
                 ));
             }
         }
-        active_keys
+        self.circuit_breaker_cache.prune_stale_targets(&active_keys);
     }
 
     /// Timestamp-neutral proxy content comparison for route-table reuse.
@@ -12827,29 +12840,12 @@ impl ProxyState {
         // Keep keys dispatch currently mints (direct-backend host:port, live
         // upstream/SD targets) so a config delta cannot reclaim still-routable
         // breakers, while still dropping retired pod IPs and removed hosts.
-        {
-            let active_keys = self.collect_active_circuit_breaker_target_keys(&new_config);
-            self.circuit_breaker_cache.prune_stale_targets(&active_keys);
-        }
+        self.prune_stale_target_health(&new_config);
 
         // --- HealthChecker: prune passive health state for removed proxies ---
         if !delta.removed_proxy_ids.is_empty() {
             self.health_checker
                 .prune_removed_proxies(&delta.removed_proxy_ids);
-        }
-        for proxy in &new_config.proxies {
-            if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = new_config
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
-            {
-                self.health_checker.remove_stale_passive_targets_for_proxy(
-                    &proxy.namespace,
-                    &proxy.id,
-                    &upstream.targets,
-                );
-            }
         }
 
         // --- DNS warmup for new/modified hostnames ---
@@ -13459,29 +13455,12 @@ impl ProxyState {
         // Keep keys dispatch currently mints (direct-backend host:port, live
         // upstream/SD targets) so a config delta cannot reclaim still-routable
         // breakers, while still dropping retired pod IPs and removed hosts.
-        {
-            let active_keys = self.collect_active_circuit_breaker_target_keys(&new_config);
-            self.circuit_breaker_cache.prune_stale_targets(&active_keys);
-        }
+        self.prune_stale_target_health(&new_config);
 
         // --- HealthChecker: prune passive health state for removed proxies ---
         if !delta.removed_proxy_ids.is_empty() {
             self.health_checker
                 .prune_removed_proxies(&delta.removed_proxy_ids);
-        }
-        for proxy in &new_config.proxies {
-            if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = new_config
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
-            {
-                self.health_checker.remove_stale_passive_targets_for_proxy(
-                    &proxy.namespace,
-                    &proxy.id,
-                    &upstream.targets,
-                );
-            }
         }
 
         // --- DNS warmup for new/modified hostnames ---
@@ -34204,6 +34183,14 @@ async fn handle_proxy_request_inner(
             let mut grpc_current_cb_key = cb_target_key.clone();
 
             loop {
+                let dispatch_error = grpc_result
+                    .as_ref()
+                    .err()
+                    .map(retry::classify_grpc_proxy_error);
+                ctx.record_backend_dispatch_outcome(
+                    dispatch_error,
+                    dispatch_error.is_none_or(retry::request_reached_wire),
+                );
                 // Classify the error and determine if retryable. Narrow to
                 // the connect-class kinds via `is_connect_class()` so
                 // `retry_on_connect_failure` cannot replay non-idempotent
@@ -34799,6 +34786,14 @@ async fn handle_proxy_request_inner(
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
+        let dispatch_error = grpc_result
+            .as_ref()
+            .err()
+            .map(retry::classify_grpc_proxy_error);
+        ctx.record_backend_dispatch_outcome(
+            dispatch_error,
+            dispatch_error.is_none_or(retry::request_reached_wire),
+        );
         match grpc_result {
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
                 let grpc_backend_admission_elapsed = grpc_backend_admission_started_at.elapsed();
@@ -36981,6 +36976,7 @@ async fn handle_proxy_request_inner(
         };
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            ctx.record_backend_dispatch_outcome(result.error_class, !result.connection_error);
             // Re-check the CURRENT target's DestinationRule maxRetries before
             // authorizing another retry. Use the original route ceiling (not a
             // permanently lowered initial-port projection) so a looser rotated
@@ -37702,6 +37698,7 @@ async fn handle_proxy_request_inner(
         sticky_served_target,
     )
     .is_some();
+    ctx.record_backend_dispatch_outcome(backend_resp.error_class, !backend_resp.connection_error);
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;

@@ -550,6 +550,12 @@ fn apply_env_overrides(
             "FERRUM_MAX_CONNECTIONS" => {
                 env_config.max_connections = parse_numeric(k, v)?;
             }
+            "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => {
+                env_config.response_buffer_cutoff_bytes = parse_numeric(k, v)?;
+            }
+            "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => {
+                env_config.max_response_body_size_bytes = parse_numeric(k, v)?;
+            }
             "FERRUM_SHUTDOWN_DRAIN_SECONDS" => {
                 env_config.shutdown_drain_seconds = parse_numeric(k, v)?;
             }

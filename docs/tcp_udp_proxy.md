@@ -562,7 +562,7 @@ proxies:
 `backend_read_timeout_ms` and `backend_write_timeout_ms` apply to TCP proxies as **per-direction inactivity timeouts**. They are enforced by a watchdog that polls per-direction watermarks:
 
 - **`backend_read_timeout_ms`**: fires when the backend stops producing bytes (b2c direction goes stale). The watermark is refreshed on every successful read from the backend.
-- **`backend_write_timeout_ms`**: fires when progress stalls writing to the backend (c2b direction goes stale). The watermark is refreshed on every partial `write()` that accepts bytes, so a slow-but-progressing backend keeps the watermark fresh.
+- **`backend_write_timeout_ms`**: fires when progress stalls while client bytes are queued for the backend. The watermark is refreshed on every partial `write()` that accepts bytes and disarmed when the queue drains. A client that sends a subscription request and then only receives backend pushes does not trip this timer; a subsequent client write arms it again. This lifecycle is shared by userspace, splice, io_uring and kTLS forwarding.
 
 Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement for long-lived TCP workloads (database keep-alives, message-broker streams, SSH/IMAP passthrough). When disabled, the TCP relay relies solely on `tcp_idle_timeout_seconds` (bidirectional) and the OS TCP keep-alive.
 

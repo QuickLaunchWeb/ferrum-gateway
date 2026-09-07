@@ -28,6 +28,12 @@ Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `
 
 ### Per-namespace tenancy (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`)
 
+Only an absent `X-Ferrum-Namespace` header selects the default namespace
+(`ferrum`). A present invalid value, including non-ASCII bytes, returns `400`
+on namespace-scoped routes; it never silently selects the default. Invalid
+backup attempts retain the canonical audit bucket and fixed
+`namespace_status: invalid` metadata without storing the rejected value.
+
 On a single-namespace deployment, admin JWTs are **global** by default: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. Setting `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` makes namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace.
 
 **Enforcement also engages automatically on a multi-namespace control plane.** When `FERRUM_CP_NAMESPACES` names more than one namespace (e.g. `"prod,staging"`) or is `*`, `cp` mode turns namespace-claim enforcement on for the admin plane regardless of `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` — the same rule the CP↔DP gRPC plane applies to `ConfigSync`, `MeshConfigSync`, and xDS streams. On such a CP, **admin tokens without an `ns` claim are refused with `403` on namespace-scoped routes**, including `GET /backup` (which serialises consumer credentials) and `POST /restore`. Mint admin tokens with an explicit `ns` claim before pointing them at a multi-namespace CP. `database`, `file`, `dp`, `mesh`, and `node_agent` modes have no CP scope and keep the flag's `false` default.
@@ -847,6 +853,13 @@ A proxy-scoped plugin applies only when the target proxy lists it in `plugins`;
 The plugin-config row and the association commit in one transaction, and every
 touched proxy's `updated_at` advances so the next poll / control-plane
 broadcast republishes it. `GET /proxies/{id}` is therefore authoritative: a
+Plugin and proxy writes validate their complete prospective plugin composition
+before persistence. Invalid CORS/mesh-dispatch ordering, exclusive-instance
+conflicts, metric-tag plan budgets and global registry ownership return `400`;
+the rejected plugin row and association are not committed. File/DB/CP admission
+and runtime cache publication use the same checks. See
+[Composition admission](plugins.md#composition-admission).
+
 `201` from `POST /plugins/config` means *attached*, not merely created. A
 `proxy_id` that does not exist in the request's namespace is rejected with
 `400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing

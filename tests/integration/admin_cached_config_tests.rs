@@ -1886,6 +1886,44 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
     (state, temp_dir)
 }
 
+#[tokio::test]
+async fn file_admission_cases_match_admin_batch_and_sqlite_full_load() {
+    let cases: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/file_admission_cases.json")).unwrap();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let tc = TestConfig::default();
+        let (state, _dir) = create_db_admin_state(&tc).await;
+        let db = state.db.as_ref().unwrap().clone();
+        let (base_url, _shutdown) = start_test_admin(state).await;
+        let token = generate_test_token(&tc);
+        let mut batch = case["config"].clone();
+        batch.as_object_mut().unwrap().remove("version");
+        let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+        let loaded = db.load_full_config("ferrum").await.unwrap();
+        if let Some(expected) = case["expected_error"].as_str() {
+            assert_eq!(status, 400, "{name}: {body}");
+            assert!(body.to_string().contains(expected), "{name}: {body}");
+            assert!(
+                loaded.proxies.is_empty(),
+                "{name}: rejected batch persisted"
+            );
+            assert!(
+                loaded.plugin_configs.is_empty(),
+                "{name}: rejected plugins persisted"
+            );
+        } else {
+            assert_eq!(status, 201, "{name}: {body}");
+            assert_eq!(loaded.proxies.len(), 1, "{name}");
+            assert_eq!(
+                loaded.plugin_configs.len(),
+                batch["plugin_configs"].as_array().unwrap().len(),
+                "{name}"
+            );
+        }
+    }
+}
+
 fn db_admin_state(
     tc: &TestConfig,
     db: DatabaseStore,
@@ -8238,11 +8276,14 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
     .execute(&pool)
     .await
     .expect("proxy insert must succeed");
+    // Only the proxy association is corrupt. The global CORS configuration
+    // itself must be valid so clearing that association repairs the candidate.
     sqlx::query(
         "INSERT INTO plugin_configs \
          (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
-         VALUES ('global-invalid', 'ferrum', 'cors', '{}', 'global', NULL, 1, ?, ?)",
+         VALUES ('global-invalid', 'ferrum', 'cors', ?, 'global', NULL, 1, ?, ?)",
     )
+    .bind(json!({"allowed_origins": ["*"]}).to_string())
     .bind(&ts)
     .bind(&ts)
     .execute(&pool)
@@ -9985,5 +10026,64 @@ async fn proxy_put_omitting_plugins_preserves_associations_and_empty_array_clear
         stored["plugins"],
         json!([]),
         "an explicit `\"plugins\": []` must clear the associations: {stored:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_rejects_second_effective_load_testing_before_persistence() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let db = Arc::clone(state.db.as_ref().unwrap());
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let proxy = json!({
+        "id": "load-owner", "listen_path": "/load-owner",
+        "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "proxy creation failed: {body}");
+    let plugin = |id| {
+        json!({
+            "id": id, "plugin_name": "load_testing", "scope": "proxy",
+            "proxy_id": "load-owner", "enabled": true,
+            "config": {"key": "test-load-key-0123456789abcdef!!",
+                "concurrent_clients": 1, "duration_seconds": 1, "gateway_port": 8000}
+        })
+    };
+    let (status, body) =
+        admin_post(&base_url, "/plugins/config", &token, &plugin("load-first")).await;
+    assert_eq!(status, 201, "first valid instance must commit: {body}");
+    let before = db.get_proxy("ferrum", "load-owner").await.unwrap().unwrap();
+    assert_eq!(before.plugins.len(), 1);
+    assert_eq!(before.plugins[0].plugin_config_id, "load-first");
+
+    let (status, body) =
+        admin_post(&base_url, "/plugins/config", &token, &plugin("load-second")).await;
+    assert_eq!(
+        status, 400,
+        "second effective instance was persisted: {body}"
+    );
+    assert!(
+        body.to_string().contains("at most one effective instance"),
+        "{body}"
+    );
+    assert!(
+        db.get_plugin_config("ferrum", "load-second")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.get_plugin_config("ferrum", "load-first")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let after = db.get_proxy("ferrum", "load-owner").await.unwrap().unwrap();
+    assert_eq!(after.plugins.len(), 1);
+    assert_eq!(after.plugins[0].plugin_config_id, "load-first");
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "rejected write touched the proxy"
     );
 }

@@ -37,6 +37,7 @@
 //!     -- --ignored --nocapture
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::scaffolding::backends::{
@@ -201,7 +202,9 @@ async fn h2c_grpc_request(
         .ok_or_else(|| format!("bad target {target}"))?;
     let port: u16 = port_str.parse()?;
     let tcp = TcpStream::connect((host, port)).await?;
-    let (mut send_req, connection) = h2_client::handshake(tcp).await?;
+    let framing = Arc::new(crate::scaffolding::clients::grpc::InboundResponseFraming::default());
+    let io = crate::scaffolding::clients::grpc::FrameObservingIo::new(tcp, Arc::clone(&framing));
+    let (mut send_req, connection) = h2_client::handshake(io).await?;
     let conn_task = tokio::spawn(connection);
 
     let mut req_builder = Request::builder()
@@ -252,6 +255,7 @@ async fn h2c_grpc_request(
     Ok(GrpcResponse {
         http_status,
         headers,
+        initial_headers_end_stream: framing.initial_headers_end_stream(),
         messages,
         raw_body_frames: raw_frames,
         trailers,

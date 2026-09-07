@@ -793,46 +793,72 @@ async fn h2_pool_opens_fresh_connection_after_prior_stream_reset() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn grpc_trailers_only_response_preserves_status_in_initial_headers() {
-    let reservation = reserve_port().await.expect("reserve port");
-    let backend_port = reservation.port;
-    let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
-        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
-        .step(H2Step::DrainRequestBody)
-        .step(H2Step::RespondHeadersEndStream(vec![
-            (":status", "200".into()),
-            ("content-type", "application/grpc".into()),
-            ("grpc-status", "0".into()),
-            ("grpc-message", "trailers-only".into()),
-        ]))
-        .spawn()
-        .expect("spawn backend");
+    for mode in ["coalescing", "direct", "buffered"] {
+        let reservation = reserve_port().await.expect("reserve port");
+        let backend_port = reservation.port;
+        let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+            .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+            .step(H2Step::DrainRequestBody)
+            .step(H2Step::RespondHeadersEndStream(vec![
+                (":status", "200".into()),
+                ("content-type", "application/grpc".into()),
+                ("grpc-status", "5".into()),
+                ("grpc-message", "not-found".into()),
+                ("grpc-status-details-bin", "CAU=".into()),
+            ]))
+            .spawn()
+            .expect("spawn backend");
 
-    let harness = GatewayHarness::builder()
-        .mode_in_process()
-        .file_config(grpc_file_config(backend_port, Value::Null))
-        .pool_warmup_enabled(false)
-        .spawn()
+        let overrides = if mode == "buffered" {
+            json!({"response_body_mode": "buffer"})
+        } else {
+            Value::Null
+        };
+        let mut builder = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(grpc_file_config(backend_port, overrides))
+            .pool_warmup_enabled(false);
+        if mode == "direct" {
+            builder = builder
+                .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
+                .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0");
+        }
+        let harness = builder.spawn().await.expect("spawn gateway");
+        let gw_port = harness
+            .proxy_base_url()
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .expect("gateway port");
+        let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+        let response = tokio::time::timeout(
+            Duration::from_secs(4),
+            client.unary("/grpc/ferrum.Echo/Ping", Bytes::new()),
+        )
         .await
-        .expect("spawn gateway");
-    let gw_port = harness
-        .proxy_base_url()
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-        .expect("gateway port");
-    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
-    let response = tokio::time::timeout(
-        Duration::from_secs(4),
-        client.unary("/grpc/ferrum.Echo/Ping", Bytes::new()),
-    )
-    .await
-    .expect("trailers-only RPC bounded")
-    .expect("trailers-only response surfaced");
+        .expect("trailers-only RPC bounded")
+        .expect("trailers-only response surfaced");
 
-    assert_eq!(response.http_status, 200, "response={response:?}");
-    assert_eq!(response.grpc_status(), Some(0), "response={response:?}");
-    assert!(response.messages.is_empty(), "response={response:?}");
-    assert!(response.stream_error.is_none(), "response={response:?}");
-    assert_eq!(backend.received_stream_count(), 1);
+        assert_eq!(response.http_status, 200, "{mode}: {response:?}");
+        assert!(response.initial_headers_end_stream, "{mode}: {response:?}");
+        assert_eq!(response.grpc_status(), Some(5), "{mode}: {response:?}");
+        assert_eq!(response.effective_grpc_status(), 5, "{mode}: {response:?}");
+        assert_eq!(
+            response.grpc_message(),
+            Some("not-found"),
+            "{mode}: {response:?}"
+        );
+        assert_eq!(
+            response.headers.get("grpc-status-details-bin").unwrap(),
+            "CAU="
+        );
+        assert!(response.raw_body_frames.is_empty(), "{mode}: {response:?}");
+        assert!(response.trailers.is_none(), "{mode}: {response:?}");
+        assert!(response.messages.is_empty(), "{mode}: {response:?}");
+        assert!(response.stream_error.is_none(), "{mode}: {response:?}");
+        assert_eq!(backend.received_stream_count(), 1);
+        backend.assert_no_matcher_mismatches().await;
+        backend.assert_no_step_errors().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

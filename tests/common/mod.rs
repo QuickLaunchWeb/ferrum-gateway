@@ -58,6 +58,7 @@
 
 pub mod backend_availability;
 pub mod config_builder;
+pub mod crl_fixtures;
 pub mod echo_servers;
 pub mod gateway_harness;
 pub mod hmac_helpers;

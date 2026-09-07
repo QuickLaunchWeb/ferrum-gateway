@@ -918,8 +918,10 @@ verified SubjectPublicKeyInfo from the accepted client-CA bundle (signature
 verified; matching a DN is not enough; identical SPKIs are deduplicated). When
 the signer is not in the accepted bundle, issuer DN and Authority Key
 Identifier cannot prove its key identity: distinct keys can deliberately reuse
-both. Ferrum therefore requires an unambiguous AKI but conservatively includes
-the complete signed CRL in that issuer identity. A reissue from such an
+both. Ferrum therefore conservatively includes the complete signed CRL in that
+issuer identity. A CRL without AKI can be summarized this way, including a CRL
+in the global list whose signer belongs only to a backend trust domain. A
+present malformed or duplicate AKI remains invalid. A reissue from such an
 outside-bundle signer retires established sessions; this availability cost
 prevents colliding issuer metadata from suppressing a new revocation. A CRL
 whose issuer cannot be identified conservatively is refused and the last-good
@@ -1598,10 +1600,19 @@ after that fenced write — but before the final certificate/order publication �
 leaves an authoritative order behind in `pending_challenges`, `ready`, or
 `processing`. Its claim then expires and a successor takes over.
 
+If the CA reports the order itself as terminally `invalid`, the scheduler marks
+that unchanged active order `failed` inside the still-held renewal lease fence.
+The next due scan plans a new order; normal terminal-history pruning applies.
+Timeouts, network errors and other failures without an observed invalid order
+leave the existing order resumable. A lost claim, operator update, deletion or
+newer order prevents the stale failure write. Certificate material is retained
+and no reload is requested on this failure path. Fix the validation problem
+(such as HTTP-01 reachability or DNS-01 publication) so the next order can pass.
+
 The successor **finishes that same order**. It never treats the leftover record
 as a reason to skip the certificate (which would wedge renewal permanently,
 since the record outlives the claim that produced it) and never creates a second
-order with the CA:
+order with the CA while the original remains active:
 
 - **The finalization material is generated first and persisted with the order.**
   The certificate private key and the CSR are produced during *preparation* —

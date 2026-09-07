@@ -6957,6 +6957,7 @@ async fn handle_h3_request(
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
                 let h3_error_class = classify_h3_error(&e);
+                ctx.record_backend_dispatch_outcome(Some(h3_error_class), e.request_on_wire());
                 crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
                 let is_client_request_body_disconnect =
                     is_h3_client_request_body_disconnect(&err_msg);
@@ -8761,6 +8762,7 @@ async fn handle_h3_request(
                 },
                 attempt,
             ) {
+                ctx.record_backend_dispatch_outcome(result.error_class, result.request_on_wire);
                 // Re-check the CURRENT target's DestinationRule maxRetries
                 // before authorizing another retry — use the original route
                 // ceiling so a looser rotated candidate may continue up to
@@ -9125,6 +9127,7 @@ async fn handle_h3_request(
             )
         };
 
+        ctx.record_backend_dispatch_outcome(h3_error_class, h3_request_on_wire);
         // Record outcome against the final target (may differ from initial after retries).
         // `connection_error` shares the same typed body-on-wire signal as the
         // retry decision and CB above so passive-health / least-latency LB

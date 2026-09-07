@@ -2255,7 +2255,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         ConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
             req.metadata_mut().insert("authorization", token.clone());
             Ok(req)
-        });
+        })
+        .max_decoding_message_size(
+            crate::modes::mesh::config_consumer::common::MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE,
+        );
 
     info!(
         "Connected to CP, subscribing for config updates (DP v{})",

@@ -2852,6 +2852,15 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
     });
     assert!(validator.validate(&valid).is_ok());
 
+    for status in 200..300 {
+        let mut committed_fallback = valid.clone();
+        committed_fallback["fallback_on_status_codes"] = json!([429, status]);
+        assert!(validator.validate(&committed_fallback).is_err());
+    }
+    let mut rejection_fallback = valid.clone();
+    rejection_fallback["fallback_on_status_codes"] = json!([100, 199, 300, 429, 599]);
+    assert!(validator.validate(&rejection_fallback).is_ok());
+
     for invalid in [
         json!({"providers": [{"name": "p", "provider_type": "openai"}], "fallback_on_netwrok_errors": true}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "model_paterns": []}]}),

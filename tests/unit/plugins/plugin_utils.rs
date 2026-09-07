@@ -501,11 +501,79 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     }
 }
 
+/// A global `tracing` dispatcher whose only job is to keep callsite interest
+/// from collapsing to `never`. `tracing::subscriber::set_default` installs a
+/// thread-local dispatcher and does NOT rebuild the global interest cache, so a
+/// callsite that some other test hit first (before any dispatcher existed) can
+/// stay cached as disabled and a later thread-local capture sees nothing. With
+/// this floor registered, `rebuild_interest_cache()` yields `sometimes` for
+/// every callsite and captures work regardless of test ordering. The unit suite
+/// is split across several test binaries, so no test may rely on another
+/// module having installed a global subscriber earlier in the process.
+struct InterestFloorSubscriber;
+
+impl tracing::Subscriber for InterestFloorSubscriber {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Install [`InterestFloorSubscriber`] as the global default exactly once for
+/// this test binary. Idempotent and tolerant of an already-set global default.
+/// Call it before installing a thread-local capturing subscriber, then run
+/// `tracing::callsite::rebuild_interest_cache()` after `set_default`.
+#[allow(dead_code)]
+pub fn install_interest_floor() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(InterestFloorSubscriber);
+    });
+}
+
+/// Guarantee `FERRUM_BASIC_AUTH_HMAC_SECRET` is set for tests that construct
+/// every registered plugin (`basic_auth` refuses to start without it). The
+/// monolithic unit binary used to inherit the value from `basic_auth_tests`
+/// running earlier in the same process; each split binary must set it itself.
+/// Sets only when absent, under the shared env lock, so env-scoped tests that
+/// deliberately clear the variable are not raced.
+#[allow(dead_code)]
+pub fn ensure_basic_auth_test_secret() {
+    const KEY: &str = "FERRUM_BASIC_AUTH_HMAC_SECRET";
+    let _guard = crate::unit::env_lock::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if std::env::var_os(KEY).is_none() {
+        // SAFETY: serialized by ENV_LOCK with every env-mutating unit test, and
+        // the value is a fixed test constant set once for the process.
+        unsafe {
+            std::env::set_var(KEY, "unit-test-basic-auth-hmac-secret-0123456789abcdef");
+        }
+    }
+}
+
 /// Install a thread-local capturing subscriber for the duration of the returned
 /// guard. Use `flavor = "current_thread"` so plugin flush workers stay on the
 /// thread the subscriber is installed for.
 #[allow(dead_code)]
 pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    install_interest_floor();
     let writer = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -514,6 +582,7 @@ pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
         .with_writer(writer.clone())
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
     (writer, guard)
 }
 
