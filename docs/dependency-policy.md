@@ -564,6 +564,16 @@ When reviewing an actions Dependabot PR:
    to.
 3. Do not accept a PR that reintroduces a mutable tag ref.
 
+The setup-python v7 update is limited to eligible jobs: all uses in
+`native-cache-envelope.yml`, the `contracts`, `publish`, and `anonymous-reader`
+jobs in `native-compiler-store.yml`, and `contracts` in
+`release-platform-study.yml`. The compiler-store `produce` and platform-study
+`study` jobs retain their trusted v6 pins because their Cross-sensitive job
+bodies are frozen. The v7 action still runs on Node 24 and accepts the existing
+`python-version: '3.13'` input; its removed `pip-install` input is not used here.
+Keep future Dependabot updates scoped to eligible jobs instead of changing the
+trusted policy to admit an action bump.
+
 The ARM64 Cross build and publication contracts are deliberately frozen by the
 trusted `pull_request_target` verifier. Existing checkout uses on the guarded
 workflow surfaces still carry the historical `# v6` annotation, although their
