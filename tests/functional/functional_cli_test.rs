@@ -3449,3 +3449,86 @@ async fn functional_cli_validate_migration_reads_without_mutation() {
             .contains("backup")
     }));
 }
+
+const EMPTY_POOL_SHARD_CONFIG: &str =
+    "version: '1'\nproxies: []\nconsumers: []\nplugin_configs: []\nupstreams: []\n";
+
+async fn start_gateway_with_one_pool_shard(
+    mode: &str,
+    cp_address: Option<&str>,
+) -> (crate::common::TestGateway, Option<String>) {
+    for attempt in 1..=crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS {
+        let mut builder = crate::common::TestGateway::builder()
+            .skip_auto_build()
+            .clear_env()
+            .capture_output()
+            .env("FERRUM_POOL_SHARD_AMOUNT", "1")
+            .env("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true");
+        let mut reservation = None;
+        let mut address = None;
+        builder = match mode {
+            "file" => builder.mode_file(EMPTY_POOL_SHARD_CONFIG),
+            "database" => builder.mode_database_sqlite(),
+            "cp" => {
+                let held = reserve_port().await.unwrap();
+                let value = format!("127.0.0.1:{}", held.port);
+                builder = builder.reserve_listener_port(held.port);
+                reservation = Some(held);
+                address = Some(value.clone());
+                builder.mode_cp(crate::common::DbType::Sqlite, Some(value))
+            }
+            "dp" => builder.mode_dp(vec![format!("http://{}", cp_address.unwrap())]),
+            _ => panic!("unsupported fixture mode {mode}"),
+        };
+        drop(reservation);
+        match builder.spawn_classified().await {
+            Ok(gateway) => return (gateway, address),
+            Err(error)
+                if error.listener_addr_in_use
+                    && attempt < crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS => {}
+            Err(error) => panic!("{mode} with one pool shard: {error}"),
+        }
+    }
+    unreachable!("the final failed attempt returns its diagnostic")
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_pool_shard_one_validates_and_starts_file_database_cp_and_dp() {
+    let temp_dir = TempDir::new().unwrap();
+    let spec = temp_dir.path().join("resources.yaml");
+    std::fs::write(&spec, EMPTY_POOL_SHARD_CONFIG).unwrap();
+    for value in [0usize, 1, 2, 3, 64, 1 << 30] {
+        let mut command = hermetic_validate_command(
+            &temp_dir,
+            &["--mode", "file", "--spec", spec.to_str().unwrap()],
+        );
+        command
+            .env("FERRUM_POOL_SHARD_AMOUNT", value.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("validate must terminate")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "shard override {value}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Validation passed."));
+    }
+    for mode in ["file", "database"] {
+        let (mut gateway, _) = start_gateway_with_one_pool_shard(mode, None).await;
+        gateway.shutdown();
+    }
+    let (mut cp, address) = start_gateway_with_one_pool_shard("cp", None).await;
+    let (mut dp, _) = start_gateway_with_one_pool_shard("dp", address.as_deref()).await;
+    dp.shutdown();
+    cp.shutdown();
+}

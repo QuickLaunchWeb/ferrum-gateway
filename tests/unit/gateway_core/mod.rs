@@ -128,6 +128,7 @@ mod policy_path_tests;
 mod pool_create_failure_classification_tests;
 mod pool_create_failure_fanout_tests;
 mod pool_key_tests;
+mod pool_sharding_tests;
 mod protocol_validation_tests;
 mod proxy_body_tests;
 mod proxy_protocol_tests;

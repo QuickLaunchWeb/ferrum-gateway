@@ -7006,6 +7006,34 @@ fn test_pool_shard_amount_zero_kept_as_auto_sentinel() {
 }
 
 #[test]
+fn pool_shard_env_admission_matches_runtime_normalization_boundaries() {
+    use ferrum_edge::util::sharding::{MAX_SHARD_AMOUNT, pool_shard_amount};
+
+    let mut values = vec![0usize, 1, 2, 3, usize::MAX];
+    for exponent in 1..=30 {
+        let power = 1usize << exponent;
+        values.extend([power - 1, power, power + 1]);
+    }
+    for value in values {
+        let text = value.to_string();
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_POOL_SHARD_AMOUNT", &text),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.pool_shard_amount, value);
+                let normalized = pool_shard_amount(config.pool_shard_amount);
+                assert!(normalized.is_power_of_two());
+                assert!((2..=MAX_SHARD_AMOUNT).contains(&normalized));
+            },
+        );
+    }
+}
+
+#[test]
 fn test_k8s_istio_root_namespace_defaults_to_istio_system() {
     with_env_vars(
         &[
