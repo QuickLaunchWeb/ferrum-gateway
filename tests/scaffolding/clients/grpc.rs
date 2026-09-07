@@ -922,7 +922,8 @@ mod tests {
         GrpcResponse {
             http_status,
             headers,
-            initial_headers_end_stream: grpc_status_header.is_some() && grpc_status_trailer.is_none(),
+            initial_headers_end_stream: grpc_status_header.is_some()
+                && grpc_status_trailer.is_none(),
             messages: Vec::new(),
             raw_body_frames: Vec::new(),
             trailers,

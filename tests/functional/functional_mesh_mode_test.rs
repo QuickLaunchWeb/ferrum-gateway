@@ -5990,9 +5990,7 @@ async fn functional_mesh_grpc_trailers_only_preserves_wire_end_stream() {
             "/echo.Mesh/TrailersOnly",
             // Stop on the first backend-authored response, even if malformed.
             // A successful framing assertion must never be a convergence filter.
-            |resp| {
-                resp.headers.get("x-mesh-trailers-only").map(String::as_str) == Some("backend")
-            },
+            |resp| resp.headers.get("x-mesh-trailers-only").map(String::as_str) == Some("backend"),
         )
         .await
         .expect("secured trailers-only drive");
