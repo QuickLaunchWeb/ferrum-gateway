@@ -3367,7 +3367,6 @@ NODE_DEFAULT_REGISTRY_READ_JOB = r"""  production-dockerfile-smoke-default:
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name buildkit-registry \
-            --hit unknown \
             --note "scope=production-dockerfile-smoke-default policy=anonymous-restore-only; actual layer reuse is reported by BuildKit"
 
       - name: Record cold-cache proof
@@ -3489,7 +3488,6 @@ NODE_DEFAULT_REGISTRY_WRITE_JOB = r"""  production-dockerfile-smoke-default-writ
         run: |
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name buildkit-registry \
-            --hit unknown \
             --note "scope=production-dockerfile-smoke-default policy=trusted-main-publish; actual layer reuse is reported by BuildKit"
 
       - name: Record cold-cache proof

@@ -4927,20 +4927,20 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "actions/cache/restore" in ci_cd
-        and "actions/cache/save" in ci_cd
-        and "restore-only" in ci_cd,
-        "docs/ci_cd.md must document pinned cache restore/save and fork restore-only",
+        "anonymous" in ci_cd and "packages: write" in ci_cd
+        and "refs/heads/main" in ci_cd,
+        "docs/ci_cd.md must document anonymous image readers and trusted-main registry writers",
         failures,
     )
     require(
-        "runner.arch" in ci_cd and BUILDKIT_CACHE_SCHEMA in ci_cd,
-        "docs/ci_cd.md must document schema- and architecture-scoped BuildKit cache keys",
+        "default-v1-linux-amd64-runtime" in ci_cd
+        and "ambient-v1-linux-amd64-runtime-ebpf" in ci_cd,
+        "docs/ci_cd.md must document separate versioned, architecture-scoped registry cache references",
         failures,
     )
     require(
-        "exact" in ci_cd.lower() and "partial" in ci_cd.lower(),
-        "docs/ci_cd.md must document exact-hit restore-only vs partial/miss publish",
+        "force_cold_cache" in ci_cd and "import and export" in ci_cd,
+        "docs/ci_cd.md must document the cold path omitting registry import and export",
         failures,
     )
     require(
@@ -4949,8 +4949,8 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "type=local" in ci_cd and "restored bytes" in ci_cd.lower(),
-        "docs/ci_cd.md must document local BuildKit cache restore-byte measurement",
+        "unknown registry hit/bytes" in ci_cd and "BuildKit logs" in ci_cd,
+        "docs/ci_cd.md must distinguish unknown registry telemetry from observed BuildKit reuse",
         failures,
     )
     require(
