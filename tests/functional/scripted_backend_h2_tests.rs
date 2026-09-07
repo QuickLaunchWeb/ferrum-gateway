@@ -2139,7 +2139,9 @@ async fn bodyless_h2_probe_filter_distinguishes_eof_from_invalid_preface() {
 
     async fn handshake_error(prefix: &[u8]) -> String {
         let (server, mut peer) = tokio::io::duplex(128);
-        peer.write_all(prefix).await.expect("write preface fragment");
+        peer.write_all(prefix)
+            .await
+            .expect("write preface fragment");
         peer.shutdown().await.expect("close peer write half");
         let error = tokio::time::timeout(
             Duration::from_secs(5),
