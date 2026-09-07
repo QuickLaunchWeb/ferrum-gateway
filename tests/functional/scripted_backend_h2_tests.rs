@@ -2122,6 +2122,58 @@ async fn h2_tls_backend_fixture_can_complete_handshake() {
     assert_eq!(backend.handshakes_completed(), 1);
 }
 
+// This test permits only the two explicit startup-probe close events. An
+// invalid HTTP/2 preface is a protocol defect, even if another connection later
+// delivers the governed response successfully (#4720).
+fn is_bodyless_h2_startup_probe_close(error: &str) -> bool {
+    matches!(
+        error,
+        "h2 handshake failed: connection closed before reading preface"
+            | "ExpectHeaders: connection closed before any stream arrived"
+    )
+}
+
+#[tokio::test]
+async fn bodyless_h2_probe_filter_distinguishes_eof_from_invalid_preface() {
+    use tokio::io::AsyncWriteExt;
+
+    async fn handshake_error(prefix: &[u8]) -> String {
+        let (server, mut peer) = tokio::io::duplex(128);
+        peer.write_all(prefix).await.expect("write preface fragment");
+        peer.shutdown().await.expect("close peer write half");
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            h2::server::Builder::new().handshake::<_, Bytes>(server),
+        )
+        .await
+        .expect("bounded fixture handshake")
+        .err()
+        .expect("an incomplete or invalid preface must fail");
+        format!("h2 handshake failed: {error}")
+    }
+
+    for prefix in [b"".as_slice(), b"PRI * HT".as_slice()] {
+        let eof = handshake_error(prefix).await;
+        assert_eq!(
+            eof,
+            "h2 handshake failed: connection closed before reading preface"
+        );
+        assert!(is_bodyless_h2_startup_probe_close(&eof));
+    }
+    let invalid = handshake_error(b"GET /health HTTP/1.1\r\n\r\n").await;
+    assert!(invalid.contains("unspecific protocol error detected"));
+    assert!(!is_bodyless_h2_startup_probe_close(&invalid));
+    assert!(!is_bodyless_h2_startup_probe_close(&format!(
+        "{invalid}; preface_kind=http1-method-prefix observed_bytes=24"
+    )));
+    assert!(is_bodyless_h2_startup_probe_close(
+        "ExpectHeaders: connection closed before any stream arrived"
+    ));
+    assert!(!is_bodyless_h2_startup_probe_close(
+        "ExpectHeaders: connection closed before any stream arrived; unrelated failure"
+    ));
+}
+
 // A bodyless request has no request-body marker for the governor's reqwest
 // preference. The response must still be governed when capability warmup sends
 // it through the direct-H2 `StreamingH2` arm.
@@ -2251,18 +2303,10 @@ async fn bodyless_direct_h2_sse_response_is_governed() {
     let step_errors = backend.step_errors().await;
     let unexpected_step_errors: Vec<_> = step_errors
         .iter()
-        // Capability/pool warmup may open a speculative H2 connection and drop
-        // it before sending the client preface. A binary spawn attempt can also
-        // finish the H2 handshake before losing a late listener-bind race; its
-        // shutdown then closes the warmup connection while ExpectHeaders waits,
-        // and the harness retries with fresh listener ports. The governed
-        // response and received GET above prove the real direct-H2 connection
-        // completed, so neither independent startup disconnect is a script
-        // failure for this assertion.
-        .filter(|error| {
-            !error.starts_with("h2 handshake failed: connection error detected: unspecific protocol error detected")
-                && error.as_str() != "ExpectHeaders: connection closed before any stream arrived"
-        })
+        // A speculative warmup can close before its preface, or after a
+        // completed handshake while ExpectHeaders awaits the first stream.
+        // Neither exact close event hides an invalid-preface protocol error.
+        .filter(|error| !is_bodyless_h2_startup_probe_close(error))
         .collect();
     assert!(
         unexpected_step_errors.is_empty(),
