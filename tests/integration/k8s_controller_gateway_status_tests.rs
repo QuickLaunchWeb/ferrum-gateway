@@ -2738,3 +2738,157 @@ fn unsupported_http_and_grpc_route_features_are_refused_before_materialization()
         }
     }
 }
+
+/// The supported filter control must reach the backend, not merely appear in
+/// serialized dispatch configuration beside a rejected route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supported_gateway_request_headers_reach_backend_beside_rejected_route() {
+    use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+    use crate::scaffolding::harness::GatewayHarness;
+    use crate::scaffolding::ports::reserve_port;
+    use ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips;
+    use std::time::Duration;
+
+    let reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::custom(|request| {
+            request.method == "GET"
+                && request.path == "/admission"
+                && request.header("x-set") == Some("retained")
+                && request.header("x-added") == Some("added")
+                && request.header("x-remove").is_none()
+        })))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+    let service = object(
+        "v1",
+        "Service",
+        "api",
+        "default",
+        json!({
+            "clusterIP": "10.96.0.10",
+            "ports": [{"name": "http", "port": 8080, "targetPort": backend_port}]
+        }),
+    );
+    let mut endpoints = object(
+        "discovery.k8s.io/v1",
+        "EndpointSlice",
+        "api-manual",
+        "default",
+        json!({
+            "addressType": "IPv4",
+            "ports": [{"name": "http", "port": backend_port}],
+            "endpoints": [{"addresses": ["127.0.0.1"], "conditions": {"ready": true}}]
+        }),
+    );
+    endpoints.metadata.labels.insert(
+        "kubernetes.io/service-name".to_string(),
+        "api".to_string(),
+    );
+    let supported_rule = json!({
+        "backendRefs": [{"name": "api", "port": 8080}],
+        "filters": [{"type": "RequestHeaderModifier", "requestHeaderModifier": {
+            "set": [{"name": "x-set", "value": "retained"}],
+            "add": [{"name": "x-added", "value": "added"}],
+            "remove": ["x-remove"]
+        }}]
+    });
+    let mut unsupported_rule = supported_rule.clone();
+    unsupported_rule["filters"].as_array_mut().unwrap().push(json!({
+        "type": "ResponseHeaderModifier", "responseHeaderModifier": {"remove": ["x-secret"]}
+    }));
+    let objects = vec![
+        gateway_class(),
+        cross_kind_gateway(json!([{"name": "web", "port": 80, "protocol": "HTTP"}])),
+        service,
+        endpoints,
+        object(
+            "gateway.networking.k8s.io/v1",
+            "HTTPRoute",
+            "good",
+            "default",
+            json!({
+                "parentRefs": [{"name": "edge", "sectionName": "web"}],
+                "hostnames": ["good.test"], "rules": [supported_rule]
+            }),
+        ),
+        object(
+            "gateway.networking.k8s.io/v1",
+            "HTTPRoute",
+            "bad",
+            "default",
+            json!({
+                "parentRefs": [{"name": "edge", "sectionName": "web"}],
+                "hostnames": ["bad.test"], "rules": [unsupported_rule]
+            }),
+        ),
+    ];
+    let opts = options().with_pod_discovery_enabled(true);
+    let (mut translation, skipped) = translate_k8s_objects_collecting_skips(&objects, opts.clone())
+        .expect("translate mixed routes");
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped.keys().next().unwrap().name, "bad");
+    let updates = plan_gateway_api_status_updates(&objects, opts, &translation.route_conflicts);
+    for (name, expected) in [("good", "True"), ("bad", "False")] {
+        let update = updates
+            .iter()
+            .find(|update| update.kind == "HTTPRoute" && update.name == name)
+            .unwrap();
+        assert_eq!(accepted_condition(update)["status"], expected);
+    }
+    assert_eq!(translation.config.proxies.len(), 1);
+    assert_eq!(translation.config.proxies[0].backend_host, "127.0.0.1");
+    assert_eq!(translation.config.proxies[0].backend_port, backend_port);
+    // The harness owns an ephemeral listener instead of binding Gateway port
+    // 80. Keep the translated route, destination and filter configuration.
+    translation.config.proxies[0].listen_port = None;
+    let yaml = serde_yaml::to_string(&translation.config).expect("serialize translated config");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .env("FERRUM_NAMESPACE", "default")
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("start translated gateway");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+    let response = client
+        .get(harness.proxy_url("/admission"))
+        .header("host", "good.test")
+        .header("x-set", "original")
+        .header("x-remove", "secret")
+        .send()
+        .await
+        .expect("supported route response");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "pong");
+    backend.assert_no_matcher_mismatches().await;
+    assert_eq!(backend.received_requests().await.len(), 1);
+    let refused = client
+        .get(harness.proxy_url("/admission"))
+        .header("host", "bad.test")
+        .send()
+        .await
+        .expect("rejected route response");
+    assert_eq!(refused.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        backend.received_requests().await.len(),
+        1,
+        "rejected route must not reach backend"
+    );
+}
