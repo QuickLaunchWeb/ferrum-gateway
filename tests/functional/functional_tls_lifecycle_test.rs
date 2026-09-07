@@ -1213,8 +1213,7 @@ struct FixtureSurfaces {
 /// A running gateway with frontend mTLS and client-trust live reload armed.
 struct TrustRetirementFixture {
     _dir: TempDir,
-    child: TokioChild,
-    capture: OutputCapture,
+    gateway: crate::common::TestGateway,
     ports: Ports,
     client_ca: GeneratedCa,
     client_ca_path: String,
@@ -1251,9 +1250,18 @@ impl TrustRetirementFixture {
         let client_cert_path = write_file(&dir, "client.crt", &client_cert.cert_pem);
         let client_key_path = write_file(&dir, "client.key", &client_cert.key_pem);
         let crl_path = write_file(&dir, "revocations.crl", &baseline_crl);
-        let cfg_path = dir.path().join("cfg.yaml");
-
-        let ports = alloc_ports().await;
+        // Keep promised listener ports bound while fixture backends start.
+        // Only the subprocess bind requires releasing these reservations.
+        let https = crate::scaffolding::ports::reserve_port().await.unwrap();
+        let stream_tcp = crate::scaffolding::ports::reserve_port().await.unwrap();
+        let stream_udp = crate::scaffolding::ports::reserve_udp_port().await.unwrap();
+        let mut ports = Ports {
+            proxy_http: 0,
+            proxy_https: https.port,
+            admin_http: 0,
+            stream_tcp: stream_tcp.port,
+            stream_udp: stream_udp.port,
+        };
         let mut backends = Vec::new();
         let mut proxies = String::new();
 
@@ -1321,9 +1329,6 @@ impl TrustRetirementFixture {
         let mut config_yaml = String::from("version: \"1\"\nproxies:");
         config_yaml.push_str(&proxies);
         config_yaml.push_str("\nconsumers: []\nupstreams: []\nplugin_configs: []\n");
-        std::fs::write(&cfg_path, config_yaml).unwrap();
-
-        let metrics_token = format!("trust-retirement-{}", ports.admin_http);
         let mut envs: Vec<(&str, &str)> = vec![
             ("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path.as_str()),
             ("FERRUM_FRONTEND_TLS_KEY_PATH", key_path.as_str()),
@@ -1335,7 +1340,6 @@ impl TrustRetirementFixture {
             ("FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED", "true"),
             ("FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS", "1"),
             ("FERRUM_POOL_WARMUP_ENABLED", "false"),
-            ("FERRUM_METRICS_BEARER_TOKEN", metrics_token.as_str()),
         ];
         if surfaces.http3 {
             envs.push(("FERRUM_ENABLE_HTTP3", "true"));
@@ -1348,12 +1352,48 @@ impl TrustRetirementFixture {
             envs.push(("FERRUM_DTLS_KEY_PATH", key_path.as_str()));
             envs.push(("FERRUM_DTLS_CLIENT_CA_CERT_PATH", client_ca_path.as_str()));
         }
-        let (child, capture) = spawn_gateway_piped(cfg_path.to_str().unwrap(), &ports, &envs);
+        // Shared startup proves authenticated readiness, JWT-only admin
+        // ownership and child liveness. A foreign /health cannot admit this
+        // fixture (#4740). It does not create an extra mTLS session that could
+        // perturb the exactly-one retirement metric asserted below.
+        let mut builder = crate::common::TestGateway::builder()
+            .mode_file(config_yaml)
+            .skip_auto_build()
+            .capture_output()
+            .log_level("warn")
+            .env("RUST_LOG", "ferrum_edge=warn,warn")
+            .env("FERRUM_PROXY_HTTPS_PORT", ports.proxy_https.to_string())
+            .reserve_listener_port(ports.stream_tcp)
+            .reserve_listener_port(ports.stream_udp)
+            .health_timeout(Duration::from_secs(15));
+        for (key, value) in envs {
+            builder = builder.env(key, value);
+        }
+        https.drop_and_take_port();
+        stream_tcp.drop_and_take_port();
+        stream_udp.drop_and_take_port();
+        let gateway = match builder.spawn_classified().await {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                eprintln!("owned trust-retirement gateway did not start: {error}");
+                for backend in backends {
+                    backend.abort();
+                    let _ = backend.await;
+                }
+                assert!(
+                    error.listener_addr_in_use,
+                    "trust-retirement startup failed without a retryable bind race: {error}"
+                );
+                return None;
+            }
+        };
+        ports.proxy_http = gateway.proxy_port;
+        ports.admin_http = gateway.admin_port;
+        let metrics_token = gateway.observability_token.clone();
 
-        let mut fixture = Self {
+        Some(Self {
             _dir: dir,
-            child,
-            capture,
+            gateway,
             ports,
             client_ca,
             client_ca_path,
@@ -1365,19 +1405,15 @@ impl TrustRetirementFixture {
             revoked_serial,
             metrics_token,
             _backends: backends,
-        };
-        if wait_for_gateway(fixture.ports.admin_http, 60).await {
-            Some(fixture)
-        } else {
-            eprintln!("gateway output:\n{}", fixture.capture.snapshot().join("\n"));
-            fixture.shutdown().await;
-            None
-        }
+        })
     }
 
     async fn shutdown(&mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+        self.gateway.shutdown();
+        for backend in self._backends.drain(..) {
+            backend.abort();
+            let _ = backend.await;
+        }
     }
 
     /// Prove the gateway is still the process that refused the request.
@@ -1387,14 +1423,11 @@ impl TrustRetirementFixture {
     /// child has not exited turns "the connection failed" into "the running
     /// gateway closed the connection".
     fn assert_still_running(&mut self, context: &str) {
-        match self.child.try_wait() {
-            Ok(None) => {}
-            Ok(Some(status)) => panic!(
-                "{context}: the gateway exited ({status}) rather than refusing on a live transport; output:\n{}",
-                self.capture.snapshot().join("\n")
-            ),
-            Err(e) => panic!("{context}: could not poll the gateway process: {e}"),
-        }
+        assert!(
+            self.gateway.is_running(),
+            "{context}: the gateway is not confirmed alive after transport refusal; output:\n{}",
+            self.gateway.diagnostic_captured_output()
+        );
     }
 
     fn h1_config(&self) -> rustls::ClientConfig {
@@ -1486,6 +1519,15 @@ impl TrustRetirementFixture {
             .text()
             .await
             .expect("metrics body")
+    }
+}
+
+impl Drop for TrustRetirementFixture {
+    fn drop(&mut self) {
+        self.gateway.shutdown();
+        for backend in &self._backends {
+            backend.abort();
+        }
     }
 }
 
@@ -1635,7 +1677,12 @@ async fn test_h1_keepalive_is_refused_after_crl_revocation_without_reconnect() {
 
     let mut transport = establish_h1(fixture.ports.proxy_https, fixture.h1_config())
         .await
-        .expect("establish H1 mTLS transport");
+        .unwrap_or_else(|error| {
+            panic!(
+                "establish H1 mTLS transport: {error}; gateway output:\n{}",
+                fixture.gateway.diagnostic_captured_output()
+            )
+        });
     assert_eq!(
         transport.request("localhost").await,
         AttemptOutcome::Status(200),

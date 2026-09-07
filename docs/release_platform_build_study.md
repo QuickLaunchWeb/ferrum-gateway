@@ -7,6 +7,24 @@ x86_64 and ARM64 on macos-latest, and Windows x86_64 on windows-latest. The
 macOS x86_64 target may cross-compile on an ARM64 host; recorded host and target
 identities must be used when interpreting it.
 
+Manual dispatch defaults to `comparison=all-platforms`, retaining those three
+pairs. `comparison=macos-x86-hosts` instead measures the same x86_64 target on
+`macos-15` (ARM host) and `macos-15-intel` (native Intel host) in parallel. Both
+jobs check out the same dispatch SHA and retain the same Rust/Cargo version,
+shipping profile, target and cold-cache setup. Host architecture, CPU, memory,
+SDK and native tool versions can differ; retain the recorded provenance and
+treat this as a runner comparison, not an isolated estimate of one hardware
+factor. Job and artifact names include the runner label to distinguish results
+for the same target. `macos-tools.txt` records the runner label, macOS/Xcode/SDK,
+C compiler, protoc and available LLD versions alongside the existing provenance.
+
+Both choices use only a closed list of standard runners. GitHub lists the
+Intel runner with four CPUs and 14 GB RAM and the ARM runner with three CPUs
+and 7 GB RAM; standard hosted runners are free for this public repository.
+See the [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Confirm the actual host measurements when comparing compile time, memory and
+swap. This experiment does not select a new production release runner.
+
 The study installs and explicitly selects Rust 1.98.1 with RUSTUP_TOOLCHAIN,
 then checks the active rustc/Cargo versions and installed target before building.
 This prevents rust-toolchain.toml from selecting an older cached stable toolchain.

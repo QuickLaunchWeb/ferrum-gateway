@@ -24,24 +24,35 @@ if ! [[ "$RR_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$RR_BASE_SHA" = 00000000000000
 fi
 export RR_BASE_SHA
 git cat-file -e "$RR_BASE_SHA^{commit}"
-RR_COMPARISON_WORK="$(mktemp -d "$RUNNER_TEMP/rr-selection.XXXXXX")"
+# A random source path changes Cargo identities for the root and patched path
+# dependencies outside the standalone mesh workspace. Compile both revisions
+# at the SAME deterministic path; keep binaries and prior source trees separate.
+RR_COMPARISON_WORK="$RUNNER_TEMP/ferrum-rr-comparison"
 export RR_COMPARISON_WORK
-git -c core.hooksPath=/dev/null worktree add --detach "$RR_COMPARISON_WORK/baseline-source" "$RR_BASE_SHA"
-# The only baseline overlay is the candidate measurement harness.
-cp tests/performance/mesh/benches/rr_selection.rs "$RR_COMPARISON_WORK/baseline-source/tests/performance/mesh/benches/rr_selection.rs"
+mkdir "$RR_COMPARISON_WORK"
+RR_COMPARISON_SOURCE="$RR_COMPARISON_WORK/source"
+export RR_COMPARISON_SOURCE
 export CARGO_TARGET_DIR="$PWD/tests/performance/mesh/target"
+python3 .github/scripts/run_rr_selection_comparison.py self-test
+rustc -Vv > "$RR_COMPARISON_OUTPUT/rustc-version.txt"
+cargo -Vv > "$RR_COMPARISON_OUTPUT/cargo-version.txt"
+lscpu --json > "$RR_COMPARISON_OUTPUT/cpu.json"
 for role in candidate baseline; do
   export RR_COMPARISON_ROLE="$role"
-  if [ "$role" = candidate ]; then
-    /usr/bin/time --format='%e' --output="$RR_COMPARISON_OUTPUT/$role-compile.time" \
-      cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench rr_selection --no-run --locked --message-format=json \
-      > "$RR_COMPARISON_OUTPUT/$role-compile.jsonl"
-  else
-    /usr/bin/time --format='%e' --output="$RR_COMPARISON_OUTPUT/$role-compile.time" \
-      cargo bench --manifest-path "$RR_COMPARISON_WORK/baseline-source/tests/performance/mesh/Cargo.toml" --bench rr_selection --no-run --locked --message-format=json \
-      > "$RR_COMPARISON_OUTPUT/$role-compile.jsonl"
+  revision="$RR_CANDIDATE_SHA"
+  if [ "$role" = baseline ]; then
+    revision="$RR_BASE_SHA"
   fi
+  git -c core.hooksPath=/dev/null worktree add --detach "$RR_COMPARISON_SOURCE" "$revision"
+  # The only source overlay is the candidate measurement harness.
+  cp tests/performance/mesh/benches/rr_selection.rs "$RR_COMPARISON_SOURCE/tests/performance/mesh/benches/rr_selection.rs"
+  /usr/bin/time --format='%e' --output="$RR_COMPARISON_OUTPUT/$role-compile.time" \
+    cargo bench --manifest-path "$RR_COMPARISON_SOURCE/tests/performance/mesh/Cargo.toml" --bench rr_selection --no-run --locked --message-format=json \
+    > "$RR_COMPARISON_OUTPUT/$role-compile.jsonl"
   python3 .github/scripts/run_rr_selection_comparison.py record-build
+  # Preserve each freshly created tree, including any build-script outputs.
+  # The next revision starts from a clean checkout at the identical source path.
+  git -c core.hooksPath=/dev/null worktree move "$RR_COMPARISON_SOURCE" "$RR_COMPARISON_WORK/$role-source"
 done
 
 for round in 1 2 3; do

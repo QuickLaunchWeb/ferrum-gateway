@@ -2,6 +2,15 @@ name: Release Platform Build Study
 
 on:
   workflow_dispatch:
+    inputs:
+      comparison:
+        description: Select the unchanged-profile platform or macOS x86 host study
+        type: choice
+        required: true
+        default: all-platforms
+        options:
+          - all-platforms
+          - macos-x86-hosts
   pull_request:
     paths:
       - .github/workflows/release-platform-study.yml
@@ -39,7 +48,7 @@ jobs:
       - run: python .github/scripts/profile_release_platform.py --self-test
 
   study:
-    name: Release build study (${{ matrix.target }})
+    name: Release build study (${{ matrix.target }} on ${{ matrix.os }})
     if: github.event_name == 'workflow_dispatch'
     needs: contracts
     runs-on: ${{ matrix.os }}
@@ -47,13 +56,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+        # Both modes use a closed list of standard hosted runners. The host
+        # comparison holds macOS generation and target constant; source,
+        # toolchain version, profile and cold-cache setup are identical.
+        include: >-
+          ${{ fromJSON(inputs.comparison == 'macos-x86-hosts' &&
+          '[{"os":"macos-15","target":"x86_64-apple-darwin"},{"os":"macos-15-intel","target":"x86_64-apple-darwin"}]' ||
+          '[{"os":"macos-latest","target":"x86_64-apple-darwin"},{"os":"macos-latest","target":"aarch64-apple-darwin"},{"os":"windows-latest","target":"x86_64-pc-windows-msvc"}]') }}
     env:
       # Override rust-toolchain.toml's cached stable selection as well as
       # installing this version and its target libraries below.
@@ -132,6 +141,28 @@ jobs:
           }
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
+      - name: Record macOS native tools and SDK
+        if: runner.os == 'macOS'
+        timeout-minutes: 2
+        env:
+          STUDY_RUNNER_LABEL: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p study-results
+          {
+            printf 'Runner label: %s\n' "$STUDY_RUNNER_LABEL"
+            sw_vers
+            xcodebuild -version
+            xcrun --show-sdk-version
+            cc --version
+            protoc --version
+            if command -v ld64.lld >/dev/null 2>&1; then
+              ld64.lld --version
+            else
+              echo "ld64.lld is not on PATH; inspect canonical linker setup and recorded RUSTFLAGS"
+            fi
+          } > study-results/macos-tools.txt
+
       - name: Verify telemetry parsers on this platform
         run: python .github/scripts/profile_release_platform.py --self-test
       - name: Measure the unchanged shipping profile (x86_64-apple-darwin)
@@ -159,7 +190,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-platform-study-${{ matrix.target }}-${{ github.sha }}
+          name: release-platform-study-${{ matrix.target }}-${{ matrix.os }}-${{ github.sha }}
           path: |
             study-results/*.json
             study-results/*.jsonl
