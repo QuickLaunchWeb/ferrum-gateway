@@ -6037,14 +6037,44 @@ async fn handle_h3_request(
         && backend_supports_native_h3
         && !mesh_egress_required;
 
-    let backend_url = build_h3_backend_url_for_flavor(
+    let backend_url = match build_h3_backend_url_for_flavor(
         &proxy,
         backend_http_flavor,
         &path,
         effective_query_string.as_ref(),
         strip_len,
         upstream_target.as_deref(),
-    )?;
+    ) {
+        Ok(url) => url,
+        Err(_) => {
+            crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            record_request(
+                &state,
+                if matches!(http_flavor, HttpFlavor::Grpc) {
+                    200
+                } else {
+                    500
+                },
+            );
+            send_h3_error_flavor_aware_with_policy(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"Invalid backend path coordinates"}"#,
+                crate::proxy::grpc_proxy::grpc_status::INTERNAL,
+                "Invalid backend path coordinates",
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let backend_start = std::time::Instant::now();
     let sticky_cookie_needed = selection.sticky_cookie_needed;
     ctx.h3_response_upstream_is_fallback = selection.is_fallback;
@@ -8808,7 +8838,21 @@ async fn handle_h3_request(
                         );
                         break;
                     }
-                    Some(next)
+                    // A refused candidate leaves the last dispatched result
+                    // to the normal terminal response/accounting path.
+                    let next_url = match crate::proxy::build_backend_url_with_target(
+                        &proxy,
+                        &path,
+                        effective_query_string.as_ref(),
+                        &next.host,
+                        next.port,
+                        strip_len,
+                        next.path.as_deref(),
+                    ) {
+                        Ok(url) => url,
+                        Err(_) => break,
+                    };
+                    Some((next, next_url))
                 } else {
                     None
                 };
@@ -8854,19 +8898,11 @@ async fn handle_h3_request(
                 tokio::time::sleep(delay).await;
                 attempt += 1;
 
-                if let Some(next) = next_retry_target {
+                if let Some((next, next_url)) = next_retry_target {
                     let target_changed = current_target.as_ref().is_some_and(|prev_target| {
                         next.host != prev_target.host || next.port != prev_target.port
                     });
-                    current_url = crate::proxy::build_backend_url_with_target(
-                        &proxy,
-                        &path,
-                        effective_query_string.as_ref(),
-                        &next.host,
-                        next.port,
-                        strip_len,
-                        next.path.as_deref(),
-                    )?;
+                    current_url = next_url;
                     current_cb_target_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     current_target = Some(next);

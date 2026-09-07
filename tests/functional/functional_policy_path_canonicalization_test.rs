@@ -74,6 +74,12 @@ impl RecordingBackend {
                             Ok(read) => buffer.extend_from_slice(&chunk[..read]),
                         }
                     }
+                    // Capability refresh probes h2c even when pool warmup is
+                    // disabled. Its connection preface is not an HTTP/1
+                    // request and must not become a recorded "*" target.
+                    if buffer.starts_with(b"PRI * HTTP/2.0\r\n\r\n") {
+                        return;
+                    }
                     let text = String::from_utf8_lossy(&buffer).into_owned();
                     let target = text
                         .lines()
@@ -1125,6 +1131,13 @@ async fn coordinate_send(
         CoordinateFlavor::GrpcWeb => Some("application/grpc-web+proto"),
         _ => None,
     };
+    // A zero-length protobuf message still has a five-byte gRPC envelope.
+    // An empty upload is rejected by grpc_web before backend dispatch.
+    let request_body = if content_type.is_some() {
+        Bytes::from_static(b"\x00\x00\x00\x00\x00")
+    } else {
+        Bytes::new()
+    };
     let method = if websocket && protocol != 1 {
         Method::CONNECT
     } else if content_type.is_some() {
@@ -1150,7 +1163,7 @@ async fn coordinate_send(
                 body: Bytes::new(),
             };
         }
-        let mut options = GetOptions::default().method(method);
+        let mut options = GetOptions::default().method(method).body(request_body);
         if let Some(content_type) = content_type {
             options = options.header("content-type", content_type);
         }
@@ -1189,7 +1202,7 @@ async fn coordinate_send(
                 .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
         }
     }
-    let mut request = builder.body(Full::new(Bytes::new())).unwrap();
+    let mut request = builder.body(Full::new(request_body)).unwrap();
     if websocket && protocol == 2 {
         request
             .extensions_mut()
@@ -1259,7 +1272,7 @@ async fn coordinate_matrix(flavor: CoordinateFlavor) {
             ("/prefix/users", false, Some("/base/check/users/users")),
             ("/stable/users", false, Some("/base/check/users")),
         ] {
-            assert!(backend.take_targets().is_empty());
+            assert_eq!(backend.take_targets(), Vec::<String>::new());
             let response = tokio::time::timeout(
                 Duration::from_secs(15),
                 coordinate_send(protocol, port, target, flavor, authenticated),
@@ -1294,7 +1307,9 @@ async fn coordinate_matrix(flavor: CoordinateFlavor) {
                 };
                 assert!(
                     String::from_utf8_lossy(&response.body).contains(expected_status),
-                    "{label}"
+                    "{label}: headers={:?}, body={:?}",
+                    response.headers,
+                    response.body
                 );
             }
             let expected: Vec<String> = expected

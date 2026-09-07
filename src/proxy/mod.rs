@@ -27807,7 +27807,11 @@ async fn run_backend_path_plugins_or_build_reject(
                 };
                 let status = StatusCode::from_u16(plugin_reject.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                // Keep the rejection pipeline out of the generic request's
+                // unoptimized poll frame, including requests with no path
+                // policy. These factories allocate only on rejection; see
+                // `boxed_finalize_reject_response` for the stack invariant.
+                let reject = boxed_finalize_reject_response(
                     plugins,
                     ctx,
                     status,
@@ -27818,14 +27822,14 @@ async fn run_backend_path_plugins_or_build_reject(
                 )
                 .await;
                 apply_grpc_reject_metadata(ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     plugins,
                     ctx,
                     grpc_web_response_content_type,
                     &reject,
                 )
                 .await;
-                log_rejected_request_with_path(
+                boxed_log_rejected_request_with_path(
                     plugins,
                     ctx,
                     reject.http_status.as_u16(),
@@ -34327,7 +34331,21 @@ async fn handle_proxy_request_inner(
                         );
                         break;
                     }
-                    Some(next)
+                    // Refuse invalid coordinates before settling the current
+                    // attempt; the post-loop path still owns its outcome.
+                    let next_url = match build_backend_url_with_target(
+                        &proxy,
+                        &path,
+                        effective_query_string.as_ref(),
+                        &next.host,
+                        next.port,
+                        strip_len,
+                        next.path.as_deref(),
+                    ) {
+                        Ok(url) => url,
+                        Err(_) => break,
+                    };
+                    Some((next, next_url))
                 } else {
                     None
                 };
@@ -34417,19 +34435,8 @@ async fn handle_proxy_request_inner(
                 let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
-                if let Some(next) = next_retry_target {
-                    grpc_backend_url = match build_backend_url_with_target(
-                        &proxy,
-                        &path,
-                        effective_query_string.as_ref(),
-                        &next.host,
-                        next.port,
-                        strip_len,
-                        next.path.as_deref(),
-                    ) {
-                        Ok(url) => url,
-                        Err(_) => break,
-                    };
+                if let Some((next, next_url)) = next_retry_target {
+                    grpc_backend_url = next_url;
                     grpc_current_cb_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
@@ -36644,6 +36651,12 @@ async fn handle_proxy_request_inner(
     ) {
         Ok(value) => value,
         Err(_) => {
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
             return Ok(build_pre_plugin_reject_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 b"Invalid backend path coordinates",
@@ -37137,7 +37150,21 @@ async fn handle_proxy_request_inner(
                     );
                     break;
                 }
-                Some(next)
+                // Validate before intermediate-attempt accounting so a
+                // builder refusal leaves exactly one terminal outcome.
+                let next_url = match build_backend_url_with_target(
+                    &proxy,
+                    &path,
+                    effective_query_string.as_ref(),
+                    &next.host,
+                    next.port,
+                    strip_len,
+                    next.path.as_deref(),
+                ) {
+                    Ok(url) => url,
+                    Err(_) => break,
+                };
+                Some((next, next_url))
             } else {
                 None
             };
@@ -37212,22 +37239,11 @@ async fn handle_proxy_request_inner(
             // result correctly if we break before dispatching to the new
             // target (e.g. its circuit breaker is open).
             let pre_rotation_cb_key = current_cb_target_key.clone();
-            if let Some(next) = next_retry_target {
+            if let Some((next, next_url)) = next_retry_target {
                 let target_changed = current_target.as_ref().is_some_and(|prev_target| {
                     next.host != prev_target.host || next.port != prev_target.port
                 });
-                current_url = match build_backend_url_with_target(
-                    &proxy,
-                    &path,
-                    effective_query_string.as_ref(),
-                    &next.host,
-                    next.port,
-                    strip_len,
-                    next.path.as_deref(),
-                ) {
-                    Ok(url) => url,
-                    Err(_) => break,
-                };
+                current_url = next_url;
                 current_cb_target_key =
                     Some(crate::circuit_breaker::target_key(&next.host, next.port));
                 current_target = Some(next);
