@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""Render the injector image contract with the CI-owned Helm executable."""
+"""Verify injector manifests and errors rendered by the CI-owned Helm executable."""
 
 import argparse
 from pathlib import Path
-import subprocess
 
 import yaml
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--helm", required=True)
+    parser.add_argument("--results", required=True)
     args = parser.parse_args()
-    helm = Path(args.helm)
-    if not helm.is_absolute() or not helm.is_file():
-        parser.error("--helm must name the CI-owned absolute Helm executable")
+    results = Path(args.results)
     root = Path(__file__).resolve().parents[2]
     chart = root / "charts/ferrum-mesh"
     default_tag = str(yaml.safe_load((chart / "Chart.yaml").read_text())["appVersion"])
@@ -48,20 +45,16 @@ def main():
                                  "injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE":
                                  "ferrumedge/ferrum-edge:test@" + digest}, None),
     ]
-    for name, overrides, expected in cases:
-        command = [str(helm), "template", "ferrum", str(chart), "--namespace", "ferrum",
-                   "--kube-version", "1.32.0", "--show-only", "templates/injector-deployment.yaml",
-                   "--set", "injector.enabled=true", "--set-string",
-                   "injector.caBundle=LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t"]
-        for key, value in overrides.items():
-            command.extend(["--set-string", key + "=" + value])
-        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
+    for index, (name, overrides, expected) in enumerate(cases):
+        returncode = int((results / f"injector-image-{index}.status").read_text())
+        stdout = (results / f"injector-image-{index}.out").read_text()
+        stderr = (results / f"injector-image-{index}.err").read_text()
         if expected is None:
-            assert result.returncode != 0, f"{name}: render unexpectedly succeeded"
-            assert "-ebpf-tools tag" in result.stderr, f"{name}: {result.stderr}"
+            assert returncode != 0, f"{name}: render unexpectedly succeeded"
+            assert "-ebpf-tools tag" in stderr, f"{name}: {stderr}"
         else:
-            assert result.returncode == 0, f"{name}: {result.stderr}"
-            deployment = next(doc for doc in yaml.safe_load_all(result.stdout)
+            assert returncode == 0, f"{name}: {stderr}"
+            deployment = next(doc for doc in yaml.safe_load_all(stdout)
                               if doc and doc.get("kind") == "Deployment")
             container = deployment["spec"]["template"]["spec"]["containers"][0]
             images = [item["value"] for item in container["env"]
