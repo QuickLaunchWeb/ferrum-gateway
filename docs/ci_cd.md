@@ -2835,6 +2835,45 @@ The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto
 
 ## Image Signatures, SBOMs, and Provenance
 
+**Open validation incident ([#4856](https://github.com/ferrum-edge/ferrum-edge/issues/4856)):**
+[release run 33984483575, job 101372033947](https://github.com/ferrum-edge/ferrum-edge/actions/runs/33984483575/job/101372033947)
+failed on 2026-09-05 after pulling the pinned Syft image. Its combined scan/jq
+step returned 1 without identifying the failed operation; signing and
+verification were skipped and no SPDX artifact survived. The contract below
+describes the required release behavior, not proof that this release met it.
+
+`release-sbom-smoke.yml` provides a read-only hosted diagnostic path on PRs and
+main pushes that change the release workflow or smoke harness. It scans the
+three immutable manifest digests recorded in that run, in Docker Hub and GHCR,
+on both `linux/amd64` and `linux/arm64` (12 independent matrix entries). It
+extracts the production Syft command and manifest/SPDX jq predicates directly
+from `release.yml`; it does not execute Ferrum images. Focused hosted regression
+fixtures exercise both SPDX description encodings and reject missing/empty
+contents. No registry login, signing, publication, or OIDC permission is used.
+
+For each entry, the `release-sbom-*` artifact is retained for 14 days, including
+on failure: `status.json` identifies the immutable subject, platform descriptor,
+and each operation's exit/timeout status; separate stdout/stderr files distinguish
+manifest inspection, Syft failure, and jq rejection; `spdx-summary.json` reports
+field shapes/counts; and any generated SPDX file plus the exact predicate and
+scan command are retained. Only anonymous scans of these public images supply
+the evidence. Do not add credentials or authenticated debug dumps to this lane.
+
+Root should inspect these hosted artifacts before proposing a production fix.
+Anonymous registry access can fail independently of the authenticated release
+scan, so compare its stage and error before attributing the original failure.
+The pinned Syft v1.49.0 [encoder](https://github.com/anchore/syft/blob/v1.49.0/syft/format/common/spdxhelpers/to_format_model.go)
+constructs the document `DESCRIBES` relationship and its
+[default SPDX version](https://github.com/anchore/syft/blob/v1.49.0/syft/format/internal/spdxutil/versions.go)
+is 2.3; source inspection alone does not establish why this scan failed.
+This diagnostic lane leaves the frozen privileged release job and its inputs
+unchanged. It does not repair existing attestations or retain evidence from
+future release jobs themselves. Resolving #4856 still requires an evidenced
+production correction (including release failure artifacts), followed by
+successful signature, provenance, immutable-subject, and per-platform SBOM
+verification. A green smoke run alone is insufficient for issue closure or
+downstream reliance on the release's attestation claim.
+
 Every version-tag release signs and attests the final standard, `-ebpf`, and
 `-ebpf-tools` multi-architecture image digests in both Docker Hub and GHCR. The
 per-platform push-by-digest builds deliberately retain `provenance: false`:
