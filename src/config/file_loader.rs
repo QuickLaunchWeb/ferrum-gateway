@@ -44,7 +44,9 @@ use crate::config::stable_file::{
     read_stable_file, stable_file_error_anyhow,
 };
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
-use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::config::validation_pipeline::{
+    ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+};
 use crate::config::yaml_alias_budget::admit_yaml_alias_expansion;
 use serde::Deserialize;
 use std::path::Path;
@@ -430,6 +432,18 @@ pub fn load_config_from_file(
             "Configuration validation failed: {} stream proxy error(s) found",
         ))
         .run()?;
+
+    // File mode keeps its stricter field, identity and local-file checks above,
+    // then runs the complete shared admission gate used by database/CP loads.
+    // Do not duplicate that validator list here: newly added runtime rejection
+    // rules must also fail `validate` and SIGHUP before publication.
+    let runtime_errors = collect_rejecting_runtime_config_errors(&config);
+    if !runtime_errors.is_empty() {
+        anyhow::bail!(
+            "Configuration validation failed: {}",
+            runtime_errors.join("; ")
+        );
+    }
 
     info!(
         "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",
