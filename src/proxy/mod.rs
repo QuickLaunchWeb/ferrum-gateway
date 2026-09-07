@@ -29478,7 +29478,7 @@ async fn handle_proxy_request_on_frontend_port(
     // outlives this function scope.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
-    let response = handle_proxy_request_inner(
+    let response = boxed_handle_proxy_request_inner(
         req,
         state,
         remote_addr,
@@ -29497,6 +29497,39 @@ async fn handle_proxy_request_on_frontend_port(
         *resp.body_mut() = body.with_request_guard(request_guard);
         resp
     })
+}
+
+/// Keep the full routing/dispatch future out of the admission wrapper and
+/// Hyper's per-stream service future. In particular, H2 constructs and moves
+/// that service future before spawning it; boxing a task at spawn time does
+/// not bound those earlier stack temporaries. Rejection-only boxes also leave
+/// the successful direct-H2 dispatch pipeline embedded in every service call.
+///
+/// Construct out of line so the large temporary is gone before polling the
+/// pipeline. The caller retains the request guard and attaches it to the body
+/// exactly as before; dropping this future still cancels the same request.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_handle_proxy_request_inner(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    remote_addr: SocketAddr,
+    is_tls: bool,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
+    connection_metadata: RequestConnectionMetadata,
+) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
+    Box::pin(handle_proxy_request_inner(
+        req,
+        state,
+        remote_addr,
+        is_tls,
+        tls_client_cert_der,
+        tls_client_cert_chain_der,
+        mtls_auth_connection_cache,
+        connection_metadata,
+    ))
 }
 
 /// Inner implementation of [`handle_proxy_request`] — separated so the outer

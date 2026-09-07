@@ -1958,7 +1958,19 @@ async fn start_direct_h2_test_gateway(
                     .max_header_list_size(state.max_header_size_bytes as u32);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
-                    async move { handle_proxy_request(req, state, remote_addr, false, None, None).await }
+                    async move {
+                        let request =
+                            handle_proxy_request(req, state, remote_addr, false, None, None);
+                        // This future is embedded in Hyper's service future.
+                        // Do not box it in the fixture: that would hide a
+                        // regression at the production request boundary.
+                        let bytes = std::mem::size_of_val(&request);
+                        assert!(
+                            bytes <= 32 * 1024,
+                            "frontend service future must stay within 32 KiB, got {bytes} bytes"
+                        );
+                        request.await
+                    }
                 });
                 let _ = builder.serve_connection_with_upgrades(io, svc).await;
             });
@@ -2063,5 +2075,10 @@ async fn assert_direct_h2_host_and_authority(h2_frontend: bool) {
         Some(expected.as_str()),
         "Hyper :authority must include the same non-default port"
     );
-    let _ = response.into_body().collect().await;
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("complete H2 response");
+    assert_eq!(body.to_bytes(), Bytes::from_static(b"ok"));
 }
