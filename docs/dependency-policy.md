@@ -583,6 +583,15 @@ request cannot normalize those comments. Correct them only as part of an
 authorized, coordinated rotation of the trusted policy; do not copy the legacy
 annotation onto new uses.
 
+The install-action v2.87.5 update applies to `ci.yml` and
+`dependency-audit.yml`. The ARM64 release producer and the coverage workflow
+retain the trusted v2.87.2 SHA, including their existing `# v2` comments.
+Dependabot updates must preserve those frozen surfaces; even a patch release
+with unchanged action inputs cannot rotate them through an ordinary PR. The
+v2.87.5 action retains the composite runtime, checksum verification default,
+and existing `tool`/`fallback` inputs. No policy digest is refreshed for this
+dependency update.
+
 #### Scope of the repository-script (automation) freeze
 
 The same verifier also freezes repository scripts, and it does so bluntly: once
