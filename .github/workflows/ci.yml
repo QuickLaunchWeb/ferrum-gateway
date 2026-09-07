@@ -5850,6 +5850,23 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Extend runner swap for sanitizer compilation
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          # The observed cold compile reached 14.3 GiB process RSS, less than
+          # 250 MiB available RAM and nearly full 3 GiB swap before shutdown.
+          # Match the existing unit/PKCS11 jobs' bounded 12 GiB extension,
+          # preserving the runner's existing swap and every compiler/test bound.
+          free -h
+          df -h /mnt
+          sudo fallocate -l 12G /mnt/ferrum-fuzz-swapfile
+          sudo chmod 600 /mnt/ferrum-fuzz-swapfile
+          sudo mkswap /mnt/ferrum-fuzz-swapfile
+          sudo swapon /mnt/ferrum-fuzz-swapfile
+          free -h
+          swapon --show
+
       - name: Install required build dependency
         run: |
           set -euo pipefail

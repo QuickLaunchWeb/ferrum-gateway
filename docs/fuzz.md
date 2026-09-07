@@ -159,8 +159,10 @@ A second, best-effort channel emits at most nine notice annotations: the initial
 sample, first available-memory crossings of 75/50/25/10/5 percent, first free-swap
 crossings of 25/5 percent when swap exists, and the first increase in exposed root
 cgroup OOM counters. Simultaneous reasons share one annotation. Notices carry
-only selected numeric counters, are forwarded through the runner's live timeline,
-and do not grant API credentials to the observer or compiler. They can also be
+only selected numeric counters, are queued as runner timeline issues,
+and do not grant API credentials to the observer or compiler. Results-only live
+step updates can omit annotations; queuing does not establish that the Checks
+API exposes them before step/job completion. They can also be
 lost if the runner stops before forwarding them; missing records do not prove
 absence of memory pressure. Validate retrieval on a hosted run before relying
 on this channel. Thresholds select diagnostic samples and do not stop the build.
@@ -178,6 +180,18 @@ may include other runner processes; none alone proves that rustc exhausted
 memory. Compare the final samples and cgroup OOM counters with the runner's
 termination annotation before attributing a shutdown to resource pressure.
 
-This is diagnostic only: compiler/profile/cache settings, AddressSanitizer,
-all seven targets and every libFuzzer bound remain unchanged. The scheduled
-longer discovery workflow is unchanged.
+The second trial recovered 44 samples and six notices after a runner shutdown
+(exit 143). The largest visible process reached about 14.3 GiB RSS, available
+host memory fell below 250 MiB and the 3 GiB swap area had less than 45 MiB free.
+Root cgroup OOM counters were unavailable, so this establishes severe sampled
+pressure without proving a kernel OOM kill or the exact shutdown cause. Notices
+were not observed through the Checks API during the run; both channels became
+available afterward, so this is not proof of recovery after hard runner loss.
+
+Main/manual jobs now add a bounded 12 GiB swap file under `/mnt`, following the
+existing unit/PKCS11 provisioning. Existing swap remains enabled; provisioning
+fails visibly if allocation or activation fails. The observer records whether
+this adds useful headroom, and a fresh full run must validate it. Paging may
+increase wall time; this is not a measured latency improvement. Compiler/profile/
+cache settings, AddressSanitizer, all seven targets and every libFuzzer bound
+remain unchanged. The scheduled longer discovery workflow is unchanged.
