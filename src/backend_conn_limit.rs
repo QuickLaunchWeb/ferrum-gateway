@@ -1095,3 +1095,5 @@ mod tests {
         assert_eq!(limiter.current("h", 9090), 0);
     }
 }
+
+// CI lane probe: exercises the gated pull-request plan (throwaway).
