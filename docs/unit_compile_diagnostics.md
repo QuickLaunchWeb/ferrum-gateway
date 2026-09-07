@@ -119,16 +119,36 @@ three-job measurement spent 533.04s in that binary target after separately
 compiling the normal library and library test harness; the binary finished
 last. Its module declarations duplicated the library's gateway source tree.
 
-The executable now retains the same non-Windows jemalloc declaration and calls
-`ferrum_edge::run_gateway_cli()` under its explicit unsafe process-start contract.
-The caller must enter once before concurrent environment access or application
-thread startup, preserving the original environment-mutation precondition.
-Startup bodies live in `src/gateway_entry.rs`,
-included at the library root to preserve existing crate-relative paths and
-implicit tracing targets. The version constant remains the library's existing
-Cargo-derived constant. No startup ordering, error handling, secret resolution,
-crypto initialization, runtime sizing, shutdown logic or test selections change.
-CI relevance rules and source-contract assertions follow the startup file.
+The executable retains the same non-Windows jemalloc declaration and imports
+its gateway modules from the library with `use ferrum_edge::*`. Startup bodies
+remain in `src/gateway_entry.rs`, included at the binary root; they are not
+included by the library. This keeps the shared gateway modules compiled once
+per profile/feature set while library consumers, including the isolated fuzz
+workspace, do not compile the executable's CLI/runtime/mode-dispatch pipeline.
+There is no fuzz-only configuration branch and no change to fuzz targets,
+features, instrumentation or execution bounds.
+
+The initial extraction in #4727 also put startup in the library. Its hidden
+`ferrum_edge::run_gateway_cli()` entry has been replaced by the binary's private
+entry function, retaining the same unsafe process-start contract. Startup still
+runs once before concurrent environment access or application thread startup.
+Two narrow hidden startup adapters retain the private configuration seams:
+`startup::publish_gateway_stream_settings(&EnvConfig)` publishes the accepted
+stream settings, and `startup::initialize_gateway_buffer_budgets(&EnvConfig)`
+publishes the three process-buffer budgets. Both retain the same accepted
+fields, ordering and startup positions, before listeners or request processing
+begin. Configuration parsing and validation stay pure. The buffer budgets keep
+their existing first-initialization-wins and restart-to-change semantics.
+
+Both crate roots have the `ferrum_edge` tracing target, and crate-relative paths
+in startup resolve to the imported library modules. The version remains the
+library's Cargo-derived constant. Startup ordering, error handling, secret
+resolution, crypto initialization, runtime sizing, shutdown logic and test
+selections are unchanged. CI relevance rules and source-contract assertions
+continue to follow `src/gateway_entry.rs`. All seven sanitizer targets still
+exercise the same library APIs. Their previous successful cold measurements
+predate the initial startup extraction and are not a controlled comparison with
+the enlarged library; new hosted evidence is required for this separation.
 
 Hosted cold/warm default and ACME timings, memory/paging and complete test
 readiness must be measured before claiming a reduction. Production optimization

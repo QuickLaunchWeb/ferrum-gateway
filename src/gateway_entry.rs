@@ -1,4 +1,4 @@
-// Included at the library root to preserve the gateway tracing target and crate paths.
+// Included at the binary root; shared gateway modules are imported from the library.
 use clap::Parser;
 use config::{AdminHttpExposure, EnvConfig, OperatingMode};
 use tracing::{Level, Metadata, debug, error, info, warn};
@@ -111,8 +111,7 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
 /// threads or runtimes exist. The startup pipeline resolves secrets and mutates
 /// the process environment before starting its logging workers and main runtime;
 /// callers must not access the environment concurrently with this initialization.
-#[doc(hidden)]
-pub unsafe fn run_gateway_cli() {
+unsafe fn run_gateway_cli() {
     // ── CLI parsing ─────────────────────────────────────────────────────
     // Parse before anything else so `--settings`/`--spec`/`--mode` env var
     // overrides are in place before `CONF_FILE_CACHE` OnceLock is triggered
@@ -730,7 +729,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // `ferrum-edge validate` must not mutate a live process at all. This is the
     // one publication point, and it is on the serving path only — the `validate`
     // subcommand returns from `cli::execute_validate` and never reaches here.
-    env_config.publish_process_wide_stream_settings();
+    crate::startup::publish_gateway_stream_settings(&env_config);
 
     // Publish discovery body ceilings before any mode can start Kubernetes /
     // Consul pollers, so the process OnceLock matches the accepted EnvConfig
@@ -772,33 +771,8 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.max_concurrent_fault_delays,
     );
 
-    // Publish the buffered-response bounds before any listener accepts traffic,
-    // so the very first retained response is already charged against the
-    // aggregate budget and can never fall back to an unlimited ceiling
-    // (GHSA-pwcm-6rh8-f2gh).
-    crate::proxy::response_buffer_budget::init(
-        env_config.response_buffer_fallback_max_bytes,
-        env_config.response_buffer_max_total_bytes,
-    );
-
-    // Same rule for the aggregate budget that bounds governed REQUEST decodes
-    // (GHSA-3973-47g5-4mcx + GHSA-pwcm-6rh8-f2gh): published before the first
-    // listener binds, so no governed compressed upload can ever be decoded
-    // against a budget the operator did not configure.
-    crate::proxy::response_buffer_budget::init_request_decode(
-        env_config.request_decode_max_total_bytes,
-    );
-
-    // Same rule for the aggregate budget that bounds buffered client REQUEST
-    // bodies (issue #4153). Published before the first listener binds, so the
-    // very first prebuffered upload — which `waf` request-body inspection
-    // reaches in the `authenticate` phase, before any principal is admitted —
-    // is already collected under a finite ceiling and charged against the
-    // aggregate budget.
-    crate::proxy::response_buffer_budget::init_request_buffer(
-        env_config.request_buffer_fallback_max_bytes,
-        env_config.request_buffer_max_total_bytes,
-    );
+    // Publish all process buffer ceilings before any listener accepts traffic.
+    crate::startup::initialize_gateway_buffer_budgets(&env_config);
 
     // Initialize DTLS buffer config from resolved EnvConfig before any DTLS sessions.
     crate::dtls::init_dtls_buf_config(
