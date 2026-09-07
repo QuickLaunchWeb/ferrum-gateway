@@ -2856,6 +2856,9 @@ async fn supported_gateway_request_headers_reach_backend_beside_rejected_route()
     // The harness owns an ephemeral listener instead of binding Gateway port
     // 80. Keep the translated route, destination and filter configuration.
     translation.config.proxies[0].listen_port = None;
+    // Translation returns an internal snapshot; the file-mode fixture needs
+    // the versioned envelope normally supplied by its configuration source.
+    translation.config.version = ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string();
     let yaml = serde_yaml::to_string(&translation.config).expect("serialize translated config");
     let harness = GatewayHarness::builder()
         .mode_in_process()
