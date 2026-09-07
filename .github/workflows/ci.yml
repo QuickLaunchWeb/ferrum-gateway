@@ -680,6 +680,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
+      - name: Extend runner swap for the ACME feature compile
+        run: |
+          set -euo pipefail
+          # Same runner-loss mitigation as Unit Tests: a cold `--features acme`
+          # library compile can exceed hosted-runner RAM and the VM dies with
+          # "The runner has received a shutdown signal" (exit 143) before any
+          # diagnostic prints. Swap headroom turns that into paging.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
+
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-debug"
