@@ -853,6 +853,13 @@ A proxy-scoped plugin applies only when the target proxy lists it in `plugins`;
 The plugin-config row and the association commit in one transaction, and every
 touched proxy's `updated_at` advances so the next poll / control-plane
 broadcast republishes it. `GET /proxies/{id}` is therefore authoritative: a
+Plugin and proxy writes validate their complete prospective plugin composition
+before persistence. Invalid CORS/mesh-dispatch ordering, exclusive-instance
+conflicts, metric-tag plan budgets and global registry ownership return `400`;
+the rejected plugin row and association are not committed. File/DB/CP admission
+and runtime cache publication use the same checks. See
+[Composition admission](plugins.md#composition-admission).
+
 `201` from `POST /plugins/config` means *attached*, not merely created. A
 `proxy_id` that does not exist in the request's namespace is rejected with
 `400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
