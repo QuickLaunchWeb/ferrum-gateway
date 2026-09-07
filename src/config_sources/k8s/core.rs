@@ -994,7 +994,26 @@ fn endpoint_backend_port(
     slice: &CoreEndpointSlice,
 ) -> Option<u16> {
     match service_port_spec.and_then(|port| port.target_port.as_ref()) {
-        Some(ServiceTargetPort::Number(port)) if *port != 0 => Some(*port),
+        Some(ServiceTargetPort::Number(port)) if *port != 0 => {
+            // Kubernetes defaults targetPort to the Service port. When dialing
+            // an endpoint directly, the matching slice port is authoritative,
+            // including for manually managed selectorless Services.
+            let endpoint_port = if let Some(name) =
+                service_port_spec.and_then(|port| port.name.as_deref())
+            {
+                slice
+                    .ports
+                    .iter()
+                    .find(|port| port.name.as_deref() == Some(name))
+                    .and_then(|port| port.port)
+            } else {
+                match slice.ports.as_slice() {
+                    [only] if only.name.is_none() => only.port,
+                    _ => None,
+                }
+            };
+            endpoint_port.or(Some(*port))
+        }
         Some(ServiceTargetPort::Name(name)) => slice
             .ports
             .iter()

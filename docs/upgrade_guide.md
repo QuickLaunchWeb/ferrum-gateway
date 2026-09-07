@@ -215,6 +215,22 @@ RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Fer
 
 **Operator action:** any HTTP/1.1 client that omitted Host (non-conformant scanners, some raw sockets, misconfigured health probes) will start seeing `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that is the intended protocol.
 
+### EndpointSlice ports take precedence for direct endpoint routing (issue #4817)
+
+For selectorless and headless Services that expand onto EndpointSlice addresses,
+a matching slice port now takes precedence over a numeric Service `targetPort`.
+This includes `targetPort` defaulted by Kubernetes to the Service port and an
+explicitly different numeric value: the served object cannot distinguish them.
+Named Service ports match the slice port name; an unnamed Service port matches
+only a sole unnamed slice port. If no matching slice port is available, the
+numeric target remains the fallback. Named target resolution is unchanged.
+Selector-based ClusterIP routing still uses the Service DNS name and port.
+
+**Operator action:** verify manually managed EndpointSlices carry the intended
+backend port. Headless DNS fallback also uses a matching slice port, since its
+DNS answers are endpoint addresses rather than a ClusterIP. See Kubernetes'
+[EndpointSlice contract](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/).
+
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
 
 Auto-emitted `istio-vs-req-xform-*` / `istio-vs-resp-xform-*` consumers no
