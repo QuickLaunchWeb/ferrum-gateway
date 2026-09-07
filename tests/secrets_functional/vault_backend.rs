@@ -7,8 +7,9 @@
 
 use crate::common::containers::{VaultContainer, fail_in_ci_else_skip, start_vault_dev_container};
 use crate::common::env::{EnvGuard, assert_resolved_var};
-use ferrum_edge::secrets::vault::VaultClientWrapper;
-use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_secret};
+use ferrum_edge::secrets::{
+    resolve_all_env_secrets, resolve_external_reference, resolve_secret,
+};
 use serial_test::serial;
 use std::time::Duration;
 use wiremock::matchers::{header, method, path};
@@ -27,12 +28,13 @@ const INVALID_ADDRESSES: &[(&str, &str)] = &[
 
 #[tokio::test]
 #[serial]
-async fn vault_client_address_validation_returns_errors_without_panicking() {
+async fn vault_address_validation_precedes_reference_parsing_without_panicking() {
     let guard = EnvGuard::new();
     guard.set("VAULT_TOKEN", "address-token-sentinel");
     for &(address, reason) in INVALID_ADDRESSES {
         guard.set("VAULT_ADDR", address);
-        let error = VaultClientWrapper::new()
+        let error = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
+            .await
             .err()
             .expect("invalid address must return an ordinary error");
         assert!(error.contains("VAULT_ADDR") && error.contains(reason));
@@ -41,10 +43,16 @@ async fn vault_client_address_validation_returns_errors_without_panicking() {
         assert!(!error.contains("address-token-sentinel"));
     }
 
-    // Construction must still accept both supported schemes without a server.
+    // VaultClientWrapper is private. The public provider path constructs it
+    // before checking KV v2 reference shape, so this exact later error proves
+    // both schemes constructed successfully without requiring a network call.
     for address in ["https://vault.example.com:8200", "http://127.0.0.1:8200"] {
         guard.set("VAULT_ADDR", address);
-        assert!(VaultClientWrapper::new().is_ok());
+        let error = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
+            .await
+            .err()
+            .expect("construction succeeds before the reference is rejected");
+        assert!(error.contains("Invalid Vault KV v2 reference"), "{error}");
     }
 }
 
