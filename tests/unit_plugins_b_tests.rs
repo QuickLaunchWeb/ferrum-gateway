@@ -11,7 +11,6 @@
 //! Run with: cargo test --test unit_plugins_b_tests [filter]
 
 mod unit {
-    #[allow(dead_code)]
     pub mod env_lock;
 
     pub mod plugins {

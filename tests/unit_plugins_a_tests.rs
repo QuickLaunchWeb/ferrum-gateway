@@ -11,7 +11,6 @@
 //! Run with: cargo test --test unit_plugins_a_tests [filter]
 
 mod unit {
-    #[allow(dead_code)]
     pub mod env_lock;
 
     pub mod plugins {
@@ -70,6 +69,7 @@ mod unit {
         mod jwks_auth_inline_keys_tests;
         mod jwks_auth_multi_audience_tests;
         mod jwks_auth_output_claim_header_tests;
+        #[allow(dead_code, unused_imports)] // consumed by the k–z half
         mod jwks_auth_support;
         mod jwks_auth_tests;
         mod jwks_cache_tests;

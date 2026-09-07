@@ -2,9 +2,7 @@ mod admin;
 mod build;
 mod cli;
 mod config;
-#[allow(dead_code)]
 mod env_lock;
-#[allow(dead_code)]
 mod gateway_trust_observability_lock;
 mod identity;
 mod logging_tests;

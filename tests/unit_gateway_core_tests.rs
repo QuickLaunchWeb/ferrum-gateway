@@ -10,9 +10,7 @@
 //! Run with: cargo test --test unit_gateway_core_tests [filter]
 
 mod unit {
-    #[allow(dead_code)]
     pub mod env_lock;
-    #[allow(dead_code)]
     pub mod gateway_trust_observability_lock;
     #[allow(dead_code, unused_imports)]
     pub(crate) mod tls;
