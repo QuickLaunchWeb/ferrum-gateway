@@ -1496,7 +1496,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    bidirectional_copy(
+    bidirectional_copy_for_relay(
         client,
         backend,
         idle_timeout,
@@ -1504,7 +1504,6 @@ where
         backend_read_timeout,
         backend_write_timeout,
         buf_size,
-        None,
     )
     .await
 }
@@ -8404,6 +8403,69 @@ impl CopyDirectionState {
     }
 }
 
+// The queue state and watermark are private. Keep their deterministic
+// transition check here; end-to-end timeout coverage lives in tests/.
+#[cfg(test)]
+mod copy_direction_queue_tests {
+    use super::*;
+    use std::task::Context;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn write_watermark_disarms_only_after_drain_and_rearms_for_new_data() {
+        let (mut client, mut client_peer) = tokio::io::duplex(8);
+        let (mut backend, mut backend_peer) = tokio::io::duplex(1);
+        let mut state = CopyDirectionState::new(8);
+        let bytes = AtomicU64::new(0);
+        let write_watermark = AtomicU64::new(u64::MAX);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        client_peer.write_all(b"abc").await.unwrap();
+        for expected in b"abc" {
+            assert!(
+                poll_copy_direction(
+                    &mut cx,
+                    Pin::new(&mut client),
+                    Pin::new(&mut backend),
+                    &mut state,
+                    &bytes,
+                    None,
+                    None,
+                    Some(&write_watermark),
+                )
+                .is_pending()
+            );
+            if *expected == b'c' {
+                assert!(state.phase == CopyPhase::Reading);
+                assert_eq!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+            } else {
+                assert!(state.phase == CopyPhase::Writing);
+                assert_ne!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+                assert_eq!(backend_peer.read_u8().await.unwrap(), *expected);
+            }
+        }
+        assert_eq!(bytes.load(Ordering::Relaxed), 3);
+        // The final byte still occupies the backend socket buffer. A new
+        // client byte is now queued but cannot make write progress.
+        client_peer.write_all(b"d").await.unwrap();
+        assert!(
+            poll_copy_direction(
+                &mut cx,
+                Pin::new(&mut client),
+                Pin::new(&mut backend),
+                &mut state,
+                &bytes,
+                None,
+                None,
+                Some(&write_watermark),
+            )
+            .is_pending()
+        );
+        assert!(state.phase == CopyPhase::Writing);
+        assert_ne!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(bytes.load(Ordering::Relaxed), 3);
+    }
+}
+
 enum Phase1Outcome {
     ClientToBackend(Result<(), (StreamIoSide, std::io::Error)>),
     BackendToClient(Result<(), (StreamIoSide, std::io::Error)>),
@@ -8553,6 +8615,11 @@ where
                     }
                 }
 
+                // Nothing remains queued for the backend. Client silence
+                // must not retain the previous write-stall deadline.
+                if let Some(wm) = write_watermark {
+                    wm.store(u64::MAX, Ordering::Relaxed);
+                }
                 state.pos = 0;
                 state.cap = 0;
                 state.phase = CopyPhase::Reading;
@@ -10560,12 +10627,8 @@ fn libc_splice_loop(
                 ));
             }
         }
-        // See the io_uring loop's analogous block — the c2b worker must fire
-        // `backend_write_timeout_ms` even when stuck in the Reading phase, to
-        // match `bidirectional_copy`'s parent-watchdog semantics and the
-        // libc-async splice path's parent watchdog. The watermark is
-        // `u64::MAX` until c2b primes it on its first successful read, so
-        // this check stays inert until c2b actually carries data.
+        // The write watermark is disarmed whenever the pipe drains, so
+        // waiting for new client bytes cannot count as a backend write stall.
         if write_wm_active && let Some(wm) = write_watermark {
             let last = wm.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
@@ -10706,6 +10769,9 @@ fn libc_splice_loop(
                     ));
                 }
             }
+            if let Some(wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
+            }
         } else if n == 0 {
             shutdown_write_fd(dst_fd);
             return Ok(total);
@@ -10740,9 +10806,7 @@ fn libc_splice_loop(
                         ));
                     }
                 }
-                // Mirror the outer-loop check: the c2b worker must also
-                // fire backend_write_timeout when stuck in Phase 1 with
-                // stale queued bytes. See the outer-loop comment above.
+                // Keep the same queue-aware watermark as the outer check.
                 if write_wm_active && let Some(wm) = write_watermark {
                     let last = wm.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
@@ -10815,7 +10879,8 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 /// caller (Phase 1 watchdog in `bidirectional_splice`) reads it to fire
 /// `backend_read_timeout_ms` when the b2c direction's backend stops sending.
 /// `write_watermark` is primed when src→pipe produces queued bytes and
-/// refreshed on every successful pipe→dst splice. The caller fires
+/// refreshed on every successful pipe→dst splice, then disarmed when the
+/// pipe drains. The caller fires
 /// `backend_write_timeout_ms` from it for the c2b direction. Both are
 /// `Option<&AtomicU64>` because c2b only carries write_watermark and b2c only
 /// carries read_watermark — they share scope with the watchdog instead of
@@ -10970,6 +11035,9 @@ async fn splice_one_direction_no_guard(
                     half_close_relay_write_side(dst, dst_is_ktls).await?;
                     return Ok(());
                 }
+            }
+            if let Some(ref wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
             }
         } else if n == 0 {
             // EOF — source closed.
@@ -11246,6 +11314,9 @@ async fn resolve_ktls_splice_einval(
             }
             bytes.fetch_add(len as u64, Ordering::Relaxed);
             refresh_splice_write_progress(last_activity, write_watermark);
+            if let Some(wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
+            }
             KtlsSpliceEinval::Resume
         }
         KtlsRecvOutcome::Control { record_type, len } => {

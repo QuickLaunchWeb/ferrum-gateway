@@ -2653,3 +2653,107 @@ fn tcp_stream_duration_uses_instant_not_wall_clock() {
         disconnected_wall_forward.to_rfc3339()
     );
 }
+
+async fn assert_request_then_push_survives_write_timeout<C, B, F>(
+    mut client: C,
+    mut backend: B,
+    relay: F,
+) where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+    F: std::future::Future<Output = ferrum_edge::_test_support::StreamCopyResult>,
+{
+    let backend_work = async move {
+        assert_eq!(backend.read_u8().await.unwrap(), b'S');
+        for byte in 0..30u8 {
+            backend.write_all(&[byte]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // The client remains writable while receiving, then sends another
+        // request: draining once must not disable enforcement permanently.
+        assert_eq!(backend.read_u8().await.unwrap(), b'Q');
+        backend.write_all(b"!").await.unwrap();
+        backend.shutdown().await.unwrap();
+    };
+    let client_work = async move {
+        client.write_all(b"S").await.unwrap();
+        for expected in 0..30u8 {
+            assert_eq!(client.read_u8().await.unwrap(), expected);
+        }
+        client.write_all(b"Q").await.unwrap();
+        assert_eq!(client.read_u8().await.unwrap(), b'!');
+        client.shutdown().await.unwrap();
+    };
+    let (result, (), ()) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(relay, backend_work, client_work)
+    })
+    .await
+    .expect("request followed by active backend pushes must complete");
+    assert!(result.first_failure.is_none(), "{result:?}");
+    assert_eq!(result.bytes_client_to_backend, 2);
+    assert_eq!(result.bytes_backend_to_client, 31);
+}
+
+#[tokio::test]
+async fn test_userspace_and_mesh_relay_write_timeout_ignores_drained_queue() {
+    let (client, client_peer) = tokio::io::duplex(64);
+    let (backend, backend_peer) = tokio::io::duplex(64);
+    // This entry uses bidirectional_copy_for_relay, the same shared helper
+    // used by the mesh TCP/HBONE callers.
+    assert_request_then_push_survives_write_timeout(
+        client_peer,
+        backend_peer,
+        bidirectional_copy_for_test_with_timeouts(
+            client,
+            backend,
+            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(5)),
+            None,
+            Some(Duration::from_millis(500)),
+            1024,
+        ),
+    )
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_splice_write_timeout_ignores_drained_pipe() {
+    let (client, client_peer) = connected_tcp_pair().await;
+    let (backend, backend_peer) = connected_tcp_pair().await;
+    assert_request_then_push_survives_write_timeout(
+        client_peer,
+        backend_peer,
+        ferrum_edge::_test_support::bidirectional_splice_for_test_with_timeouts(
+            client,
+            backend,
+            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(5)),
+            None,
+            Some(Duration::from_millis(500)),
+            64 * 1024,
+        ),
+    )
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_io_uring_or_fallback_write_timeout_ignores_drained_pipe() {
+    let (client, client_peer) = connected_tcp_pair().await;
+    let (backend, backend_peer) = connected_tcp_pair().await;
+    assert_request_then_push_survives_write_timeout(
+        client_peer,
+        backend_peer,
+        ferrum_edge::_test_support::bidirectional_splice_io_uring_for_test_with_timeouts(
+            client,
+            backend,
+            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(5)),
+            None,
+            Some(Duration::from_millis(500)),
+            64 * 1024,
+        ),
+    )
+    .await;
+}
