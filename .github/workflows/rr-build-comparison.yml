@@ -1,0 +1,108 @@
+name: RoundRobin Build Comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Immutable ancestor commit SHA to compare with this workflow ref
+        type: string
+        required: true
+  pull_request:
+    paths:
+      - .github/workflows/rr-build-comparison.yml
+      - .github/scripts/run_rr_selection_comparison.py
+      - .github/scripts/run_rr_selection_comparison.sh
+      - .github/scripts/verify_rr_selection_benchmark.py
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/rr-build-comparison.yml
+      - .github/scripts/run_rr_selection_comparison.py
+      - .github/scripts/run_rr_selection_comparison.sh
+      - .github/scripts/verify_rr_selection_benchmark.py
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  contracts:
+    name: RR comparison evidence contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - run: |
+          python3 .github/scripts/run_rr_selection_comparison.py self-test
+          python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
+          bash -n .github/scripts/run_rr_selection_comparison.sh
+
+  compare:
+    name: Paired RR comparison with selected ancestor
+    if: github.event_name == 'workflow_dispatch'
+    needs: contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RR_BASE_SHA: ${{ inputs.baseline }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable ancestor before compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$RR_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$RR_BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
+            echo '::error::baseline must be an immutable nonzero commit SHA'
+            exit 1
+          fi
+          git cat-file -e "$RR_BASE_SHA^{commit}"
+          git merge-base --is-ancestor "$RR_BASE_SHA" HEAD
+      - uses: ./.github/actions/setup-rust-ci
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_BUILD_RUSTC_WRAPPER: ""
+        with:
+          shared-key: ci-perf
+          workspaces: |
+            . -> target
+            tests/performance/mesh -> target
+      - name: Stabilize performance compiler wrapper identity
+        run: |
+          set -euo pipefail
+          source="${FERRUM_SCCACHE_BIN:-}"
+          if [ -z "$source" ] || [ ! -x "$source" ]; then
+            printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+            echo "sccache is unavailable; performance builds will run uncached"
+            exit 0
+          fi
+
+          stable_root="${RUNNER_TEMP}/ferrum-performance-sccache"
+          stable_wrapper="${stable_root}/bin/sccache"
+          rm -rf "$stable_root"
+          mkdir -p "${stable_root}/bin"
+          cp -- "$source" "$stable_wrapper"
+          chmod 0755 "$stable_wrapper"
+          printf '%s\n' \
+            "RUSTC_WRAPPER=${stable_wrapper}" \
+            "CARGO_BUILD_RUSTC_WRAPPER=${stable_wrapper}" >> "$GITHUB_ENV"
+          echo "Performance compiler wrapper activated at a deterministic runner-local path"
+
+      - name: Run the unchanged paired selection gate
+        run: bash .github/scripts/run_rr_selection_comparison.sh
+      - name: Upload comparison data
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rr-build-comparison-${{ github.sha }}
+          path: tests/performance/ci_results/rr-comparison
+          if-no-files-found: error
+          retention-days: 7
