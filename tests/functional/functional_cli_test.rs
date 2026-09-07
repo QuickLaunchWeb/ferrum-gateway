@@ -599,6 +599,95 @@ fn hermetic_validate_command(temp_dir: &TempDir, args: &[&str]) -> Command {
     cmd
 }
 
+#[ignore]
+#[tokio::test]
+async fn functional_cli_file_admission_validate_and_run_agree() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../fixtures/file_admission_cases.json")).unwrap();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let spec = temp_dir.path().join("resources.json");
+        std::fs::write(&spec, serde_json::to_vec(&case["config"]).unwrap()).unwrap();
+        let mut command = hermetic_validate_command(
+            &temp_dir,
+            &["--mode", "file", "--spec", spec.to_str().unwrap()],
+        );
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("file validate must terminate")
+        .expect("run file validate");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(expected) = case["expected_error"].as_str() {
+            assert_eq!(output.status.code(), Some(1), "{name}: {combined}");
+            assert!(combined.contains(expected), "{name}: {combined}");
+
+            let failed = crate::common::TestGateway::builder()
+                .skip_auto_build()
+                .clear_env()
+                .mode_file(serde_json::to_string(&case["config"]).unwrap())
+                .max_attempts(1)
+                .spawn_expect_failure(Duration::from_secs(30))
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let diagnostic = failed.combined_output();
+            assert_eq!(failed.status.and_then(|status| status.code()), Some(1));
+            assert!(diagnostic.contains(expected), "{name}: {diagnostic}");
+            assert!(
+                diagnostic.contains("Configuration validation failed:"),
+                "run must reject at file admission: {name}: {diagnostic}"
+            );
+        } else {
+            assert!(output.status.success(), "{name}: {combined}");
+            assert!(
+                combined.contains("Validation passed."),
+                "{name}: {combined}"
+            );
+
+            // TCP fixture ports are replaced on every attempt; only a reported
+            // listener bind race permits another spawn. The harness proves
+            // readiness with this child's authenticated health identity.
+            let attempts = crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS;
+            let mut started = false;
+            for attempt in 1..=attempts {
+                let mut config = case["config"].clone();
+                let reservation = reserve_port().await.unwrap();
+                let port = reservation.port;
+                if config["proxies"][0].get("listen_port").is_some() {
+                    config["proxies"][0]["listen_port"] = port.into();
+                }
+                let builder = crate::common::TestGateway::builder()
+                    .skip_auto_build()
+                    .clear_env()
+                    .mode_file(serde_json::to_string(&config).unwrap())
+                    .reserve_listener_port(port)
+                    .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+                drop(reservation);
+                match builder.spawn_classified().await {
+                    Ok(mut gateway) => {
+                        gateway.shutdown();
+                        started = true;
+                        break;
+                    }
+                    Err(error) if error.listener_addr_in_use && attempt < attempts => {}
+                    Err(error) => panic!("{name}: {error}"),
+                }
+            }
+            assert!(started, "{name}: valid file must reach owned readiness");
+        }
+    }
+}
+
 /// Database-mode `validate` in the hermetic environment.
 ///
 /// Database-mode validate requires *both* `FERRUM_DB_TYPE` and `FERRUM_DB_URL`
@@ -3359,4 +3448,87 @@ async fn functional_cli_validate_migration_reads_without_mutation() {
             .to_string_lossy()
             .contains("backup")
     }));
+}
+
+const EMPTY_POOL_SHARD_CONFIG: &str =
+    "version: '1'\nproxies: []\nconsumers: []\nplugin_configs: []\nupstreams: []\n";
+
+async fn start_gateway_with_one_pool_shard(
+    mode: &str,
+    cp_address: Option<&str>,
+) -> (crate::common::TestGateway, Option<String>) {
+    for attempt in 1..=crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS {
+        let mut builder = crate::common::TestGateway::builder()
+            .skip_auto_build()
+            .clear_env()
+            .capture_output()
+            .env("FERRUM_POOL_SHARD_AMOUNT", "1")
+            .env("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true");
+        let mut reservation = None;
+        let mut address = None;
+        builder = match mode {
+            "file" => builder.mode_file(EMPTY_POOL_SHARD_CONFIG),
+            "database" => builder.mode_database_sqlite(),
+            "cp" => {
+                let held = reserve_port().await.unwrap();
+                let value = format!("127.0.0.1:{}", held.port);
+                builder = builder.reserve_listener_port(held.port);
+                reservation = Some(held);
+                address = Some(value.clone());
+                builder.mode_cp(crate::common::DbType::Sqlite, Some(value))
+            }
+            "dp" => builder.mode_dp(vec![format!("http://{}", cp_address.unwrap())]),
+            _ => panic!("unsupported fixture mode {mode}"),
+        };
+        drop(reservation);
+        match builder.spawn_classified().await {
+            Ok(gateway) => return (gateway, address),
+            Err(error)
+                if error.listener_addr_in_use
+                    && attempt < crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS => {}
+            Err(error) => panic!("{mode} with one pool shard: {error}"),
+        }
+    }
+    unreachable!("the final failed attempt returns its diagnostic")
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_pool_shard_one_validates_and_starts_file_database_cp_and_dp() {
+    let temp_dir = TempDir::new().unwrap();
+    let spec = temp_dir.path().join("resources.yaml");
+    std::fs::write(&spec, EMPTY_POOL_SHARD_CONFIG).unwrap();
+    for value in [0usize, 1, 2, 3, 64, 1 << 30] {
+        let mut command = hermetic_validate_command(
+            &temp_dir,
+            &["--mode", "file", "--spec", spec.to_str().unwrap()],
+        );
+        command
+            .env("FERRUM_POOL_SHARD_AMOUNT", value.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("validate must terminate")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "shard override {value}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Validation passed."));
+    }
+    for mode in ["file", "database"] {
+        let (mut gateway, _) = start_gateway_with_one_pool_shard(mode, None).await;
+        gateway.shutdown();
+    }
+    let (mut cp, address) = start_gateway_with_one_pool_shard("cp", None).await;
+    let (mut dp, _) = start_gateway_with_one_pool_shard("dp", address.as_deref()).await;
+    dp.shutdown();
+    cp.shutdown();
 }
