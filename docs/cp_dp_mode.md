@@ -48,6 +48,24 @@ CP and DP communicate via the `ConfigSync` gRPC service defined in `proto/ferrum
 - **`Subscribe(SubscribeRequest) -> stream ConfigUpdate`** — Server-streaming RPC. The DP subscribes and receives an initial full config snapshot followed by streaming updates whenever the CP detects config changes.
 - **`GetFullConfig(FullConfigRequest) -> FullConfigResponse`** — Unary RPC for on-demand full config retrieval.
 
+### Configuration message size
+
+ConfigSync uses the same **16 MiB (16,777,216 byte)** message limit as the mesh
+configuration consumers. The limit covers the complete encoded protobuf body,
+including configuration JSON, trust bundles, and version metadata; it is not a
+per-resource or JSON-only allowance. DPs accept snapshots and deltas above
+4 MiB up to this bound on both initial connection and subsequent updates.
+
+The CP checks each namespace's snapshot, delta, unary response, and stream
+recovery before transmission. An oversized message is refused with a warning
+containing `namespace`, `encoded_bytes`, and `max_bytes`, without configuration
+contents. Initial subscription and unary retrieval return `RESOURCE_EXHAUSTED`;
+an oversized recovery terminates the stream. Rejected broadcasts do not advance
+the DP registry's last-update timestamp. DPs retain their last-known-good
+configuration under the existing staleness policy. Reduce the affected
+namespace's configuration below the bound to restore delivery. CP liveness alone
+does not certify that every namespace's configuration is deliverable.
+
 ### Authentication
 
 All gRPC calls are authenticated with JWT HS256 tokens:
