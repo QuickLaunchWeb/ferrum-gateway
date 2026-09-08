@@ -75,12 +75,10 @@ mod unit {
         mod jwks_cache_tests;
         mod jwks_store_tests;
         mod jwt_auth_plugin_tests;
-        #[allow(dead_code, unused_imports)]
-        mod plugin_cache_tests; // shared helper, also compiled by the other half
 
         #[allow(unused_imports)]
-        pub(crate) use plugin_cache_tests::{
-            make_plugin_config_with_json, make_proxy, minimal_plugin_config,
+        pub(crate) use plugin_utils::{
+            make_plugin_config, make_plugin_config_with_json, make_proxy, minimal_plugin_config,
         };
     }
 }
