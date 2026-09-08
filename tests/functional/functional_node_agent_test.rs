@@ -72,6 +72,7 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
         let log_file = fs::File::create(&log_path).expect("node_agent log file");
         let log_err = log_file.try_clone().expect("clone node_agent log file");
         let mut command = Command::new(gateway_binary_path());
+        command.arg("run");
         prepend_noop_shell(&mut command, tmp.path());
         let metrics_token = uuid::Uuid::new_v4().to_string();
         let mut child = command

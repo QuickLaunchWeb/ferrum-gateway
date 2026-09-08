@@ -3000,10 +3000,8 @@ struct TcpConnParams {
     backend_scheme: BackendScheme,
     dns_override: Option<String>,
     dns_cache_ttl_seconds: Option<u64>,
-    backend_connect_timeout_ms: u64,
     backend_read_timeout_ms: u64,
     backend_write_timeout_ms: u64,
-    tcp_idle_timeout_seconds: u64,
     /// Hard cap on Phase 2 (half-close drain). Applies even when the session
     /// idle timeout is disabled, preventing a stalled peer from wedging the
     /// drain future forever. `0` disables the cap.
@@ -3777,18 +3775,6 @@ async fn handle_tcp_connection_inner(
             is_half_open_probe: false,
         };
 
-        // Honor DestinationRule per-port `connect_timeout_ms` and
-        // `tcp_idle_timeout_seconds` overrides on the L4/TCP path. The override
-        // is keyed by destination policy port and lives on the proxy's
-        // pre-computed `dispatch_port_overrides` map — single field read, no
-        // DashMap/ArcSwap traversal. `Some(0)` idle is an explicit disable.
-        let port_override = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|m| m.get(&backend_policy_port));
-        let effective_backend_connect_timeout_ms = port_override
-            .and_then(|override_config| override_config.connect_timeout_ms)
-            .unwrap_or(proxy.backend_connect_timeout_ms);
         let params = TcpConnParams {
             backend_host,
             backend_port,
@@ -3796,13 +3782,8 @@ async fn handle_tcp_connection_inner(
             backend_scheme: proxy.effective_scheme(),
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
-            backend_connect_timeout_ms: effective_backend_connect_timeout_ms,
             backend_read_timeout_ms: proxy.backend_read_timeout_ms,
             backend_write_timeout_ms: proxy.backend_write_timeout_ms,
-            tcp_idle_timeout_seconds: port_override
-                .and_then(|override_config| override_config.tcp_idle_timeout_seconds)
-                .or(proxy.tcp_idle_timeout_seconds)
-                .unwrap_or(global_tcp_idle_timeout),
             tcp_half_close_max_wait_seconds,
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
@@ -4162,8 +4143,9 @@ async fn handle_tcp_connection_inner(
                 // Target rotation can cross DestinationRule policy-port lanes.
                 // Resolve the connect budget for every attempt rather than
                 // retaining the failed target's per-port policy.
-                let (backend_connect_timeout_ms, _) = passthrough_timeout_policy(
+                let (backend_connect_timeout_ms, _) = tcp_timeout_policy(
                     &params,
+                    params.backend_policy_port,
                     proxy,
                     global_tcp_idle_timeout,
                 );
@@ -4312,8 +4294,12 @@ async fn handle_tcp_connection_inner(
         let passthrough_port_override = resolve_port_override(&params, params.backend_policy_port);
         // The relay belongs to the target that ultimately connected, so its
         // idle watchdog must use that target's policy lane as well.
-        let (_, tcp_idle_timeout_seconds) =
-            passthrough_timeout_policy(&params, proxy, global_tcp_idle_timeout);
+        let (_, tcp_idle_timeout_seconds) = tcp_timeout_policy(
+            &params,
+            params.backend_policy_port,
+            proxy,
+            global_tcp_idle_timeout,
+        );
         let idle_timeout =
             (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
 
@@ -4488,12 +4474,6 @@ async fn handle_tcp_connection_inner(
     }
 
     let is_backend_tls = params.backend_scheme == BackendScheme::Tcps;
-    let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
-    let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
-        Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
-    } else {
-        None
-    };
     let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
         Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
     } else {
@@ -5266,8 +5246,14 @@ async fn handle_tcp_connection_inner(
             }
         };
 
-        // Attempt backend TCP connection (with optional TLS origination)
-        let current_host_ref = current_host.as_str();
+        // Resolve every attempt from the selected policy lane, including retries
+        // after DNS, circuit-breaker, or connection-limit rejection.
+        let (backend_connect_timeout_ms, _) =
+            tcp_timeout_policy(&params, current_policy_port, proxy, global_tcp_idle_timeout);
+        let connect_timeout = Duration::from_millis(backend_connect_timeout_ms);
+        // The authenticated TLS name is independent of the socket dial host.
+        // Keep the cached verifier (including mesh identity policy) unchanged.
+        let tls_server_name = proxy.resolved_tls.sni.as_deref().unwrap_or(&current_host);
         let params_ref = &params;
         let outbound_pp = outbound_proxy_v2_header.as_deref();
         let connect_attempt = crate::dns::connect_candidates(
@@ -5278,7 +5264,7 @@ async fn handle_tcp_connection_inner(
                 if is_backend_tls {
                     connect_backend_tls_cached(
                         addr,
-                        current_host_ref,
+                        tls_server_name,
                         connect_timeout,
                         cached_backend_tls,
                         params_ref.tcp_fastopen_enabled,
@@ -5343,7 +5329,7 @@ async fn handle_tcp_connection_inner(
             Ok(result) => result.map_err(|error| match error {
                 crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
                     "Backend TCP connect budget exhausted after {}ms (last={})",
-                    params.backend_connect_timeout_ms,
+                    backend_connect_timeout_ms,
                     last_addr
                 ),
                 crate::dns::CandidateConnectError::Failed { source, .. } => source,
@@ -5453,6 +5439,10 @@ async fn handle_tcp_connection_inner(
             }
         }
     };
+    let (_, tcp_idle_timeout_seconds) =
+        tcp_timeout_policy(&params, current_policy_port, proxy, global_tcp_idle_timeout);
+    let idle_timeout =
+        (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
     let (_backend_socket_addr, mut backend_stream, _backend_inflight_guard) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
     let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
@@ -6212,10 +6202,8 @@ mod backend_target_selection_tests {
             backend_scheme: BackendScheme::Tcp,
             dns_override: None,
             dns_cache_ttl_seconds: None,
-            backend_connect_timeout_ms: 1000,
             backend_read_timeout_ms: 0,
             backend_write_timeout_ms: 0,
-            tcp_idle_timeout_seconds: 60,
             tcp_half_close_max_wait_seconds: 0,
             retry: None,
             upstream_id: Some("orders".to_string()),
@@ -6231,7 +6219,7 @@ mod backend_target_selection_tests {
     }
 
     #[test]
-    fn passthrough_retry_timeouts_follow_current_policy_port() {
+    fn tcp_retry_timeouts_follow_current_policy_port() {
         let mut proxy = proxy_with_subset(None);
         proxy.backend_connect_timeout_ms = 5_000;
         proxy.tcp_idle_timeout_seconds = Some(300);
@@ -6255,18 +6243,22 @@ mod backend_target_selection_tests {
         ]));
         let mut params = retry_params();
         params.backend_policy_port = 6379;
-        params.backend_connect_timeout_ms = 9_000;
-        params.tcp_idle_timeout_seconds = 0;
         params.dispatch_port_overrides = proxy.dispatch_port_overrides.clone();
 
-        assert_eq!(passthrough_timeout_policy(&params, &proxy, 600), (9_000, 0));
+        assert_eq!(
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
+            (9_000, 0)
+        );
 
         params.backend_policy_port = 6380;
-        assert_eq!(passthrough_timeout_policy(&params, &proxy, 600), (250, 2));
+        assert_eq!(
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
+            (250, 2)
+        );
 
         params.backend_policy_port = 6381;
         assert_eq!(
-            passthrough_timeout_policy(&params, &proxy, 600),
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
             (5_000, 300),
             "a lane without overrides must not inherit the initial target's values"
         );
@@ -7662,17 +7654,15 @@ fn resolve_port_override(
         .and_then(|m| m.get(&port))
 }
 
-/// Resolve passthrough timeouts for the currently selected policy port.
-///
-/// `TcpConnParams` contains the effective values for the initially selected
-/// target. Passthrough retries can rotate to a different policy-port lane, so
-/// fallback must use the proxy/global defaults rather than those cached values.
-fn passthrough_timeout_policy(
+/// Resolve TCP timeouts for the selected policy port on either relay path.
+/// A lane without overrides uses proxy/global defaults, never the first lane.
+fn tcp_timeout_policy(
     params: &TcpConnParams,
+    policy_port: u16,
     proxy: &Proxy,
     global_tcp_idle_timeout: u64,
 ) -> (u64, u64) {
-    let port_override = resolve_port_override(params, params.backend_policy_port);
+    let port_override = resolve_port_override(params, policy_port);
     let connect_timeout_ms = port_override
         .and_then(|override_config| override_config.connect_timeout_ms)
         .unwrap_or(proxy.backend_connect_timeout_ms);

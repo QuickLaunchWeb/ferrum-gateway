@@ -713,6 +713,18 @@ its stale `nextUpdate`, so the
 exported rather than counting further and further negative for material nothing
 staples.
 
+**Every certificate source is enrolled, including the Gateway-API frontend.**
+The operator-configured single-certificate listener and the Gateway-API
+multi-certificate frontend accept a staple through one shared code path that
+validates it against the chain that will serve it, logs the acceptance, fires
+the lead-time warning, and enrols it in the hourly re-check — a certificate
+source cannot admit a staple without also arming its retirement. For the
+SNI-selecting Gateway resolver the retirement republishes the whole name index
+without the staple in a single atomic store, so every name the certificate is
+reachable under — its declared listener hostname, its certificate SAN aliases,
+and the fallback slot — stops offering the expired response on the same
+handshake.
+
 **Refresh is still the operator's job.** Ferrum has **no OCSP responder
 client**: nothing inside the gateway fetches a fresh response, so re-attaching
 one is the operator's own fetch loop plus live reload. Refresh the OCSP source
@@ -1115,7 +1127,7 @@ ACME TLS-ALPN-01 validation still takes precedence over SNI selection, so `acme:
 
 **Rotation and deletion.** Each source carries a content digest (`k8s://<ns>/<secret>#tls.crt?sha256=…`), so a Secret update changes the snapshot and the control plane broadcasts it; the data plane rebuilds the resolver and swaps it atomically for new handshakes. In-flight sessions keep the configuration they negotiated. Deleting a Gateway or listener withdraws exactly its own certificates; when the last Gateway certificate for the namespace goes away, the data plane restores the operator's `FERRUM_FRONTEND_TLS_*` material if any was configured.
 
-**Bounds.** At most 256 Gateway certificates are admitted per configuration snapshot and at most 4096 SNI names are indexed. Certificate admission is listener-atomic: if every `certificateRef` on one listener cannot fit, none of that listener's certificates or routes are materialized. The runtime indexes every explicit listener hostname before adding certificate-derived SAN aliases, so SAN-heavy certificates cannot displace a later listener's declared SNI mapping; only surplus SAN aliases are omitted at the name bound. A stapled OCSP response (`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE`) is bound to one certificate, so it is stapled only when the data plane serves exactly one Gateway certificate; with several it is not stapled to any and a warning is logged.
+**Bounds.** At most 256 Gateway certificates are admitted per configuration snapshot and at most 4096 SNI names are indexed. Certificate admission is listener-atomic: if every `certificateRef` on one listener cannot fit, none of that listener's certificates or routes are materialized. The runtime indexes every explicit listener hostname before adding certificate-derived SAN aliases, so SAN-heavy certificates cannot displace a later listener's declared SNI mapping; only surplus SAN aliases are omitted at the name bound. A stapled OCSP response (`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE`) is bound to one certificate, so it is stapled only when the data plane serves exactly one Gateway certificate; with several it is not stapled to any and a warning is logged. When it is stapled, it is enrolled in the hourly freshness re-check on the same terms as a single-certificate listener and is retired once it reaches its `nextUpdate` — see [Stapled OCSP Responses](#stapled-ocsp-responses).
 
 ### TLS Inventory Visibility and Metrics
 

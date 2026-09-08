@@ -396,6 +396,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_ai_federation_circuits_open` | gauge | `namespace` | `ai` | `documented_only` | `always` | Current ai_federation provider circuits in open or half-open recovery state. |
 | `ferrum_ai_federation_circuits_opened_total` | counter | `namespace` | `ai` | `documented_only` | `always` | ai_federation provider circuit closed-to-open transitions. |
 | `ferrum_ai_prompt_tokens_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Prompt tokens reported by AI providers. |
+| `ferrum_ai_rate_limit_local_accounting_tokens_total` | counter | `namespace` | `ai` | `documented_only` | `always` | AI tokens charged locally after centralized reconciliation failed. |
+| `ferrum_ai_rate_limit_unaccounted_tokens_total` | counter | `namespace` | `ai` | `documented_only` | `always` | AI tokens not charged because local reconciliation capacity was exhausted. |
 | `ferrum_ai_tokens_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Total tokens reported by AI providers. |
 | `ferrum_api_bandwidth_charges_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `direction`, `currency`, `protocol_family`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total bandwidth charges per consumer, split by direction. |
 | `ferrum_api_bytes_received_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `protocol_family`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total bytes the gateway received backend->client and forwarded to this consumer. |

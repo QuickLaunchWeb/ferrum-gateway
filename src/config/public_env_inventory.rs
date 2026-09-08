@@ -632,3 +632,20 @@ pub fn is_public_ferrum_env_coverage_exempt(key: &str) -> bool {
         .binary_search(&key)
         .is_ok()
 }
+
+/// Recognized settings-file keys. This does not restrict arbitrary process
+/// environment variables or extend secret-suffix resolution to ferrum.conf.
+pub fn is_recognized_ferrum_setting(key: &str) -> bool {
+    if PUBLIC_FERRUM_ENV_SETTINGS.binary_search(&key).is_ok() {
+        return true;
+    }
+    // Preserve the documented dynamic transcript sink-secret namespace.
+    key.strip_prefix("FERRUM_TRANSCRIPT_SINK_SECRET_")
+        .is_some_and(|name| {
+            let mut bytes = name.bytes();
+            bytes
+                .next()
+                .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+                && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        })
+}

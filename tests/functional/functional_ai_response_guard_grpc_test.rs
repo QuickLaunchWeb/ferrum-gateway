@@ -211,6 +211,7 @@ fn start_gateway(
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())

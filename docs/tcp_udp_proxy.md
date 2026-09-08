@@ -1380,6 +1380,31 @@ Stream proxy connections track:
 - Connection errors
 - UDP `hook_ingress_drops` (listener counter): client→backend datagrams dropped when a session's bounded `on_udp_datagram` ingress queue is full or closed (fail closed; see [UDP Session Management](#udp-session-management))
 
+## Stream Listener Recovery and Readiness
+
+After initial reconciliation, a supervisor retries non-serving stream listeners every
+30 seconds without requiring a configuration change. It reuses the serialized
+reconciliation path, including current listener ownership, TLS validation, and route
+withdrawal. Healthy listeners continue serving. Shutdown fences reconciliation so
+recovery cannot rebind a draining listener.
+
+A configured listener with a hard bind/backend-TLS failure or whose task exited makes
+`/health` and `/status` return `503`, `status: "degraded"`, and `ready: false`.
+Soft frontend TLS/DTLS deferrals and DTLS config-build failures report
+`status: "degraded"` with HTTP `200` and `ready: true` when otherwise healthy.
+A pending asynchronous bind alone does not degrade health or withdraw readiness
+during runtime reconciliation; startup still waits for listener binds.
+Readiness recovers when the hard failure clears or its configuration is removed.
+Authenticated `/overload` retains the existing stream bind-failure diagnostics;
+unauthenticated health responses still contain only `status` and `ready`. `/live`
+is unaffected. Initial hard bind failures remain fatal in file/database mode and
+non-fatal in DP mode.
+
+TCP+TLS origination honors the upstream's `backend_tls_sni` as both the ClientHello
+SNI and the certificate verification name. The selected target host/IP still controls
+the socket destination. With no override, the selected host remains the TLS name;
+configured mesh identity verification remains enforced by the existing verifier.
+
 ## TCP Accept-Loop Supervision
 
 When `FERRUM_ACCEPT_THREADS > 1`, a TCP stream listener binds **one exclusive** listen socket and duplicates that fd for extra accept workers (never `SO_REUSEPORT`; issue #3924). Those loops are peer components of a single listener:

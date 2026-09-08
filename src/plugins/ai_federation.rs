@@ -4374,6 +4374,17 @@ fn insert_normalized_usage(
     }
 }
 
+/// Shared buffered/streamed Anthropic terminal-reason mapping.
+pub(crate) fn map_anthropic_stop_reason(reason: &str) -> Result<&'static str, &'static str> {
+    match reason {
+        "end_turn" | "stop_sequence" | "pause_turn" => Ok("stop"),
+        "max_tokens" => Ok("length"),
+        "tool_use" => Ok("tool_calls"),
+        "refusal" => Ok("content_filter"),
+        _ => Err("upstream provider sent an unsupported Anthropic stop_reason"),
+    }
+}
+
 fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenCounts), String> {
     if resp["type"].as_str() != Some("message") || resp["role"].as_str() != Some("assistant") {
         return Err(
@@ -4439,17 +4450,9 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
             "ai_federation: Anthropic tool_use content and stop_reason disagree".to_string(),
         );
     }
-    let finish_reason = match stop_reason {
-        "end_turn" | "stop_sequence" | "pause_turn" => "stop",
-        "max_tokens" => "length",
-        "tool_use" => "tool_calls",
-        "refusal" => "content_filter",
-        _ => {
-            return Err(
-                "ai_federation: Anthropic response has an unsupported stop_reason".to_string(),
-            );
-        }
-    };
+    let finish_reason = map_anthropic_stop_reason(stop_reason).map_err(|_| {
+        "ai_federation: Anthropic response has an unsupported stop_reason".to_string()
+    })?;
 
     let (input_tokens, output_tokens) = native_usage_pair(
         resp.get("usage"),

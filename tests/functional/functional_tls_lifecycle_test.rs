@@ -263,6 +263,7 @@ fn spawn_gateway_piped(
     envs: &[(&str, &str)],
 ) -> (TokioChild, OutputCapture) {
     let mut cmd = TokioCommand::new(gw_bin());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", ports.proxy_http.to_string())
