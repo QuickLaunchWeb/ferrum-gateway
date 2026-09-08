@@ -3100,7 +3100,10 @@ fn the_periodic_recheck_retains_a_fresh_gateway_multi_cert_staple() {
         let outcome =
             ferrum_edge::tls::ocsp_recheck::run_recheck_at_scoped(at, Some(ocsp_path.as_str()));
         assert_eq!(outcome.dropped, 0, "a fresh staple must not be retired");
-        assert_eq!(outcome.tracked, 1, "and must stay tracked for the next pass");
+        assert_eq!(
+            outcome.tracked, 1,
+            "and must stay tracked for the next pass"
+        );
     }
     assert_eq!(
         served_staple(Arc::clone(&config), "localhost", b"h2"),
