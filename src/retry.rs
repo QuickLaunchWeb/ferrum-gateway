@@ -661,11 +661,12 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 // variant is excluded from `retry_on_connect_failure` regardless
                 // of the class.
                 GrpcBackendUnavailableKind::BackendRequest => ErrorClass::ConnectionReset,
-                // Pooled sender canceled before dispatch (hyper `is_canceled`)
-                // with a buffered/replayable body. Pre-wire pool/stale-sender
-                // failure — `request_reached_wire` is false so connect-failure
-                // retry can redial.
-                GrpcBackendUnavailableKind::DispatchCanceled => ErrorClass::ConnectionPoolError,
+                // A buffered/replayable request was never dispatched (hyper
+                // `is_canceled`) or explicitly rejected without application
+                // processing (typed RFC 9113 NACK). Both are pre-wire pool
+                // failures, so configured connect-failure retries can redial.
+                GrpcBackendUnavailableKind::DispatchCanceled
+                | GrpcBackendUnavailableKind::ProtocolNack => ErrorClass::ConnectionPoolError,
                 // A trust-generation fence refused the transport before the
                 // request reached the destination. Pre-wire, so retry may
                 // acquire a fresh transport under the newly published authority
@@ -1342,7 +1343,15 @@ fn classify_boxed_with_phase(
 ///
 /// Error path only.
 pub fn reqwest_error_is_protocol_nack(e: &reqwest::Error) -> bool {
-    let mut source = StdError::source(e);
+    error_chain_is_protocol_nack(e)
+}
+
+/// Share reqwest's typed RFC 9113 rejection proof with buffered native gRPC.
+/// h2 surfaces a remote GOAWAY on a response future only when its stream ID
+/// exceeds last_stream_id. Never infer this guarantee from an error message,
+/// and never use it after response headers or with an unreplayable upload.
+pub(crate) fn error_chain_is_protocol_nack(e: &(dyn StdError + 'static)) -> bool {
+    let mut source = Some(e);
     while let Some(err) = source {
         if let Some(h2_err) = err.downcast_ref::<h2::Error>()
             && h2_err.is_remote()
