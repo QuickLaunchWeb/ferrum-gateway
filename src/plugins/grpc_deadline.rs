@@ -238,8 +238,11 @@ fn timeout_header(headers: &HashMap<String, String>) -> Option<&str> {
 /// True when the client sent `grpc-timeout` but it cannot establish a positive
 /// deadline (malformed wire value, zero timeout, or otherwise invalid).
 fn client_grpc_timeout_is_invalid(headers: &HashMap<String, String>) -> bool {
-    timeout_header(headers)
-        .is_some_and(|value| parse_grpc_timeout(value).and_then(duration_millis_ceil_saturating).is_none())
+    timeout_header(headers).is_some_and(|value| {
+        parse_grpc_timeout(value)
+            .and_then(duration_millis_ceil_saturating)
+            .is_none()
+    })
 }
 
 fn strip_grpc_timeout_header(headers: &mut HashMap<String, String>) {
