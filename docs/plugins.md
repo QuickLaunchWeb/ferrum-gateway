@@ -6317,8 +6317,8 @@ Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy 
 | `provider.api_key_env` | string | optional | Environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
 | `provider.request_timeout_ms` | u64 | `5000` | Per-request embedding provider timeout in milliseconds |
 | `builtins.*` | bool/object | all enabled when `builtins` is omitted | Built-in packs. Boolean shorthand enables/disables a pack; object form supports `enabled`, `examples_mode`, and `examples` |
-| `extraction.request_json_paths` | string[] | common LLM paths | Supported request extraction paths. When configured, this list replaces the defaults and controls all inspected request fields |
-| `extraction.response_json_paths` | string[] | common LLM paths | Supported response extraction paths. When configured, this list replaces the defaults and controls all inspected response fields |
+| `extraction.request_json_paths` | string[] | all supported request paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported request paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected request fields |
+| `extraction.response_json_paths` | string[] | all supported response paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported response paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected response fields |
 | `allow_topics` | object[] | `[]` | Mandatory request-side semantic allow topics; no match rejects or warns by topic config |
 | `deny_topics` | object[] | `[]` | Customer-defined semantic deny topics |
 | `custom_rules` | object[] | `[]` | Customer-defined semantic rules with `direction`, `severity`, `action` (`reject` or `warn`), `examples`, and `threshold`. Use `allow_topics` for allowlist semantics |
@@ -6333,7 +6333,67 @@ Provider API-key resolution remains lazy and secret-independent at validation ti
 
 In `mode: enforce`, the default `on_error: reject` fails closed when provider outages, parse errors, or timeouts prevent semantic evaluation. `on_error: warn` and `on_error: allow` are explicit fail-open choices; `warn` continues the request/response and emits provider-error metadata. In `dry_run`, the default remains `warn` so rollout traffic continues while surfacing provider problems. Use `on_error: reject` for production enforcement, especially for `allow_topics` where a provider outage otherwise prevents proving the request is in an allowed topic.
 
-The default request extraction paths include chat message content, message tool-call function names and arguments, the legacy Completions `prompt`, top-level `input` and `instructions`, tool definitions, `context`, `documents[*].text`, `retrieved_context[*].content`, and `tool_results[*].content`. The default response paths include legacy `choices[*].text`, OpenAI-compatible message/delta content, response tool-call names and arguments, `output_text`, Responses API output text, and output arguments. An explicit extraction array must not be empty when that direction has active rules.
+**Supported provider shapes.** The plugin is not OpenAI-only: the supported extraction paths below are also the complete allowlist `extraction.request_json_paths` / `extraction.response_json_paths` accept, and by default every one of them is active.
+
+Request paths:
+
+| Path | Shape |
+|---|---|
+| `$.messages[*].content` | OpenAI chat content, and — because content-block arrays are recursed — Anthropic Messages and Bedrock Converse `messages[].content[].text` |
+| `$.messages[*].function_call.name`, `$.messages[*].function_call.arguments` | Legacy OpenAI function call in message history |
+| `$.messages[*].tool_calls[*].function.name`, `$.messages[*].tool_calls[*].function.arguments` | OpenAI tool calls in message history |
+| `$.prompt` | Legacy Completions prompt |
+| `$.input` | Responses API / embeddings input, including structured message arrays |
+| `$.instructions` | Responses API developer instructions |
+| `$.tools[*].function.name`, `$.tools[*].function.description`, `$.tools[*].function.parameters` | OpenAI tool definitions; the `function` wrapper is optional, so Anthropic `tools[].name` / `.description` are covered |
+| `$.context`, `$.documents[*].text`, `$.retrieved_context[*].content`, `$.tool_results[*].content` | RAG context, documents, and tool results |
+| `$.system` | Anthropic Messages and Bedrock Converse top-level system prompt, as a string or an array of text blocks |
+| `$.contents[*].parts[*].text` | Google Gemini / Vertex prompt turns |
+| `$.systemInstruction.parts[*].text` | Google Gemini / Vertex system instruction (the `system_instruction` proto casing is read too) |
+| `$.inputText` | Amazon Bedrock Titan text generation |
+| `$.data_sources[*].parameters.role_information` | Azure OpenAI "On Your Data" per-data-source instruction (the `dataSources` / `roleInformation` casings are read too) |
+| `$.message`, `$.preamble`, `$.chat_history[*].message` | Cohere v1 `/chat` turn, system preamble, and history (kind follows `chat_history[].role`: `USER`, `CHATBOT`, `SYSTEM`, `TOOL`) |
+| `$.inputs` | Hugging Face TGI text generation, as a prompt string or an array of prompt strings |
+| `$.content` | OpenAI Assistants `POST /v1/threads/{id}/messages`. Read **only** when the body also carries a string `role` sibling; `content` alone is too common in unrelated JSON |
+| `$.instances[*].prompt` | Google Vertex legacy `predict` |
+| `$.requests[*].params` | Anthropic Message Batches. Each entry's `params` object is re-scanned once with every other configured request path, prefixed `$.requests[i].params.…`. Bounded to one level: a batch nested inside a batch is not expanded again |
+
+Response paths:
+
+| Path | Shape |
+|---|---|
+| `$.choices[*].text`, `$.choices[*].message.content`, `$.choices[*].delta.content` | OpenAI-compatible completion and streamed delta text |
+| `$.choices[*].message.tool_calls[*].function.name`, `$.choices[*].message.tool_calls[*].function.arguments`, `$.choices[*].delta.tool_calls[*].function.name`, `$.choices[*].delta.tool_calls[*].function.arguments` | OpenAI-compatible response tool calls |
+| `$.output_text`, `$.output[*].content[*].text`, `$.output[*].arguments` | Responses API output text and function-call arguments |
+| `$.candidates[*].content.parts[*].text` | Google Gemini / Vertex `generateContent` |
+| `$.content[*].text` | Anthropic Messages non-streaming completion |
+| `$.output.message.content[*].text` | Amazon Bedrock Converse |
+| `$.content_block_delta.delta.text` | An Anthropic Messages streaming text-delta event delivered as a JSON body |
+| `$.results[*].outputText` | Amazon Bedrock Titan text generation |
+| `$.text` | Cohere v1 `/chat` and `/generate` completion text |
+| `$.response` | Ollama `/api/generate` completion text |
+| `$[*].generated_text` | Hugging Face TGI, whose completion is a top-level JSON **array** rather than an object |
+
+Extraction is bounded at every path: `parts[]`, content-block arrays, and tool-result payloads contribute only each element's own `text` string and are never recursed into.
+
+Content blocks additionally yield their tool-result and guardrail text. An Anthropic `{"type": "tool_result", "content": …}` block and a Bedrock Converse `{"toolResult": {"content": [...]}}` block are attributed `ToolResult` — not `UserPrompt` — even though they ride inside a `role: "user"` message, so the `indirect_prompt_injection` built-in (which applies to `RagContext`, `Document`, `ToolResult`) fires on a poisoned tool result. A Converse `{"guardContent": {"text": {"text": …}}}` block is read as message content, in both the nested and the flat `{"guardContent": {"text": …}}` spelling.
+
+The generic top-level fields (`$.system`, `$.inputs`, `$.message`, `$.preamble`, `$.content`, `$.inputText`, `$.text`, `$.response`, and the per-element `prompt` / `outputText` / `generated_text`) are read only when the value is a **string or an array**. An object value — `{"system": {"tenant": "acme", "api_key": "…"}}` — yields no segment, so unrelated structured data is never stringified into a prompt segment and shipped to the embedding provider; the body is then treated as uninspectable instead. `$.context` and `$.tools[*].function.parameters` are the two paths that deliberately do stringify an object, because a tool-parameter schema is model-visible.
+
+An explicit extraction array must not be empty when that direction has active rules.
+
+**Unrecognized AI bodies fail closed.** A request or response body that looks like an AI body but yields no inspectable segments — a provider shape the extraction paths do not cover, or one the operator's `extraction` override excluded — is routed through `fail_on_uninspectable_body` (default `true`, so `on_error: reject` rejects it) and records `ai_semantic_firewall.uninspectable_body=no_extractable_content` rather than passing silently. That marker is also one of the keys `ai_transcript_audit`'s `always_capture_on_guardrail` treats as a fired guardrail, so an uninspected AI body is captured even under `fail_on_uninspectable_body: false` or `on_error: allow`.
+
+AI-body recognition keys off these top-level markers:
+
+- **Request:** `messages`, `prompt`, `input`, `instructions`, `tools`, `context`, `documents`, `retrieved_context`, `tool_results`, `system`, `contents`, `systemInstruction`, `system_instruction`, `inputText`, `inputs`, `data_sources`, `dataSources`, `message`, `preamble`, `chat_history`, `instances`; plus an array `requests` with at least one entry carrying an object `params` (Anthropic Message Batches).
+- **Response:** `choices`, `output_text`, `output`, `candidates`; a `type` of `content_block_delta`; an array `content` with at least one **object** element carrying `text` or `type` (so a Spring-Data `Page` such as `{"content": [{"id": 1}], "totalPages": 3}` is not an AI response); an array `results` with at least one object element carrying `outputText` or `completionReason` (Bedrock Titan, rather than every paginated `{"results": []}` endpoint); or a top-level JSON **array** with an element carrying `generated_text` (Hugging Face TGI).
+
+Config-only siblings (`toolConfig`, `inferenceConfig`, `generationConfig`, `textGenerationConfig`) are deliberately **not** markers: none can occur without `messages`, `contents`, or `inputText`, so listing them would widen what a non-AI body must avoid without recognising one extra AI body. Every marker above has a matching extraction path, so a recognised body is refused only when the marker is present but carries no extractable text (a non-string `system`, an image-only `contents`, a `candidates` entry with only a `functionCall`).
+
+**Blast radius on a shared proxy.** Under the defaults (`mode: enforce`, `on_error: reject`, `fail_on_uninspectable_body: true`, `inspect.response: true`) a **non-AI** JSON body carrying one of the markers above and no extractable text is **rejected**, not passed through: `{"system": true}` and `{"inputs": {"a": 1}}` and `{"contents": [{"id": 1}]}` become `400`, and the response-side equivalents become `502`. A marker whose value *is* text is inspected and sent to the embedding provider — `{"system": "inventory"}` is scored as a system prompt, and the deliberately marker-less response paths `$.text` and `$.response` mean a plain `{"status": "ok", "text": "…"}` reply has that string inspected too. `message` is likewise a broad marker: Cohere v1 needs it, and an ordinary `{"message": "…"}` body gets that string inspected. Scope the plugin to AI routes, trim `extraction.request_json_paths` / `response_json_paths` to the shapes your backends actually speak, or set `fail_on_uninspectable_body: false` if a shared proxy must keep non-AI JSON flowing.
+
+**Provider event streams are not delta-reassembled.** Anthropic Messages `text_delta` events and Gemini `streamGenerateContent?alt=sse` frames are deliberately not inspected per frame — each frame carries one fragment, so scoring it inflates embedding cost, lets a phrase split across two frames evade every rule, and stamps a clean allow decision over content nothing read as a whole. Both `streaming_response: buffer` and `streaming_response: inspect` therefore yield no segments for those streams and fail closed through `on_error` (`buffer` via the uninspectable-stream path; `inspect` via a window whose frames are recognisably governed but unmapped). An OpenAI-shaped stream is unaffected: its role-only and lifecycle frames still release clean. Use `streaming_response: reject` if you need those clients to fall back to non-streaming, inspectable responses. Reassembling the Anthropic and Gemini stream shapes so their windows are inspected rather than refused is tracked as future work ("Anthropic stream reassembly", "Gemini stream reassembly").
 
 **Built-in packs:**
 

@@ -13925,6 +13925,23 @@ pub mod _test_support {
         )
     }
 
+    /// The `ai_semantic_firewall` supported extraction paths: the request list
+    /// and the response list, in declaration order.
+    ///
+    /// These are the same arrays `openapi.yaml` publishes as the `enum` and
+    /// `default` of `AiSemanticFirewallConfig.extraction.request_json_paths` /
+    /// `response_json_paths`, and the same set `docs/plugins.md` tabulates
+    /// under "Supported provider shapes". Exposed so the OpenAPI parity test
+    /// can assert that three-way agreement instead of carrying a second copy of
+    /// the list that can silently drift.
+    pub fn ai_semantic_firewall_extraction_paths_for_test()
+    -> (&'static [&'static str], &'static [&'static str]) {
+        (
+            crate::plugins::ai_semantic_firewall::DEFAULT_REQUEST_JSON_PATHS,
+            crate::plugins::ai_semantic_firewall::DEFAULT_RESPONSE_JSON_PATHS,
+        )
+    }
+
     /// Build an email channel with deterministic `*_env` resolution for unit
     /// tests. Production uses [`crate::notifications::channels::EmailChannel::new`]
     /// and real `std::env::var`.
