@@ -51,6 +51,7 @@ use super::utils::byte_budget::{
     materialize_reserved_payload, process_ceiling,
 };
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
+use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
@@ -15956,9 +15957,11 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
     // Charge the Arc allocation and lifetime bookkeeping to the existing budget.
     let retained = charge_event_retained_bytes(&event).saturating_add(128);
     if retained > MAX_CHARGE_EVENT_BYTES {
-        runtime
-            .byte_budget
-            .record_drop("charge event exceeded max retained bytes");
+        let budget = runtime.byte_budget.as_ref();
+        budget.record_drop(
+            SinkLossReason::RecordTooLarge,
+            "charge event exceeded max retained bytes",
+        );
         invalidate_status_cache();
         return;
     }

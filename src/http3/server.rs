@@ -9571,6 +9571,16 @@ async fn handle_h3_request(
         ) {
             gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
         }
+        if ctx.response_transform_size_refusal_selected()
+            && let Some(value) = crate::proxy::x_gateway_error_for_response(
+                &ctx,
+                !h3_request_on_wire,
+                response_status,
+            )
+        {
+            crate::proxy::restore_authoritative_gateway_error_header(&mut response_headers, value);
+            gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
+        }
 
         // Reconcile surviving backend trailers with the response-header policy
         // this path already applied. Every response-header phase — `after_proxy`,
@@ -10091,24 +10101,23 @@ async fn run_h3_backend_admission_or_send_reject(
     }
 }
 
+/// H3 entry point for the shared HALF_OPEN probe release (issue #4792).
+///
+/// Delegates to [`crate::proxy::release_circuit_breaker_probe_on_admission_reject`]
+/// so the H1/H2/WebSocket/gRPC handler, this path, and the H3 WebSocket path
+/// cannot drift into three separately-maintained copies of one invariant.
 fn release_h3_circuit_breaker_probe_on_admission_reject(
     state: &ProxyState,
     proxy: &Proxy,
     target_key: Option<&str>,
     is_half_open_probe: bool,
 ) {
-    if !is_half_open_probe {
-        return;
-    }
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            &proxy.id,
-            target_key,
-            cb_config,
-        );
-        cb.record_neutral(true);
-    }
+    crate::proxy::release_circuit_breaker_probe_on_admission_reject(
+        state,
+        proxy,
+        target_key,
+        is_half_open_probe,
+    );
 }
 
 fn record_h3_backend_admission_outcome(

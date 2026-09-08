@@ -4813,6 +4813,12 @@ where
             response_body.len(),
         );
         sanitize_client_response_headers_for_wire(&mut response_headers, buffered_framing);
+        if ctx.response_transform_size_refusal_selected()
+            && let Some(value) =
+                crate::proxy::x_gateway_error_for_response(ctx, false, response_status)
+        {
+            crate::proxy::restore_authoritative_gateway_error_header(&mut response_headers, value);
+        }
         super::server::finalize_h3_response_routing_headers(
             ctx.h3_response_upstream_is_fallback,
             response_via,

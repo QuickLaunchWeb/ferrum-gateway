@@ -45,6 +45,47 @@ paths:
 - Istio and xDS compatibility coverage goes in `tests/conformance/<category>.rs` with `register_feature!`.
 - New `tests/unit/` files must be added to the appropriate `tests/unit/<category>/mod.rs`.
 
+## Shared-Invariant Parity: When Fixing One Path, Name The Siblings
+
+Issue #4792 catalogued thirteen separately-filed defects with one shape: a rule
+was corrected on ONE call site or ONE protocol path, and the siblings that share
+the same rule were left behind. In two cases the correct code's own comment
+described the failure its sibling still had.
+
+- Before landing a fix, ask who else carries the invariant: the other protocol
+  paths (H1/H2, WebSocket, H3, gRPC, HBONE, raw TCP/UDP), the other direction
+  (request vs response), the other providers (`dns_sd` / Consul / Kubernetes),
+  the other CLI subcommands, the other pool families. Name them in the change,
+  even when the answer is "none".
+- Prefer correcting the shared helper over defending at the call site. A local
+  workaround leaves every other caller with the original bug, and later reads as
+  evidence that someone already hit it.
+- When a composed value (a pool key, a metadata blob) gains a field, re-check
+  every consumer that parses it. Match a delimited segment, not a terminal one,
+  so appending a field cannot silently disable a matcher.
+- Encode the answer as a parity test rather than a comment. The pattern is the
+  existing three-way `builtin_parity` registry/factory/metadata set-equality
+  check: a table that enumerates the siblings and fails when a new one is added
+  without the invariant.
+
+Where the invariant cannot be observed at runtime without a live server, assert
+it structurally over `src/` (the technique `dp_config_admission_sites_tests.rs`
+and `allowed_methods_logging_tests.rs` already use), so a new sibling breaks the
+build rather than shipping the gap.
+
+The parity tables live in:
+
+- `tests/unit/gateway_core/shared_invariant_parity_tests.rs` — circuit-breaker
+  HALF_OPEN probe release, discovery-target health pruning, RFC 9113
+  protocol-NACK classification, CLI external-secret resolution, discovery
+  dial-identity dedup, the `pool_shard_amount` minimum, and SVID
+  generation-segment matching across all four pool families.
+- `tests/unit/plugins/waf_body_charset_parity_tests.rs` — wide-charset
+  (UTF-16/UTF-32) body decoding on both the request and response scan paths.
+
+Add a new table to those files when you fix an invariant that more than one path
+shares.
+
 ## Targeted Commands
 
 - Existing inline source test: `cargo test --lib <module>::tests`

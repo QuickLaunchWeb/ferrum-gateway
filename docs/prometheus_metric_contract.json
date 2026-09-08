@@ -4298,6 +4298,31 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_plugin_log_sink_records_accepted_total",
+    "type": "counter",
+    "help": "Observability records admitted to a per-plugin logging sink's bounded queue. Process-cumulative; not reset by a plugin-cache reload.",
+    "labels": [
+      "plugin"
+    ],
+    "subsystem": "logging_sinks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_plugin_log_sink_records_dropped_total",
+    "type": "counter",
+    "help": "Observability records discarded by a per-plugin logging sink, by bounded reason. Process-cumulative; not reset by a plugin-cache reload.",
+    "labels": [
+      "plugin",
+      "reason"
+    ],
+    "subsystem": "logging_sinks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_proxy_passive_unhealthy_targets",
     "type": "gauge",
     "help": "Targets this proxy has ejected from traffic-based passive health checking.",

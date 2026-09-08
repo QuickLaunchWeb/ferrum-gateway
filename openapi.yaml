@@ -13876,7 +13876,7 @@ components:
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `gateway_listeners`,
-        `logging`,
+        `logging`, `log_sink_record_loss`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
         `service_discovery`, `dp_config`, `cp_dp_trust`, `replay_authority`) are
         present only when the caller is
@@ -14187,6 +14187,8 @@ components:
           $ref: "#/components/schemas/AuditPipelineStatus"
         logging:
           $ref: "#/components/schemas/LoggingSinkSnapshot"
+        log_sink_record_loss:
+          $ref: "#/components/schemas/LogSinkRecordLossSnapshot"
         ai_transcript_audit:
           type: array
           description: >-
@@ -16128,6 +16130,47 @@ components:
           oneOf:
             - $ref: "#/components/schemas/LoggingSinkState"
             - type: "null"
+
+    LogSinkRecordLossSnapshot:
+      type: object
+      description: >-
+        Authenticated per-plugin logging-sink record loss (issue #4801).
+        Process-cumulative counts with closed-set plugin and reason labels
+        only — never an endpoint, topic, namespace, policy id, or record
+        content. Counters are not reset by a plugin-cache reload. The same
+        data is published on `/metrics` as
+        `ferrum_plugin_log_sink_records_dropped_total` and
+        `ferrum_plugin_log_sink_records_accepted_total`.
+      required: [dropped_total, accepted_total, dropped_by_plugin]
+      properties:
+        dropped_total:
+          type: integer
+          description: Records discarded across every sink and reason since process start.
+        accepted_total:
+          type: integer
+          description: >-
+            Records admitted to a sink's bounded queue across every sink since
+            process start.
+        dropped_by_plugin:
+          type: object
+          description: >-
+            Per-plugin loss, listed only for sinks that have lost a record and
+            only for the reasons with a non-zero count. Keys are the closed
+            sink set (`ai_transcript_audit`, `api_chargeback_sink`,
+            `http_logging`, `kafka_logging`, `loki_logging`, `other`,
+            `statsd_logging`, `tcp_logging`, `udp_logging`, `ws_logging`).
+          additionalProperties:
+            type: object
+            description: >-
+              Loss counts keyed by the closed reason set (`batch_discard`,
+              `byte_budget`, `queue_full`, `record_too_large`, `shutdown`,
+              `sink_error`).
+            additionalProperties:
+              type: integer
+          example:
+            udp_logging:
+              byte_budget: 6000
+              batch_discard: 683
 
     LoggingSinkState:
       type: object
@@ -23600,6 +23643,13 @@ components:
         `body` only — unlike request_transformer, there is no `query`
         target.
 
+        Body-rule output above the effective response ceiling is refused with
+        HTTP 502 and the Response body too large JSON error with numeric limit, X-Gateway-Error:
+        overload, and error_class: dispatch_policy_rejected. One warning names
+        proxy id, plugin, ceiling, and the produced-size lower bound at the first
+        refused serializer write; no payload is logged. Exactly-at-ceiling
+        output passes. Aggregate retained-buffer exhaustion remains HTTP 503.
+
         When `apply_route_overrides: true`, the plugin accepts an empty `rules`
         array so it can participate in the chain-level response route-header
         final phase for transforms published by `mesh_route_dispatch` onto
@@ -24642,6 +24692,11 @@ components:
         and does not disable an active route limit, and multiple instances
         compose to their minimum. It also bounds the buffered-representation
         decode gate and compression admission.
+        Response-transformer output above this ceiling is a deterministic
+        gateway policy refusal: HTTP 502 with the Response body too large JSON error and limit,
+        X-Gateway-Error: overload, and error_class: dispatch_policy_rejected.
+        It emits one bounded warning. Oversized backend bodies retain backend
+        attribution; actual aggregate-buffer exhaustion remains HTTP 503.
         Repeated identical Content-Length values are parsed per comma-folded
         member and compared against the limit; a declared length that cannot be
         reduced to one agreed value fails closed with HTTP 502. Bodyless
@@ -27441,6 +27496,13 @@ components:
                   - "$.systemInstruction.parts[*].text"
                   - "$.inputText"
                   - "$.data_sources[*].parameters.role_information"
+                  - "$.message"
+                  - "$.preamble"
+                  - "$.chat_history[*].message"
+                  - "$.inputs"
+                  - "$.content"
+                  - "$.instances[*].prompt"
+                  - "$.requests[*].params"
               default:
                 - "$.messages[*].content"
                 - "$.messages[*].function_call.name"
@@ -27462,6 +27524,13 @@ components:
                 - "$.systemInstruction.parts[*].text"
                 - "$.inputText"
                 - "$.data_sources[*].parameters.role_information"
+                - "$.message"
+                - "$.preamble"
+                - "$.chat_history[*].message"
+                - "$.inputs"
+                - "$.content"
+                - "$.instances[*].prompt"
+                - "$.requests[*].params"
               description: Supported simple request extraction paths. When configured, this list replaces the defaults.
             response_json_paths:
               type: array
@@ -27482,6 +27551,10 @@ components:
                   - "$.content[*].text"
                   - "$.output.message.content[*].text"
                   - "$.content_block_delta.delta.text"
+                  - "$.results[*].outputText"
+                  - "$.text"
+                  - "$.response"
+                  - "$[*].generated_text"
               default:
                 - "$.choices[*].text"
                 - "$.choices[*].message.content"
@@ -27497,6 +27570,10 @@ components:
                 - "$.content[*].text"
                 - "$.output.message.content[*].text"
                 - "$.content_block_delta.delta.text"
+                - "$.results[*].outputText"
+                - "$.text"
+                - "$.response"
+                - "$[*].generated_text"
               description: Supported simple response extraction paths. When configured, this list replaces the defaults.
         allow_topics:
           type: array
