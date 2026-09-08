@@ -29181,7 +29181,32 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports multiplexed SSE sessions: GET with Accept text/event-stream attaches one generation-scoped listener per live downstream session and routes events by a bounded, type-sensitive JSON-RPC request/stream identity over a single retained-event ring with one byte budget. While a listener is attached, every aggregate JSON-RPC request with a representable id opens its identity before catalog refresh or upstream dispatch and answers 202 with its response published on the stream — gateway-authored list/ping/error responses and upstream-routed tools/call, prompts/get, resources/read, and passthrough methods alike — so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed. Notifications, batch members, and initialize are never multiplexed. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed, and a retention refusal terminalizes the identity and answers the POST inline rather than dropping a JSON-RPC response. Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports multiplexed SSE sessions: GET with Accept text/event-stream attaches one generation-scoped listener per live downstream session and routes events by a bounded, type-sensitive JSON-RPC request/stream identity preserving the exact numeric wire token over a single retained-event ring with one byte budget. While a listener is attached, every aggregate JSON-RPC request with a representable id opens its identity before catalog refresh or upstream dispatch and answers 202 with its response published on the stream — gateway-authored list/ping/error responses and upstream-routed tools/call, prompts/get, resources/read, and passthrough methods alike — so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed. Notifications, batch members, and initialize are never multiplexed. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed; mismatched or ambiguous correlated responses are replaced by a bounded gateway -32603 error that carries the request's own JSON-RPC id token so the pending call still resolves, and are never published or returned as successful inline answers (the id comparison is byte-exact and runs only while a listener is attached; mcp.sse.delivery records refused), and a retention refusal terminalizes the identity and answers the POST inline rather than dropping a JSON-RPC response. Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint.path scopes, and endpoint.path may not be \"/\", because the endpoint reserves its whole path subtree. A client JSON-RPC id token reflected into a gateway-authored singleton response is bounded at 4096 wire bytes; a larger id is refused with a fixed -32600 that does not echo it."
+      allOf:
+        - if:
+            properties:
+              mode:
+                const: transparent_proxy
+            required: [mode]
+          then:
+            properties:
+              policy:
+                not:
+                  anyOf:
+                    - required: [default_action]
+                    - required: [tools]
+                    - required: [hide_denied_tools]
+              discovery:
+                not:
+                  anyOf:
+                    - required: [aggregate_tools]
+                    - required: [aggregate_resources]
+                    - required: [aggregate_prompts]
+                    - required: [namespace_separator]
+                    - required: [cache_ttl_seconds]
+                    - required: [hide_denied_items]
+                    - required: [on_new_tool]
+                    - required: [on_schema_change]
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -29196,7 +29221,7 @@ components:
           properties:
             path:
               type: string
-              description: Public MCP endpoint path, such as /mcp.
+              description: Canonical public MCP endpoint path, such as /mcp. Must not be "/" — the endpoint reserves its whole path subtree, so a root endpoint would refuse every other handler on the proxy and is rejected at admission. Only the exact path is served; slash-delimited descendants return 404 in both modes. A trailing-slash endpoint also reserves its unsuffixed scope. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint scopes; admission rejects the pair. Queries do not change selection. Methods other than GET, POST, and DELETE return 405 when they reach this plugin.
             protocol_versions:
               type: array
               minItems: 1
@@ -29206,6 +29231,7 @@ components:
               description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version. Includes 2025-03-26 when JSON-RPC batches are desired; batches are admitted under validation.max_batch_* limits.
         discovery:
           type: object
+          description: Catalog discovery requires aggregate_router. Explicit aggregate_tools, aggregate_resources, aggregate_prompts, namespace_separator, cache_ttl_seconds, hide_denied_items, on_new_tool, and on_schema_change fields are rejected in transparent_proxy, including explicit defaults, because every one of them is inert without a mediated catalog.
           properties:
             aggregate_tools:
               type: boolean
@@ -29430,6 +29456,7 @@ components:
                 description: Overrides sessions.initialize_upstreams for this server; startup is accepted as a V1 alias for lazy.
         policy:
           type: object
+          description: Catalog policy requires aggregate_router. Explicit default_action, tools, and hide_denied_tools fields are rejected in transparent_proxy, including explicit defaults.
           properties:
             default_action:
               type: string

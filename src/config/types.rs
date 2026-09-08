@@ -4988,6 +4988,10 @@ impl GatewayConfig {
             errors.extend(soap_errors);
         }
 
+        if let Err(mcp_errors) = crate::plugins::mcp_gateway::validate_composition(self) {
+            errors.extend(mcp_errors);
+        }
+
         for plugin in &self.plugin_configs {
             // `transaction_log_schema` is process-global by design (it
             // registers named schemas into a single registry); reject
