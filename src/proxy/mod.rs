@@ -18242,8 +18242,7 @@ fn ws_websocket_is_draining(
     overload: &crate::overload::OverloadState,
     shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
 ) -> bool {
-    overload.draining.load(Ordering::Acquire)
-        || shutdown.is_some_and(|receiver| *receiver.borrow())
+    overload.draining.load(Ordering::Acquire) || shutdown.is_some_and(|receiver| *receiver.borrow())
 }
 
 fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
