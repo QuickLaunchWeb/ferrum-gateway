@@ -2757,3 +2757,42 @@ async fn test_io_uring_or_fallback_write_timeout_ignores_drained_pipe() {
     )
     .await;
 }
+
+// ── io_uring splice relay cap derivation (issue #4786) ────────────────
+
+#[test]
+fn io_uring_relay_cap_is_derived_from_the_blocking_pool() {
+    use ferrum_edge::proxy::tcp_proxy::{
+        DEFAULT_BLOCKING_THREADS, derive_io_uring_splice_max_concurrent,
+    };
+
+    // Each admitted relay holds two blocking threads for the connection's
+    // whole lifetime, so a quarter of the pool in relays is half of it in
+    // threads — the other half stays available for the overload monitor's
+    // open-FD count, config reload, and every other spawn_blocking user.
+    for pool in [8usize, 128, 512, 4096] {
+        let cap = derive_io_uring_splice_max_concurrent(Some(pool));
+        let quarter = pool / 4;
+        assert!(cap <= quarter, "cap {cap} exceeds a quarter of pool {pool}");
+        assert!(cap > 0, "cap for pool {pool} must never be 0");
+    }
+
+    // An unset FERRUM_BLOCKING_THREADS reproduces the previous hardcoded 128,
+    // so nothing changes for a deployment that never touched the knob.
+    assert_eq!(derive_io_uring_splice_max_concurrent(None), 128);
+    let default_cap = derive_io_uring_splice_max_concurrent(Some(DEFAULT_BLOCKING_THREADS));
+    assert_eq!(default_cap, 128);
+}
+
+#[test]
+fn io_uring_relay_cap_never_disables_the_path_on_a_tiny_pool() {
+    use ferrum_edge::proxy::tcp_proxy::derive_io_uring_splice_max_concurrent;
+
+    for pool in [0usize, 1, 2, 3, 4] {
+        assert_eq!(
+            derive_io_uring_splice_max_concurrent(Some(pool)),
+            1,
+            "a tiny pool should still admit exactly one relay"
+        );
+    }
+}

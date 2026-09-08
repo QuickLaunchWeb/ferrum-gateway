@@ -7614,9 +7614,10 @@ fn shutdown_predrain_default_is_zero_in_every_mode() {
 
 /// `main.rs` must resolve the window through the mode gate above rather than
 /// re-deriving it, so the chart contract and the runtime cannot drift apart
-/// again. The signal handler must also publish the draining verdict BEFORE it
+/// again. The drain sequencer must also publish the draining verdict BEFORE it
 /// sleeps: the whole point of the window is that readiness already reports
-/// `ready:false` while the accept loops stay open.
+/// `ready:false` while the accept loops stay open. The window itself races the
+/// shutdown-escalation token so a second signal ends it early.
 #[test]
 fn main_resolves_predrain_through_the_shared_mode_gate() {
     const MAIN_SOURCE: &str = include_str!("../../../src/gateway_entry.rs");
@@ -7635,9 +7636,15 @@ fn main_resolves_predrain_through_the_shared_mode_gate() {
     let announce_at = MAIN_SOURCE
         .find("overload::announce_shutdown_drain();")
         .expect("the signal handler must publish the draining verdict");
+    // The wait is a `select!` arm rather than a bare `.await`: a repeated
+    // shutdown signal must be able to cut the window short (issue #4829), so
+    // match the timer expression itself and assert the race separately below.
     let sleep_at = MAIN_SOURCE
-        .find("tokio::time::sleep(shutdown_predrain).await;")
+        .find("tokio::time::sleep(shutdown_predrain)")
         .expect("the signal handler must hold the accept loops open for the window");
+    let escalation_at = MAIN_SOURCE
+        .find("overload::shutdown_escalation_token().cancelled()")
+        .expect("a repeated shutdown signal must be able to cut the pre-drain window short");
     let broadcast_at = MAIN_SOURCE
         .find("let _ = shutdown_tx_signal.send(true);")
         .expect("the signal handler must close the accept loops afterwards");
@@ -7646,4 +7653,96 @@ fn main_resolves_predrain_through_the_shared_mode_gate() {
         "readiness must flip to not-ready, then the window elapses, and only then do the accept \
          loops close"
     );
+    assert!(
+        sleep_at < escalation_at && escalation_at < broadcast_at,
+        "the pre-drain wait must race the escalation token inside the window, not outlive it"
+    );
+}
+
+// ── Graceful-shutdown drain bounds (issue #4829) ──────────────────────
+
+#[test]
+fn test_env_config_shutdown_drain_seconds_accepts_zero_default_and_maximum() {
+    for (value, expected) in [("0", 0u64), ("30", 30), ("86400", 86_400)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_DRAIN_SECONDS", value),
+            ],
+            || {
+                assert_eq!(
+                    EnvConfig::from_env().unwrap().shutdown_drain_seconds,
+                    expected
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_drain_seconds_rejects_values_above_the_maximum() {
+    for value in ["86401", "31536000"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_DRAIN_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    error.contains("FERRUM_SHUTDOWN_DRAIN_SECONDS"),
+                    "unexpected error for {value}: {error}"
+                );
+                assert!(
+                    error.contains("86400"),
+                    "error should name the documented maximum: {error}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_predrain_seconds_accepts_zero_and_maximum() {
+    for (value, expected) in [("0", 0u64), ("3600", 3_600)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_PREDRAIN_SECONDS", value),
+            ],
+            || {
+                assert_eq!(
+                    EnvConfig::from_env().unwrap().shutdown_predrain_seconds,
+                    expected
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_predrain_seconds_rejects_values_above_the_maximum() {
+    for value in ["3601", "86400"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_PREDRAIN_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    error.contains("FERRUM_SHUTDOWN_PREDRAIN_SECONDS"),
+                    "unexpected error for {value}: {error}"
+                );
+                assert!(
+                    error.contains("3600"),
+                    "error should name the documented maximum: {error}"
+                );
+            },
+        );
+    }
 }
