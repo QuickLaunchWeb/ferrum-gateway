@@ -2669,7 +2669,10 @@ async fn reject_grpc_stream_with_goaway_zero(
         let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
         assert!(len <= 16_384, "fixture expects default-size H2 frames");
         let mut payload = vec![0; len];
-        stream.read_exact(&mut payload).await.expect("frame payload");
+        stream
+            .read_exact(&mut payload)
+            .await
+            .expect("frame payload");
         match header[3] {
             4 if header[4] & 1 == 0 => {
                 stream
@@ -2810,7 +2813,11 @@ async fn grpc_protocol_nack_refused_stream_replay_and_controls() {
         let streams = backend.received_streams().await;
         if ok || drain {
             let processed = if ok { 1 } else { 0 };
-            assert_eq!(streams[processed].body, [0, 0, 0, 0, 2, b'o', b'k'], "{case}");
+            assert_eq!(
+                streams[processed].body,
+                [0, 0, 0, 0, 2, b'o', b'k'],
+                "{case}"
+            );
         }
         if ok {
             assert_eq!(response.messages, vec![Bytes::from_static(b"ok")]);
