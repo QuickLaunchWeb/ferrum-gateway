@@ -191,7 +191,8 @@ jobs:
           # The lib-unit shard compiles the superset of the instrumented
           # dependency graph and is the lane's sole producer on main.
           save: ${{ matrix.kind == 'lib-unit' && 'true' || 'false' }}
-          cache-on-failure: "true"
+          # Publish a complete instrumented dependency lane only after success.
+          cache-on-failure: "false"
 
       - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2

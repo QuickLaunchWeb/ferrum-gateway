@@ -556,7 +556,8 @@ jobs:
           # Only the `core` shard publishes the shared dependency lane; the
           # other shards compile the same dependency graph and restore only.
           save: ${{ matrix.shard == 'core' && 'true' || 'false' }}
-          cache-on-failure: "true"
+          # A setup/compile failure must not reserve an incomplete immutable key.
+          cache-on-failure: "false"
 
       - name: Precompile inline and hardening test binaries
         # Compile this shard's targets in one Cargo invocation before running
@@ -5968,7 +5969,8 @@ jobs:
         with:
           shared-key: "ci-lint"
           save: "true"
-          cache-on-failure: "true"
+          # Main concurrency protection does not prevent setup/compile failures.
+          cache-on-failure: "false"
           components: clippy
 
       - name: Run clippy
