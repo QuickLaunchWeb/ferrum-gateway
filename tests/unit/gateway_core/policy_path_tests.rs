@@ -497,7 +497,7 @@ async fn shared_before_proxy_boundary_validates_absolute_provider_paths() {
             );
             ctx.route_override_path = Some(path.to_string());
             ctx.route_override_path_is_absolute = absolute;
-            ctx.matched_path_strip_len = 7;
+            ctx.set_matched_path_strip_len(7);
             let result = run_before_proxy_hooks_for_test(&[], &mut ctx, &mut HashMap::new()).await;
             if let Some(expected) = expected {
                 assert!(matches!(result, PluginResult::Continue));
@@ -513,7 +513,8 @@ async fn shared_before_proxy_boundary_validates_absolute_provider_paths() {
             }
             assert_eq!(ctx.path, "/public");
             assert_eq!(
-                ctx.matched_path_strip_len, 7,
+                ctx.matched_path_strip_len(),
+                7,
                 "rebase owns the offset reset"
             );
             assert_eq!(ctx.route_override_path_is_absolute, absolute);
