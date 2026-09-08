@@ -7115,6 +7115,12 @@ async fn handle_h3_request(
         let backend_admission_response_elapsed = backend_admission_start.elapsed();
         let response_status = h3_resp.status;
         let mut response_headers = h3_resp.headers;
+        // Capture transport semantics before response hooks can mutate context.
+        let response_omits_body = crate::http3::client::cancel_bodyless_h3_response(
+            &mut h3_resp.recv_stream,
+            &method,
+            response_status,
+        );
 
         // Hop-by-hop headers already filtered during collection in the H3 pool.
 
@@ -7128,7 +7134,8 @@ async fn handle_h3_request(
         if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
             &response_headers,
             effective_max_response_body_size_bytes,
-        ) {
+        ) && !response_omits_body
+        {
             warn!(
                 proxy_id = %proxy.id,
                 response_body_bytes = len,
@@ -7344,7 +7351,7 @@ async fn handle_h3_request(
         // can be stripped — the inspector transforms the body, so the backend's
         // length no longer applies and would make a cut look like a truncated body.
         // Gated once per response; the common case (no opt-in) skips it entirely.
-        let mut response_inspector = if stream_hooks_enabled {
+        let mut response_inspector = if stream_hooks_enabled && !response_omits_body {
             let content_type = response_headers.get("content-type").map(String::as_str);
             crate::plugins::create_response_stream_inspector_for_enabled_plugins(
                 &plugins,
@@ -7378,7 +7385,7 @@ async fn handle_h3_request(
         // captured above.
         sanitize_client_response_headers_for_wire(
             &mut response_headers,
-            ClientResponseFraming::for_streaming_response(&ctx.method, response_status),
+            ClientResponseFraming::for_streaming_response(&method, response_status),
         );
 
         // Send response headers on the H3 stream.
@@ -7562,6 +7569,15 @@ async fn handle_h3_request(
         // would only rediscover the dead stream on its first send_data and
         // there is no backend data worth pulling for it.
         'outer: while headers_committed && !client_disconnected {
+            if response_omits_body {
+                // The upstream receive direction was cancelled at HEADERS.
+                // Finish without polling DATA, trailers, or inspector on_end.
+                if authorized_send!(stream.finish()) {
+                    body_completed = true;
+                    stream.record_clean_finish();
+                }
+                break;
+            }
             // Re-arm the read deadline only once the previous backend frame has
             // actually been flushed downstream (`coalesce_buf` empty), so neither
             // the direct send NOR a slow flush of a buffered sub-target chunk is
@@ -9524,11 +9540,20 @@ async fn handle_h3_request(
         // valid representation length instead of inventing 0). Shared with the
         // H3 cross-protocol bridge's buffered writer so the two cannot drift.
         let framing = ClientResponseFraming::for_buffered_response(
-            &ctx.method,
+            &method,
             response_status,
             response_body.len(),
         );
         sanitize_client_response_headers_for_wire(&mut response_headers, framing);
+        // Hooks can synthesize a body or replace the status after collection.
+        // Enforce the final wire semantics as well as the upstream boundary.
+        if crate::plugins::utils::synthetic_response::synthetic_response_omits_body(
+            &method,
+            response_status,
+        ) {
+            response_body = Bytes::new();
+            response_trailers = None;
+        }
 
         // Restore the gateway-owned token at the same post-hook / pre-wire
         // boundary as H1/H2's response builder. Classification is the original
@@ -10906,6 +10931,17 @@ async fn collect_h3_open_response_body(
     // it from (`GHSA-xrfj-852f-645j`).
     effective_max_response_body_size_bytes: usize,
 ) -> H3BufferedDispatchResult {
+    if crate::http3::client::cancel_bodyless_h3_response(&mut recv_stream, method, response_status)
+    {
+        return H3BufferedDispatchResult {
+            status: response_status,
+            body: Bytes::new(),
+            headers: response_headers,
+            trailers: None,
+            error_class: None,
+            request_on_wire: true,
+        };
+    }
     // Parsed per comma-folded member so a repeated identical declaration is
     // honored by both the ceiling check and the preallocation hint below
     // (`GHSA-xrfj-852f-645j`).
@@ -11167,16 +11203,21 @@ async fn stream_h3_open_response_to_client(
     backend_admission_elapsed: std::time::Duration,
     trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3StreamResult, anyhow::Error> {
+    let response_omits_body = crate::http3::client::cancel_bodyless_h3_response(
+        &mut recv_stream,
+        method,
+        response_status,
+    );
     // Effective response ceiling for this request: the global knob narrowed by
     // any active route ceiling (`GHSA-xrfj-852f-645j`). Hoisted so the streaming
     // chunk loop below compares against a plain local.
     let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
-    // Parsed per comma-folded member so a repeated identical declaration is
-    // honored instead of skipping this reject (`GHSA-xrfj-852f-645j`).
+    // A HEAD representation length is metadata, not bytes to retain or relay.
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
         &response_headers,
         effective_max_response_body_size_bytes,
-    ) {
+    ) && !response_omits_body
+    {
         warn!(
             proxy_id = %proxy.id,
             response_body_bytes = len,
@@ -11450,6 +11491,13 @@ async fn stream_h3_open_response_to_client(
     }
 
     'outer: loop {
+        if response_omits_body {
+            if authorized_send!(h3_stream.finish()) {
+                body_completed = true;
+                h3_stream.record_clean_finish();
+            }
+            break;
+        }
         if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
             read_deadline.as_mut().reset(
                 tokio::time::Instant::now()
@@ -15237,11 +15285,17 @@ async fn proxy_to_backend_h3_streaming(
     // honors these markers before committing response coding headers.
     stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
 
+    let response_omits_body = crate::http3::client::cancel_bodyless_h3_response(
+        &mut h3_resp.recv_stream,
+        method,
+        response_status,
+    );
     // Enforce response body size limit via Content-Length fast path
     if let Some(len) = crate::proxy::declared_response_length_exceeds_limit(
         &response_headers,
         effective_max_response_body_size_bytes,
-    ) {
+    ) && !response_omits_body
+    {
         warn!(
             "Backend response body ({} bytes) exceeds limit ({} bytes)",
             len, effective_max_response_body_size_bytes
@@ -15541,6 +15595,13 @@ async fn proxy_to_backend_h3_streaming(
     }
 
     'outer: loop {
+        if response_omits_body {
+            if authorized_send!(h3_stream.finish()) {
+                body_completed = true;
+                h3_stream.record_clean_finish();
+            }
+            break;
+        }
         if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
             read_deadline.as_mut().reset(
                 tokio::time::Instant::now()
