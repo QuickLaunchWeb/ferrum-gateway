@@ -2165,10 +2165,7 @@ pub mod _test_support {
             explicit_end_session_endpoint,
         )
         .await?;
-        Ok((
-            resolved.userinfo_endpoint,
-            resolved.end_session_endpoint,
-        ))
+        Ok((resolved.userinfo_endpoint, resolved.end_session_endpoint))
     }
 
     /// Await a plugin's background discovery task and return the resolved

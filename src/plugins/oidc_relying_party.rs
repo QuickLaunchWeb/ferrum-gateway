@@ -3904,7 +3904,7 @@ fn apply_discovery_endpoint_overrides(
 #[allow(dead_code)]
 #[doc(hidden)]
 pub(crate) mod discovery_test_seams {
-    use super::{apply_discovery_endpoint_overrides, fetch_discovery, PluginHttpClient};
+    use super::{PluginHttpClient, apply_discovery_endpoint_overrides, fetch_discovery};
 
     /// The two discovery endpoints an external unit test can assert after
     /// resolving a discovery document with optional operator overrides.
