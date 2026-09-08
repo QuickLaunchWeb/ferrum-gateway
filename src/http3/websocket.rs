@@ -1288,7 +1288,7 @@ pub(crate) async fn handle_h3_websocket(
                                             next.port,
                                             strip_len,
                                             next.path.as_deref(),
-                                        );
+                                        )?;
                                     retry_cb_target_key = Some(crate::circuit_breaker::target_key(
                                         &next.host, next.port,
                                     ));
