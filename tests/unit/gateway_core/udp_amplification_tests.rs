@@ -123,6 +123,22 @@ fn a_single_request_cannot_exceed_factor_times_size() {
 }
 
 #[test]
+fn exhausted_exchanges_do_not_subsidize_a_later_over_budget_reply() {
+    let remaining = AtomicU64::new(0);
+    for _ in 0..32 {
+        publish_request_budget(&remaining, 200, 8.0);
+        assert!(charge_response_budget(&remaining, 1600));
+        assert_eq!(remaining.load(Ordering::Acquire), 0);
+    }
+
+    assert_eq!(publish_request_budget(&remaining, 100, 8.0), 800);
+    assert!(!charge_response_budget(&remaining, 900));
+    assert!(charge_response_budget(&remaining, 300));
+    assert!(charge_response_budget(&remaining, 300));
+    assert!(!charge_response_budget(&remaining, 300));
+}
+
+#[test]
 fn accrual_is_capped_at_a_fixed_multiple_of_the_per_request_budget() {
     let remaining = AtomicU64::new(0);
     for _ in 0..100_000 {

@@ -14,6 +14,12 @@
 //! without bound. A zero-length response still consumes one unit of remaining
 //! budget so a finite factor cannot admit an unbounded packet count.
 //!
+//! Sessions start at zero; each admitted request is credited exactly once,
+//! immediately before its backend send. Credit remains live until charged or
+//! the session expires. Exhausting the budget leaves no credit for the next
+//! exchange. UDP has no generic request-completion marker, so a short reply
+//! does not retire unused credit that may still fund delayed reply datagrams.
+//!
 //! Metrics are process-wide and unlabeled except for the Prometheus plugin's
 //! own gateway-namespace series. They never carry route, backend, source,
 //! factor, or error-text labels.
@@ -167,6 +173,9 @@ pub fn udp_amplification_response_budget(request_size: u64, factor: f32) -> u64 
 /// cap keeps a long-lived session from accumulating unbounded credit while the
 /// aggregate bound — outbound bytes ≤ `factor ×` inbound bytes — is preserved
 /// exactly. Returns the new remaining budget.
+///
+/// Initialize `remaining` to zero, including for the first request: seeding it
+/// with that request's budget and then publishing would double its allowance.
 pub fn publish_request_budget(remaining: &AtomicU64, request_size: u64, factor: f32) -> u64 {
     let budget = udp_amplification_response_budget(request_size, factor);
     if budget == 0 {

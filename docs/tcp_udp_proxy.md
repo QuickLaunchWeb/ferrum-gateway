@@ -882,6 +882,28 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Response amplification guard**: When `udp_max_response_amplification_factor` is set, every backend→client datagram **charges** a session-level remaining payload-byte budget. Each admitted client request **accrues** `request_payload_size × factor` onto that budget (saturating addition, capped at 16× a single request's budget) instead of resetting it, so a reply in flight for request *N* is charged against *N*'s budget rather than a later, smaller request's, while a session's aggregate outbound bytes stay bounded by `factor ×` its aggregate inbound bytes. Several replies that are each under a single request's product still fail closed once their **sum** exceeds the remaining budget. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance. A zero-length response still consumes one unit of remaining budget so a finite factor cannot admit an unbounded packet count; nonempty responses charge their payload size exactly. The budget lives on the UDP session (not the selected backend), so weighted multi-backend selection cannot reset or multiply it. Negative, non-finite, and factors above 1024 are rejected at config admission. The guard is on by DEFAULT on every configuration source — file mode, database mode, the admin API, CP→DP distribution, mesh materialization, and Gateway API `UDPRoute` translation all normalize an unset factor to `8.0` in `Proxy::normalize_fields()`, so a UDP proxy is never an open reflector because of who authored it. `0` is the explicit operator opt-out meaning unlimited; it is accepted only on `udp`/`dtls` proxies, and the affected listener emits a startup warning naming its `proxy_id` and `listen_port` (`ferrum-edge validate` exits before listener bind, so it does not surface that warning). A Gateway API dual-acknowledged `mode: Unlimited` override is materialized as the same `0` sentinel.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
+The finite budget starts at **zero**, including on session creation. Each
+policy-admitted request earns credit exactly once, immediately before its backend
+send, for both plain UDP and terminating DTLS. With remaining credit `R` and new
+request allowance `B`, publication sets `R = max(R, min(R + B, 16 × B))`, using
+saturating arithmetic. A smaller request never removes existing credit, but may
+earn no additional credit when the current balance already exceeds its cap.
+
+Credit stays live until charged or the session expires. Fully consuming an
+exchange's allowance leaves zero credit: a subsequent 100-byte request at factor
+8 permits at most 800 reply bytes, so a 900-byte reply or the third of three
+300-byte replies is dropped. Two requests admitted before their replies can both
+contribute to the balance. UDP has no generic transaction-completion marker;
+receiving a short reply does not prove that all replies have arrived, so unused
+credit is retained within the cap rather than retired after the first reply.
+
+The aggregate guarantee is relative to earned credit: for any interval, response
+charges cannot exceed its opening balance plus the allowances earned during that
+interval. From session creation, or from a fully exhausted balance, that is at
+most `factor × inbound payload bytes`, plus the explicit one-unit allowance for
+each empty request. An arbitrary interval containing delayed replies must include
+their previously earned opening credit; it cannot be bounded by new input alone.
+
 ### Mesh UDP capture is a separate datapath
 
 Everything above describes a **configured** UDP proxy: an operator-declared

@@ -8004,20 +8004,11 @@ async fn create_session(
         expired: std::sync::atomic::AtomicBool::new(false),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
-        // Establish the first response budget before the reply task is spawned.
-        // The caller has already accepted this datagram through policy hooks.
+        // Start without credit: the first datagram, like every follow-up, earns
+        // its budget in forward_client_datagram_commit before the backend send.
+        // Seeding it here as well would grant the first request twice.
         last_request_size: AtomicU64::new(initial_data.len() as u64),
-        response_budget_remaining: AtomicU64::new(
-            proxy
-                .udp_max_response_amplification_factor
-                .map(|factor| {
-                    crate::udp_amplification::udp_amplification_response_budget(
-                        initial_data.len() as u64,
-                        factor,
-                    )
-                })
-                .unwrap_or(0),
-        ),
+        response_budget_remaining: AtomicU64::new(0),
         amplification_factor: proxy.udp_max_response_amplification_factor,
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
