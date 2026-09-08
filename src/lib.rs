@@ -11248,30 +11248,46 @@ pub mod _test_support {
         )
     }
 
-    pub fn udp_logging_classify_dtls_batch_size_for_test(
-        dtls_enabled: bool,
+    pub fn udp_logging_classify_batch_size_for_test(
         payload_len: usize,
         batch_len: usize,
-        max_plaintext: usize,
+        max_datagram_bytes: usize,
     ) -> &'static str {
-        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
-        match crate::plugins::udp_logging::classify_dtls_batch_size(
-            dtls_enabled,
+        use crate::plugins::udp_logging::BatchSizeDecision;
+        match crate::plugins::udp_logging::classify_batch_size(
             payload_len,
             batch_len,
-            max_plaintext,
+            max_datagram_bytes,
         ) {
-            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
-            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
-            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+            BatchSizeDecision::SendAsIs => "send_as_is",
+            BatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            BatchSizeDecision::SplitPerEntry => "split_per_entry",
         }
+    }
+
+    /// Effective per-datagram ceiling for the active transport.
+    pub fn udp_logging_effective_datagram_limit_for_test(
+        dtls_enabled: bool,
+        remote_addr: Option<std::net::SocketAddr>,
+    ) -> usize {
+        crate::plugins::udp_logging::effective_datagram_limit(dtls_enabled, remote_addr)
+    }
+
+    /// Largest `max_entry_bytes` whose own datagram still fits `limit`.
+    pub fn udp_logging_max_deliverable_entry_bytes_for_test(max_datagram_bytes: usize) -> usize {
+        crate::plugins::udp_logging::max_deliverable_entry_bytes(max_datagram_bytes)
+    }
+
+    /// Process-wide count of records rejected alone by the datagram gate.
+    pub fn udp_logging_local_record_drops_for_test() -> u64 {
+        crate::plugins::udp_logging::local_record_drops_for_test()
     }
 
     pub fn udp_logging_classify_serialized_summaries_for_test(
         summaries: &[crate::plugins::TransactionSummary],
-        max_plaintext: usize,
+        max_datagram_bytes: usize,
     ) -> Result<(&'static str, usize), String> {
-        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
+        use crate::plugins::udp_logging::BatchSizeDecision;
         use crate::plugins::utils::ByteBudget;
         use crate::plugins::utils::byte_budget::accounted_summary_bytes;
         use crate::plugins::utils::summary_log_budget::serialize_under_byte_budget;
@@ -11287,14 +11303,14 @@ pub mod _test_support {
             entries.push(payload);
         }
         let (decision, payload_len) =
-            crate::plugins::udp_logging::classify_serialized_dtls_batch_for_test(
+            crate::plugins::udp_logging::classify_serialized_batch_for_test(
                 &entries,
-                max_plaintext,
+                max_datagram_bytes,
             )?;
         let label = match decision {
-            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
-            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
-            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+            BatchSizeDecision::SendAsIs => "send_as_is",
+            BatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            BatchSizeDecision::SplitPerEntry => "split_per_entry",
         };
         Ok((label, payload_len))
     }
@@ -11546,8 +11562,8 @@ pub mod _test_support {
         crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
     }
 
-    pub fn udp_logging_local_dtls_size_rejection_preserves_sender_for_test() -> bool {
-        crate::plugins::udp_logging::local_dtls_size_rejection_preserves_sender_for_test()
+    pub fn udp_logging_local_size_rejection_preserves_sender_for_test() -> bool {
+        crate::plugins::udp_logging::local_size_rejection_preserves_sender_for_test()
     }
 
     pub fn udp_logging_transport_dtls_failure_requires_sender_reset_for_test() -> bool {

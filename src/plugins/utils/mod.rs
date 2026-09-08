@@ -70,8 +70,8 @@ pub use log_helpers::{
     redacted_endpoint_url, redacted_endpoint_url_str, validate_batch_config,
 };
 pub use summary_log_budget::{
-    QueuedSummaryPayload, admit_http_summary, admit_stream_summary, assemble_json_array,
-    assemble_ndjson,
+    JSON_ARRAY_FRAMING_BYTES, QueuedSummaryPayload, admit_http_summary, admit_stream_summary,
+    assemble_json_array, assemble_ndjson, json_array_len,
 };
 // Re-exported for external unit tests; unused inside the binary target.
 #[allow(unused_imports)]

@@ -16,10 +16,18 @@
 //!
 //! Each batch is serialized as a JSON array and sent as a single UDP datagram.
 //! DTLS success means local engine + connected-socket acceptance, not remote
-//! UDP delivery. Payloads larger than `FERRUM_DTLS_MAX_PLAINTEXT_BYTES`
-//! (default 16,384) fail closed into the batching retry / final-loss path;
-//! multi-entry batches that exceed the ceiling are split so one oversized
-//! record cannot silently discard its co-batched neighbors.
+//! UDP delivery.
+//!
+//! Every batch is gated by the *active transport's* per-datagram ceiling, not
+//! only under DTLS (GHSA-cr65-wcww-rr49; the plain-UDP half of GHSA-q77f).
+//! Under DTLS the ceiling is `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default
+//! 16,384); on plain UDP it is the datagram maximum for the resolved
+//! destination's address family (IPv4 65,507 / IPv6 65,527 payload bytes).
+//! Single-entry batches over the ceiling fail closed into the batching retry /
+//! final-loss path; multi-entry batches over it are split per entry so one
+//! oversized record cannot silently discard its co-batched neighbors. The
+//! ceiling is evaluated from the predicted serialized length, so an
+//! undeliverable contiguous payload is never assembled.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,10 +43,11 @@ use tracing::warn;
 
 use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
-    QueuedSummaryPayload, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits, admit_http_summary,
-    admit_stream_summary, assemble_json_array, bind_connected_udp_socket, build_batch_config,
-    parse_socket_host, resolve_udp_endpoint, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, JSON_ARRAY_FRAMING_BYTES,
+    PluginHttpClient, QueuedSummaryPayload, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
+    admit_http_summary, admit_stream_summary, assemble_json_array, bind_connected_udp_socket,
+    build_batch_config, json_array_len, parse_socket_host, resolve_udp_endpoint,
+    validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
@@ -699,6 +708,15 @@ impl UdpDeliveryError {
     }
 }
 
+/// Snapshot of the process-wide local record-drop counter.
+///
+/// Lets external tests prove that an undeliverable record was rejected on its
+/// own rather than silently taking its co-batched siblings with it.
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn local_record_drops_for_test() -> u64 {
+    LOCAL_RECORD_DROPS.load(Ordering::Relaxed)
+}
+
 fn record_local_record_drop(error: &UdpDeliveryError) {
     let total = LOCAL_RECORD_DROPS
         .fetch_add(1, Ordering::Relaxed)
@@ -768,8 +786,8 @@ pub(crate) fn dtls_send_timeout_requires_sender_reset_for_test() -> bool {
 
 /// Test helper: local deterministic rejection must not reset the sender.
 #[allow(dead_code)] // used via library `_test_support`; dead in the bin target
-pub(crate) fn local_dtls_size_rejection_preserves_sender_for_test() -> bool {
-    let error = UdpDeliveryError::local(oversized_dtls_batch_error(16_384, 16_385));
+pub(crate) fn local_size_rejection_preserves_sender_for_test() -> bool {
+    let error = UdpDeliveryError::local(oversized_batch_error(16_384, 16_385));
     !error.requires_sender_reset()
 }
 
@@ -908,7 +926,13 @@ async fn send_batch(
     }
 
     let result = match sender.as_ref() {
-        Some(active_sender) => deliver_batch(cfg, active_sender, batch).await,
+        Some(active_sender) => {
+            // Resolve the ceiling from the transport actually in use: the DTLS
+            // plaintext ceiling, or the datagram maximum for the pinned
+            // destination's address family on plain UDP.
+            let max_datagram_bytes = effective_datagram_limit(cfg.dtls_enabled, current_addr);
+            deliver_batch(active_sender, batch, max_datagram_bytes).await
+        }
         None => Err(UdpDeliveryError::transport(
             "udp_logging: sender unavailable after initialization".to_string(),
         )),
@@ -939,13 +963,51 @@ async fn send_batch(
     result.map_err(UdpDeliveryError::into_message)
 }
 
-/// DTLS plaintext-size gate for one already-serialized batch payload.
+/// Largest UDP payload one IPv4 datagram can carry: the 65,535-byte total
+/// length minus the 20-byte IPv4 header and the 8-byte UDP header.
+pub(crate) const IPV4_MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
+
+/// Largest UDP payload one IPv6 datagram can carry: the 65,535-byte payload
+/// length minus the 8-byte UDP header. Jumbograms (RFC 2675) are deliberately
+/// not assumed — a path that cannot carry one would fail closed at send.
+pub(crate) const IPV6_MAX_UDP_PAYLOAD_BYTES: usize = 65_527;
+
+/// Plain-UDP per-datagram ceiling for `remote_addr`'s address family.
+pub(crate) fn plain_udp_max_datagram_bytes(remote_addr: SocketAddr) -> usize {
+    match remote_addr {
+        SocketAddr::V4(_) => IPV4_MAX_UDP_PAYLOAD_BYTES,
+        SocketAddr::V6(_) => IPV6_MAX_UDP_PAYLOAD_BYTES,
+    }
+}
+
+/// Effective per-datagram payload ceiling for the transport actually in use.
 ///
-/// Kept pure (no async / no I/O) so the multi-entry split path can call a
-/// non-recursive single-entry helper without boxing an async recursion.
+/// The plugin exposes no datagram-size knob, so the plain-UDP bound is fixed by
+/// the address family rather than configurable. An unresolved destination is
+/// gated on the smaller (IPv4) bound so the gate can never be skipped.
+pub(crate) fn effective_datagram_limit(
+    dtls_enabled: bool,
+    remote_addr: Option<SocketAddr>,
+) -> usize {
+    if dtls_enabled {
+        return crate::dtls::max_plaintext_bytes();
+    }
+    match remote_addr {
+        Some(addr) => plain_udp_max_datagram_bytes(addr),
+        None => IPV4_MAX_UDP_PAYLOAD_BYTES,
+    }
+}
+
+/// Transport-neutral datagram-size gate for one batch.
+///
+/// Sizing a datagram is a property of the transport, not of DTLS: plain UDP has
+/// its own hard ceiling, and skipping the gate there let one oversized record
+/// destroy every co-batched record (GHSA-cr65-wcww-rr49). Kept pure (no async /
+/// no I/O) so the multi-entry split path can call a non-recursive single-entry
+/// helper without boxing an async recursion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DtlsBatchSizeDecision {
-    /// Payload fits the ceiling (or DTLS is off); send as one datagram.
+pub(crate) enum BatchSizeDecision {
+    /// Payload fits the ceiling; send as one datagram.
     SendAsIs,
     /// Single-entry batch exceeds the ceiling — fail closed into retry/final-loss.
     RejectOversizedSingle,
@@ -953,26 +1015,25 @@ pub(crate) enum DtlsBatchSizeDecision {
     SplitPerEntry,
 }
 
-pub(crate) fn classify_dtls_batch_size(
-    dtls_enabled: bool,
+pub(crate) fn classify_batch_size(
     payload_len: usize,
     batch_len: usize,
-    max_plaintext: usize,
-) -> DtlsBatchSizeDecision {
-    if !dtls_enabled || payload_len <= max_plaintext {
-        return DtlsBatchSizeDecision::SendAsIs;
+    max_datagram_bytes: usize,
+) -> BatchSizeDecision {
+    if payload_len <= max_datagram_bytes {
+        return BatchSizeDecision::SendAsIs;
     }
     if batch_len == 1 {
-        DtlsBatchSizeDecision::RejectOversizedSingle
+        BatchSizeDecision::RejectOversizedSingle
     } else {
-        DtlsBatchSizeDecision::SplitPerEntry
+        BatchSizeDecision::SplitPerEntry
     }
 }
 
-fn oversized_dtls_batch_error(max_plaintext: usize, got: usize) -> String {
+fn oversized_batch_error(max_datagram_bytes: usize, got: usize) -> String {
     format!(
-        "udp_logging: DTLS batch exceeds max_plaintext \
-         ({max_plaintext} bytes, got {got}); local delivery rejected before driver enqueue"
+        "udp_logging: batch exceeds the transport datagram limit \
+         ({max_datagram_bytes} bytes, got {got}); local delivery rejected before send"
     )
 }
 
@@ -980,39 +1041,51 @@ fn serialize_batch_payload(batch: &[QueuedSummaryPayload]) -> Vec<u8> {
     assemble_json_array(batch).into_bytes()
 }
 
+/// Largest `max_entry_bytes` whose own single-entry datagram still fits `limit`.
+///
+/// Documentation helper: a record above this cannot be carried by that
+/// transport at all and is dropped alone rather than with its siblings.
 #[allow(dead_code)] // used via library `_test_support`; dead in the bin target
-pub(crate) fn classify_serialized_dtls_batch_for_test(
+pub(crate) const fn max_deliverable_entry_bytes(max_datagram_bytes: usize) -> usize {
+    max_datagram_bytes.saturating_sub(JSON_ARRAY_FRAMING_BYTES)
+}
+
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn classify_serialized_batch_for_test(
     batch: &[QueuedSummaryPayload],
-    max_plaintext: usize,
-) -> Result<(DtlsBatchSizeDecision, usize), String> {
-    let payload = serialize_batch_payload(batch);
-    let decision = classify_dtls_batch_size(true, payload.len(), batch.len(), max_plaintext);
-    Ok((decision, payload.len()))
+    max_datagram_bytes: usize,
+) -> Result<(BatchSizeDecision, usize), String> {
+    let payload_len = json_array_len(batch);
+    let decision = classify_batch_size(payload_len, batch.len(), max_datagram_bytes);
+    debug_assert_eq!(payload_len, serialize_batch_payload(batch).len());
+    Ok((decision, payload_len))
 }
 
 async fn deliver_batch(
-    cfg: &UdpFlushConfig,
     sender: &UdpSender,
     batch: &[QueuedSummaryPayload],
+    max_datagram_bytes: usize,
 ) -> Result<(), UdpDeliveryError> {
-    let payload = serialize_batch_payload(batch);
-
-    let max_plaintext = crate::dtls::max_plaintext_bytes();
-    match classify_dtls_batch_size(cfg.dtls_enabled, payload.len(), batch.len(), max_plaintext) {
-        DtlsBatchSizeDecision::SendAsIs => sender.send(&payload).await,
-        DtlsBatchSizeDecision::RejectOversizedSingle => Err(UdpDeliveryError::local(
-            oversized_dtls_batch_error(max_plaintext, payload.len()),
+    // Bound the assembled batch by construction: classify on the length the
+    // assembler *would* produce so a payload no transport can carry is never
+    // materialized. `batch_size` x `max_entry_bytes` may reach ~640 KB, an
+    // order of magnitude past any UDP datagram.
+    let payload_len = json_array_len(batch);
+    match classify_batch_size(payload_len, batch.len(), max_datagram_bytes) {
+        BatchSizeDecision::SendAsIs => {
+            let payload = serialize_batch_payload(batch);
+            sender.send(&payload).await
+        }
+        BatchSizeDecision::RejectOversizedSingle => Err(UdpDeliveryError::local(
+            oversized_batch_error(max_datagram_bytes, payload_len),
         )),
-        DtlsBatchSizeDecision::SplitPerEntry => {
+        BatchSizeDecision::SplitPerEntry => {
             // Fixed one-level fan-out into the non-recursive single-entry helper
             // so one oversized record cannot erase co-batched siblings. Oversized
             // singles are discarded with an explicit warning; other local delivery
             // failures still propagate into retry/final-loss.
-            // Release the superseded contiguous batch before assembling each
-            // single-entry payload so the two-copy byte accounting remains exact.
-            drop(payload);
             for entry in batch {
-                match deliver_one_entry(cfg, sender, entry).await {
+                match deliver_one_entry(sender, entry, max_datagram_bytes).await {
                     Ok(()) => {}
                     Err(error) if !error.requires_sender_reset() => {
                         record_local_record_drop(&error);
@@ -1029,23 +1102,23 @@ async fn deliver_batch(
 /// so the multi-entry oversized split stays a fixed-depth fan-out (no async
 /// recursion / no `Box::pin` of an unbounded path).
 async fn deliver_one_entry(
-    cfg: &UdpFlushConfig,
     sender: &UdpSender,
     entry: &QueuedSummaryPayload,
+    max_datagram_bytes: usize,
 ) -> Result<(), UdpDeliveryError> {
-    let payload = serialize_batch_payload(std::slice::from_ref(entry));
-
-    let max_plaintext = crate::dtls::max_plaintext_bytes();
-    match classify_dtls_batch_size(cfg.dtls_enabled, payload.len(), 1, max_plaintext) {
-        DtlsBatchSizeDecision::SendAsIs => sender.send(&payload).await,
-        DtlsBatchSizeDecision::RejectOversizedSingle => Err(UdpDeliveryError::local(
-            oversized_dtls_batch_error(max_plaintext, payload.len()),
-        )),
+    let batch = std::slice::from_ref(entry);
+    let payload_len = json_array_len(batch);
+    match classify_batch_size(payload_len, 1, max_datagram_bytes) {
+        BatchSizeDecision::SendAsIs => {
+            let payload = serialize_batch_payload(batch);
+            sender.send(&payload).await
+        }
         // `batch_len == 1` never selects split; keep fail-closed if the
         // classifier contract changes.
-        DtlsBatchSizeDecision::SplitPerEntry => Err(UdpDeliveryError::local(
-            oversized_dtls_batch_error(max_plaintext, payload.len()),
-        )),
+        BatchSizeDecision::RejectOversizedSingle | BatchSizeDecision::SplitPerEntry => {
+            let error = oversized_batch_error(max_datagram_bytes, payload_len);
+            Err(UdpDeliveryError::local(error))
+        }
     }
 }
 
