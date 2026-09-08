@@ -130,10 +130,7 @@ fn response_shapes() -> Vec<ResponseShape> {
                     }
                 }]
             }),
-            semantic_firewall: Coverage::Gap(
-                "DEFAULT_RESPONSE_JSON_PATHS carries $.candidates[*].content.parts[*].text only, \
-                 with no parts[*].functionCall path",
-            ),
+            semantic_firewall: Coverage::Extracts,
             response_guard: Coverage::Gap(
                 "the Gemini arm of extract_completion_texts reads parts[].text only",
             ),
