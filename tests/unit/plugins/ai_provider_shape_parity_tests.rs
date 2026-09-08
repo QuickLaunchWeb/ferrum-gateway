@@ -194,9 +194,7 @@ fn provider_shapes() -> Vec<ProviderShape> {
             body: json!({"instances": [{"prompt": MARKER}]}),
             semantic_firewall: Coverage::Extracts,
             prompt_shield: Coverage::Gap("instances is not in CONTENT_SCAN_FIELDS"),
-            request_guard: Coverage::Gap(
-                "count_prompt_characters has no `instances` arm",
-            ),
+            request_guard: Coverage::Gap("count_prompt_characters has no `instances` arm"),
         },
     ]
 }
