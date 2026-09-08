@@ -136,12 +136,28 @@ pub fn admit_stream_summary(
     }
 }
 
+/// Bytes [`assemble_json_array`] adds around the entries themselves: the
+/// opening `[` and the closing `]`.
+pub const JSON_ARRAY_FRAMING_BYTES: usize = 2;
+
+/// Exact byte length [`assemble_json_array`] will produce for `batch`, computed
+/// without allocating.
+///
+/// Datagram sinks classify a payload against the transport's per-datagram
+/// ceiling before assembling it, so an undeliverable contiguous buffer is never
+/// materialized. Kept beside the assembler (and used for its exact capacity) so
+/// the predicted and produced lengths cannot drift.
+pub fn json_array_len(batch: &[QueuedSummaryPayload]) -> usize {
+    let mut total = JSON_ARRAY_FRAMING_BYTES.saturating_add(batch.len().saturating_sub(1));
+    for entry in batch {
+        total = total.saturating_add(entry.json.len());
+    }
+    total
+}
+
 /// Assemble a JSON array body from pre-serialized entries for HTTP/UDP sinks.
 pub fn assemble_json_array(batch: &[QueuedSummaryPayload]) -> String {
-    let capacity = batch.iter().fold(2usize, |total, entry| {
-        total.saturating_add(entry.json.len().saturating_add(1))
-    });
-    let mut body = String::with_capacity(capacity);
+    let mut body = String::with_capacity(json_array_len(batch));
     body.push('[');
     for (idx, entry) in batch.iter().enumerate() {
         if idx > 0 {
