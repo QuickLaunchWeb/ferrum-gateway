@@ -28304,7 +28304,22 @@ async fn finalize_upload_deadline_rejection(
     response
 }
 
-fn release_circuit_breaker_probe_on_admission_reject(
+/// Release a HALF_OPEN probe slot `check_circuit_breaker` admitted, for a
+/// request the gateway rejects before it ever reaches the backend.
+///
+/// A gateway-side refusal is neither a backend success nor a backend failure,
+/// so the slot is released NEUTRAL: the breaker's health is unchanged and the
+/// next probe can be admitted instead of the breaker wedging OPEN forever.
+///
+/// Siblings that share this invariant and MUST route through this one
+/// implementation (issue #4792): the H1/H2/WebSocket/gRPC handler in this
+/// module, [`crate::http3::server::release_h3_circuit_breaker_probe_on_admission_reject`],
+/// and [`crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject`].
+/// The gRPC dispatch block additionally carries `GrpcProbeReleaseGuard`, an RAII
+/// wrapper over the same NEUTRAL release for its many early returns. When one of
+/// these changes, change them together —
+/// `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts they agree.
+pub(crate) fn release_circuit_breaker_probe_on_admission_reject(
     state: &ProxyState,
     proxy: &Proxy,
     target_key: Option<&str>,
