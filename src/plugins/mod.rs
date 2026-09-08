@@ -7729,23 +7729,33 @@ pub async fn log_with_mirror(
     // trailers-only), gRPC-Web, H1/H2/H3, the HBONE relay, and the WebSocket
     // upgrade summary — so no call site has to remember to carry it.
     //
-    // The clone happens only when this request actually evaluated a trigger and
-    // the summary does not already carry one; the untriggered default
-    // configuration pays one `is_empty()` check and no allocation.
+    // Clone only to stamp a missing trigger carrier or the detected WebSocket
+    // flavor. Ordinary untriggered HTTP keeps the allocation-free path.
     // Keep the conditional clone out of this async future's inline state. A
     // `TransactionSummary` is deliberately broad; storing it inline here grows
     // every request future (including the allocation-free, untriggered case)
     // and can exhaust a worker stack under instrumentation. The triggered path
     // already clones owned summary data, so one box does not change the common
     // path and bounds the future itself to a pointer-sized optional value.
-    let mut stamped =
-        if ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty() {
-            Some(Box::new(summary.clone()))
-        } else {
-            None
-        };
+    let stamp_triggers =
+        ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty();
+    let stamp_websocket = matches!(ctx.request_http_flavor(), HttpFlavor::WebSocket);
+    let mut stamped = if stamp_triggers || stamp_websocket {
+        Some(Box::new(summary.clone()))
+    } else {
+        None
+    };
     if let Some(stamped) = stamped.as_deref_mut() {
-        stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+        if stamp_triggers {
+            stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+        }
+        if stamp_websocket {
+            // H2/H3 Extended CONNECT succeeds with 2xx, not H1's 101. Carry
+            // the private, detected flavor through the shared terminal funnel.
+            stamped
+                .metadata
+                .insert("request_protocol".to_string(), "ws".to_string());
+        }
     }
     let summary = stamped.as_deref().unwrap_or(summary);
     let precompute_mesh_key = plugins

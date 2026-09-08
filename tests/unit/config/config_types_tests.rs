@@ -6284,6 +6284,92 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
     }));
 }
 
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy() {
+    let mut config = empty_config();
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: "charge-a".into(),
+        },
+        PluginAssociation {
+            plugin_config_id: "charge-b".into(),
+        },
+    ];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![
+        PluginConfig {
+            id: "charge-a".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "api_chargeback_sink".into(),
+            config: serde_json::json!({
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+                "clickhouse": {"url": "http://localhost:8123"},
+                "spool": {"enabled": false}
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".into()),
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        PluginConfig {
+            id: "charge-b".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "api_chargeback_sink".into(),
+            config: serde_json::json!({
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.02}],
+                "clickhouse": {"url": "http://localhost:8123"},
+                "spool": {"enabled": false}
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".into()),
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    ];
+
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("duplicate effective api_chargeback_sink must be rejected");
+    assert!(errors.iter().any(|error| {
+        error.contains("at most one effective instance per proxy")
+            && error.contains("charge-a")
+            && error.contains("charge-b")
+    }));
+    assert!(
+        ferrum_edge::PluginCache::new(&config).is_err(),
+        "cache construction must enforce sink exclusivity too"
+    );
+    let duplicates = config.clone();
+    config.proxies[0].plugins.pop();
+    config.plugin_configs.pop();
+    config.validate_plugin_references().unwrap();
+    let cache = ferrum_edge::PluginCache::new(&config).expect("one sink must build with a runtime");
+    assert!(
+        cache.rebuild(&duplicates).is_err(),
+        "reload must refuse duplicate sinks"
+    );
+    // A scoped sink shadows a global sink rather than multiplying its output.
+    let mut global = config.plugin_configs[0].clone();
+    global.id = "global-sink".into();
+    global.scope = PluginScope::Global;
+    global.proxy_id = None;
+    config.plugin_configs.push(global);
+    config.validate_plugin_references().unwrap();
+    cache
+        .rebuild(&config)
+        .expect("scoped override must remain valid");
+}
+
 #[test]
 fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
     let mut config = empty_config();

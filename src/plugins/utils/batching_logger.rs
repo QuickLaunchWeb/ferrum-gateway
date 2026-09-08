@@ -580,6 +580,11 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
         }
     }
 
+    /// Accepted records still queued, pending in a batch, or being flushed.
+    pub fn outstanding_count(&self) -> usize {
+        self.outstanding_count.load(Ordering::Relaxed)
+    }
+
     pub fn queue_depth(&self) -> usize {
         self.queue_depth.load(Ordering::Relaxed)
     }

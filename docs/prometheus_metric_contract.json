@@ -94,6 +94,16 @@
     "emission": "when_plugin_enabled"
   },
   {
+    "name": "chargeback_sink_queue_outstanding",
+    "type": "gauge",
+    "help": "Current accepted generations' queued, batched, and exporting rows.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
     "name": "chargeback_sink_queue_retained_bytes",
     "type": "gauge",
     "help": "Chargeback sink retained export and spool-delivery bytes under the configured buffer_max_bytes budget.",
