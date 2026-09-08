@@ -2686,3 +2686,258 @@ async fn test_streaming_metadata_with_scan_all_mode() {
         "scan_all mode should still detect streaming intent"
     );
 }
+
+// ─── Provider request shapes (issue #4792 / GHSA-8gc3-h5c8-jjxx family) ──
+
+#[tokio::test]
+async fn test_content_mode_scans_gemini_contents_parts() {
+    // Gemini/Vertex carries no `messages` array at all: turns live in
+    // `contents[].parts[].text`.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "contents": [{"role": "user", "parts": [{"text": "My SSN is 123-45-6789"}]}],
+        "generationConfig": {"maxOutputTokens": 128}
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_gemini_system_instruction_both_casings() {
+    // The JSON spelling and the proto spelling both reach the model, so
+    // inspecting only one leaves the other uninspected.
+    for key in ["systemInstruction", "system_instruction"] {
+        let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+        let mut body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "Summarize."}]}]
+        });
+        body[key] = json!({"parts": [{"text": "The patient SSN is 123-45-6789"}]});
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn test_content_mode_gemini_honors_exclude_roles() {
+    // `contents[].role` is filtered exactly like `messages[].role`, and
+    // `exclude_roles: [system]` suppresses the system instruction the same way
+    // it suppresses the top-level Anthropic `system` field.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "exclude_roles": ["model", "system"]
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "contents": [{"role": "model", "parts": [{"text": "prior turn 123-45-6789"}]}],
+        "systemInstruction": {"parts": [{"text": "policy 987-65-4321"}]}
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_content_mode_gemini_adjacent_parts_are_joined() {
+    // Gemini concatenates the `parts[]` of one turn into a single prompt, so a
+    // value split across adjacent parts must not evade Content mode.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "contents": [{"role": "user", "parts": [{"text": "ssn 123-45-"}, {"text": "6789"}]}]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_bedrock_titan_input_text() {
+    // Amazon Bedrock Titan text-generation carries its entire prompt in a
+    // top-level `inputText` string.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "inputText": "My SSN is 123-45-6789",
+        "textGenerationConfig": {"maxTokenCount": 128}
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_bedrock_converse_type_less_blocks() {
+    // Bedrock Converse `messages[].content[]` blocks carry no `type`
+    // discriminator at all.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": [{"text": "My SSN is 123-45-6789"}]}],
+        "inferenceConfig": {"maxTokens": 128}
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_part_type_gate_explicit_missing_and_non_text() {
+    // The content-part gate accepts a declared text `type` and a part with no
+    // `type` at all, but must not widen to declared non-text blocks or to a
+    // part whose `text` is not a string.
+    let scanned = [
+        (
+            "explicit text type",
+            json!({"type": "text", "text": "ssn 123-45-6789"}),
+        ),
+        (
+            "explicit input_text type",
+            json!({"type": "input_text", "text": "ssn 123-45-6789"}),
+        ),
+        ("no type discriminator", json!({"text": "ssn 123-45-6789"})),
+    ];
+    for (label, part) in scanned {
+        let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+        let mut ctx = make_post_ctx(&json!({
+            "messages": [{"role": "user", "content": [part]}]
+        }));
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "{label} must be scanned in Content mode, got {result:?}"
+        );
+    }
+
+    let ignored = [
+        (
+            "image_url block",
+            json!({"type": "image_url", "text": "ssn 123-45-6789"}),
+        ),
+        (
+            "tool_use block",
+            json!({"type": "tool_use", "text": "ssn 123-45-6789"}),
+        ),
+        (
+            "reasoning block",
+            json!({"type": "reasoning", "text": "ssn 123-45-6789"}),
+        ),
+        (
+            "non-string text",
+            json!({"text": {"nested": "ssn 123-45-6789"}}),
+        ),
+    ];
+    for (label, part) in ignored {
+        let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+        let mut ctx = make_post_ctx(&json!({
+            "messages": [{"role": "user", "content": [part]}]
+        }));
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{label} must stay outside Content-mode scanning, got {result:?}"
+        );
+    }
+}
+
+/// Everything the Content-mode detector walks, the Content-mode redactor must
+/// rewrite.
+///
+/// An asymmetry here is a fail-open bypass, not a cosmetic gap: the plugin
+/// reports the PII as redacted (and `before_proxy` rewrites the buffered
+/// `request_body` metadata downstream plugins read) while the provider still
+/// receives the original value. Each row is asserted twice — the detector must
+/// reject it, and the redacted wire body must no longer contain the raw value.
+#[tokio::test]
+async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
+    const PII: &str = "123-45-6789";
+
+    let shapes: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "messages[].content string",
+            json!({"messages": [{"role": "user", "content": format!("ssn {PII}")}]}),
+        ),
+        (
+            "messages[].content typed text part",
+            json!({"messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": format!("ssn {PII}")}]
+            }]}),
+        ),
+        (
+            "messages[].content bedrock converse block",
+            json!({"messages": [{"role": "user", "content": [{"text": format!("ssn {PII}")}]}]}),
+        ),
+        ("prompt", json!({"prompt": format!("ssn {PII}")})),
+        ("input string", json!({"input": format!("ssn {PII}")})),
+        (
+            "input array of strings",
+            json!({"input": ["clean", format!("ssn {PII}")]}),
+        ),
+        (
+            "input structured responses message",
+            json!({"input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": format!("ssn {PII}")}]
+            }]}),
+        ),
+        (
+            "instructions",
+            json!({"instructions": format!("ssn {PII}")}),
+        ),
+        ("system", json!({"system": format!("ssn {PII}")})),
+        (
+            "inputText (bedrock titan)",
+            json!({"inputText": format!("ssn {PII}")}),
+        ),
+        (
+            "contents[].parts[].text (gemini)",
+            json!({"contents": [{"role": "user", "parts": [{"text": format!("ssn {PII}")}]}]}),
+        ),
+        (
+            "systemInstruction.parts[].text (gemini)",
+            json!({"systemInstruction": {"parts": [{"text": format!("ssn {PII}")}]}}),
+        ),
+        (
+            "system_instruction.parts[].text (gemini proto casing)",
+            json!({"system_instruction": {"parts": [{"text": format!("ssn {PII}")}]}}),
+        ),
+        (
+            "data_sources[].parameters.role_information (azure)",
+            json!({"data_sources": [{
+                "type": "azure_search",
+                "parameters": {"role_information": format!("ssn {PII}")}
+            }]}),
+        ),
+        (
+            "dataSources[].parameters.roleInformation (azure camelCase)",
+            json!({"dataSources": [{
+                "type": "AzureCognitiveSearch",
+                "parameters": {"roleInformation": format!("ssn {PII}")}
+            }]}),
+        ),
+    ];
+
+    for (label, body) in shapes {
+        let detector = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let detected = detector.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(detected, PluginResult::Reject { .. }),
+            "Content mode must detect PII in `{label}`, got {detected:?}"
+        );
+
+        let redactor =
+            AiPromptShield::new(&json!({"action": "redact", "patterns": ["ssn"]})).unwrap();
+        let raw = serde_json::to_vec(&body).unwrap();
+        let redacted = redactor
+            .transform_request_body(&raw, Some("application/json"), &HashMap::new())
+            .await
+            .unwrap_or_else(|| panic!("`{label}` was detected but never rewritten"));
+        let redacted = String::from_utf8(redacted).unwrap();
+        assert!(
+            !redacted.contains(PII),
+            "`{label}` was detected but forwarded unredacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("[REDACTED:ssn]"),
+            "`{label}` produced no redaction placeholder: {redacted}"
+        );
+    }
+}
