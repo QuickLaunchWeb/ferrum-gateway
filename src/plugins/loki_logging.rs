@@ -221,7 +221,10 @@ impl LokiByteBudget {
             });
         if reserved.is_err() {
             drop(process);
-            self.record_drop(SinkLossReason::ByteBudget, "retained-content byte budget exhausted");
+            self.record_drop(
+                SinkLossReason::ByteBudget,
+                "retained-content byte budget exhausted",
+            );
             return None;
         }
 

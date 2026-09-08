@@ -174,10 +174,10 @@ async fn buffer_full_counts_queue_full_and_accepted_accounts_for_every_record() 
 
     // Left uncommitted so the flush worker stays dormant and nothing drains
     // the bounded channel; every send after the first is a queue-full loss.
-    let logger: BatchingLogger<u64> = BatchingLogger::spawn(
-        probe_batch_config(8, 1, 1),
-        |_batch: Arc<Vec<u64>>| async { Ok::<(), String>(()) },
-    );
+    let logger: BatchingLogger<u64> =
+        BatchingLogger::spawn(probe_batch_config(8, 1, 1), |_batch: Arc<Vec<u64>>| async {
+            Ok::<(), String>(())
+        });
 
     let mut accepted = 0u64;
     let mut refused = 0u64;
@@ -302,8 +302,7 @@ fn exposition_carries_help_type_and_every_series_even_at_zero() {
         assert!(exposition.contains(&accepted), "missing {plugin} accepted");
         for reason in SinkLossReason::ALL {
             let label = reason.as_str();
-            let series =
-                format!("{dropped_family}{{plugin=\"{plugin}\",reason=\"{label}\"}} ");
+            let series = format!("{dropped_family}{{plugin=\"{plugin}\",reason=\"{label}\"}} ");
             assert!(
                 exposition.contains(&series),
                 "missing zero-valued series for {plugin}/{label}"
