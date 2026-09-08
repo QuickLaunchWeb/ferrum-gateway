@@ -182,7 +182,7 @@ fn every_circuit_breaker_admission_site_carries_a_probe_release_mechanism() {
         .iter()
         .map(|(_, file, _, _, _)| *file)
         .collect();
-    for site in PROBE_ADMISSION_SITES {
+    for &site in PROBE_ADMISSION_SITES {
         assert!(
             defining.contains(site),
             "{site} admits HALF_OPEN probes but defines no probe-release mechanism"
@@ -192,7 +192,7 @@ fn every_circuit_breaker_admission_site_carries_a_probe_release_mechanism() {
 
 #[test]
 fn every_probe_release_mechanism_settles_through_the_shared_neutral_release() {
-    for (label, file, signature, terminator, marker) in PROBE_RELEASE_MECHANISMS {
+    for &(label, file, signature, terminator, marker) in PROBE_RELEASE_MECHANISMS {
         let text = source(file);
         let body = item_body(&text, signature, terminator);
         assert!(
@@ -210,7 +210,10 @@ fn the_two_http3_probe_releases_delegate_to_the_shared_implementation() {
     // path. These two were byte-identical copies of the H1/H2 helper; they now
     // delegate, so a change to the release semantics cannot reach one path only.
     for (file, signature) in [
-        ("src/http3/server.rs", "fn release_h3_circuit_breaker_probe_on_admission_reject("),
+        (
+            "src/http3/server.rs",
+            "fn release_h3_circuit_breaker_probe_on_admission_reject(",
+        ),
         (
             "src/http3/websocket.rs",
             "pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(",
@@ -246,7 +249,7 @@ fn breaker_holding_one_probe() -> CircuitBreaker {
     cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
     assert!(
-        cb.can_execute().expect("timeout_seconds = 0 admits a probe"),
+        cb.can_execute().expect("timeout 0 admits a probe"),
         "the admitted request must be flagged as the HALF_OPEN probe"
     );
     assert_eq!(cb.half_open_in_flight(), 1);
@@ -276,9 +279,18 @@ fn record_probe_neutral(cb: &CircuitBreaker) {
 /// Every terminal outcome a dispatch path can record for an admitted probe.
 const PROBE_OUTCOMES: &[(&str, fn(&CircuitBreaker))] = &[
     ("record_success", record_probe_success),
-    ("record_failure(tripping status)", record_probe_tripping_failure),
-    ("record_failure(non-tripping status)", record_probe_non_tripping_status),
-    ("record_failure(connection error)", record_probe_connection_failure),
+    (
+        "record_failure(tripping status)",
+        record_probe_tripping_failure,
+    ),
+    (
+        "record_failure(non-tripping status)",
+        record_probe_non_tripping_status,
+    ),
+    (
+        "record_failure(connection error)",
+        record_probe_connection_failure,
+    ),
     ("record_neutral", record_probe_neutral),
 ];
 
@@ -286,12 +298,11 @@ const PROBE_OUTCOMES: &[(&str, fn(&CircuitBreaker))] = &[
 fn every_probe_outcome_kind_releases_the_half_open_slot() {
     // Every one of them must return the slot: a path that records nothing —
     // the original gRPC defect — leaks it and wedges the breaker OPEN.
-    for (label, record) in PROBE_OUTCOMES {
+    for &(label, record) in PROBE_OUTCOMES {
         let cb = breaker_holding_one_probe();
         record(&cb);
         assert_eq!(
-            cb.half_open_in_flight(),
-            0,
+            cb.half_open_in_flight(), 0,
             "{label} must release the HALF_OPEN probe slot"
         );
     }
@@ -335,8 +346,7 @@ fn all_three_target_health_layers_prune_from_one_live_snapshot() {
         ".health_checker.remove_stale_passive_targets_for_proxy(",
     ] {
         assert_eq!(
-            proxy.matches(layer).count(),
-            body.matches(layer).count(),
+            proxy.matches(layer).count(), body.matches(layer).count(),
             "every `{layer}` call site in src/proxy/mod.rs must live inside \
              prune_stale_target_health, against the one live snapshot"
         );
@@ -383,7 +393,11 @@ fn active_probing_resolves_targets_through_the_load_balancer_cache() {
 /// Every dispatch path that classifies a protocol NACK, and the shared
 /// predicate it must route through.
 const PROTOCOL_NACK_CONSUMERS: &[(&str, &str, &str)] = &[
-    ("reqwest dispatch", "src/proxy/mod.rs", "retry::reqwest_error_is_protocol_nack"),
+    (
+        "reqwest dispatch",
+        "src/proxy/mod.rs",
+        "retry::reqwest_error_is_protocol_nack",
+    ),
     (
         "HTTP/3 plain bridge",
         "src/http3/cross_protocol.rs",
@@ -398,7 +412,7 @@ const PROTOCOL_NACK_CONSUMERS: &[(&str, &str, &str)] = &[
 
 #[test]
 fn every_protocol_nack_consumer_routes_through_the_shared_predicate() {
-    for (label, file, predicate) in PROTOCOL_NACK_CONSUMERS {
+    for &(label, file, predicate) in PROTOCOL_NACK_CONSUMERS {
         let text = source(file);
         assert!(
             text.contains(predicate),
@@ -416,8 +430,7 @@ fn every_protocol_nack_consumer_routes_through_the_shared_predicate() {
 fn the_protocol_nack_predicate_has_exactly_one_implementation() {
     let retry = source("src/retry.rs");
     assert_eq!(
-        retry.matches("h2::Reason::REFUSED_STREAM").count(),
-        1,
+        retry.matches("h2::Reason::REFUSED_STREAM").count(), 1,
         "the RFC 9113 rejection proof must live in exactly one predicate"
     );
     let body = item_body(
@@ -444,8 +457,11 @@ fn every_buffered_upload_dispatch_replays_through_one_driver() {
         proxy.contains("pub(crate) async fn send_buffered_upload_with_protocol_nack_replay<"),
         "the buffered-upload replay driver must remain shared"
     );
+    let replay_sites = proxy
+        .matches("send_buffered_upload_with_protocol_nack_replay(")
+        .count();
     assert!(
-        proxy.matches("send_buffered_upload_with_protocol_nack_replay(").count() >= 2,
+        replay_sites >= 2,
         "every buffered-upload dispatch site must reach the shared replay driver"
     );
 }
@@ -586,7 +602,7 @@ const REGISTRY_DEDUP_PROVIDERS: &[&str] = &["consul", "kubernetes"];
 
 #[test]
 fn every_registry_provider_dedups_its_snapshot_by_dial_identity() {
-    for provider in REGISTRY_DEDUP_PROVIDERS {
+    for &provider in REGISTRY_DEDUP_PROVIDERS {
         // The same endpoint spelled two ways: a canonical IPv6 form and its
         // expanded form. Both dial the same socket.
         let admitted = filter_discovered_targets(
@@ -600,8 +616,7 @@ fn every_registry_provider_dedups_its_snapshot_by_dial_identity() {
             BackendEgressPolicy::unrestricted(),
         );
         assert_eq!(
-            admitted.len(),
-            2,
+            admitted.len(), 2,
             "{provider} must collapse duplicate dial identities before publication"
         );
         let identities: BTreeSet<(String, u16)> = admitted
@@ -663,8 +678,7 @@ fn the_shared_helper_clamps_every_shard_override_to_a_workable_minimum() {
         );
     }
     assert_eq!(
-        pool_shard_amount(1),
-        2,
+        pool_shard_amount(1), 2,
         "an explicit override of one must round up in the helper"
     );
 }

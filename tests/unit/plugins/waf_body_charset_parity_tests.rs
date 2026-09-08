@@ -261,9 +261,11 @@ async fn the_shared_body_scan_engine_serves_both_directions() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins/waf/scan.rs"),
     )
     .expect("src/plugins/waf/scan.rs must be readable");
+    let decode_sites = scan
+        .matches("normalize::decode_wide_charset_body_views(")
+        .count();
     assert_eq!(
-        scan.matches("normalize::decode_wide_charset_body_views(").count(),
-        1,
+        decode_sites, 1,
         "the wide-charset decode must have exactly one call site, shared by both directions"
     );
     for entry in [
