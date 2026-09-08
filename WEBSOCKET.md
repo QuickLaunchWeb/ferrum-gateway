@@ -46,13 +46,16 @@ This matches the same TLS configuration hierarchy used by HTTP/HTTPS backends in
 
 ## Header Forwarding
 
-Client request headers are forwarded to the backend WebSocket server during the upgrade handshake. The following hop-by-hop and WebSocket handshake headers are excluded:
+Client request headers are forwarded to the backend WebSocket server during the upgrade handshake. The following hop-by-hop, WebSocket handshake, and gateway-reserved headers are excluded:
 
 - `connection`, `upgrade`, `transfer-encoding`, `te`, `trailer`, `keep-alive`
 - `sec-websocket-key`, `sec-websocket-version`, `sec-websocket-accept`
+- `sec-websocket-extensions` — stripped so `permessage-deflate` cannot negotiate end to end; message bodies therefore stay uncompressed and inspectable by frame-level plugins such as `waf`
+- `x-consumer-*` (`x-consumer-username`, `x-consumer-custom-id`, and any other `x-consumer-` prefix) — stripped so a client cannot forge gateway-asserted consumer identity; the gateway re-injects authenticated values after the plugin pipeline when applicable
+- `x-geo-country` — stripped so a client cannot forge gateway-asserted geography; the gateway re-injects the lookup result from `geo_restriction` when configured
 - `host`, `proxy-authorization`, `proxy-connection`
 
-All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`, custom headers, etc.) are forwarded to the backend.
+All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`, custom headers, etc.) are forwarded to the backend. The same reserved-header strip set applies across HTTP, gRPC, and WebSocket backend boundaries; see [Plugin Execution Order — Backend Request Trailers](docs/plugin_execution_order.md#backend-request-trailers) for the full cross-protocol list.
 
 ## Timeouts and Limits
 
