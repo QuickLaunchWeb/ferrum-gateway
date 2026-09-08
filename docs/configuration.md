@@ -2,6 +2,21 @@
 
 Ferrum Edge is configured primarily through environment variables. An optional `ferrum.conf` file can provide defaults.
 
+`ferrum.conf` rejects unrecognized keys with a line number and key name, without
+printing the value. Accepted names follow the public settings inventory,
+including documented dynamic transcript sink-secret names. External secret
+suffixes (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`) belong in the environment,
+not in `ferrum.conf`; ordinary documented path keys ending in `_FILE` remain
+valid. This check does not impose an allowlist on the process environment.
+
+`run` and `validate` reject enabled proxy/admin HTTP/HTTPS and CP gRPC listeners
+that share a TCP port on overlapping bind addresses. Port `0` disables a listener;
+HTTPS is considered only when its certificate and key are configured. Distinct
+specific addresses may share a port. Wildcard binds overlap specific addresses,
+and an IPv6 wildcard is treated conservatively as dual-stack. Only listeners
+owned by the selected operating mode participate.
+
+
 This page is the canonical human-readable reference for `FERRUM_*` variables and built-in defaults. Runtime behavior is defined in [`src/config/env_config.rs`](../src/config/env_config.rs); the root `ferrum.conf` is an editable operator template that mirrors this reference with concise comments and example values. When variables or defaults change, update the code, this reference, and then `ferrum.conf` so the template stays in sync without becoming the primary reference. The DOC-03 coverage contract in [`src/config/public_env_inventory.rs`](../src/config/public_env_inventory.rs) defines one complete machine-readable inventory of public operator `FERRUM_*` settings (including controls resolved outside `EnvConfig`). `tests/unit/config/env_docs_parity_tests.rs` fails closed when an inventory setting lacks either a variable-table row here or a `ferrum.conf` template assignment, and when production `EnvConfig` acceptance sites omit a key from that inventory.
 
 ## TLS Material Sources
@@ -151,7 +166,7 @@ value.
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
 | `FERRUM_ADMIN_TLS_KEY_SOURCE` | If HTTPS and set | — | Source override for `FERRUM_ADMIN_TLS_KEY_PATH`; accepts path, `file://`, inline PEM, provider URI, or `pkcs11://` RSA signer URI when built with the `pkcs11` feature |
 | `FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE` | No | — | Source for DER OCSP response bytes to staple on admin TLS handshakes. File/provider-backed sources are watched when frontend/admin TLS live reload is enabled |
-| `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Must be distinct from `FERRUM_CP_DP_GRPC_JWT_SECRET` whenever both are configured (identical values are rejected at startup). Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed. In `file`/`mesh`/`node_agent`, omitting the secret generates a random read-only secret at startup; setting a short or otherwise invalid value fails startup. On a CP that watches a trust bundle this same fleet-shared secret is the HMAC-SHA-256 key for the Admin-JWT-only `cp_dp_trust.active_generation` identifier; metrics bearer tokens and metrics-allowlisted sources receive `null`, and the secret is never returned to a JWT holder |
+| `FERRUM_ADMIN_JWT_SECRET` | DB/CP/DP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Must be distinct from `FERRUM_CP_DP_GRPC_JWT_SECRET` whenever both are configured (identical values are rejected at startup). Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed. In `file`/`mesh`/`node_agent`, omitting the secret generates a random read-only secret at startup; setting a short or otherwise invalid value fails startup. On a CP that watches a trust bundle this same fleet-shared secret is the HMAC-SHA-256 key for the Admin-JWT-only `cp_dp_trust.active_generation` identifier; metrics bearer tokens and metrics-allowlisted sources receive `null`, and the secret is never returned to a JWT holder |
 | `FERRUM_ADMIN_JWT_ISSUER` | No | `ferrum-edge` | Required `iss` claim for Admin API JWT tokens |
 | `FERRUM_ADMIN_JWT_AUDIENCE` | No | — | Optional expected `aud` (audience) claim for Admin API JWT tokens. When set, tokens must carry a matching `aud`. When unset (default), tokens without `aud` pass but tokens carrying `aud` are rejected (RFC 7519 strict audience handling) |
 | `FERRUM_ADMIN_JWT_MAX_TTL` | No | `3600` | Maximum accepted token lifetime (seconds) for externally minted Admin API JWTs, enforced against verifier time so future-shifted timestamps cannot extend real validity. The nominal lifetime (`exp - iat`) must be positive and within this value; `iat` must not be later than verifier time plus the 60-second clock-skew leeway; the remaining lifetime (`exp - now`) must be within this value **plus that same 60-second leeway** (one skew window, so an issuer whose clock runs fast can still mint full-length tokens); and `exp` must still be in the future at verifier time, with no additional expiry grace. Effective maximum real validity is therefore `FERRUM_ADMIN_JWT_MAX_TTL + 60s`. `0` intentionally disables the lifetime cap; a value above `9223372036854775807` is rejected at startup as invalid rather than treated as unlimited |

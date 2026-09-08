@@ -183,6 +183,7 @@ ENV PATH="/app:${PATH}" \
 EXPOSE 8000 8443 9000 9443 50051
 
 # Health check using the built-in CLI subcommand (no curl needed)
+# Infer the effective admin host/port, including endpoint secret suffixes.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/app/ferrum-edge", "health"]
 
@@ -284,6 +285,7 @@ ENV PATH="/app:${PATH}" \
 
 EXPOSE 8000 8443 9000 9443 50051
 
+# Infer the effective admin host/port, including endpoint secret suffixes.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/app/ferrum-edge", "health"]
 

@@ -4242,7 +4242,7 @@ impl EnvConfig {
             admin_bind_address: String = "FERRUM_ADMIN_BIND_ADDRESS" => "127.0.0.1".to_string();
             allow_insecure_admin_http: bool = "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" => false;
             admin_jwt_secret: Option<String> = "FERRUM_ADMIN_JWT_SECRET"
-                => required_for(["database", "cp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+                => required_for(["database", "cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
@@ -5681,6 +5681,93 @@ impl EnvConfig {
                  the poll interval.",
                 self.cp_dp_trust_max_stale_seconds, self.secret_refresh_interval_seconds
             ));
+        }
+        Ok(())
+    }
+
+    /// Refuse overlapping binary-owned TCP listeners before any socket binds.
+    /// Distinct specific addresses may share a port; wildcard and dual-stack
+    /// binds overlap all addresses they can receive on. Port zero is disabled.
+    pub fn validate_gateway_listener_bindings(&self) -> Result<(), String> {
+        use std::net::{IpAddr, SocketAddr};
+
+        let serving = matches!(
+            self.mode,
+            OperatingMode::Database
+                | OperatingMode::File
+                | OperatingMode::DataPlane
+                | OperatingMode::Mesh
+        );
+        if !serving && self.mode != OperatingMode::ControlPlane {
+            return Ok(());
+        }
+        let proxy_ip = self
+            .proxy_bind_address
+            .parse::<IpAddr>()
+            .map_err(|_| "FERRUM_PROXY_BIND_ADDRESS must be an IP address".to_string())?;
+        let admin_ip = self
+            .admin_bind_address
+            .parse::<IpAddr>()
+            .map_err(|_| "FERRUM_ADMIN_BIND_ADDRESS must be an IP address".to_string())?;
+        let mut listeners = Vec::new();
+        if serving {
+            listeners.push((
+                "FERRUM_PROXY_HTTP_PORT",
+                SocketAddr::new(proxy_ip, self.proxy_http_port),
+            ));
+            if self.frontend_tls_cert_path.is_some() && self.frontend_tls_key_path.is_some() {
+                listeners.push((
+                    "FERRUM_PROXY_HTTPS_PORT",
+                    SocketAddr::new(proxy_ip, self.proxy_https_port),
+                ));
+            }
+        }
+        listeners.push((
+            "FERRUM_ADMIN_HTTP_PORT",
+            SocketAddr::new(admin_ip, self.admin_http_port),
+        ));
+        if self.admin_https_listener_enabled() {
+            listeners.push((
+                "FERRUM_ADMIN_HTTPS_PORT",
+                SocketAddr::new(admin_ip, self.admin_https_port),
+            ));
+        }
+        if self.mode == OperatingMode::ControlPlane
+            && let Some(addr) = &self.cp_grpc_listen_addr
+        {
+            let addr = addr
+                .parse::<SocketAddr>()
+                .map_err(|_| "FERRUM_CP_GRPC_LISTEN_ADDR must be an IP socket address".to_string())?;
+            listeners.push(("FERRUM_CP_GRPC_LISTEN_ADDR", addr));
+        }
+        for (index, (left_key, left)) in listeners.iter().enumerate() {
+            if left.port() == 0 {
+                continue;
+            }
+            for (right_key, right) in &listeners[index + 1..] {
+                if left.port() != right.port() {
+                    continue;
+                }
+                // Canonicalize IPv4-mapped IPv6 addresses before comparison.
+                let canonical = |ip: IpAddr| match ip {
+                    IpAddr::V6(ip) => ip
+                        .to_ipv4_mapped()
+                        .map(IpAddr::V4)
+                        .unwrap_or(IpAddr::V6(ip)),
+                    ip => ip,
+                };
+                let left_ip = canonical(left.ip());
+                let right_ip = canonical(right.ip());
+                let overlap = left_ip == right_ip
+                    || (left_ip.is_unspecified() && (left_ip.is_ipv6() || right_ip.is_ipv4()))
+                    || (right_ip.is_unspecified() && (right_ip.is_ipv6() || left_ip.is_ipv4()));
+                if overlap {
+                    return Err(format!(
+                        "{left_key} and {right_key} configure overlapping listener binds; \
+                         choose distinct ports or non-overlapping bind addresses"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -7372,6 +7459,8 @@ impl EnvConfig {
                 )
             ));
         }
+
+        self.validate_gateway_listener_bindings()?;
 
         // Safe-by-default management plane. The admin bind defaults to loopback,
         // so a fresh startup is never exposed. This guard catches the case where
