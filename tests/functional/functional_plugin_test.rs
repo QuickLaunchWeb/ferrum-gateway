@@ -2085,7 +2085,10 @@ mod waf_wide_charset {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn encode(text: &str, charset: &str, bom: bool) -> Vec<u8> {
-        assert!(text.is_ascii(), "transport fixtures use ASCII policy markers");
+        assert!(
+            text.is_ascii(),
+            "transport fixtures use ASCII policy markers"
+        );
         let (width, big, prefix): (usize, bool, &[u8]) = match charset {
             "utf-16le" => (2, false, &[0xFF, 0xFE]),
             "utf-16be" => (2, true, &[0xFE, 0xFF]),
@@ -2237,7 +2240,9 @@ mod waf_wide_charset {
                     let response = client
                         .post(gateway.proxy_url("/inspect"))
                         .header("content-type", &content_type)
-                        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(chunks)))
+                        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                            chunks,
+                        )))
                         .send()
                         .await
                         .unwrap();

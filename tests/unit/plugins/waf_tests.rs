@@ -7533,8 +7533,7 @@ async fn wide_body_inference_preserves_benign_binary_and_explicit_charset_contro
                 "application/octet-stream",
                 "multipart/form-data; boundary=fixture",
             ] {
-                let (result, _) =
-                    scan_wide_direction(&plugin, response, content_type, &body).await;
+                let (result, _) = scan_wide_direction(&plugin, response, content_type, &body).await;
                 assert!(matches!(result, PluginResult::Continue));
             }
             // Interior wide text is not sufficient to infer an encoding.
@@ -7561,8 +7560,7 @@ async fn wide_body_inference_preserves_benign_binary_and_explicit_charset_contro
         // Raw scanning survives inference, including bytes after wide text.
         let mut mixed = encode_utf16("ordinary text", false);
         mixed.extend_from_slice(b"inspection-marker");
-        let (result, _) =
-            scan_wide_direction(&plugin, response, "application/json", &mixed).await;
+        let (result, _) = scan_wide_direction(&plugin, response, "application/json", &mixed).await;
         assert!(matches!(result, PluginResult::Reject { .. }));
     }
 }
@@ -7635,13 +7633,8 @@ async fn wide_response_conflicts_malformed_units_and_specialized_rules_keep_cove
         ),
     ] {
         let content_type = format!("text/plain; charset={charset}");
-        let (result, _) = scan_wide_direction(
-            &plugin,
-            true,
-            &content_type,
-            &with_bom(opposite_bom, &body),
-        )
-        .await;
+        let (result, _) =
+            scan_wide_direction(&plugin, true, &content_type, &with_bom(opposite_bom, &body)).await;
         assert!(matches!(result, PluginResult::Reject { .. }));
     }
     for (kind, pattern, text) in [
@@ -7659,8 +7652,7 @@ async fn wide_response_conflicts_malformed_units_and_specialized_rules_keep_cove
         }))
         .unwrap();
         for (_, _, body) in wide_encodings(text) {
-            let (result, request) =
-                scan_wide_direction(&plugin, true, "text/plain", &body).await;
+            let (result, request) = scan_wide_direction(&plugin, true, "text/plain", &body).await;
             assert!(matches!(result, PluginResult::Reject { .. }));
             assert_eq!(
                 request.metadata.get("waf.rule_hits").unwrap(),
@@ -7673,10 +7665,7 @@ async fn wide_response_conflicts_malformed_units_and_specialized_rules_keep_cove
 #[tokio::test]
 async fn wide_response_bodyless_and_disabled_inspection_stay_inactive() {
     let plugin = wide_parity_waf();
-    let headers = HashMap::from([(
-        "content-type".into(),
-        "text/plain; charset=utf-16le".into(),
-    )]);
+    let headers = HashMap::from([("content-type".into(), "text/plain; charset=utf-16le".into())]);
     let body = encode_utf16("inspection-marker", false);
     for (method, status) in [
         ("HEAD", 200),
@@ -7715,8 +7704,7 @@ async fn wide_body_filters_and_wire_size_limits_still_apply() {
         }))
         .unwrap();
         for (_, _, body) in wide_encodings("allowed inspection%2Dmarker") {
-            let (result, _) =
-                scan_wide_direction(&plugin, response, "text/plain", &body).await;
+            let (result, _) = scan_wide_direction(&plugin, response, "text/plain", &body).await;
             assert!(matches!(result, PluginResult::Continue));
         }
         // 32 UTF-32 ASCII units are exactly 128 wire bytes. A benign extra
