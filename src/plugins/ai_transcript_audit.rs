@@ -6450,6 +6450,17 @@ fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value,
             }
         }
         Value::Object(map) => {
+            // Tool arguments are an embedded JSON document, not ordinary text.
+            // If its structure cannot be read, field-name redaction cannot be
+            // applied safely. Keep a bounded diagnostic beside the replacement.
+            if let Some(Value::Object(function)) = map.get_mut("function")
+                && let Some(Value::String(arguments)) = function.get_mut("arguments")
+                && arguments.as_str() != AMBIGUOUS_TOOL_CALL_ARGUMENTS
+                && serde_json::from_str::<Value>(arguments).is_err()
+            {
+                *arguments = "[UNPARSEABLE]".to_string();
+                function.insert("arguments_redaction_failed".to_string(), Value::Bool(true));
+            }
             let entries = std::mem::take(map);
             for (key, mut value) in entries {
                 if sensitive_json_field(&key) {
