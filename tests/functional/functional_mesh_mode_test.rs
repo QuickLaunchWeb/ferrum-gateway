@@ -20864,3 +20864,182 @@ async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
 
     gateway.shutdown().await;
 }
+
+/// Exercise materialized aliases and numeric authority ports over real sidecar
+/// mTLS, with both positive and negative host matchers and a destination-port
+/// control. Every successful request must reach the labeled workload backend.
+async fn drive_inbound_authority_policy_matrix() -> Result<(), String> {
+    use ferrum_edge::modes::mesh::config::RequestMatch;
+
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-authority-policy-{attempt}");
+        let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_port = start_labeled_echo_backend("authority-workload-ok").await;
+        let mut slice =
+            inbound_authz_slice(&node_id, server_spiffe, client_spiffe, backend_port, true);
+        let canonical = format!("echo:{backend_port}");
+        let padded = format!("echo:0{backend_port}");
+        let mut rules = Vec::new();
+        for (path, hosts, not_hosts, ports) in [
+            ("/hosts", vec![canonical.clone()], vec![], vec![]),
+            ("/padded", vec![padded.clone()], vec![], vec![]),
+            ("/negative", vec![], vec![canonical.clone()], vec![]),
+            ("/wildcard", vec!["echo:*".to_string()], vec![], vec![]),
+            (
+                "/aliases",
+                vec!["echo.ferrum.svc.cluster.local".to_string()],
+                vec![],
+                vec![],
+            ),
+            ("/ports", vec![], vec![], vec![backend_port]),
+        ] {
+            rules.push(MeshRule {
+                action: PolicyAction::Deny,
+                to: vec![RequestMatch {
+                    paths: vec![path.to_string()],
+                    hosts,
+                    not_hosts,
+                    ports,
+                    ..RequestMatch::default()
+                }],
+                ..MeshRule::default()
+            });
+        }
+        slice.mesh_policies.push(MeshPolicy {
+            name: "authority-policy".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules,
+        });
+        let cp = start_static_mesh_cp(slice).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+        let readiness = wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = readiness.describe("authority policy sidecar", inbound_port);
+            kill_child(&mut child);
+            cp.shutdown().await;
+            continue;
+        }
+        let mut cases = Vec::new();
+        for authority in [
+            canonical.clone(),
+            padded,
+            format!("echo:00{backend_port}"),
+            format!("ECHO:{backend_port}"),
+            format!("echo.:{backend_port}"),
+        ] {
+            for (path, expected) in [
+                ("/public", 200),
+                ("/hosts", 403),
+                ("/padded", 403),
+                ("/negative", 200),
+                ("/wildcard", 403),
+            ] {
+                cases.push((authority.clone(), path, expected));
+            }
+        }
+        for alias in [
+            "echo",
+            "echo.ferrum",
+            "echo.ferrum.svc",
+            "echo.ferrum.svc.cluster.local",
+        ] {
+            cases.push((alias.to_string(), "/public", 200));
+            cases.push((alias.to_string(), "/ports", 403));
+            let expected = if alias.ends_with("cluster.local") {
+                403
+            } else {
+                200
+            };
+            cases.push((alias.to_string(), "/aliases", expected));
+        }
+        cases.push((
+            "echo.ferrum.svc.cluster.local".to_string(),
+            "/negative",
+            403,
+        ));
+        for authority in [
+            format!("echo:+{backend_port}"),
+            "echo:99999".to_string(),
+            "echo:abc".to_string(),
+        ] {
+            cases.push((authority, "/public", 400));
+        }
+        let mut observations = Vec::new();
+        for (authority, path, expected) in cases {
+            let result = mesh_inbound_http_get(
+                inbound_port,
+                &peers.ca_pem,
+                server_spiffe,
+                Some((&peers.client_cert_pem, &peers.client_key_pem)),
+                &authority,
+                path,
+            )
+            .await;
+            observations.push((authority, path, expected, result));
+        }
+        if let Some(exited) =
+            exited_gateway_diagnostic(&mut [("authority policy sidecar", &mut child)])
+        {
+            last_failure = format!("attempt {attempt}: {exited}");
+            kill_child(&mut child);
+            cp.shutdown().await;
+            continue;
+        }
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+        for (authority, path, expected, result) in observations {
+            let (status, body) =
+                result.map_err(|e| format!("{authority} {path}: {e}\n{output}"))?;
+            assert_eq!(status, expected, "{authority} {path}: {body}\n{output}");
+            assert_eq!(
+                body.contains("authority-workload-ok"),
+                expected == 200,
+                "{authority} {path}"
+            );
+        }
+        return Ok(());
+    }
+    Err(format!("authority policy fixture failed: {last_failure}"))
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_authority_policy_ports_and_literal_aliases() {
+    drive_inbound_authority_policy_matrix().await.unwrap();
+}

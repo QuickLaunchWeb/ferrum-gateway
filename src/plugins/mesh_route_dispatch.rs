@@ -370,6 +370,16 @@ fn validate_and_normalize_rewrite(
             ));
         }
         reject_crlf(rule_idx, "rewrite.uri", uri)?;
+        if !uri.starts_with('/') || uri.contains(['?', '#']) {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].rewrite.uri must be an absolute path without a query or fragment"
+            ));
+        }
+        if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(uri) {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].rewrite.uri is not canonical: {reason}"
+            ));
+        }
     }
     if let Some(authority) = rewrite.authority.as_mut() {
         if authority.is_empty() {
@@ -1977,13 +1987,26 @@ impl Plugin for MeshRouteDispatch {
                 // overrides above — a matching instance sets BOTH fields
                 // (clearing any prior rewrite that no longer applies).
                 if let Some(rewrite) = rule.rewrite.as_ref() {
-                    ctx.route_override_path = rewrite.uri.as_deref().map(|uri| {
+                    let mut rewritten = rewrite.uri.as_deref().map(|uri| {
                         rewrite_request_path(
                             ctx.path.as_str(),
                             uri,
                             rewrite.match_prefix.as_deref(),
                         )
                     });
+                    // Even canonical operands can compose a dot segment at
+                    // the prefix boundary. Refuse before publishing an override
+                    // that later hooks or a backend URL parser could reinterpret.
+                    if let Some(path) = rewritten.as_mut() {
+                        match crate::policy_path::canonicalize_policy_path(path) {
+                            Ok(std::borrow::Cow::Borrowed(_)) => {}
+                            Ok(std::borrow::Cow::Owned(canonical)) => *path = canonical,
+                            Err(rejection) => {
+                                return crate::proxy::reject_route_override_path(rejection);
+                            }
+                        }
+                    }
+                    ctx.route_override_path = rewritten;
                     // Authority rewrite rebases the forwarded `Host` header.
                     // Writing it into the live header map plus stamping
                     // `route_override_authority` (which flips

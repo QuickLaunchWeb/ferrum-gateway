@@ -3564,6 +3564,24 @@ impl RequestContext {
         }
     }
 
+    /// Router offset of the matched path prefix in the current dispatch path.
+    /// The proxy dispatch path owns this value and resets it when a rewrite
+    /// replaces the request path; the reader is public only so external test
+    /// crates can assert the offset a matched route would otherwise produce.
+    #[inline]
+    pub fn matched_path_strip_len(&self) -> usize {
+        self.matched_path_strip_len
+    }
+
+    /// Seed the router offset of the matched path prefix. The proxy dispatch
+    /// path owns this value and resets it when a rewrite replaces the request
+    /// path; the setter is public only so external test crates can build a
+    /// `RequestContext` that a matched route would otherwise produce.
+    #[inline]
+    pub fn set_matched_path_strip_len(&mut self, strip_len: usize) {
+        self.matched_path_strip_len = strip_len;
+    }
+
     pub(crate) fn publish_correlation_id(
         &mut self,
         instance_key: &str,

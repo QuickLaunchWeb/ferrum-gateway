@@ -20662,6 +20662,10 @@ components:
         ambient mTLS streams. DENY rules are evaluated first (first match
         wins); the presence of any ALLOW rule with no match triggers an
         implicit deny.
+        `to.hosts` / `notHosts` match normalized literal request authorities,
+        without service-alias expansion. Explicit decimal ports use one
+        canonical spelling on both request and pattern sides; wildcard ports
+        remain supported. Signed request ports are rejected at admission.
 
         Source matching enforces both the positive identity matchers
         (`principals` in Istio `<trust-domain>/ns/.../sa/...` form,
@@ -21430,7 +21434,11 @@ components:
                       Replacement request path forwarded to the backend. When
                       `match_prefix` is set (the source `match.uri` was a
                       prefix) only that prefix is replaced; otherwise the whole
-                      path is replaced. CRLF is rejected at load time.
+                      path is replaced. Must be a canonical absolute path
+                      without a query or fragment. Percent escapes, dot
+                      segments, backslashes, and CRLF are rejected at load
+                      time. The composed path is checked again before policy
+                      and dispatch; ambiguous paths are refused, not resolved.
                   authority:
                     type: [string, "null"]
                     description: |
