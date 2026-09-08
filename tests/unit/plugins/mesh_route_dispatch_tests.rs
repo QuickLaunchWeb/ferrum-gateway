@@ -2206,3 +2206,72 @@ async fn query_predicate_reads_the_credential_stripped_query() {
         other => panic!("expected the unmatched 404, got {other:?}"),
     }
 }
+
+#[test]
+fn rewrite_paths_require_canonical_config_admission() {
+    for uri in [
+        "/v2/../admin",
+        "/v2/./users",
+        "/%76two",
+        "/v2%2fusers",
+        "/v2%252fusers",
+        "/v2\\users",
+        "/v2?query=yes",
+        "/v2#fragment",
+        "relative",
+    ] {
+        let config = json!({"rules": [{
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "rewrite": {"uri": uri}
+        }]});
+        assert!(MeshRouteDispatch::new(&config).is_err(), "{uri}");
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", &config).is_err(),
+            "shared admission: {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rewrite_composition_refuses_new_dot_segments_before_publication() {
+    for replacement in ["/v2", "/v2/"] {
+        let plugin = MeshRouteDispatch::new(&json!({"rules": [{
+            "match": {"uri": {"prefix": "/api"}},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "rewrite": {"uri": replacement, "match_prefix": "/api"}
+        }]}))
+        .unwrap();
+        for (path, expected) in [
+            ("/api../admin", None),
+            ("/api..", None),
+            ("/api./users", None),
+            ("/api/users", Some("/v2/users")),
+            ("/api..hidden/users", Some("/v2/..hidden/users")),
+            ("/other/users", None),
+        ] {
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                path.to_string(),
+            );
+            let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+            if expected.is_some() || path.starts_with("/other") {
+                assert!(
+                    matches!(result, PluginResult::Continue),
+                    "{path}: {result:?}"
+                );
+                assert_eq!(ctx.route_override_path.as_deref(), expected);
+            } else {
+                assert!(matches!(
+                    result,
+                    PluginResult::Reject {
+                        status_code: 400,
+                        ..
+                    }
+                ));
+                assert!(ctx.route_override_path.is_none());
+            }
+            assert_eq!(ctx.path, path, "client path provenance must survive");
+        }
+    }
+}

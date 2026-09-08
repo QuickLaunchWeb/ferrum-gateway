@@ -1371,3 +1371,142 @@ async fn functional_path_coordinates_grpc_web() {
 async fn functional_path_coordinates_websocket() {
     coordinate_matrix(CoordinateFlavor::WebSocket).await;
 }
+
+async fn rewritten_path_matrix(flavor: CoordinateFlavor) {
+    use serde_json::json;
+
+    let backend = coordinate_backend(flavor).await;
+    let config_text = coordinate_config(backend.port, flavor);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&config_text).expect("coordinate fixture config");
+    // Reuse the existing authentication and protocol setup, with one root
+    // route so raw prefix tails reach mesh_route_dispatch unchanged.
+    let mut proxy = config["proxies"][0].clone();
+    proxy["listen_path"] = json!("/");
+    proxy["backend_path"] = json!("/base");
+    let attachments = proxy["plugins"].as_array_mut().unwrap();
+    attachments.push(json!({"plugin_config_id": "composed-rewrite"}));
+    config["proxies"] = json!([proxy]);
+    let plugins = config["plugin_configs"].as_array_mut().unwrap();
+    plugins.retain(|plugin| plugin["proxy_id"] == "guard");
+    plugins.push(json!({
+        "id": "composed-rewrite", "plugin_name": "mesh_route_dispatch",
+        "scope": "proxy", "proxy_id": "guard", "enabled": true,
+        "config": {"rules": [
+            {
+                "match": {"uri": {"prefix": "/api"}},
+                "destination": {"backend_host": "127.0.0.1", "backend_port": backend.port},
+                "rewrite": {"uri": "/v2", "match_prefix": "/api"}
+            },
+            {
+                "match": {"uri": {"prefix": "/slash"}},
+                "destination": {"backend_host": "127.0.0.1", "backend_port": backend.port},
+                "rewrite": {"uri": "/v2/", "match_prefix": "/slash"}
+            }
+        ]}
+    }));
+    let (mut gateway, https_port) = spawn_path_gateway(&config.to_string(), None).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .unwrap();
+    for protocol in 1..=3 {
+        if flavor == CoordinateFlavor::Grpc && protocol == 1 {
+            continue;
+        }
+        let port = if protocol == 3 {
+            https_port
+        } else {
+            gateway.proxy_port
+        };
+        for (target, authenticated, status, expected_path) in [
+            ("/api/users", false, 401, None),
+            ("/api../admin", false, 401, None),
+            ("/api../admin", true, 400, None),
+            ("/api..", true, 400, None),
+            ("/api./users", true, 400, None),
+            ("/slash../admin", true, 400, None),
+            ("/api/%2e%2e/admin", true, 400, None),
+            ("/api%2fusers", true, 400, None),
+            ("/api/users", true, 200, Some("/base/v2/users")),
+            ("/slash/users", true, 200, Some("/base/v2/users")),
+            (
+                "/api..hidden/users",
+                true,
+                200,
+                Some("/base/v2/..hidden/users"),
+            ),
+            ("/other/users", true, 200, Some("/base/other/users")),
+        ] {
+            assert!(backend.take_targets().is_empty());
+            let response = tokio::time::timeout(
+                Duration::from_secs(15),
+                coordinate_send(protocol, port, target, flavor, authenticated),
+            )
+            .await
+            .expect("rewritten path exchange timed out");
+            let label = format!("{flavor:?} H{protocol} {target} auth={authenticated}");
+            let rpc = matches!(flavor, CoordinateFlavor::Grpc | CoordinateFlavor::GrpcWeb);
+            let expected_status = if rpc {
+                200
+            } else if status == 200 && flavor == CoordinateFlavor::WebSocket && protocol == 1 {
+                101
+            } else {
+                status
+            };
+            assert_eq!(response.status.as_u16(), expected_status, "{label}");
+            let grpc_status = match status {
+                200 => "0",
+                401 => "16",
+                _ => "3",
+            };
+            if flavor == CoordinateFlavor::Grpc {
+                assert_eq!(response.headers["grpc-status"], grpc_status, "{label}");
+            } else if flavor == CoordinateFlavor::GrpcWeb {
+                assert!(
+                    String::from_utf8_lossy(&response.body)
+                        .contains(&format!("grpc-status: {grpc_status}")),
+                    "{label}: {:?}",
+                    response.body
+                );
+            } else if flavor == CoordinateFlavor::Http && status == 400 {
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert!(body["error"].is_string(), "{label}: fixed error envelope");
+                assert!(!String::from_utf8_lossy(&response.body).contains(target));
+            }
+            assert_eq!(
+                backend.take_targets(),
+                expected_path
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                "{label}: actual upstream path"
+            );
+        }
+    }
+    gateway.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_rewritten_path_http() {
+    rewritten_path_matrix(CoordinateFlavor::Http).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_rewritten_path_grpc() {
+    rewritten_path_matrix(CoordinateFlavor::Grpc).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_rewritten_path_grpc_web() {
+    rewritten_path_matrix(CoordinateFlavor::GrpcWeb).await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_rewritten_path_websocket() {
+    rewritten_path_matrix(CoordinateFlavor::WebSocket).await;
+}

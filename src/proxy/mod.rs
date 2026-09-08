@@ -28572,7 +28572,27 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
             }
         }
     }
+    // All transports and deferred passes converge here before rebasing or
+    // evaluating the backend path. Provider overrides share the same path
+    // contract as mesh rewrites; retain the client path for policy/logging.
+    if let Some(path) = ctx.route_override_path.as_mut() {
+        match crate::policy_path::canonicalize_policy_path(path) {
+            Ok(std::borrow::Cow::Borrowed(_)) => {}
+            Ok(std::borrow::Cow::Owned(canonical)) => *path = canonical,
+            Err(rejection) => return reject_route_override_path(rejection),
+        }
+    }
     PluginResult::Continue
+}
+
+pub(crate) fn reject_route_override_path(
+    rejection: crate::policy_path::PolicyPathRejection,
+) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: rejection.client_error_body().to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
 }
 
 const MAX_SET_COOKIE_NAME_VALUE_BYTES: usize = 4096;
@@ -46025,7 +46045,7 @@ fn is_valid_ip_literal_contents(content: &str) -> bool {
 /// dispatch where the same string would be re-parsed and fail with a
 /// less-specific error.
 fn is_valid_port(port: &str) -> bool {
-    !port.is_empty() && port.parse::<u16>().is_ok()
+    crate::util::http_headers::parse_authority_port(port).is_some()
 }
 
 fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
