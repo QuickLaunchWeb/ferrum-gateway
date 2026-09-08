@@ -1032,7 +1032,10 @@ async fn functional_protocol_validation_pipelined_parse_reject_preserves_first_r
     .await
     .expect("startup h2c probe did not reach backend");
     assert_eq!(startup_requests.len(), 1, "{startup_requests:?}");
-    assert_eq!(startup_requests[0].raw_prelude.as_slice(), b"PRI * HTTP/2.0");
+    assert_eq!(
+        startup_requests[0].raw_prelude.as_slice(),
+        b"PRI * HTTP/2.0"
+    );
     backend.assert_no_matcher_mismatches().await;
 
     let valid = b"GET /PROOF HTTP/1.1\r\nHost: app.example\r\n\r\n";
