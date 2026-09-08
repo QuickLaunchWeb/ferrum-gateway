@@ -20621,6 +20621,9 @@ async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
     let observed = peer.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed.method, "POST");
     assert!(observed.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed.body, payload);
     assert!(
         !socket_path.exists(),
         "H3 must never create/dial the Unix socket"
@@ -20763,6 +20766,11 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
     assert_eq!(first.status.as_u16(), 200);
     let observed_a = peer_a.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed_a.method, "POST");
+    assert!(observed_a.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed_a.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed_a.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed_a.body, b"h3-plain-reload");
+    assert_eq!(first.body_bytes.as_ref(), b"h3-plain-reload");
 
     let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
     h3_mesh_plain_reload(&gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
@@ -20770,6 +20778,11 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
     assert_eq!(retargeted.status.as_u16(), 200);
     let observed_b = peer_b.wait_for_http(Duration::from_secs(10)).await;
     assert_eq!(observed_b.method, "POST");
+    assert!(observed_b.presented_client_spiffe(H3_MESH_GATEWAY_SPIFFE));
+    assert_eq!(observed_b.authority, H3_MESH_SERVICE_AUTHORITY);
+    assert_eq!(observed_b.path, H3_MESH_PLAIN_BACKEND_PATH);
+    assert_eq!(observed_b.body, b"h3-plain-reload");
+    assert_eq!(retargeted.body_bytes.as_ref(), b"h3-plain-reload");
 
     let peer_b_accepts = peer_b.accept_count();
     h3_mesh_plain_reload(&gateway, config_for(&[], 2), &[]).await;

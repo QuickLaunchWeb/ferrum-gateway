@@ -811,7 +811,7 @@ fn select_next_cross_protocol_retry_target(
         return CrossProtocolRetryTarget::RetryBudgetExceeded;
     }
 
-    let next_url = crate::proxy::build_backend_url_with_target(
+    let Ok(next_url) = crate::proxy::build_backend_url_with_target(
         proxy,
         path,
         query_string,
@@ -819,7 +819,10 @@ fn select_next_cross_protocol_retry_target(
         next.port,
         strip_len,
         next.path.as_deref(),
-    );
+    ) else {
+        return CrossProtocolRetryTarget::BackendPathMismatch;
+    };
+
     let next_cb_target_key = crate::circuit_breaker::target_key(&next.host, next.port);
     CrossProtocolRetryTarget::Selected(next, next_cb_target_key, next_url)
 }
@@ -863,7 +866,24 @@ fn strip_query_from_backend_url(url: &str) -> String {
 /// responses when buffering is active. Without these, H3 clients on non-H3
 /// backends would silently skip body validators, response transformers,
 /// exporters, sticky sessions, etc.
-pub(crate) async fn run<S>(
+#[inline(never)]
+pub(crate) fn run<'a, S>(
+    request: CrossProtocolRequest<'a, S>,
+) -> impl std::future::Future<Output = Result<CrossProtocolOutcome, anyhow::Error>> + Send + 'a
+where
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped + Send + 'a,
+{
+    // `run_inner` contains the buffered gRPC dispatcher as well as the boxed
+    // plain dispatcher. Its concrete future is therefore large even for plain
+    // mesh traffic. Keep it out of handle_h3_request's poll frame before that
+    // frame calls through dispatch_plain -> mesh retry -> mTLS send/collect.
+    // A box around dispatch_plain alone does not cut this enclosing edge.
+    // This factory returns before polling; stream ownership, cancellation,
+    // admission permits and retry accounting all remain in the same task.
+    Box::pin(run_inner(request))
+}
+
+async fn run_inner<S>(
     request: CrossProtocolRequest<'_, S>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where

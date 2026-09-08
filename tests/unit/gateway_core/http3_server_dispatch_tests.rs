@@ -92,8 +92,20 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
 #[test]
 fn h3_plain_dispatcher_is_boxed_off_the_cross_protocol_run_stack() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let entry = source
+        .split("pub(crate) fn run<'a, S>(")
+        .nth(1)
+        .expect("out-of-line cross-protocol entry")
+        .split("async fn run_inner<S>(")
+        .next()
+        .expect("bounded entry factory");
+    assert!(
+        source.contains("#[inline(never)]\npub(crate) fn run<'a, S>(")
+            && entry.contains("Box::pin(run_inner(request))"),
+        "the enclosing bridge future must leave the H3 request frame before mesh dispatch is polled"
+    );
     let run = source
-        .split("pub(crate) async fn run<S>(")
+        .split("async fn run_inner<S>(")
         .nth(1)
         .expect("cross-protocol run dispatcher")
         .split("type BoxedPlainDispatchFuture<'a>")
@@ -561,7 +573,7 @@ fn translated_h3_grpc_web_threads_preacquired_admission_into_grpc_dispatch() {
 
     let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
     let run = cross_protocol
-        .find("pub(crate) async fn run<S>(")
+        .find("async fn run_inner<S>(")
         .expect("cross-protocol run entry point must remain present");
     let grpc_arm = cross_protocol[run..]
         .find("HttpFlavor::Grpc => {")
