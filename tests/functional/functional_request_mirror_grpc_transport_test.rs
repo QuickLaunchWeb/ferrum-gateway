@@ -780,6 +780,20 @@ async fn request_mirror_grpc_h2c_missing_and_client_supplied_te() {
             stream.headers
         );
     }
+    // Issue #4720: this fixture once recorded an extra `h2 handshake failed`
+    // from a connection nothing in the test explains. The bounded, non-payload
+    // accept ledger is what attributes the next occurrence: every accepted
+    // connection carries an index, the peer socket the kernel reported and a
+    // millisecond offset from fixture start, so a failing
+    // `assert_no_step_errors` names the sending socket instead of only the
+    // protocol error. Assert the ledger is actually populated here so the
+    // diagnostic cannot silently regress to an empty list.
+    let accepts = mirror.accept_log();
+    assert!(
+        !accepts.is_empty(),
+        "the mirror fixture must record every accepted connection; accepted={}",
+        mirror.accepted_connections()
+    );
     mirror.assert_no_step_errors().await;
 }
 
