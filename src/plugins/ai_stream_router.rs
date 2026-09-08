@@ -4460,6 +4460,7 @@ struct AnthropicSseNormalizer {
     normalized_out_bytes: usize,
     model: String,
     stream_id: Option<String>,
+    synthetic_id: String,
     created: i64,
     message_started: bool,
     role_emitted: bool,
@@ -4468,8 +4469,9 @@ struct AnthropicSseNormalizer {
     /// When true, any Anthropic `tool_use` fails closed instead of becoming
     /// OpenAI `tool_calls` deltas (caller constrained this generation to none).
     tools_forbidden: bool,
-    /// Anthropic content-block index → OpenAI `tool_calls` index.
-    tool_indices: HashMap<u64, u32>,
+    /// Active tool blocks: Some(index) is a client call; None is provider-executed.
+    tool_indices: HashMap<u64, Option<u32>>,
+    finish_reason: Option<&'static str>,
     next_tool_index: u32,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
@@ -4486,6 +4488,7 @@ impl AnthropicSseNormalizer {
             normalized_out_bytes: 0,
             model,
             stream_id: None,
+            synthetic_id: format!("chatcmpl-stream-{}", uuid::Uuid::new_v4().simple()),
             created: Utc::now().timestamp(),
             message_started: false,
             role_emitted: false,
@@ -4493,6 +4496,7 @@ impl AnthropicSseNormalizer {
             terminal: None,
             tools_forbidden,
             tool_indices: HashMap::new(),
+            finish_reason: None,
             next_tool_index: 0,
             prompt_tokens: None,
             completion_tokens: None,
@@ -4533,7 +4537,7 @@ impl AnthropicSseNormalizer {
         if let Some(id) = &self.stream_id {
             return id.clone();
         }
-        let id = format!("chatcmpl-stream-{}", self.created);
+        let id = self.synthetic_id.clone();
         self.stream_id = Some(id.clone());
         id
     }
@@ -4561,18 +4565,25 @@ impl AnthropicSseNormalizer {
         out.write_sse_data_line(&payload);
     }
 
-    /// The final usage chunk, written through the same bounded accumulator.
+    /// The terminal finish and known usage, written through the bounded accumulator.
     /// Returns an error when provider-controlled u64 counts overflow on add so
     /// the caller can fail closed instead of publishing a wrapped total.
-    fn write_usage_line(&mut self, out: &mut NormalizedSseOut) -> Result<(), &'static str> {
-        let (Some(p), Some(c)) = (self.prompt_tokens, self.completion_tokens) else {
-            return Ok(());
-        };
-        let Some(total) = p.checked_add(c) else {
-            return Err(
+    fn write_terminal_lines(&mut self, out: &mut NormalizedSseOut) -> Result<(), &'static str> {
+        let total = match (self.prompt_tokens, self.completion_tokens) {
+            (Some(p), Some(c)) => Some(p.checked_add(c).ok_or(
                 "upstream provider sent usage token counts that overflow u64 total; stream terminated",
-            );
+            )?),
+            _ => None,
         };
+        let finish = self.finish_reason.unwrap_or(if self.next_tool_index > 0 {
+            "tool_calls"
+        } else {
+            "stop"
+        });
+        self.write_chunk_line(json!({}), Some(finish), out);
+        if self.prompt_tokens.is_none() && self.completion_tokens.is_none() {
+            return Ok(());
+        }
         let id = self.id();
         let payload = json!({
             "id": id,
@@ -4581,8 +4592,8 @@ impl AnthropicSseNormalizer {
             "model": self.model,
             "choices": [],
             "usage": {
-                "prompt_tokens": p,
-                "completion_tokens": c,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
                 "total_tokens": total,
             },
         });
@@ -4630,6 +4641,9 @@ impl AnthropicSseNormalizer {
                 if let Some(tokens) = message["usage"]["input_tokens"].as_u64() {
                     self.prompt_tokens = Some(tokens);
                 }
+                if let Some(tokens) = message["usage"]["output_tokens"].as_u64() {
+                    self.completion_tokens = Some(tokens);
+                }
                 if !self.role_emitted {
                     self.role_emitted = true;
                     self.write_chunk_line(json!({ "role": "assistant" }), None, out);
@@ -4640,9 +4654,30 @@ impl AnthropicSseNormalizer {
                 if !self.require_message_start("content_block_start", out) {
                     return true;
                 }
-                let index = event["index"].as_u64().unwrap_or(0);
                 let block = &event["content_block"];
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                let block_type = block.get("type").and_then(Value::as_str);
+                if matches!(
+                    block_type,
+                    Some("tool_use" | "server_tool_use" | "mcp_tool_use")
+                ) {
+                    let Some(index) = event["index"].as_u64() else {
+                        self.fail_bound(
+                            "upstream provider sent a tool block without an index",
+                            out,
+                        );
+                        return true;
+                    };
+                    if self.tool_indices.contains_key(&index) {
+                        self.fail_bound(
+                            "upstream provider repeated an active tool block index",
+                            out,
+                        );
+                        return true;
+                    }
+                    if block_type != Some("tool_use") {
+                        self.tool_indices.insert(index, None);
+                        return false;
+                    }
                     if self.tools_forbidden {
                         self.emit_upstream_error(
                             "upstream provider emitted tool use despite tool_choice none",
@@ -4651,11 +4686,15 @@ impl AnthropicSseNormalizer {
                         self.finish(StreamTerminal::UpstreamFailure, out);
                         return true;
                     }
-                    let tool_index = self.next_tool_index;
-                    self.next_tool_index += 1;
-                    self.tool_indices.insert(index, tool_index);
                     let id = block.get("id").and_then(Value::as_str).unwrap_or("");
                     let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    if id.is_empty() || name.is_empty() {
+                        self.fail_bound("upstream provider sent a tool call without identity", out);
+                        return true;
+                    }
+                    let tool_index = self.next_tool_index;
+                    self.next_tool_index += 1;
+                    self.tool_indices.insert(index, Some(tool_index));
                     self.write_chunk_line(
                         json!({
                             "tool_calls": [{
@@ -4675,7 +4714,6 @@ impl AnthropicSseNormalizer {
                 if !self.require_message_start("content_block_delta", out) {
                     return true;
                 }
-                let index = event["index"].as_u64().unwrap_or(0);
                 let delta = &event["delta"];
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
@@ -4685,6 +4723,20 @@ impl AnthropicSseNormalizer {
                         }
                     }
                     Some("input_json_delta") => {
+                        let tool_index = match event["index"]
+                            .as_u64()
+                            .and_then(|index| self.tool_indices.get(&index))
+                        {
+                            Some(Some(index)) => *index,
+                            Some(None) => return false,
+                            None => {
+                                self.fail_bound(
+                                    "upstream provider sent arguments without an active tool block",
+                                    out,
+                                );
+                                return true;
+                            }
+                        };
                         if self.tools_forbidden {
                             self.emit_upstream_error(
                                 "upstream provider emitted tool use despite tool_choice none",
@@ -4694,7 +4746,6 @@ impl AnthropicSseNormalizer {
                             return true;
                         }
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
-                            let tool_index = self.tool_indices.get(&index).copied().unwrap_or(0);
                             self.write_chunk_line(
                                 json!({
                                     "tool_calls": [{
@@ -4729,8 +4780,32 @@ impl AnthropicSseNormalizer {
                     self.finish(StreamTerminal::UpstreamFailure, out);
                     return true;
                 }
-                let finish = map_stop_reason(stop_reason);
-                self.write_chunk_line(json!({}), Some(finish), out);
+                if !event["delta"]["stop_reason"].is_null() {
+                    let finish = stop_reason
+                        .ok_or("upstream provider sent a non-string Anthropic stop_reason")
+                        .and_then(super::ai_federation::map_anthropic_stop_reason);
+                    let finish = match finish {
+                        Ok(finish) => finish,
+                        Err(message) => {
+                            self.fail_bound(message, out);
+                            return true;
+                        }
+                    };
+                    if self
+                        .finish_reason
+                        .is_some_and(|previous| previous != finish)
+                    {
+                        self.fail_bound("upstream provider changed Anthropic stop_reason", out);
+                        return true;
+                    }
+                    self.finish_reason = Some(finish);
+                }
+                false
+            }
+            Some("content_block_stop") => {
+                if let Some(index) = event["index"].as_u64() {
+                    self.tool_indices.remove(&index);
+                }
                 false
             }
             Some("message_stop") => {
@@ -4748,7 +4823,7 @@ impl AnthropicSseNormalizer {
                 self.finish(StreamTerminal::ProviderError, out);
                 true
             }
-            // ping, content_block_stop, and unknown events produce no output
+            // ping and unknown events produce no output
             // (forward-compatible). Events with a present `type` that is not a
             // known Anthropic frame are ignored; malformed JSON is handled by
             // the caller as an upstream failure.
@@ -4775,7 +4850,7 @@ impl AnthropicSseNormalizer {
         false
     }
 
-    /// Emit the final usage chunk (when successful) and the OpenAI `[DONE]`
+    /// Emit the finish and final usage (when successful), then the OpenAI `[DONE]`
     /// sentinel exactly once.
     fn finish(&mut self, terminal: StreamTerminal, out: &mut NormalizedSseOut) {
         if self.done_emitted {
@@ -4783,7 +4858,7 @@ impl AnthropicSseNormalizer {
         }
         let mut terminal = terminal;
         if terminal == StreamTerminal::MessageStop
-            && let Err(message) = self.write_usage_line(out)
+            && let Err(message) = self.write_terminal_lines(out)
         {
             self.emit_upstream_error(message, out);
             terminal = StreamTerminal::ProviderError;
@@ -5192,8 +5267,8 @@ struct GeminiStreamNormalizer {
     json_array_state: GeminiJsonArrayState,
     model: String,
     stream_id: Option<String>,
-    /// True once a provider `responseId` has been pinned for this stream.
-    response_id_pinned: bool,
+    /// First provider responseId, independent of any emitted synthetic identity.
+    provider_response_id: Option<String>,
     created: i64,
     done_emitted: bool,
     terminal: Option<StreamTerminal>,
@@ -5219,7 +5294,7 @@ impl GeminiStreamNormalizer {
             json_array_state: GeminiJsonArrayState::Inactive,
             model,
             stream_id: None,
-            response_id_pinned: false,
+            provider_response_id: None,
             created: Utc::now().timestamp(),
             done_emitted: false,
             terminal: None,
@@ -5228,10 +5303,7 @@ impl GeminiStreamNormalizer {
             saw_successful_finish: false,
             prompt_tokens: None,
             completion_tokens: None,
-            call_id_prefix: format!(
-                "{:x}",
-                (Utc::now().timestamp() as u64).wrapping_mul(1_000_000_007)
-            ),
+            call_id_prefix: uuid::Uuid::new_v4().simple().to_string(),
         }
     }
 
@@ -5285,7 +5357,7 @@ impl GeminiStreamNormalizer {
         if let Some(id) = &self.stream_id {
             return id.clone();
         }
-        let id = format!("chatcmpl-stream-{}", self.created);
+        let id = format!("chatcmpl-stream-{}", self.call_id_prefix);
         self.stream_id = Some(id.clone());
         id
     }
@@ -5549,18 +5621,7 @@ impl GeminiStreamNormalizer {
                 self.finish(StreamTerminal::UpstreamFailure, out);
                 return true;
             }
-            if self.response_id_pinned {
-                if self.stream_id.as_deref() != Some(response_id) {
-                    self.emit_upstream_error(
-                        "upstream provider changed Gemini responseId mid-stream; stream terminated",
-                        out,
-                    );
-                    self.finish(StreamTerminal::UpstreamFailure, out);
-                    return true;
-                }
-            } else if let Some(existing) = self.stream_id.as_deref() {
-                // A synthetic chunk id was already committed; refusing to rewrite
-                // mid-stream keeps claim-owned identity stable.
+            if let Some(existing) = self.provider_response_id.as_deref() {
                 if existing != response_id {
                     self.emit_upstream_error(
                         "upstream provider changed Gemini responseId mid-stream; stream terminated",
@@ -5569,10 +5630,13 @@ impl GeminiStreamNormalizer {
                     self.finish(StreamTerminal::UpstreamFailure, out);
                     return true;
                 }
-                self.response_id_pinned = true;
             } else {
-                self.stream_id = Some(response_id.to_string());
-                self.response_id_pinned = true;
+                // Keep an already emitted synthetic id stable, while admitting
+                // the first real provider id as the baseline for later checks.
+                if self.stream_id.is_none() {
+                    self.stream_id = Some(response_id.to_string());
+                }
+                self.provider_response_id = Some(response_id.to_string());
             }
         }
         // Validate provider modelVersion shape when present, but never replace
@@ -6686,15 +6750,6 @@ async fn normalize_provider_stream_buffered(
         engine.drive_end(&mut out);
     }
     out.finish()
-}
-
-fn map_stop_reason(reason: Option<&str>) -> &'static str {
-    match reason {
-        Some("max_tokens") => "length",
-        Some("tool_use") => "tool_calls",
-        // end_turn, stop_sequence, and anything else → "stop".
-        _ => "stop",
-    }
 }
 
 /// Index just past the first complete SSE event boundary (a blank line), or
