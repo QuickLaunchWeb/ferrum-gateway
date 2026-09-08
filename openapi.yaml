@@ -13258,6 +13258,15 @@ components:
               type: string
               default: default
               description: Kubernetes namespace
+            address_type:
+              type: [string, "null"]
+              enum: [IPv4, IPv6, null]
+              description: >-
+                Select one EndpointSlice IP family. When omitted or null, use
+                IPv4 if eligible IPv4 targets exist, otherwise IPv6. Explicit
+                selection never falls back to the other family. Missing,
+                unsupported, or mismatched EndpointSlice addressType values
+                are rejected. Duplicate dial addresses count only once.
             port_name:
               type: [string, "null"]
               description: Named port to select from EndpointSlice
