@@ -552,6 +552,10 @@ impl AiResponseGuard {
     /// detection and length enforcement see the logical completion the client
     /// renders rather than each part in isolation. Tool/function `arguments`
     /// contribute both the raw string and its decoded JSON tokens.
+    ///
+    /// The last two arms cover the shapes that are not an OpenAI-style object:
+    /// Cohere v1's top-level `text` / echoed `chat_history[]`, and Hugging Face
+    /// TGI, whose completion document has no object root at all.
     fn extract_completion_texts<'a>(&self, json: &'a Value) -> Vec<Cow<'a, str>> {
         let mut texts = Vec::new();
 
@@ -628,6 +632,9 @@ impl AiResponseGuard {
                 }
             }
         }
+
+        collect_cohere_completion_texts(json, &mut texts);
+        collect_tgi_generated_texts(json, &mut texts);
 
         texts
     }
@@ -1264,6 +1271,29 @@ impl AiResponseGuard {
                             self.redact_string_value(text);
                         }
                     }
+                }
+            }
+        }
+
+        // Cohere v1: top-level `text` and the echoed `chat_history[].message`
+        // turns. Field-for-field mirror of `collect_cohere_completion_texts`.
+        if let Some(text) = json.get_mut("text") {
+            self.redact_string_value(text);
+        }
+        if let Some(history) = json.get_mut("chat_history").and_then(Value::as_array_mut) {
+            for turn in history {
+                if let Some(message) = turn.get_mut("message") {
+                    self.redact_string_value(message);
+                }
+            }
+        }
+
+        // Hugging Face TGI: a top-level ARRAY document, so this arm rewrites
+        // the document root. Mirror of `collect_tgi_generated_texts`.
+        if let Some(items) = json.as_array_mut() {
+            for item in items {
+                if let Some(generated) = item.get_mut("generated_text") {
+                    self.redact_string_value(generated);
                 }
             }
         }
@@ -4565,6 +4595,37 @@ fn collect_content_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, s
     }
     if let Some(parts) = value.as_array() {
         push_joined_adjacent_texts(parts.iter().map(content_part_text), texts);
+    }
+}
+
+/// Cohere v1 `/chat` and `/generate` completion text: the top-level `text`
+/// field, plus the `chat_history[]` turns the API echoes back to the client.
+///
+/// A turn's `role` is `USER` / `CHATBOT` / `SYSTEM` / `TOOL`, and Cohere spells
+/// it in either case. Unlike the request-side readers this mirrors, this plugin
+/// has no `exclude_roles` knob, so the role gates nothing here and there is no
+/// case-sensitive comparison to get wrong: every echoed turn is client-visible,
+/// so every turn's `message` is scanned whatever its role says. Bounded to one
+/// level — a turn contributes its own `message` string and nothing recurses.
+fn collect_cohere_completion_texts<'a>(json: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+    collect_string_value(json.get("text"), texts);
+    let Some(history) = json.get("chat_history").and_then(Value::as_array) else {
+        return;
+    };
+    for turn in history {
+        collect_string_value(turn.get("message"), texts);
+    }
+}
+
+/// Hugging Face TGI text generation: the completion is a top-level JSON ARRAY
+/// of `{"generated_text": …}` objects rather than an object, so this arm reads
+/// the document root itself rather than a field of it. One level, no recursion.
+fn collect_tgi_generated_texts<'a>(json: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+    let Some(items) = json.as_array() else {
+        return;
+    };
+    for item in items {
+        collect_string_value(item.get("generated_text"), texts);
     }
 }
 

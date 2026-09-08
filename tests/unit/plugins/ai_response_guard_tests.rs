@@ -5891,3 +5891,217 @@ async fn test_redact_mode_rewrites_bedrock_converse_output_message() {
     assert!(!out.contains("123-45-6789"), "not redacted: {out}");
     assert!(out.contains("[REDACTED:pii:ssn]"), "no placeholder: {out}");
 }
+
+// ─── Cohere v1 / Hugging Face TGI response shapes (#4907) ───────────────
+
+#[tokio::test]
+async fn test_content_mode_scans_cohere_v1_completion_text() {
+    // Cohere v1 `/chat` and `/generate` answer with a top-level `text`.
+    // `extract_completion_texts` read `choices`, `output*`, Anthropic
+    // `content[]`, and Gemini `candidates[]` only, so a Cohere completion
+    // passed content mode entirely unscanned.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = serde_json::to_vec(&json!({
+        "generation_id": "gen-1",
+        "text": "ssn 123-45-6789"
+    }))
+    .unwrap();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "Cohere v1 completion text must be scanned, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_cohere_chat_history_in_either_role_casing() {
+    // Cohere echoes the conversation back on `/chat`, so every turn's
+    // `message` is client-visible response text. This plugin has no
+    // `exclude_roles` knob, so the role gates nothing and both the upper-case
+    // spelling the API documents and a lower-case one must be scanned
+    // identically.
+    for role in ["CHATBOT", "chatbot", "USER", "user", "TOOL", "SYSTEM"] {
+        let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let body = serde_json::to_vec(&json!({
+            "generation_id": "gen-1",
+            "chat_history": [{"role": role, "message": "ssn 123-45-6789"}]
+        }))
+        .unwrap();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "Cohere chat_history turn with role `{role}` must be scanned, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_huggingface_tgi_array_root_response() {
+    // TGI's completion document has no object root: it is a top-level JSON
+    // ARRAY of `{"generated_text": …}` objects. The body parsed fine and
+    // reached content extraction, but every arm keyed on an object member, so
+    // `extract_completion_texts` returned nothing and the completion was
+    // forwarded unscanned.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = serde_json::to_vec(&json!([{"generated_text": "ssn 123-45-6789"}])).unwrap();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "TGI array-root completion must be scanned, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_array_root_response_without_governed_content_still_passes() {
+    // The array-root arm is bounded to `generated_text`: an ordinary JSON list
+    // response carrying the same text in a field no model authored stays
+    // outside content mode, exactly as an object-rooted business body does.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = serde_json::to_vec(&json!([
+        {"order_id": "A-1001", "internal_note": "ssn 123-45-6789"}
+    ]))
+    .unwrap();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a non-AI array response must stay outside content mode, got {result:?}"
+    );
+}
+
+/// Everything the Content-mode detector walks, the Content-mode redactor must
+/// rewrite.
+///
+/// An asymmetry here is a fail-open bypass, not a cosmetic gap: `action:
+/// redact` returns `Continue` from inspection and promises the producer phase
+/// will install a replacement, so a field that is detected but never rewritten
+/// is reported as redacted while the original value is delivered. Each row is
+/// asserted twice — the detector must reject it, and the rewritten wire body
+/// must no longer contain the raw value.
+#[tokio::test]
+async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
+    const PII: &str = "123-45-6789";
+
+    let shapes: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "choices[].message.content string",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": format!("ssn {PII}")
+            }}]}),
+        ),
+        (
+            "choices[].message.content typed text part",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": format!("ssn {PII}")}]
+            }}]}),
+        ),
+        (
+            "choices[].text",
+            json!({"choices": [{"text": format!("ssn {PII}")}]}),
+        ),
+        (
+            "choices[].message.refusal",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "refusal": format!("ssn {PII}")
+            }}]}),
+        ),
+        ("output_text", json!({"output_text": format!("ssn {PII}")})),
+        (
+            "output[].content[].text (responses api)",
+            json!({"output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": format!("ssn {PII}")}]
+            }]}),
+        ),
+        (
+            "output.message.content[].text (bedrock converse)",
+            json!({"output": {"message": {
+                "role": "assistant",
+                "content": [{"text": format!("ssn {PII}")}]
+            }}}),
+        ),
+        (
+            "content[].text (anthropic)",
+            json!({"content": [{"type": "text", "text": format!("ssn {PII}")}]}),
+        ),
+        (
+            "candidates[].content.parts[].text (gemini)",
+            json!({"candidates": [{
+                "content": {"role": "model", "parts": [{"text": format!("ssn {PII}")}]}
+            }]}),
+        ),
+        (
+            "text (cohere v1)",
+            json!({"generation_id": "gen-1", "text": format!("ssn {PII}")}),
+        ),
+        (
+            "chat_history[].message (cohere v1)",
+            json!({
+                "generation_id": "gen-1",
+                "chat_history": [{"role": "CHATBOT", "message": format!("ssn {PII}")}]
+            }),
+        ),
+        (
+            "[].generated_text (huggingface tgi array root)",
+            json!([{"generated_text": format!("ssn {PII}")}]),
+        ),
+    ];
+
+    for (label, body) in shapes {
+        let detector = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let raw = serde_json::to_vec(&body).unwrap();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let detected = detector
+            .on_response_body(&mut ctx, 200, &mut headers, &raw)
+            .await;
+        assert!(
+            matches!(detected, PluginResult::Reject { .. }),
+            "Content mode must detect PII in `{label}`, got {detected:?}"
+        );
+
+        let redactor = make_plugin(json!({"pii_patterns": ["ssn"], "action": "redact"}));
+        let redacted = redactor
+            .transform_response_body(
+                &raw,
+                Some("application/json"),
+                &HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            )
+            .await
+            .unwrap_or_else(|| panic!("`{label}` was detected but never rewritten"));
+        let redacted = String::from_utf8(redacted).unwrap();
+        assert!(
+            !redacted.contains(PII),
+            "`{label}` was detected but forwarded unredacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("[REDACTED:pii:ssn]"),
+            "`{label}` produced no redaction placeholder: {redacted}"
+        );
+    }
+}
