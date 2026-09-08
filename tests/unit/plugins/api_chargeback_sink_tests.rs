@@ -5536,8 +5536,10 @@ fn queue_status_counters() -> (u64, u64, u64, u64, u64) {
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn no_spool_uses_full_buffer_capacity_past_high_water() {
     let baseline = render_prometheus();
-    let diversions_baseline =
-        prometheus_counter(&baseline, "chargeback_sink_queue_high_water_diversions_total");
+    let diversions_baseline = prometheus_counter(
+        &baseline,
+        "chargeback_sink_queue_high_water_diversions_total",
+    );
     let drops_baseline = prometheus_counter(&baseline, "chargeback_sink_queue_full_drops_total");
     let mut held_export = HeldClickHouseExport::start().await;
 
@@ -5627,14 +5629,24 @@ async fn no_spool_uses_full_buffer_capacity_past_high_water() {
     replacement.commit_background_tasks();
     assert_ne!(plugin.active_generation(), replacement.active_generation());
     assert_eq!(
-        prometheus_counter(&render_prometheus(), "chargeback_sink_queue_full_drops_total"),
+        prometheus_counter(
+            &render_prometheus(),
+            "chargeback_sink_queue_full_drops_total"
+        ),
         drops_baseline + 1
     );
-    assert_eq!(queue_status_counters().4, 0, "replacement diagnostics are local");
+    assert_eq!(
+        queue_status_counters().4,
+        0,
+        "replacement diagnostics are local"
+    );
     // The old hook is still in flight and can add truthful process loss after publication.
     plugin.log(&billable_summary("late-old-full")).await;
     assert_eq!(
-        prometheus_counter(&render_prometheus(), "chargeback_sink_queue_full_drops_total"),
+        prometheus_counter(
+            &render_prometheus(),
+            "chargeback_sink_queue_full_drops_total"
+        ),
         drops_baseline + 2
     );
     held_export.release_held_connections();

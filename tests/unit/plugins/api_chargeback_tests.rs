@@ -4724,7 +4724,12 @@ async fn explicit_zero_tier_records_a_call_in_the_shared_registry() {
     assert_eq!(free.charge_total, 0.0);
 
     let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
-    let summary = make_summary("zero-price-presence", "Free API", Some("zero-tier-user"), 200);
+    let summary = make_summary(
+        "zero-price-presence",
+        "Free API",
+        Some("zero-tier-user"),
+        200,
+    );
     plugin.log(&summary).await;
     let registry = global_registry();
     let rows: Vec<_> = registry

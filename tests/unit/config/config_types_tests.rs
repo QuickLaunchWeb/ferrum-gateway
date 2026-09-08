@@ -6352,9 +6352,12 @@ fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy() {
     config.proxies[0].plugins.pop();
     config.plugin_configs.pop();
     config.validate_plugin_references().unwrap();
-    let cache = ferrum_edge::PluginCache::new(&config)
-        .expect("one sink must build without a runtime");
-    assert!(cache.rebuild(&duplicates).is_err(), "reload must refuse duplicate sinks");
+    let cache =
+        ferrum_edge::PluginCache::new(&config).expect("one sink must build without a runtime");
+    assert!(
+        cache.rebuild(&duplicates).is_err(),
+        "reload must refuse duplicate sinks"
+    );
     // A scoped sink shadows a global sink rather than multiplying its output.
     let mut global = config.plugin_configs[0].clone();
     global.id = "global-sink".into();
@@ -6362,7 +6365,9 @@ fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy() {
     global.proxy_id = None;
     config.plugin_configs.push(global);
     config.validate_plugin_references().unwrap();
-    cache.rebuild(&config).expect("scoped override must remain valid");
+    cache
+        .rebuild(&config)
+        .expect("scoped override must remain valid");
 }
 
 #[test]

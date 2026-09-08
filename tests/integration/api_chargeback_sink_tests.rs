@@ -848,7 +848,11 @@ async fn pending_rows_remain_visible_across_replacement_and_graceful_retirement(
         .flat_map(|request| std::str::from_utf8(&request.body).unwrap().lines())
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows.len(), 3, "retirement must actually deliver pending rows");
+    assert_eq!(
+        rows.len(),
+        3,
+        "retirement must actually deliver pending rows"
+    );
     let identities: std::collections::HashSet<_> = rows
         .iter()
         .map(|row| row["event_id"].as_str().unwrap())
@@ -885,10 +889,9 @@ async fn failed_unspooled_delivery_is_counted_after_retirement_and_reload() {
     assert_eq!(sink_metric("per_event_persisted_total"), persisted);
     assert_eq!(sink_metric("per_event_pending"), pending);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    let status: Value = serde_json::from_str(
-        &ferrum_edge::plugins::api_chargeback_sink::render_status_json(),
-    )
-    .unwrap();
+    let status: Value =
+        serde_json::from_str(&ferrum_edge::plugins::api_chargeback_sink::render_status_json())
+            .unwrap();
     assert_eq!(status["totals"]["per_event"]["dropped_total"], dropped + 1);
     assert_eq!(status["instances"][0]["per_event"]["dropped_total"], 0);
     drop(replacement);
@@ -989,11 +992,13 @@ async fn detected_websocket_flavor_prices_h1_h2_h3_handshakes_equally() {
         ("grpc", Version::HTTP_2, 200, HttpFlavor::Grpc),
     ] {
         let mut request = Request::builder()
-            .method(if expected_flavor == HttpFlavor::WebSocket && version != Version::HTTP_11 {
-                "CONNECT"
-            } else {
-                "GET"
-            })
+            .method(
+                if expected_flavor == HttpFlavor::WebSocket && version != Version::HTTP_11 {
+                    "CONNECT"
+                } else {
+                    "GET"
+                },
+            )
             .uri("https://billing.example/socket")
             .version(version)
             .body(())
@@ -1014,7 +1019,9 @@ async fn detected_websocket_flavor_prices_h1_h2_h3_handshakes_equally() {
                     "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
                 );
             } else if version == Version::HTTP_3 {
-                request.extensions_mut().insert(h3::ext::Protocol::WEB_SOCKET);
+                request
+                    .extensions_mut()
+                    .insert(h3::ext::Protocol::WEB_SOCKET);
             } else {
                 request
                     .extensions_mut()
@@ -1117,10 +1124,9 @@ fn chargeback_process_counters_start_fresh_only_in_a_new_process() {
         assert_eq!(sink_metric("per_event_received_total"), 0);
         assert_eq!(sink_metric("per_event_dropped_total"), 0);
         assert_eq!(sink_metric("queue_full_drops_total"), 0);
-        let status: Value = serde_json::from_str(
-            &ferrum_edge::plugins::api_chargeback_sink::render_status_json(),
-        )
-        .unwrap();
+        let status: Value =
+            serde_json::from_str(&ferrum_edge::plugins::api_chargeback_sink::render_status_json())
+                .unwrap();
         assert_eq!(status["totals"]["export"]["events_enqueued_total"], 0);
         assert_eq!(status["totals"]["per_event"]["pending"], 0);
         return;
@@ -1176,7 +1182,10 @@ async fn failed_export_settles_once_only_after_spool_write_with_unchanged_identi
     assert_eq!(sink_metric("per_event_pending"), pending);
     assert_eq!(sink_metric("per_event_dropped_total"), dropped);
     let requests = server.received_requests().await.unwrap();
-    assert!(!requests.is_empty(), "must actually attempt ClickHouse delivery");
+    assert!(
+        !requests.is_empty(),
+        "must actually attempt ClickHouse delivery"
+    );
     let posted: Value = requests[0].body_json().unwrap();
     let mut dirs = vec![temp.path().to_path_buf()];
     let mut rows = Vec::new();

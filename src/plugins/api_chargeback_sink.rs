@@ -3920,25 +3920,37 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     let mut queue_depth = 0u64;
     let mut queue_outstanding = 0u64;
     let mut queue_capacity = 0u64;
-    let high_water = process_metrics().queue_high_water_hits_total.load(Ordering::Relaxed);
-    let high_water_diversions =
-        process_metrics().queue_high_water_diversions_total.load(Ordering::Relaxed);
-    let full_drops = process_metrics().queue_full_drops_total.load(Ordering::Relaxed);
+    let high_water = process_metrics()
+        .queue_high_water_hits_total
+        .load(Ordering::Relaxed);
+    let high_water_diversions = process_metrics()
+        .queue_high_water_diversions_total
+        .load(Ordering::Relaxed);
+    let full_drops = process_metrics()
+        .queue_full_drops_total
+        .load(Ordering::Relaxed);
     let mut spool_files = 0u64;
     let mut spool_bytes = 0u64;
     let spool_drops = process_metrics().spool_drops_total.load(Ordering::Relaxed);
-    let spool_prepare_failures =
-        process_metrics().spool_prepare_failures_total.load(Ordering::Relaxed);
+    let spool_prepare_failures = process_metrics()
+        .spool_prepare_failures_total
+        .load(Ordering::Relaxed);
     let mut spool_unbound_files = 0u64;
     let mut spool_unbound_namespaces = 0u64;
-    let spool_replay_attempts =
-        process_metrics().spool_replay_attempts_total.load(Ordering::Relaxed);
-    let spool_dead_letter_rows =
-        process_metrics().spool_dead_letter_rows_total.load(Ordering::Relaxed);
+    let spool_replay_attempts = process_metrics()
+        .spool_replay_attempts_total
+        .load(Ordering::Relaxed);
+    let spool_dead_letter_rows = process_metrics()
+        .spool_dead_letter_rows_total
+        .load(Ordering::Relaxed);
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
-    let events_enqueued = process_metrics().events_enqueued_total.load(Ordering::Relaxed);
-    let events_exported = process_metrics().events_exported_total.load(Ordering::Relaxed);
+    let events_enqueued = process_metrics()
+        .events_enqueued_total
+        .load(Ordering::Relaxed);
+    let events_exported = process_metrics()
+        .events_exported_total
+        .load(Ordering::Relaxed);
     let failures = process_metrics().failures_total.load(Ordering::Relaxed);
 
     for runtime in sinks.values() {
@@ -4184,19 +4196,26 @@ fn render_prometheus_for_sinks(
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
     let mut queue_retained_bytes = 0u64;
-    let queue_byte_budget_exhausted =
-        process.queue_byte_budget_exhausted_total.load(Ordering::Relaxed);
+    let queue_byte_budget_exhausted = process
+        .queue_byte_budget_exhausted_total
+        .load(Ordering::Relaxed);
     let queue_high_water_hits = process.queue_high_water_hits_total.load(Ordering::Relaxed);
-    let queue_high_water_diversions =
-        process.queue_high_water_diversions_total.load(Ordering::Relaxed);
+    let queue_high_water_diversions = process
+        .queue_high_water_diversions_total
+        .load(Ordering::Relaxed);
     let queue_full_drops = process.queue_full_drops_total.load(Ordering::Relaxed);
     let snapshot_emits = process.snapshot_emits_total.load(Ordering::Relaxed);
     let mut snapshot_entries = 0u64;
     let mut snapshot_retained_bytes = 0u64;
-    let snapshot_overflow_spooled = process.snapshot_overflow_spooled_total.load(Ordering::Relaxed);
-    let snapshot_overflow_pending = process.snapshot_overflow_pending_total.load(Ordering::Relaxed);
-    let snapshot_cardinality_rejections =
-        process.snapshot_cardinality_rejections_total.load(Ordering::Relaxed);
+    let snapshot_overflow_spooled = process
+        .snapshot_overflow_spooled_total
+        .load(Ordering::Relaxed);
+    let snapshot_overflow_pending = process
+        .snapshot_overflow_pending_total
+        .load(Ordering::Relaxed);
+    let snapshot_cardinality_rejections = process
+        .snapshot_cardinality_rejections_total
+        .load(Ordering::Relaxed);
     let mut any_snapshot = false;
 
     for runtime in sinks.values() {
@@ -15951,14 +15970,11 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
         invalidate_status_cache();
         return;
     };
-    match runtime
-        .logger
-        .try_send_outcome(QueuedChargeEvent {
-            event,
-            lease,
-            accounting: Some(Arc::new(accounting)),
-        })
-    {
+    match runtime.logger.try_send_outcome(QueuedChargeEvent {
+        event,
+        lease,
+        accounting: Some(Arc::new(accounting)),
+    }) {
         TrySendOutcome::ChannelAccepted | TrySendOutcome::DiversionAccepted => {
             runtime
                 .metrics
