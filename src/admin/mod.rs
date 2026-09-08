@@ -2883,6 +2883,13 @@ async fn handle_admin_request_inner(
             }
             health_status["logging"] =
                 serde_json::to_value(crate::logging::snapshot()).unwrap_or_default();
+            // Per-plugin sink record loss (issue #4801). Closed-set plugin and
+            // reason labels with process-cumulative counts only — never an
+            // endpoint, topic, policy id, or record payload. Surfaced here so
+            // an audit-trail truncation is visible without a metrics backend.
+            health_status["log_sink_record_loss"] =
+                serde_json::to_value(crate::plugins::utils::sink_loss::snapshot())
+                    .unwrap_or_default();
             health_status["kafka_logging"] =
                 serde_json::to_value(crate::plugins::kafka_logging::snapshots())
                     .unwrap_or_default();
@@ -3068,6 +3075,7 @@ async fn handle_admin_request_inner(
         metrics_output.push_str(&crate::plugins::utils::jwks_cache::render_prometheus());
         metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::observability_delivery::render_prometheus());
+        metrics_output.push_str(&crate::plugins::utils::sink_loss::render_prometheus());
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
