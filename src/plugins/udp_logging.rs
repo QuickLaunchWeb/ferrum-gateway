@@ -42,6 +42,7 @@ use tokio::time::{Instant, timeout};
 use tracing::warn;
 
 use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
+use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, JSON_ARRAY_FRAMING_BYTES,
     PluginHttpClient, QueuedSummaryPayload, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
@@ -681,7 +682,9 @@ struct UdpDeliveryError {
 }
 
 impl UdpDeliveryError {
-    fn local(message: String) -> Self {
+    /// Deterministic local rejection of a record that exceeds the active
+    /// transport's per-datagram ceiling. Keeps the healthy sender.
+    fn record_too_large(message: String) -> Self {
         Self {
             message,
             reset_sender: false,
@@ -718,11 +721,12 @@ pub(crate) fn local_record_drops_for_test() -> u64 {
 }
 
 fn record_local_record_drop(error: &UdpDeliveryError) {
-    crate::plugins::utils::sink_loss::record_dropped(
-        "udp_logging",
-        crate::plugins::utils::sink_loss::SinkLossReason::SinkError,
-        1,
-    );
+    // `sink_error`, not `record_too_large`: this record was already admitted to
+    // the bounded queue and counted as accepted, and `record_too_large` is
+    // reserved for admission-time refusals so that `accepted` plus the
+    // admission reasons still accounts for every record the sink was offered
+    // (see docs/prometheus_metrics.md).
+    sink_loss::record_dropped("udp_logging", SinkLossReason::SinkError, 1);
     let total = LOCAL_RECORD_DROPS
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
@@ -792,7 +796,7 @@ pub(crate) fn dtls_send_timeout_requires_sender_reset_for_test() -> bool {
 /// Test helper: local deterministic rejection must not reset the sender.
 #[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn local_size_rejection_preserves_sender_for_test() -> bool {
-    let error = UdpDeliveryError::local(oversized_batch_error(16_384, 16_385));
+    let error = UdpDeliveryError::record_too_large(oversized_batch_error(16_384, 16_385));
     !error.requires_sender_reset()
 }
 
@@ -1081,7 +1085,7 @@ async fn deliver_batch(
             let payload = serialize_batch_payload(batch);
             sender.send(&payload).await
         }
-        BatchSizeDecision::RejectOversizedSingle => Err(UdpDeliveryError::local(
+        BatchSizeDecision::RejectOversizedSingle => Err(UdpDeliveryError::record_too_large(
             oversized_batch_error(max_datagram_bytes, payload_len),
         )),
         BatchSizeDecision::SplitPerEntry => {
@@ -1122,7 +1126,7 @@ async fn deliver_one_entry(
         // classifier contract changes.
         BatchSizeDecision::RejectOversizedSingle | BatchSizeDecision::SplitPerEntry => {
             let error = oversized_batch_error(max_datagram_bytes, payload_len);
-            Err(UdpDeliveryError::local(error))
+            Err(UdpDeliveryError::record_too_large(error))
         }
     }
 }

@@ -9,6 +9,7 @@ use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::udp_logging::{UDP_LOGGING_CONFIG_KEYS, UdpLogging};
+use ferrum_edge::plugins::utils::sink_loss::{SinkLossReason, dropped_total};
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, validate_plugin_config};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_RSA_SHA256,
@@ -1418,6 +1419,7 @@ async fn test_udp_logging_plain_udp_oversized_record_spares_cobatched_siblings()
     plugin.commit_background_tasks();
 
     let drops_before = ferrum_edge::_test_support::udp_logging_local_record_drops_for_test();
+    let sink_loss_before = dropped_total("udp_logging", SinkLossReason::SinkError);
 
     let ordinary = create_test_transaction_summary();
     let mut attacker = create_test_transaction_summary();
@@ -1453,6 +1455,11 @@ async fn test_udp_logging_plain_udp_oversized_record_spares_cobatched_siblings()
     assert!(
         drops_after > drops_before,
         "the record rejected alone must be counted as a local drop"
+    );
+    let sink_loss_after = dropped_total("udp_logging", SinkLossReason::SinkError);
+    assert!(
+        sink_loss_after > sink_loss_before,
+        "the rejected record must be published as a per-plugin sink loss"
     );
 }
 
@@ -1730,6 +1737,7 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         "**65,507**",
         "**65,527**",
         "bounds the assembled datagram by construction",
+        "reserved for admission-time refusals",
         "split per entry",
         "co-batched siblings",
         "at-least-once",
