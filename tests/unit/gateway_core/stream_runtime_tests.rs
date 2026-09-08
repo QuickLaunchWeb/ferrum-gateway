@@ -142,7 +142,10 @@ async fn stream_readiness_grants_pending_bind_grace_but_rejects_exited_task() {
                 tokio::pin!(reconcile);
                 let failures = std::future::poll_fn(|cx| {
                     if manager.stream_bind_failures().is_empty() {
-                        assert!(manager.is_ready(), "readiness flapped before reconcile poll");
+                        assert!(
+                            manager.is_ready(),
+                            "readiness flapped before reconcile poll"
+                        );
                     }
                     let result = std::future::Future::poll(reconcile.as_mut(), cx);
                     if manager.stream_bind_failures().is_empty() {

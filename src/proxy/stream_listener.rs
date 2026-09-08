@@ -2364,7 +2364,11 @@ impl StreamListenerManager {
                 .load()
                 .iter()
                 .any(|failure| failure.kind.is_hard_bind_failure())
-            && self.serving_tasks.load().iter().all(|task| !task.is_finished())
+            && self
+                .serving_tasks
+                .load()
+                .iter()
+                .all(|task| !task.is_finished())
     }
 
     /// Any recorded degradation or exited task, including non-fatal frontend
@@ -2372,7 +2376,11 @@ impl StreamListenerManager {
     /// admin health status and recovery retries independently of readiness.
     pub fn has_degraded_listeners(&self) -> bool {
         !self.bind_failures.load().is_empty()
-            || self.serving_tasks.load().iter().any(|task| task.is_finished())
+            || self
+                .serving_tasks
+                .load()
+                .iter()
+                .any(|task| task.is_finished())
     }
 
     /// Reconcile active listeners against the current config.
