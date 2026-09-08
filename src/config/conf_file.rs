@@ -157,11 +157,13 @@ impl ConfFile {
                         _ => '?',
                     })
                     .collect();
-                let secret_suffix = crate::secrets::EXTERNAL_SECRET_SUFFIXES.iter().any(|suffix| {
-                    key.strip_suffix(*suffix).is_some_and(
-                        crate::config::public_env_inventory::is_recognized_ferrum_setting,
-                    )
-                });
+                let secret_suffix = crate::secrets::EXTERNAL_SECRET_SUFFIXES
+                    .iter()
+                    .any(|suffix| {
+                        key.strip_suffix(*suffix).is_some_and(
+                            crate::config::public_env_inventory::is_recognized_ferrum_setting,
+                        )
+                    });
                 return Err(if secret_suffix {
                     format!(
                         "Invalid ferrum.conf key '{display_key}' at line {}: external secret \

@@ -5735,9 +5735,9 @@ impl EnvConfig {
         if self.mode == OperatingMode::ControlPlane
             && let Some(addr) = &self.cp_grpc_listen_addr
         {
-            let addr = addr
-                .parse::<SocketAddr>()
-                .map_err(|_| "FERRUM_CP_GRPC_LISTEN_ADDR must be an IP socket address".to_string())?;
+            let addr = addr.parse::<SocketAddr>().map_err(|_| {
+                "FERRUM_CP_GRPC_LISTEN_ADDR must be an IP socket address".to_string()
+            })?;
             listeners.push(("FERRUM_CP_GRPC_LISTEN_ADDR", addr));
         }
         for (index, (left_key, left)) in listeners.iter().enumerate() {

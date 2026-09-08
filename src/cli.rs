@@ -436,7 +436,9 @@ pub fn infer_file_mode() {
     {
         return;
     }
-    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH") || conf.get("FERRUM_FILE_CONFIG_PATH").is_some() {
+    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH")
+        || conf.get("FERRUM_FILE_CONFIG_PATH").is_some()
+    {
         // SAFETY: startup only, before logging workers or the serving runtime.
         unsafe { std::env::set_var("FERRUM_MODE", "file") };
     }
@@ -1161,14 +1163,17 @@ fn resolve_health_target(args: &HealthArgs) -> Result<(String, u16, bool), Strin
     } else {
         ConfFile::default()
     };
-    let configured_port = |values: &std::collections::HashMap<String, String>, key: &str, default| {
-        match values.get(key).map(String::as_str).or_else(|| conf.get(key)) {
+    let configured_port =
+        |values: &std::collections::HashMap<String, String>, key: &str, default| match values
+            .get(key)
+            .map(String::as_str)
+            .or_else(|| conf.get(key))
+        {
             Some(value) => value
                 .parse::<u16>()
                 .map_err(|_| format!("{key} must be an integer from 0 to 65535")),
             None => Ok(default),
-        }
-    };
+        };
     let use_tls = args.tls
         || (args.port.is_none() && configured_port(&values, "FERRUM_ADMIN_HTTP_PORT", 9000)? == 0);
     if args.port.is_none() && use_tls {
@@ -1494,9 +1499,9 @@ fn health_request_tls(
     })?;
 
     let mut tls_stream = rustls::StreamOwned::new(conn, stream);
-    tls_stream
-        .write_all(request.as_bytes())
-        .map_err(|_| "Failed to send TLS request; check endpoint and certificate trust".to_string())?;
+    tls_stream.write_all(request.as_bytes()).map_err(|_| {
+        "Failed to send TLS request; check endpoint and certificate trust".to_string()
+    })?;
     read_health_response_head(&mut tls_stream, deadline, "TLS")
 }
 

@@ -3741,7 +3741,15 @@ async fn functional_cli_health_infers_endpoint_and_fetches_only_needed_sources()
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     for case in [
-        "settings", "env", "suffix", "wildcard", "mapped", "specific", "v6wildcard", "explicit", "live",
+        "settings",
+        "env",
+        "suffix",
+        "wildcard",
+        "mapped",
+        "specific",
+        "v6wildcard",
+        "explicit",
+        "live",
     ] {
         if case == "specific" && !cfg!(target_os = "linux") {
             continue;
@@ -3928,7 +3936,10 @@ async fn functional_cli_health_uses_secret_endpoint_for_tls_gateway() {
         .env("FERRUM_ADMIN_HTTP_PORT_FILE", http_source)
         .env("FERRUM_ADMIN_HTTPS_PORT_FILE", https_source)
         .env("FERRUM_ADMIN_BIND_ADDRESS_FILE", host_source)
-        .env("FERRUM_ADMIN_TLS_KEY_PATH_FILE", "unrelated-unread-server-key");
+        .env(
+            "FERRUM_ADMIN_TLS_KEY_PATH_FILE",
+            "unrelated-unread-server-key",
+        );
     let output = cli_contract_output(command).await;
     gateway.shutdown();
     assert!(

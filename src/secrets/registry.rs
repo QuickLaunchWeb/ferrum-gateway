@@ -581,7 +581,9 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
 
 /// Resolve a bounded set of endpoint settings without materializing them into
 /// the environment. Unrelated sources are neither validated nor fetched.
-pub(crate) async fn resolve_selected_env_secrets(keys: &[&str]) -> Result<ResolvedEnvSecrets, String> {
+pub(crate) async fn resolve_selected_env_secrets(
+    keys: &[&str],
+) -> Result<ResolvedEnvSecrets, String> {
     resolve_env_secrets(Some(keys)).await
 }
 
