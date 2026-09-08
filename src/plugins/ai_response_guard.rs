@@ -39,8 +39,8 @@ use tracing::{debug, warn};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
-    SseReassembler, SseTextKind, is_text_event_stream_media_type,
-    original_response_is_event_stream, parse_sse_data_frames, parse_sse_data_frames_checked,
+    AnthropicEvent, SseEventName, SseReassembler, SseTextKind, is_text_event_stream_media_type,
+    original_response_is_event_stream, parse_sse_data_frames_checked,
 };
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -721,16 +721,24 @@ impl AiResponseGuard {
     /// `ScanMode::All` SSE detection: the union of decoded parsed frames and a
     /// raw-body pass.
     ///
-    /// `parse_sse_data_frames` silently drops `data:` payloads that are not JSON
-    /// (a plain `data: user@example.com` frame, or malformed JSON), so scanning
-    /// only the parsed frames would let blocked content in unparseable SSE data
-    /// bypass scan-all policies. Running the `RegexSet` over the raw body too
-    /// restores the original whole-body coverage for those payloads, while the
-    /// decoded-frame pass adds `\uXXXX`-escaped detection (issue #1720).
-    /// `raw` is `None` only when the body is not valid UTF-8.
+    /// `parse_sse_data_frames_checked` silently drops `data:` payloads that are
+    /// not JSON (a plain `data: user@example.com` frame, or malformed JSON), so
+    /// scanning only the parsed frames would let blocked content in unparseable
+    /// SSE data bypass scan-all policies. Running the `RegexSet` over the raw
+    /// body too restores the original whole-body coverage for those payloads,
+    /// while the decoded-frame pass adds `\uXXXX`-escaped detection (issue
+    /// #1720). `raw` is `None` only when the body is not valid UTF-8.
+    ///
+    /// `events` carries the SSE `event:` name of each frame, in the same order,
+    /// so an Anthropic stream whose frames declare the discriminator only on
+    /// the event line still reassembles here. Without it the reassembled pass
+    /// would silently see nothing on such a stream while the caller's
+    /// fully-reassembled check reported success — a match split across
+    /// `text_delta` fragments would then be delivered (issue #4901).
     fn detect_matches_in_decoded_sse_frames(
         &self,
         frames: &[Value],
+        events: &[Option<SseEventName>],
         raw: Option<&str>,
     ) -> Vec<String> {
         if self.detection_pattern_count == 0 {
@@ -751,7 +759,7 @@ impl AiResponseGuard {
         // decoded frame. In particular, Responses API argument deltas are a
         // serialized JSON document that may span events; only reassembly can
         // expose JSON escapes such as `\u0040` to the detector.
-        let accumulated = self.extract_sse_completion_texts(frames);
+        let (accumulated, _) = self.extract_sse_completion_texts_checked(frames, events);
         for text in &accumulated {
             for idx in self.detection_set.matches(text).into_iter() {
                 hit[idx] = true;
@@ -1015,9 +1023,9 @@ impl AiResponseGuard {
         if !parsed.fully_parsed {
             return true;
         }
-        let mut frames = parsed.frames;
+        let (mut frames, events) = (parsed.frames, parsed.events);
         if self.scan_mode == ScanMode::Content {
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let (accumulated, _) = self.extract_sse_completion_texts_checked(&frames, &events);
             return accumulated.iter().any(|text| {
                 self.detection_set
                     .is_match(&self.strip_known_placeholders(text))
@@ -1028,7 +1036,7 @@ impl AiResponseGuard {
         // present. Structural masking is only for the decoded-token and raw
         // residual passes; doing it first would hide Responses delta kinds and
         // let a match split across their argument events escape this re-scan.
-        let accumulated = self.extract_sse_completion_texts(&frames);
+        let (accumulated, _) = self.extract_sse_completion_texts_checked(&frames, &events);
 
         for frame in &mut frames {
             blank_top_level_structural_scalars(frame);
@@ -1408,22 +1416,44 @@ impl AiResponseGuard {
     /// - OpenAI: `choices[].delta.content` keyed by choice `index`, plus
     ///   legacy `function_call` name/argument deltas and `delta.refusal`
     /// - OpenAI Responses: reassembler deltas plus `response.refusal.delta`
-    /// - Anthropic: `content_block_delta` events with `delta.text` keyed by block `index`
+    /// - Anthropic: the Messages event protocol, reassembled per content-block
+    ///   `index` by the shared reassembler into `$.content[*].text` prose and
+    ///   `$.content[*].input` tool-use argument JSON
     /// - Gemini: `candidates[].content.parts[].text` keyed by candidate position
     ///
     /// Returns one accumulated `String` per choice/block index, ordered by
     /// index (BTreeMap keeps output deterministic across runs). Accumulated
     /// tool/function argument strings additionally contribute their decoded
     /// JSON tokens so escapes cannot hide content from detection.
-    fn extract_sse_completion_texts(&self, frames: &[Value]) -> Vec<String> {
+    ///
+    /// Also reports whether the stream was FULLY reassembled. `false` means an
+    /// Anthropic Messages stream carried an event, a `delta.type`, or a
+    /// content-block index the reassembler could not fold into its document, so
+    /// the accumulated texts do not necessarily cover every client-visible
+    /// byte; an enforcing caller must fail closed instead of clearing the
+    /// response.
+    ///
+    /// `events` are the SSE `event:` names of `frames`, in the same order and
+    /// of the same length (exactly what `SseParse` produces). The parameter
+    /// is deliberately NOT optional: an Anthropic stream may declare the event
+    /// discriminator only on the `event:` line, and a caller that dropped the
+    /// names would reassemble nothing from it while still being told the stream
+    /// was fully reassembled (issue #4901).
+    fn extract_sse_completion_texts_checked(
+        &self,
+        frames: &[Value],
+        events: &[Option<SseEventName>],
+    ) -> (Vec<String>, bool) {
         let mut reassembler = SseReassembler::default();
         let mut provider_texts: std::collections::BTreeMap<(u8, usize), String> =
             std::collections::BTreeMap::new();
 
-        for frame in frames {
-            // Shared OpenAI chat/completions + Responses API reassembly covers
-            // prose, tool/function names and arguments, and Responses deltas.
-            reassembler.push_frame(frame);
+        for (frame_index, frame) in frames.iter().enumerate() {
+            // Shared OpenAI chat/completions + Responses API + Anthropic
+            // Messages reassembly covers prose, tool/function names and
+            // arguments, Responses deltas, and Anthropic content blocks.
+            let event = events.get(frame_index).copied().flatten();
+            reassembler.push_event_frame(event, frame);
 
             // Legacy Chat Completions streamed `function_call` before the
             // indexed `tool_calls` shape. Keep name and arguments in separate
@@ -1485,18 +1515,6 @@ impl AiResponseGuard {
                     .push_str(delta);
             }
 
-            // Anthropic streaming: type=content_block_delta, delta.text
-            if frame.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
-                let index = frame.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                if let Some(text) = frame
-                    .get("delta")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    provider_texts.entry((0, index)).or_default().push_str(text);
-                }
-            }
-
             // Gemini: candidates[].content.parts[].text
             if let Some(candidates) = frame.get("candidates").and_then(|c| c.as_array()) {
                 for (idx, candidate) in candidates.iter().enumerate() {
@@ -1516,10 +1534,13 @@ impl AiResponseGuard {
         }
 
         let mut texts: Vec<String> = Vec::new();
+        let fully_reassembled = !reassembler.anthropic_stream_uninspectable();
         for sse_text in reassembler.into_texts() {
             if matches!(
                 sse_text.kind,
-                SseTextKind::ChatToolArguments | SseTextKind::ResponsesArguments
+                SseTextKind::ChatToolArguments
+                    | SseTextKind::ResponsesArguments
+                    | SseTextKind::AnthropicToolInput
             ) {
                 append_decoded_argument_texts(&sse_text.text, &mut texts);
             }
@@ -1533,11 +1554,18 @@ impl AiResponseGuard {
             }
             texts.push(text);
         }
-        texts
+        (texts, fully_reassembled)
     }
 
     /// Redact content fields in a single parsed SSE frame.
-    fn redact_sse_frame(&self, frame: &mut Value) {
+    ///
+    /// `event` is the frame's SSE `event:` name when it carried one. Anthropic
+    /// Messages events are routed from the JSON `type` field when present and
+    /// from that name otherwise, mirroring how the reassembler that scanned
+    /// them resolved the discriminator — an intermediary that strips the
+    /// duplicated JSON `type` must not turn a redactable match into a hard
+    /// failure.
+    fn redact_sse_frame(&self, event: Option<SseEventName>, frame: &mut Value) {
         if let Some(choices) = frame.get_mut("choices").and_then(Value::as_array_mut) {
             for choice in choices {
                 if let Some(text) = choice.get_mut("text") {
@@ -1569,17 +1597,55 @@ impl AiResponseGuard {
             }
         }
 
-        // Anthropic streaming: content_block_delta
-        if frame.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
-            && let Some(text) = frame
-                .get("delta")
-                .and_then(|d| d.get("text"))
-                .and_then(|t| t.as_str())
-        {
-            let redacted = self.redact_text(text);
-            if redacted != text {
-                frame["delta"]["text"] = Value::String(redacted);
+        // Anthropic streaming. The reassembler scans `content_block_delta`
+        // prose, `input_json_delta` tool input, the `content_block_start` tool
+        // name, and an `error` event's message, so redact mode has to be able
+        // to rewrite all of them or a match confined to one would hard-fail
+        // instead of being redacted. The JSON `type` field decides when it is
+        // present (it describes the very payload being rewritten) and the SSE
+        // `event:` line stands in when an intermediary stripped it. A match
+        // that exists only ACROSS fragments is not rewritable in any single
+        // frame and still fails closed through the residual re-scan.
+        let anthropic_event = frame
+            .get("type")
+            .and_then(Value::as_str)
+            .map(SseEventName::from_name)
+            .or(event);
+        match anthropic_event {
+            Some(SseEventName::Anthropic(AnthropicEvent::ContentBlockDelta)) => {
+                if let Some(delta) = frame.get_mut("delta") {
+                    if let Some(text) = delta.get_mut("text") {
+                        self.redact_string_value(text);
+                    }
+                    // `partial_json` is one fragment of a serialized tool-input
+                    // document, so it gets the same treatment as OpenAI
+                    // tool-call `arguments`: value-safe redaction of the
+                    // decoded document when the fragment happens to be
+                    // self-contained JSON, plain string redaction otherwise.
+                    if let Some(partial) = delta.get_mut("partial_json") {
+                        self.redact_arguments_value(partial);
+                    }
+                }
             }
+            Some(SseEventName::Anthropic(AnthropicEvent::ContentBlockStart)) => {
+                if let Some(name) = frame
+                    .get_mut("content_block")
+                    .and_then(|block| block.get_mut("name"))
+                {
+                    self.redact_string_value(name);
+                }
+            }
+            // A mid-stream `error` event's `error.message` is client-visible
+            // free text the reassembler now scans.
+            Some(SseEventName::Anthropic(AnthropicEvent::Error)) => {
+                if let Some(message) = frame
+                    .get_mut("error")
+                    .and_then(|error| error.get_mut("message"))
+                {
+                    self.redact_string_value(message);
+                }
+            }
+            _ => {}
         }
 
         // Gemini: candidates[].content.parts[].text
@@ -1607,11 +1673,12 @@ impl AiResponseGuard {
         output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
         lines: &[&str],
     ) -> Option<bool> {
+        let event = sse_event_name_of(lines);
         rewrite_sse_json_event_into(output, lines, |json| {
             if self.scan_mode == ScanMode::All {
                 self.redact_all_strings_with_argument_shield(json);
             } else {
-                self.redact_sse_frame(json);
+                self.redact_sse_frame(event, json);
             }
         })
     }
@@ -1633,14 +1700,14 @@ impl AiResponseGuard {
         // content) with a raw-body pass (so cross-token/contextual patterns and
         // unparseable `data:` payloads are not skipped here while the
         // reject/warn detection path would have flagged them).
+        let parsed = parse_sse_data_frames_checked(body);
+        let (frames, events) = (&parsed.frames, &parsed.events);
         let has_match = if self.scan_mode == ScanMode::All {
-            let frames = parse_sse_data_frames(body);
             !self
-                .detect_matches_in_decoded_sse_frames(&frames, Some(body_str))
+                .detect_matches_in_decoded_sse_frames(frames, events, Some(body_str))
                 .is_empty()
         } else {
-            let frames = parse_sse_data_frames(body);
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let (accumulated, _) = self.extract_sse_completion_texts_checked(frames, events);
             let refs: Vec<&str> = accumulated.iter().map(String::as_str).collect();
             !self.detect_matches(&refs).is_empty()
         };
@@ -3287,12 +3354,23 @@ impl Plugin for AiResponseGuard {
                     "SSE contains malformed, non-JSON, or non-UTF-8 data",
                 );
             }
-            let frames = parsed.frames;
+            let (frames, events) = (parsed.frames, parsed.events);
             if frames.is_empty() && self.scan_mode != ScanMode::All {
                 return PluginResult::Continue;
             }
 
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let (accumulated, fully_reassembled) =
+                self.extract_sse_completion_texts_checked(&frames, &events);
+            if !fully_reassembled {
+                // An Anthropic Messages stream carried an event, a delta type,
+                // or a content-block index reassembly could not cover, so the
+                // accumulated text is not proof the whole response is clean.
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "uninspectable_sse",
+                    "SSE contains an unsupported Anthropic streaming event",
+                );
+            }
 
             // Check max completion length on accumulated text
             if self.max_completion_length > 0 {
@@ -3319,7 +3397,11 @@ impl Plugin for AiResponseGuard {
             }
 
             let detected = if self.scan_mode == ScanMode::All {
-                self.detect_matches_in_decoded_sse_frames(&frames, std::str::from_utf8(body).ok())
+                self.detect_matches_in_decoded_sse_frames(
+                    &frames,
+                    &events,
+                    std::str::from_utf8(body).ok(),
+                )
             } else {
                 let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
                 self.detect_matches(&refs)
@@ -3935,6 +4017,23 @@ fn blank_top_level_structural_scalars(value: &mut Value) {
             }
         }
     }
+}
+
+/// The classified `event:` name of one complete SSE event's lines, if it
+/// carried one. Per the WHATWG spec the last `event:` field of an event wins,
+/// matching `parse_sse_data_frames_checked`.
+fn sse_event_name_of(lines: &[&str]) -> Option<SseEventName> {
+    let mut name = None;
+    for line in lines {
+        let content = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if let Some(rest) = content.strip_prefix("event:") {
+            name = Some(SseEventName::from_name(rest.trim()));
+        }
+    }
+    name
 }
 
 /// Rewrite one SSE event's JSON `data:` payload straight into `output`.

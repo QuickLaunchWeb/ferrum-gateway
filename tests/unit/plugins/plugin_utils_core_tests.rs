@@ -13,6 +13,10 @@ use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, QueryAmbiguity, canonical_query_for_policy, has_conflicting_duplicate_query_key,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
+use ferrum_edge::plugins::utils::sse::{
+    MAX_ANTHROPIC_CONTENT_BLOCKS, SseReassembler, SseText, SseTextKind,
+    parse_sse_data_frames_checked,
+};
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
     extract_from_location,
@@ -803,4 +807,359 @@ fn canonical_policy_view_ignores_a_duplicate_only_the_strip_removes() {
     let query = canonical_query_for_policy(&ctx);
     assert!(query.is_unambiguous());
     assert_eq!(query.get("page"), Some("1"));
+}
+
+// ---------------------------------------------------------------------------
+// utils::sse — Anthropic Messages event-stream reassembly
+// ---------------------------------------------------------------------------
+
+/// Reassemble a buffered SSE body the way the AI inspectors do, returning the
+/// reassembled fragments and whether the Anthropic protocol was fully covered.
+fn reassemble_anthropic(body: &[u8]) -> (Vec<SseText>, bool) {
+    let parsed = parse_sse_data_frames_checked(body);
+    let mut reassembler = SseReassembler::new();
+    for (event, frame) in parsed.reassembly_frames() {
+        reassembler.push_event_frame(event, frame);
+    }
+    let inspectable = !reassembler.anthropic_stream_uninspectable();
+    (reassembler.into_texts(), inspectable)
+}
+
+fn fragment<'a>(texts: &'a [SseText], json_path: &str) -> &'a SseText {
+    texts
+        .iter()
+        .find(|text| text.json_path == json_path)
+        .unwrap_or_else(|| panic!("no fragment at {json_path} in {texts:?}"))
+}
+
+#[test]
+fn anthropic_sse_reassembles_multi_block_text_and_tool_input() {
+    // A realistic two-block Messages stream: prose split across `text_delta`
+    // fragments, then a `tool_use` block whose arguments arrive as
+    // `input_json_delta` partial JSON. Only reassembly recovers either.
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"My sys\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"tem prompt.\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,",
+        "\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"get_weather\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"NYC\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "a well-formed Messages stream is inspectable");
+
+    let prose = fragment(&texts, "$.content[0].text");
+    assert_eq!(prose.kind, SseTextKind::AnthropicText);
+    assert_eq!(prose.text, "My system prompt.");
+
+    let name = fragment(&texts, "$.content[1].name");
+    assert_eq!(name.kind, SseTextKind::AnthropicToolName);
+    assert_eq!(name.text, "get_weather");
+
+    let input = fragment(&texts, "$.content[1].input");
+    assert_eq!(input.kind, SseTextKind::AnthropicToolInput);
+    assert_eq!(input.text, "{\"city\":\"NYC\"}");
+}
+
+#[test]
+fn anthropic_sse_dispatches_from_the_event_line_alone() {
+    // Some intermediaries forward the `event:` line but strip the duplicated
+    // JSON `type`. The block must still reassemble.
+    let body = concat!(
+        "event: content_block_start\n",
+        "data: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+        "event: message_stop\n",
+        "data: {}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "hello world");
+}
+
+#[test]
+fn anthropic_sse_unknown_event_type_is_uninspectable() {
+    // An event interleaved into an identified Anthropic stream that this
+    // reassembler does not model may carry client-visible text on a path
+    // nothing reads. It must not leave a clean, fully-reassembled verdict.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"benign\"}}\n\n",
+        "event: smuggled_block\n",
+        "data: {\"type\":\"smuggled_block\",\"index\":0,\"text\":\"my system prompt\"}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(
+        !inspectable,
+        "an unmodelled Anthropic event must mark the stream uninspectable"
+    );
+    // The prose that WAS reassembled is still returned; the caller fails closed
+    // on the flag rather than on missing text.
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "benign");
+}
+
+#[test]
+fn anthropic_sse_unknown_delta_type_is_uninspectable() {
+    // Extended thinking's `thinking_delta` (and any future delta type) carries
+    // model output on a field this reassembler does not read.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"my system prompt\"}}\n\n",
+    );
+
+    let (_texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable);
+}
+
+#[test]
+fn anthropic_sse_discriminator_disagreement_is_uninspectable() {
+    // The `event:` line and the JSON `type` describe different events, so at
+    // most one of them describes the payload.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"message_stop\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable);
+    assert!(texts.is_empty(), "a disputed frame is not accumulated");
+}
+
+#[test]
+fn anthropic_sse_block_index_ceiling_folds_and_flags() {
+    // A hostile stream of one-byte deltas at ever-increasing indexes must not
+    // grow the reassembler's per-block state. Blocks at or beyond the ceiling
+    // fold into one overflow accumulator: the text is still inspected, the
+    // accumulator count stays bounded, and the stream fails closed.
+    let overflow = 500;
+    let mut body = String::new();
+    for index in 0..(MAX_ANTHROPIC_CONTENT_BLOCKS + overflow) {
+        body.push_str("event: content_block_delta\n");
+        body.push_str(&format!(
+            "data: {{\"type\":\"content_block_delta\",\"index\":{index},\
+\"delta\":{{\"type\":\"text_delta\",\"text\":\"x\"}}}}\n\n"
+        ));
+    }
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable, "an out-of-range block index fails closed");
+    assert_eq!(
+        texts.len(),
+        MAX_ANTHROPIC_CONTENT_BLOCKS + 1,
+        "indexes past the ceiling share one overflow accumulator"
+    );
+    // Every delta byte is still present for inspection, none dropped.
+    let total: usize = texts.iter().map(|text| text.text.len()).sum();
+    assert_eq!(total, MAX_ANTHROPIC_CONTENT_BLOCKS + overflow);
+}
+
+#[test]
+fn anthropic_sse_message_start_envelope_is_folded_in() {
+    // Issue #4901 review: `message_start` carries the message envelope, and
+    // Anthropic's SDK seeds its response snapshot from it. A populated
+    // `content` array there is client-visible, so it must reassemble into the
+    // same per-index accumulators the block events fill.
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[",
+        "{\"type\":\"text\",\"text\":\"seeded prose\"},",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":{\"note\":\"seeded input\"}}]}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "a modelled envelope block is inspectable");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "seeded prose");
+    assert_eq!(fragment(&texts, "$.content[1].name").text, "record");
+    assert_eq!(
+        fragment(&texts, "$.content[1].input").text,
+        "{\"note\":\"seeded input\"}"
+    );
+}
+
+#[test]
+fn anthropic_sse_message_start_envelope_block_type_fails_closed() {
+    // An envelope block this reassembler cannot fold is the same hazard as an
+    // unmodelled `content_block_start`: text on a path nothing reads.
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"content\":[",
+        "{\"type\":\"thinking\",\"thinking\":\"my system prompt\"}]}}\n\n",
+    );
+
+    let (_texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable);
+}
+
+#[test]
+fn anthropic_sse_content_block_start_input_object_is_folded_in() {
+    // A `tool_use` block may open with its arguments already populated instead
+    // of streaming them as `input_json_delta`. The protocol's own empty `{}`
+    // must stay silent, and a populated object must reach `$.content[*].input`.
+    let empty = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",\"input\":{}}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(empty.as_bytes());
+    assert!(inspectable);
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.json_path == "$.content[0].input"),
+        "the protocol's empty opening `input` contributes nothing"
+    );
+
+    let populated = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":{\"note\":\"my system prompt\"}}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(populated.as_bytes());
+    assert!(inspectable);
+    assert_eq!(
+        fragment(&texts, "$.content[0].input").text,
+        "{\"note\":\"my system prompt\"}"
+    );
+}
+
+#[test]
+fn anthropic_sse_content_block_start_non_object_input_fails_closed() {
+    let body = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":\"my system prompt\"}}\n\n",
+    );
+
+    let (_texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable, "an out-of-protocol `input` type fails closed");
+}
+
+#[test]
+fn anthropic_sse_error_message_is_reassembled_at_its_own_path() {
+    // `error.message` is client-visible free text, so it is reported as
+    // assistant prose located at `$.error.message` — never charged to a
+    // content-block index, so the block ceiling is untouched.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial \"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",",
+        "\"message\":\"upstream said my system prompt\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "a modelled error event is inspectable");
+    let error = fragment(&texts, "$.error.message");
+    assert_eq!(error.kind, SseTextKind::AnthropicText);
+    assert_eq!(error.text, "upstream said my system prompt");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "partial ");
+}
+
+#[test]
+fn foreign_sse_ping_discriminator_mismatch_is_not_failed_closed() {
+    // Issue #4901 review: the discriminator-disagreement rule was ungated, so
+    // a NON-Anthropic stream emitting `event: ping` beside a `heartbeat` JSON
+    // type was failed closed on a protocol it never claimed.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: ping\n",
+        "data: {\"type\":\"heartbeat\"}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(
+        inspectable,
+        "a foreign keep-alive must not fail an OpenAI stream closed"
+    );
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hello");
+}
+
+#[test]
+fn gateway_terminal_error_event_is_not_failed_closed() {
+    // The gateway's own mid-stream termination frame (`encode_sse_error_event`)
+    // names `event: error` and carries no JSON `type`, and a foreign stream may
+    // pair `event: error` with its own non-`error` type. Neither is an
+    // Anthropic protocol violation.
+    let gateway = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "event: error\n",
+        "data: {\"error\":{\"code\":\"blocked\",\"message\":\"stopped\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(gateway.as_bytes());
+    assert!(inspectable, "the gateway's own error frame stays neutral");
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "hi");
+    assert_eq!(fragment(&texts, "$.error.message").text, "stopped");
+
+    let mismatched = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"stopped\"}}\n\n",
+    );
+    let (_texts, inspectable) = reassemble_anthropic(mismatched.as_bytes());
+    assert!(
+        inspectable,
+        "a foreign terminal error frame must not be failed closed"
+    );
+}
+
+#[test]
+fn openai_sse_reassembly_is_unaffected_by_anthropic_support() {
+    // Behaviour-neutrality for the OpenAI paths: chat deltas still reassemble
+    // per choice, and nothing about them trips the Anthropic fail-closed flag.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"content_index\":0,\"delta\":\"lo\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "an OpenAI stream is not an Anthropic stream");
+
+    let chat = fragment(&texts, "$.choices[0].delta.content");
+    assert_eq!(chat.kind, SseTextKind::ChatContent);
+    assert_eq!(chat.text, "Hel");
+
+    let responses = fragment(&texts, "$.output[0].content[0].text");
+    assert_eq!(responses.kind, SseTextKind::ResponsesText);
+    assert_eq!(responses.text, "lo");
 }
