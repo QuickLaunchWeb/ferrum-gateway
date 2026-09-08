@@ -4270,26 +4270,31 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_update_matching_a_backend_li
 
 /// Same owned-replacement boundary as
 /// [`deadline_rebuild_keeps_an_owned_set_cookie_update_matching_a_backend_line`],
-/// reached through a fired `rename` whose destination is `set-cookie`.
+/// reached through an operator-configured update plus source removal. Renaming
+/// into `set-cookie` is forbidden because the source is backend-controlled.
 /// Mutation tracking observes only the source removal, so ownership is the sole
 /// signal that the destination is gateway-authored.
 #[tokio::test]
-async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
+async fn deadline_rebuild_keeps_an_owned_set_cookie_update_with_source_removal() {
     use ferrum_edge::_test_support::{
         run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
         set_grpc_deadline_budget_for_test,
     };
 
-    const SHARED: &str = "sid=renamed; Path=/";
+    const SHARED: &str = "sid=operator-owned; Path=/";
 
     let transformer = create_plugin(
         "response_transformer",
         &json!({
             "rules": [{
-                "operation": "rename",
+                "operation": "update",
+                "target": "header",
+                "key": "set-cookie",
+                "value": SHARED,
+            }, {
+                "operation": "remove",
                 "target": "header",
                 "key": "x-session-source",
-                "new_key": "set-cookie",
             }]
         }),
     )
@@ -4301,9 +4306,9 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
     let mut ctx = create_grpc_context_with_timeout(None);
     set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
 
-    // The backend supplies BOTH the rename source and a `set-cookie` that is
-    // byte-identical to what the rename will produce, so the post-rename value
-    // has zero surplus over the backend baseline.
+    // The backend spoofs BOTH the removed source and the operator's cookie.
+    // The trusted update has zero surplus over this backend baseline, so only
+    // explicit ownership can preserve it through the later deadline rebuild.
     let mut headers = HashMap::from([
         ("content-type".to_string(), "application/grpc".to_string()),
         ("x-session-source".to_string(), SHARED.to_string()),
@@ -4315,7 +4320,7 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
     );
     assert!(
         !headers.contains_key("x-session-source"),
-        "precondition: the rename consumed the source header"
+        "precondition: the remove rule consumed the backend source header"
     );
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
@@ -4336,11 +4341,11 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some(SHARED),
-        "the fired rename destination is gateway-authored and must survive"
+        "the operator-written cookie is gateway-authored and must survive"
     );
     assert!(
         !headers.contains_key("x-session-source"),
-        "the renamed-away backend source header must not reappear"
+        "the removed backend source header must not reappear"
     );
 }
 

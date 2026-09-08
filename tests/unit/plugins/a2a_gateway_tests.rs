@@ -3576,13 +3576,17 @@ async fn grpc_policy_deny_returns_reject_for_proxy_normalization() {
     let (mut ctx, mut headers) = grpc_ctx("SendMessage", "application/grpc");
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        PluginResult::Reject {
-            status_code: 403,
-            ..
-        }
-    ));
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = result
+    else {
+        panic!("expected gRPC policy denial");
+    };
+    assert_eq!(status_code, 403);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"error": "A2A method denied by gateway policy"})
+    );
 }
 
 #[tokio::test]

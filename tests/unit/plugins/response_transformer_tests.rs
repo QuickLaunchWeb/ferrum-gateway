@@ -2494,3 +2494,42 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
         "the shared transform loop must consume the pending signal"
     );
 }
+
+#[test]
+fn cookie_rename_is_refused_in_both_directions() {
+    for (source, destination) in [
+        ("Set-Cookie", "X-Cookie"),
+        ("X-Cookie", "SET-COOKIE"),
+        ("set-cookie", "set-cookie"),
+    ] {
+        let error = ResponseTransformer::new(&json!({"rules": [{
+            "target": "header", "operation": "rename", "key": source, "new_key": destination
+        }]}))
+        .err()
+        .expect("cookie rename must fail before any response is processed");
+        assert!(error.contains("rule[0]"));
+        assert!(error.contains("set-cookie"));
+    }
+}
+
+#[tokio::test]
+async fn ordinary_response_rename_preserves_all_cookie_values() {
+    let plugin = ResponseTransformer::new(&json!({"rules": [{
+        "target": "header", "operation": "rename", "key": "x-old", "new_key": "x-new"
+    }]}))
+    .unwrap();
+    for cookies in [None, Some("one=1"), Some("one=1\ntwo=2\nthree=3")] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        let mut headers = HashMap::from([("x-old".to_string(), "value".to_string())]);
+        if let Some(cookies) = cookies {
+            headers.insert("set-cookie".to_string(), cookies.to_string());
+        }
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(headers.get("set-cookie").map(String::as_str), cookies);
+        assert_eq!(headers.get("x-new").map(String::as_str), Some("value"));
+        assert!(!headers.contains_key("x-old"));
+    }
+}
