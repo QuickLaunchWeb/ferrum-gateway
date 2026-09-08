@@ -66,6 +66,16 @@ async fn transformer_response_size_policy_status_logging_and_attribution() {
         ("response", Some("response_transformer"), 115),
         ("boundary", Some("response_transformer"), 114),
     ] {
+        // File-mode proxies only run the plugin configs they attach; a
+        // `proxy_id` on the config alone does not bind it to the route.
+        let mut attached = vec![serde_json::json!({
+            "plugin_config_id": format!("{route}-limit")
+        })];
+        if transformer.is_some() {
+            attached.push(serde_json::json!({
+                "plugin_config_id": format!("{route}-transform")
+            }));
+        }
         proxies.push(serde_json::json!({
             "id": route,
             "listen_path": format!("/{route}"),
@@ -73,7 +83,8 @@ async fn transformer_response_size_policy_status_logging_and_attribution() {
             "backend_host": "127.0.0.1",
             "backend_port": backend_port,
             "strip_listen_path": false,
-            "pool_enable_http2": false
+            "pool_enable_http2": false,
+            "plugins": attached
         }));
         plugin_configs.push(serde_json::json!({
             "id": format!("{route}-limit"),
