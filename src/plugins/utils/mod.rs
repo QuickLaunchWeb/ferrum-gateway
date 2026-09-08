@@ -42,6 +42,7 @@ pub mod route_header_transform;
 pub mod runtime_bool_gate;
 pub mod scope_role_check;
 pub mod session_cookie;
+pub mod sink_loss;
 pub mod size_limit;
 pub mod socket_host;
 pub mod sse;
