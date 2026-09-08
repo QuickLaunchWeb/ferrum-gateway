@@ -20069,10 +20069,12 @@ components:
                 type: string
               userinfo_endpoint:
                 type: string
+                description: Optional UserInfo endpoint. When set alongside discovery_url, the explicit value overrides the UserInfo endpoint advertised by the discovery document, including one that omits it.
               jwks_uri:
                 type: string
               end_session_endpoint:
                 type: string
+                description: Optional end-session endpoint used for RP-initiated logout. When set alongside discovery_url, the explicit value overrides the end-session endpoint advertised by the discovery document, including one that omits it.
               post_logout_redirect_uri:
                 type: string
                 description: Absolute HTTPS redirect URI sent to the provider after RP-initiated logout; HTTP is allowed only for localhost or literal loopback development endpoints.

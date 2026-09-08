@@ -130,6 +130,7 @@ pub mod _test_support {
     use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
+    use crate::plugins::oidc_relying_party::discovery_test_seams as oidc_discovery_seams;
     use crate::plugins::oidc_relying_party::refresh_flight_test_seams as oidc_refresh_flight_seams;
 
     /// Parse-only URI authority and Host header a Unix WebSocket handshake uses.
@@ -2144,6 +2145,39 @@ pub mod _test_support {
             refresh_token,
             refresh_after_unix,
         })
+    }
+
+    // ── OIDC discovery endpoint overrides (issue #4761) ────────────────────
+
+    /// Resolve a live discovery document with optional operator-supplied
+    /// `userinfo_endpoint` / `end_session_endpoint` overrides, returning the
+    /// effective optional endpoints as `(userinfo, end_session)`.
+    pub async fn oidc_resolve_discovery_for_test(
+        http_client: &crate::plugins::PluginHttpClient,
+        discovery_url: &str,
+        explicit_userinfo_endpoint: Option<String>,
+        explicit_end_session_endpoint: Option<String>,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        let resolved = oidc_discovery_seams::resolve_discovery_for_test(
+            http_client,
+            discovery_url,
+            explicit_userinfo_endpoint,
+            explicit_end_session_endpoint,
+        )
+        .await?;
+        Ok((
+            resolved.userinfo_endpoint,
+            resolved.end_session_endpoint,
+        ))
+    }
+
+    /// Await a plugin's background discovery task and return the resolved
+    /// optional endpoints as `(userinfo, end_session)`. Consumes the plugin so
+    /// the discovery task can be awaited to completion.
+    pub async fn oidc_resolved_discovery_endpoints_for_test(
+        plugin: crate::plugins::oidc_relying_party::OidcRelyingParty,
+    ) -> Option<(Option<String>, Option<String>)> {
+        plugin.resolved_discovery_endpoints_for_tests().await
     }
 
     // ── OIDC refresh single-flight seams (issue #4640) ──────────────────────
