@@ -39,7 +39,7 @@ use tracing::{debug, warn};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
-    SseReassembler, SseTextKind, is_text_event_stream_media_type,
+    SseEventName, SseReassembler, SseTextKind, is_text_event_stream_media_type,
     original_response_is_event_stream, parse_sse_data_frames, parse_sse_data_frames_checked,
 };
 use super::utils::synthetic_response::{
@@ -1006,9 +1006,10 @@ impl AiResponseGuard {
         if !parsed.fully_parsed {
             return true;
         }
-        let mut frames = parsed.frames;
+        let (mut frames, events) = (parsed.frames, parsed.events);
         if self.scan_mode == ScanMode::Content {
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let (accumulated, _) =
+                self.extract_sse_completion_texts_checked(&frames, Some(&events));
             return accumulated.iter().any(|text| {
                 self.detection_set
                     .is_match(&self.strip_known_placeholders(text))
@@ -1019,7 +1020,7 @@ impl AiResponseGuard {
         // present. Structural masking is only for the decoded-token and raw
         // residual passes; doing it first would hide Responses delta kinds and
         // let a match split across their argument events escape this re-scan.
-        let accumulated = self.extract_sse_completion_texts(&frames);
+        let (accumulated, _) = self.extract_sse_completion_texts_checked(&frames, Some(&events));
 
         for frame in &mut frames {
             blank_top_level_structural_scalars(frame);
@@ -1389,7 +1390,9 @@ impl AiResponseGuard {
     /// - OpenAI: `choices[].delta.content` keyed by choice `index`, plus
     ///   legacy `function_call` name/argument deltas and `delta.refusal`
     /// - OpenAI Responses: reassembler deltas plus `response.refusal.delta`
-    /// - Anthropic: `content_block_delta` events with `delta.text` keyed by block `index`
+    /// - Anthropic: the Messages event protocol, reassembled per content-block
+    ///   `index` by the shared reassembler into `$.content[*].text` prose and
+    ///   `$.content[*].input` tool-use argument JSON
     /// - Gemini: `candidates[].content.parts[].text` keyed by candidate position
     ///
     /// Returns one accumulated `String` per choice/block index, ordered by
@@ -1397,14 +1400,36 @@ impl AiResponseGuard {
     /// tool/function argument strings additionally contribute their decoded
     /// JSON tokens so escapes cannot hide content from detection.
     fn extract_sse_completion_texts(&self, frames: &[Value]) -> Vec<String> {
+        self.extract_sse_completion_texts_checked(frames, None).0
+    }
+
+    /// Like [`extract_sse_completion_texts`](Self::extract_sse_completion_texts),
+    /// but also reports whether the stream was FULLY reassembled.
+    ///
+    /// `false` means an Anthropic Messages stream carried an event, a
+    /// `delta.type`, or a content-block index the reassembler could not fold
+    /// into its document, so the accumulated texts do not necessarily cover
+    /// every client-visible byte; an enforcing caller must fail closed instead
+    /// of clearing the response. `events` supplies the SSE `event:` names when
+    /// the caller kept them, so a stream whose frames carry the discriminator
+    /// only on the event line is still routed.
+    fn extract_sse_completion_texts_checked(
+        &self,
+        frames: &[Value],
+        events: Option<&[Option<SseEventName>]>,
+    ) -> (Vec<String>, bool) {
         let mut reassembler = SseReassembler::default();
         let mut provider_texts: std::collections::BTreeMap<(u8, usize), String> =
             std::collections::BTreeMap::new();
 
-        for frame in frames {
-            // Shared OpenAI chat/completions + Responses API reassembly covers
-            // prose, tool/function names and arguments, and Responses deltas.
-            reassembler.push_frame(frame);
+        for (frame_index, frame) in frames.iter().enumerate() {
+            // Shared OpenAI chat/completions + Responses API + Anthropic
+            // Messages reassembly covers prose, tool/function names and
+            // arguments, Responses deltas, and Anthropic content blocks.
+            let event = events
+                .and_then(|names| names.get(frame_index).copied())
+                .flatten();
+            reassembler.push_event_frame(event, frame);
 
             // Legacy Chat Completions streamed `function_call` before the
             // indexed `tool_calls` shape. Keep name and arguments in separate
@@ -1466,18 +1491,6 @@ impl AiResponseGuard {
                     .push_str(delta);
             }
 
-            // Anthropic streaming: type=content_block_delta, delta.text
-            if frame.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
-                let index = frame.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                if let Some(text) = frame
-                    .get("delta")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    provider_texts.entry((0, index)).or_default().push_str(text);
-                }
-            }
-
             // Gemini: candidates[].content.parts[].text
             if let Some(candidates) = frame.get("candidates").and_then(|c| c.as_array()) {
                 for (idx, candidate) in candidates.iter().enumerate() {
@@ -1497,10 +1510,13 @@ impl AiResponseGuard {
         }
 
         let mut texts: Vec<String> = Vec::new();
+        let fully_reassembled = !reassembler.anthropic_stream_uninspectable();
         for sse_text in reassembler.into_texts() {
             if matches!(
                 sse_text.kind,
-                SseTextKind::ChatToolArguments | SseTextKind::ResponsesArguments
+                SseTextKind::ChatToolArguments
+                    | SseTextKind::ResponsesArguments
+                    | SseTextKind::AnthropicToolInput
             ) {
                 append_decoded_argument_texts(&sse_text.text, &mut texts);
             }
@@ -1514,7 +1530,7 @@ impl AiResponseGuard {
             }
             texts.push(text);
         }
-        texts
+        (texts, fully_reassembled)
     }
 
     /// Redact content fields in a single parsed SSE frame.
@@ -1620,8 +1636,9 @@ impl AiResponseGuard {
                 .detect_matches_in_decoded_sse_frames(&frames, Some(body_str))
                 .is_empty()
         } else {
-            let frames = parse_sse_data_frames(body);
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let parsed = parse_sse_data_frames_checked(body);
+            let (accumulated, _) =
+                self.extract_sse_completion_texts_checked(&parsed.frames, Some(&parsed.events));
             let refs: Vec<&str> = accumulated.iter().map(String::as_str).collect();
             !self.detect_matches(&refs).is_empty()
         };
@@ -3268,12 +3285,23 @@ impl Plugin for AiResponseGuard {
                     "SSE contains malformed, non-JSON, or non-UTF-8 data",
                 );
             }
-            let frames = parsed.frames;
+            let (frames, events) = (parsed.frames, parsed.events);
             if frames.is_empty() && self.scan_mode != ScanMode::All {
                 return PluginResult::Continue;
             }
 
-            let accumulated = self.extract_sse_completion_texts(&frames);
+            let (accumulated, fully_reassembled) =
+                self.extract_sse_completion_texts_checked(&frames, Some(&events));
+            if !fully_reassembled {
+                // An Anthropic Messages stream carried an event, a delta type,
+                // or a content-block index reassembly could not cover, so the
+                // accumulated text is not proof the whole response is clean.
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "uninspectable_sse",
+                    "SSE contains an unsupported Anthropic streaming event",
+                );
+            }
 
             // Check max completion length on accumulated text
             if self.max_completion_length > 0 {

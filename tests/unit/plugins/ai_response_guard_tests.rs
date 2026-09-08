@@ -1375,6 +1375,99 @@ async fn test_sse_anthropic_streaming_format() {
 }
 
 #[tokio::test]
+async fn test_sse_anthropic_tool_input_is_inspected() {
+    // Issue #4901: a `tool_use` block's arguments stream as `input_json_delta`
+    // fragments. Only reassembly across those fragments exposes the value, and
+    // the guard must scan it like any other client-visible completion text.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let mut body = String::from(
+        "event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\
+\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\"}}\n\n",
+    );
+    for partial in &["{\"ssn\":\"123-", "45-6789\"}"] {
+        let frame = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": partial},
+        });
+        body.push_str("event: content_block_delta\n");
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+    body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an SSN split across Anthropic tool-input deltas must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_anthropic_event_line_only_is_inspected() {
+    // An intermediary that forwards the `event:` line but strips the duplicated
+    // JSON `type` must still be reassembled rather than silently uninspected.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let mut body = String::new();
+    for text in &["Your SSN is ", "123-45-6789"] {
+        let frame = json!({
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        });
+        body.push_str("event: content_block_delta\n");
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "event-line-only Anthropic frames must still reassemble"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_anthropic_unmodelled_event_fails_closed() {
+    // Negative case: the reassembled prose is benign, but an interleaved event
+    // the reassembler does not model could carry client-visible text on a path
+    // nothing scanned. The guard must fail closed instead of clearing it.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"all clear\"}}\n\n",
+        "event: smuggled_block\n",
+        "data: {\"type\":\"smuggled_block\",\"index\":0,\"text\":\"ssn 123-45-6789\"}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an unmodelled Anthropic event must not be cleared as inspected"
+    );
+}
+
+#[tokio::test]
 async fn test_sse_anthropic_redaction() {
     let plugin = make_plugin(json!({
         "pii_patterns": ["email"],

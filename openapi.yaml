@@ -27480,6 +27480,8 @@ components:
                   - "$.output[*].arguments"
                   - "$.candidates[*].content.parts[*].text"
                   - "$.content[*].text"
+                  - "$.content[*].name"
+                  - "$.content[*].input"
                   - "$.output.message.content[*].text"
                   - "$.content_block_delta.delta.text"
               default:
@@ -27495,6 +27497,8 @@ components:
                 - "$.output[*].arguments"
                 - "$.candidates[*].content.parts[*].text"
                 - "$.content[*].text"
+                - "$.content[*].name"
+                - "$.content[*].input"
                 - "$.output.message.content[*].text"
                 - "$.content_block_delta.delta.text"
               description: Supported simple response extraction paths. When configured, this list replaces the defaults.
