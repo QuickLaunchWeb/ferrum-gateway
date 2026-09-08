@@ -4406,6 +4406,22 @@ Outside mesh mode there is no overlay, so a configured scope simply resolves to 
 
 ### `response_transformer`
 
+**Output size refusal.** JSON body rules serialize through a bounded writer at
+the effective response ceiling (including `response_size_limiting.max_bytes`).
+Output over that ceiling is a deterministic gateway policy refusal: HTTP **502**,
+`{"error":"Response body too large","limit":128}` (for a 128-byte ceiling),
+`X-Gateway-Error: overload`, and access-log
+`error_class: dispatch_policy_rejected`. The existing `overload` token attributes
+this resource-policy refusal to the gateway; it does not imply a transient 503.
+One `warn` names the proxy id, `response_transformer`, ceiling, and
+`produced_bytes_at_least`: the length reached including the first refused write.
+Serialization stops there, so this is a lower bound, not a fully allocated or
+recounted output size. No payload is logged. Output exactly at the ceiling passes.
+Actual aggregate retained-buffer exhaustion remains HTTP 503 /
+`gateway_buffer_capacity`. Native gRPC and gRPC-Web retain their protocol-shaped
+HTTP 200 / `RESOURCE_EXHAUSTED` terminal with `Response body too large` and the
+gateway policy error class. See [Error classification](error_classification.md).
+
 Modifies response headers and JSON body fields before sending to the client. When body rules are configured, response body buffering is automatically enabled.
 
 **Priority:** 4000
@@ -5132,6 +5148,16 @@ empty member, or a value wider than `u64`) is refused **fail-closed** with HTTP
 as an absent length.
 
 ### `response_size_limiting`
+
+The HTTP response ceiling is **502**. An oversized backend body retains backend
+attribution (`response_body_too_large`, `X-Gateway-Error: backend_error`). A
+`response_transformer` expansion above the effective ceiling instead reports
+the existing `Response body too large` JSON error with its numeric `limit`,
+`X-Gateway-Error: overload`, and
+`dispatch_policy_rejected`: the gateway's configured rewrite exceeded its own
+policy. It emits one bounded warning with proxy, plugin, produced-size lower
+bound, and ceiling. It is not a transient buffer-budget 503 and does not penalize
+a healthy backend. The request-side transformer ceiling remains 413.
 
 Enforces per-proxy response body size limits. Rejects with HTTP 502.
 

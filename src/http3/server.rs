@@ -9571,6 +9571,16 @@ async fn handle_h3_request(
         ) {
             gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
         }
+        if ctx.response_transform_size_refusal_selected()
+            && let Some(value) = crate::proxy::x_gateway_error_for_response(
+                &ctx,
+                !h3_request_on_wire,
+                response_status,
+            )
+        {
+            crate::proxy::restore_authoritative_gateway_error_header(&mut response_headers, value);
+            gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
+        }
 
         // Reconcile surviving backend trailers with the response-header policy
         // this path already applied. Every response-header phase — `after_proxy`,

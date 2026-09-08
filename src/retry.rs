@@ -83,11 +83,12 @@ pub enum ErrorClass {
     /// spec-legal teardown signal (RFC 9114 §8.1), not a transport-level
     /// capability failure. See [`crate::http3::client::is_h3_graceful_close`].
     GracefulRemoteClose,
-    /// Gateway dispatch policy rejected the request before any backend dial.
+    /// Terminal gateway policy refused dispatch or response-transform output.
     ///
     /// Used for terminal gateway decisions where replaying would produce the
     /// same policy response (for example a backend TLS SNI override on a path
-    /// that cannot honor per-request SNI, or a final request-body hook reject).
+    /// that cannot honor per-request SNI, a final request-body hook reject, or
+    /// a response transform exceeding the gateway's output ceiling).
     /// Classified as non-connection-error so `retry_on_connect_failure` does
     /// not fire, and `should_retry` rejects it before status-code retry checks.
     DispatchPolicyRejected,
