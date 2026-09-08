@@ -6284,8 +6284,9 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
     }));
 }
 
-#[test]
-fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy() {
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy() {
     let mut config = empty_config();
     let mut proxy = make_proxy("p1", "/api");
     proxy.plugins = vec![
@@ -6352,8 +6353,7 @@ fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy() {
     config.proxies[0].plugins.pop();
     config.plugin_configs.pop();
     config.validate_plugin_references().unwrap();
-    let cache =
-        ferrum_edge::PluginCache::new(&config).expect("one sink must build without a runtime");
+    let cache = ferrum_edge::PluginCache::new(&config).expect("one sink must build with a runtime");
     assert!(
         cache.rebuild(&duplicates).is_err(),
         "reload must refuse duplicate sinks"

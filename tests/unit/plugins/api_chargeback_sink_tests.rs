@@ -5659,6 +5659,12 @@ async fn no_spool_uses_full_buffer_capacity_past_high_water() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn spool_enabled_high_water_diversion_is_durable_and_distinct_from_drops() {
+    let baseline = render_prometheus();
+    let drops_baseline = prometheus_counter(&baseline, "chargeback_sink_queue_full_drops_total");
+    let diversions_baseline = prometheus_counter(
+        &baseline,
+        "chargeback_sink_queue_high_water_diversions_total",
+    );
     let mut held_export = HeldClickHouseExport::start().await;
 
     let temp = tempfile::tempdir().unwrap();
@@ -5711,10 +5717,13 @@ async fn spool_enabled_high_water_diversion_is_durable_and_distinct_from_drops()
     );
 
     let prom = render_prometheus();
-    assert!(prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total") >= 1);
+    assert!(
+        prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total")
+            > diversions_baseline
+    );
     assert_eq!(
         prometheus_counter(&prom, "chargeback_sink_queue_full_drops_total"),
-        0
+        drops_baseline
     );
 
     // The delivery worker persists through spawn_blocking. A fixed number of
