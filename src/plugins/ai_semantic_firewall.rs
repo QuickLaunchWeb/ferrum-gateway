@@ -5530,7 +5530,6 @@ fn extract_known_path(
             json.get("content"),
             direction,
             SegmentKind::ToolCall,
-            Some("assistant"),
             "$.content",
             "name",
             prefix,
@@ -5540,7 +5539,6 @@ fn extract_known_path(
             json.get("content"),
             direction,
             SegmentKind::ToolArguments,
-            Some("assistant"),
             "$.content",
             "input",
             prefix,
@@ -5766,7 +5764,8 @@ fn extract_content_block_text(
 }
 
 /// Push one named field of each block in a provider content-block array —
-/// Anthropic Messages tool-use `name` and `input`.
+/// Anthropic Messages tool-use `name` and `input`. Tool-use blocks are always
+/// the assistant's, so the role is fixed here rather than passed in.
 ///
 /// Bounded the same way as [`extract_content_block_text`]: one level, this
 /// block's own field. An `input` object is serialized compactly by
@@ -5777,7 +5776,6 @@ fn extract_content_block_field(
     blocks: Option<&Value>,
     direction: Direction,
     kind: SegmentKind,
-    role: Option<&str>,
     base_path: &str,
     field: &str,
     prefix: Option<&str>,
@@ -5791,7 +5789,7 @@ fn extract_content_block_field(
             block.get(field),
             direction,
             kind,
-            role.map(str::to_string),
+            Some("assistant".to_string()),
             Some(prefixed_json_path(
                 prefix,
                 format!("{base_path}[{block_index}].{field}"),
