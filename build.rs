@@ -150,15 +150,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let builtin_names =
-        builtin_plugin_names::builtin_plugin_name_set_from_mod_rs(Path::new("src/plugins/mod.rs"))
-            .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
-    let collisions =
-        builtin_plugin_names::format_builtin_name_collision_errors(&plugin_sources, &builtin_names);
-    if !collisions.is_empty() {
-        panic!(
-            "custom plugin file stem must not shadow a built-in plugin name:\n  {}",
-            collisions.join("\n  ")
+    // The container builder pre-compiles dependencies against a stub `src/`
+    // before the real tree is copied in; the collision check re-runs once
+    // `src/plugins/mod.rs` exists (see the rerun-if-changed directive below).
+    let builtin_registry = Path::new("src/plugins/mod.rs");
+    if !plugin_sources.is_empty() && builtin_registry.exists() {
+        let builtin_names =
+            builtin_plugin_names::builtin_plugin_name_set_from_mod_rs(builtin_registry)
+                .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
+        let collisions = builtin_plugin_names::format_builtin_name_collision_errors(
+            &plugin_sources,
+            &builtin_names,
+        );
+        if !collisions.is_empty() {
+            panic!(
+                "custom plugin file stem must not shadow a built-in plugin name:\n  {}",
+                collisions.join("\n  ")
+            );
+        }
+    } else if !plugin_sources.is_empty() {
+        println!(
+            "cargo:warning=src/plugins/mod.rs is absent; the built-in plugin name collision check runs once the source tree is present"
         );
     }
 
