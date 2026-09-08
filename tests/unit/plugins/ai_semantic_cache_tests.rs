@@ -211,7 +211,12 @@ async fn drive_cache_lookup(
         .get("request_body")
         .cloned()
         .unwrap_or_default();
-    drive_cache_lookup_with_body(plugin, ctx, headers, body.as_bytes()).await
+    // Match the production framed request view, including serialized length.
+    let mut headers = headers.clone();
+    headers
+        .entry("content-length".to_string())
+        .or_insert_with(|| body.len().to_string());
+    drive_cache_lookup_with_body(plugin, ctx, &headers, body.as_bytes()).await
 }
 
 /// Lookup over an explicit final backend-visible body, independent of whatever
@@ -7146,4 +7151,165 @@ async fn anonymous_shared_opt_out_does_not_reach_a_pristine_only_credential() {
         partition_is_hit(&shared, &mut anon_b).await,
         "an anonymous caller must still share under the opt-out"
     );
+}
+
+#[tokio::test]
+async fn semantic_identity_ignores_json_wire_length() {
+    let server = MockServer::start().await;
+    mount_embedding_mock(&server, 1).await;
+    let plugin = make_plugin(semantic_config(&server));
+    let compact = serde_json::to_string(&semantic_request_body()).unwrap();
+    let pretty = serde_json::to_string_pretty(&semantic_request_body()).unwrap();
+    assert_ne!(compact.len(), pretty.len());
+    let (mut first, _) = run_lookup(&plugin, &compact, None).await;
+    let (second, _) = run_lookup(&plugin, &pretty, None).await;
+    assert_eq!(
+        ai_semantic_cache_scope_key(&first, instance_id(&plugin)),
+        ai_semantic_cache_scope_key(&second, instance_id(&plugin))
+    );
+    assert!(ai_semantic_cache_scope_key(&first, instance_id(&plugin)).is_some());
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    plugin
+        .on_final_response_body(&mut first, 200, &headers, br#"{"answer":"Paris"}"#)
+        .await;
+    let (_, result) = run_lookup(&plugin, &pretty, None).await;
+    let PluginResult::RejectBinary { headers, .. } = result else {
+        panic!("equivalent JSON must hit despite different Content-Length");
+    };
+    assert_eq!(headers.get("x-ai-cache-match").unwrap(), "exact");
+}
+
+#[tokio::test]
+async fn semantic_cache_compression_replay_encodes_once() {
+    use ferrum_edge::_test_support::{
+        apply_synthetic_response_body_hooks_for_test, stamp_original_response_metadata_for_test,
+        transform_buffered_response_body_with_deadline_full_for_test,
+    };
+    use std::io::Read;
+
+    let cache = make_plugin(json!({}));
+    let compression =
+        Arc::new(CompressionPlugin::new(&json!({"min_content_length": 10})).unwrap()) as Arc<dyn Plugin>;
+    let request = serde_json::to_string(&semantic_request_body()).unwrap();
+    let (mut ctx, result) = run_lookup(&cache, &request, None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    ctx.headers.insert("accept-encoding".into(), "gzip".into());
+    compression.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    let response = json!({"answer": "Paris is the capital of France. ".repeat(20)});
+    let original = serde_json::to_vec(&response).unwrap();
+    let mut status = 200;
+    let mut headers = HashMap::from([
+        ("content-type".into(), "application/json".into()),
+        ("content-length".into(), original.len().to_string()),
+    ]);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    compression.after_proxy(&mut ctx, status, &mut headers).await;
+    let mut body = bytes::Bytes::from(original.clone());
+    let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[Arc::clone(&compression)],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    assert!(!replaced);
+    assert!(rewritten);
+    assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
+    cache
+        .on_final_response_body(&mut ctx, status, &headers, &body)
+        .await;
+    let (mut hit_ctx, result) = run_lookup(&cache, &request, None).await;
+    let PluginResult::RejectBinary {
+        mut headers,
+        mut body,
+        ..
+    } = result
+    else {
+        panic!("compressed response must populate the cache");
+    };
+    assert_eq!(body.as_ref(), original.as_slice());
+    assert!(!headers.contains_key("content-encoding"));
+    hit_ctx.headers.insert("accept-encoding".into(), "gzip".into());
+    compression
+        .before_proxy(&mut hit_ctx, &mut HashMap::new())
+        .await;
+    compression
+        .after_proxy(&mut hit_ctx, status, &mut headers)
+        .await;
+    apply_synthetic_response_body_hooks_for_test(
+        &[compression],
+        &mut hit_ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+    assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(body.as_ref())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, original);
+}
+
+#[tokio::test]
+async fn semantic_cache_encoded_admission_is_bounded_and_fail_closed() {
+    use std::io::Write;
+
+    let request = serde_json::to_string(&semantic_request_body()).unwrap();
+    let gzip = |body: &[u8]| {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    };
+    let valid = br#"{"answer":"Paris"}"#;
+    let encoded = gzip(valid);
+    let mut brotli = Vec::new();
+    {
+        let mut encoder = brotli::CompressorWriter::new(&mut brotli, 4096, 4, 22);
+        encoder.write_all(valid).unwrap();
+    }
+    let oversized = gzip(serde_json::to_string(&"x".repeat(2048)).unwrap().as_bytes());
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    for (coding, body, content_type, admitted) in [
+        ("gzip", encoded.clone(), "application/json", true),
+        ("br", brotli, "application/json", true),
+        ("identity", valid.to_vec(), "application/json", true),
+        ("gzip", gzip(b"not JSON"), "application/json", false),
+        ("gzip", oversized, "application/json", false),
+        (
+            "gzip",
+            encoded[..encoded.len() - 2].to_vec(),
+            "application/json",
+            false,
+        ),
+        ("gzip", trailing, "application/json", false),
+        ("zstd", encoded.clone(), "application/json", false),
+        ("gzip, gzip, gzip", encoded.clone(), "application/json", false),
+        ("gzip", encoded, "text/event-stream", false),
+    ] {
+        let plugin = make_plugin(json!({"max_entry_size_bytes": 1024}));
+        let (mut ctx, _) = run_lookup(&plugin, &request, None).await;
+        let headers = HashMap::from([
+            ("content-type".into(), content_type.into()),
+            ("Content-Encoding".into(), coding.into()),
+            ("ETag".into(), "encoded-validator".into()),
+            ("Content-Length".into(), body.len().to_string()),
+        ]);
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await;
+        let (_, result) = run_lookup(&plugin, &request, None).await;
+        assert_eq!(matches!(result, PluginResult::RejectBinary { .. }), admitted);
+        if let PluginResult::RejectBinary { headers, body, .. } = result {
+            assert_eq!(body.as_ref(), valid);
+            for name in ["content-encoding", "etag", "content-length"] {
+                assert!(!headers.keys().any(|key| key.eq_ignore_ascii_case(name)));
+            }
+        }
+    }
 }
