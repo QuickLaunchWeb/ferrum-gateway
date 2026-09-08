@@ -1,9 +1,8 @@
 //! Cumulative UDP amplification budget and charge accounting (#3836).
 
 use ferrum_edge::udp_amplification::{
-    MAX_UDP_AMPLIFICATION_FACTOR, UDP_AMPLIFICATION_BUDGET_CAP_MULTIPLE,
-    charge_response_budget, factor_is_valid, publish_request_budget,
-    udp_amplification_response_budget,
+    MAX_UDP_AMPLIFICATION_FACTOR, UDP_AMPLIFICATION_BUDGET_CAP_MULTIPLE, charge_response_budget,
+    factor_is_valid, publish_request_budget, udp_amplification_response_budget,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 

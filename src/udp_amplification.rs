@@ -176,12 +176,7 @@ pub fn publish_request_budget(remaining: &AtomicU64, request_size: u64, factor: 
     loop {
         let current = remaining.load(Ordering::Acquire);
         let next = current.saturating_add(budget).min(cap).max(current);
-        match remaining.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match remaining.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return next,
             Err(_) => continue,
         }
