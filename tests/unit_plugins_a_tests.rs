@@ -24,6 +24,7 @@ mod unit {
         mod ai_federation_tests;
         mod ai_prompt_compressor_tests;
         mod ai_prompt_shield_tests;
+        mod ai_provider_shape_parity_tests;
         mod ai_rate_limiter_tests;
         mod ai_request_guard_tests;
         mod ai_response_guard_tests;

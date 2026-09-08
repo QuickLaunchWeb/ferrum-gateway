@@ -6271,8 +6271,8 @@ Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy 
 | `provider.api_key_env` | string | optional | Environment variable holding the provider API key, sent as `Authorization: Bearer ...`. Resolved lazily at the first embedding call (not at config load), so CP admin validation and `ferrum-edge validate` do not require the secret; a configured-but-missing variable surfaces as a provider error at request time (subject to `on_error`) |
 | `provider.request_timeout_ms` | u64 | `5000` | Per-request embedding provider timeout in milliseconds |
 | `builtins.*` | bool/object | all enabled when `builtins` is omitted | Built-in packs. Boolean shorthand enables/disables a pack; object form supports `enabled`, `examples_mode`, and `examples` |
-| `extraction.request_json_paths` | string[] | common LLM paths | Supported request extraction paths. When configured, this list replaces the defaults and controls all inspected request fields |
-| `extraction.response_json_paths` | string[] | common LLM paths | Supported response extraction paths. When configured, this list replaces the defaults and controls all inspected response fields |
+| `extraction.request_json_paths` | string[] | all supported request paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported request paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected request fields |
+| `extraction.response_json_paths` | string[] | all supported response paths | **Subset selector, not free-form JSONPath.** Every entry must be one of the supported response paths listed under **Supported provider shapes** below; any other value is rejected at configuration load. When configured, this list replaces the defaults and controls all inspected response fields |
 | `allow_topics` | object[] | `[]` | Mandatory request-side semantic allow topics; no match rejects or warns by topic config |
 | `deny_topics` | object[] | `[]` | Customer-defined semantic deny topics |
 | `custom_rules` | object[] | `[]` | Customer-defined semantic rules with `direction`, `severity`, `action` (`reject` or `warn`), `examples`, and `threshold`. Use `allow_topics` for allowlist semantics |
@@ -6287,7 +6287,43 @@ Provider API-key resolution remains lazy and secret-independent at validation ti
 
 In `mode: enforce`, the default `on_error: reject` fails closed when provider outages, parse errors, or timeouts prevent semantic evaluation. `on_error: warn` and `on_error: allow` are explicit fail-open choices; `warn` continues the request/response and emits provider-error metadata. In `dry_run`, the default remains `warn` so rollout traffic continues while surfacing provider problems. Use `on_error: reject` for production enforcement, especially for `allow_topics` where a provider outage otherwise prevents proving the request is in an allowed topic.
 
-The default request extraction paths include chat message content, message tool-call function names and arguments, the legacy Completions `prompt`, top-level `input` and `instructions`, tool definitions, `context`, `documents[*].text`, `retrieved_context[*].content`, and `tool_results[*].content`. The default response paths include legacy `choices[*].text`, OpenAI-compatible message/delta content, response tool-call names and arguments, `output_text`, Responses API output text, and output arguments. An explicit extraction array must not be empty when that direction has active rules.
+**Supported provider shapes.** The plugin is not OpenAI-only: the supported extraction paths below are also the complete allowlist `extraction.request_json_paths` / `extraction.response_json_paths` accept, and by default every one of them is active.
+
+Request paths:
+
+| Path | Shape |
+|---|---|
+| `$.messages[*].content` | OpenAI chat content, and — because content-block arrays are recursed — Anthropic Messages and Bedrock Converse `messages[].content[].text` |
+| `$.messages[*].function_call.name` / `.arguments` | Legacy OpenAI function call in message history |
+| `$.messages[*].tool_calls[*].function.name` / `.arguments` | OpenAI tool calls in message history |
+| `$.prompt` | Legacy Completions prompt |
+| `$.input` | Responses API / embeddings input, including structured message arrays |
+| `$.instructions` | Responses API developer instructions |
+| `$.tools[*].function.name` / `.description` / `.parameters` | OpenAI tool definitions; the `function` wrapper is optional, so Anthropic `tools[].name` / `.description` are covered |
+| `$.context`, `$.documents[*].text`, `$.retrieved_context[*].content`, `$.tool_results[*].content` | RAG context, documents, and tool results |
+| `$.system` | Anthropic Messages and Bedrock Converse top-level system prompt, as a string or an array of text blocks |
+| `$.contents[*].parts[*].text` | Google Gemini / Vertex prompt turns |
+| `$.systemInstruction.parts[*].text` | Google Gemini / Vertex system instruction (the `system_instruction` proto casing is read too) |
+| `$.inputText` | Amazon Bedrock Titan text generation |
+| `$.data_sources[*].parameters.role_information` | Azure OpenAI "On Your Data" per-data-source instruction (the `dataSources` / `roleInformation` casings are read too) |
+
+Response paths:
+
+| Path | Shape |
+|---|---|
+| `$.choices[*].text`, `$.choices[*].message.content`, `$.choices[*].delta.content` | OpenAI-compatible completion and streamed delta text |
+| `$.choices[*].message.tool_calls[*].function.*`, `$.choices[*].delta.tool_calls[*].function.*` | OpenAI-compatible response tool calls |
+| `$.output_text`, `$.output[*].content[*].text`, `$.output[*].arguments` | Responses API output text and function-call arguments |
+| `$.candidates[*].content.parts[*].text` | Google Gemini / Vertex `generateContent` |
+| `$.content[*].text` | Anthropic Messages non-streaming completion |
+| `$.output.message.content[*].text` | Amazon Bedrock Converse |
+| `$.content_block_delta.delta.text` | An Anthropic Messages streaming text-delta event delivered as a JSON body |
+
+Extraction is bounded at every path: `parts[]` and content-block arrays contribute only each element's own `text` string and are never recursed into. An explicit extraction array must not be empty when that direction has active rules.
+
+**Unrecognized AI bodies fail closed.** A request or response body that looks like an AI body but yields no inspectable segments — a provider shape the extraction paths do not cover, or one the operator's `extraction` override excluded — is routed through `fail_on_uninspectable_body` (default `true`, so `on_error: reject` rejects it) and records `ai_semantic_firewall.uninspectable_body=no_extractable_content` rather than passing silently. AI-body recognition keys off the provider-native top-level markers `messages`, `prompt`, `input`, `instructions`, `tools`, `context`, `documents`, `retrieved_context`, `tool_results`, `system`, `toolConfig`, `inferenceConfig`, `contents`, `systemInstruction`, `system_instruction`, `generationConfig`, `inputText`, `textGenerationConfig`, `inputs`, `data_sources`, `dataSources`, `preamble`, and `chat_history` on the request side, and `choices`, `output_text`, `output`, `candidates`, an array `content`, or a `content_block_delta` event on the response side. A genuinely non-AI JSON body on a shared proxy still passes through untouched.
+
+Anthropic Messages **event streams** are not delta-reassembled, so their `text_delta` fragments are deliberately not inspected per frame — scoring one fragment would stamp a clean allow decision over content nothing read. Under `streaming_response: buffer` an Anthropic stream therefore yields no segments and fails closed through `on_error`; use `streaming_response: reject` if you need those clients to fall back to non-streaming, inspectable responses.
 
 **Built-in packs:**
 

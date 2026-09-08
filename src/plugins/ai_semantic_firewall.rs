@@ -27,6 +27,19 @@ use super::{
     ResponseStreamAction, ResponseStreamInspector,
 };
 
+/// Supported request extraction paths, and the default set.
+///
+/// Both OpenAI-compatible and provider-native shapes are listed: an operator
+/// fronting Anthropic, Gemini/Vertex, Bedrock, or Azure "On Your Data" must get
+/// the same inspection an OpenAI-shaped body receives (GHSA-8gc3-h5c8-jjxx —
+/// the same defect class fixed for `ai_tool_governor` in issue #4165). This
+/// list is also the allowlist `validate_extraction_paths` admits, so widening
+/// it widens what an operator may configure.
+///
+/// `$.messages[*].content` already recurses into content-block arrays, so it
+/// covers Anthropic `messages[].content[].text` and Bedrock Converse
+/// `messages[].content[].text` without a separate entry; adding one would
+/// extract the same text twice under two json paths.
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
     "$.messages[*].content",
     "$.messages[*].function_call.name",
@@ -43,8 +56,22 @@ const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
     "$.documents[*].text",
     "$.retrieved_context[*].content",
     "$.tool_results[*].content",
+    // Anthropic Messages and Bedrock Converse top-level system prompt: a
+    // string, or an array of `{"type": "text", "text": …}` / `{"text": …}`
+    // blocks.
+    "$.system",
+    // Google Gemini / Vertex prompt turns and system instruction.
+    "$.contents[*].parts[*].text",
+    "$.systemInstruction.parts[*].text",
+    // Amazon Bedrock Titan text generation.
+    "$.inputText",
+    // Azure OpenAI "On Your Data": a per-data-source instruction the backend
+    // applies as a de-facto system prompt.
+    "$.data_sources[*].parameters.role_information",
 ];
 
+/// Supported response extraction paths, and the default set. Provider-native
+/// response shapes are listed for the same reason as the request list above.
 const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.choices[*].text",
     "$.choices[*].message.content",
@@ -56,6 +83,16 @@ const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.output_text",
     "$.output[*].content[*].text",
     "$.output[*].arguments",
+    // Google Gemini / Vertex `generateContent`.
+    "$.candidates[*].content.parts[*].text",
+    // Anthropic Messages non-streaming completion.
+    "$.content[*].text",
+    // Amazon Bedrock Converse.
+    "$.output.message.content[*].text",
+    // Anthropic Messages streaming text delta event. See
+    // [`SSE_DELTA_RESPONSE_PATHS`] for why a streamed Anthropic body is failed
+    // closed rather than inspected per fragment.
+    "$.content_block_delta.delta.text",
 ];
 
 /// Embedding-provider responses are small JSON documents in normal operation.
@@ -77,16 +114,26 @@ const MAX_INSPECTION_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// instances on one proxy never consume one another's dedup state.
 static NEXT_FIREWALL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Incremental chat/completions streaming response paths. These are reassembled
-/// across frames by [`SseReassembler`]; per-frame extraction must skip them or
-/// it re-introduces the meaningless per-fragment segments reassembly exists to
-/// avoid. Non-incremental paths (`message.*`, `output_text`, `output[*].*`) are
-/// not listed here because per-frame extraction handles them correctly.
+/// Incremental streaming response paths. These are reassembled across frames by
+/// [`SseReassembler`]; per-frame extraction must skip them or it re-introduces
+/// the meaningless per-fragment segments reassembly exists to avoid.
+/// Non-incremental paths (`message.*`, `output_text`, `output[*].*`,
+/// `candidates[*].*`, `content[*].text`) are not listed here because per-frame
+/// extraction handles them correctly.
+///
+/// `$.content_block_delta.delta.text` is listed even though [`SseReassembler`]
+/// does not reassemble Anthropic events: inspecting one `text_delta` fragment
+/// is semantically meaningless and would stamp a clean allow decision over
+/// content nothing ever read. Excluded from the per-frame pass, an Anthropic
+/// event stream yields no segments and a caller that asked for stream
+/// inspection fails closed through `handle_uninspectable_buffered_stream`
+/// instead. The path still applies to a non-SSE JSON body carrying the event.
 const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
     "$.choices[*].text",
     "$.choices[*].delta.content",
     "$.choices[*].delta.tool_calls[*].function.name",
     "$.choices[*].delta.tool_calls[*].function.arguments",
+    "$.content_block_delta.delta.text",
 ];
 
 /// Metadata key recording how a streamed response was handled. Set on the
@@ -5280,6 +5327,32 @@ fn extract_known_path(
             prefix,
             segments,
         ),
+        // Anthropic Messages / Bedrock Converse top-level system prompt. A
+        // string is taken as-is; an array of content blocks is read for each
+        // block's `text` by `extract_text_value`.
+        "$.system" => extract_text_value(
+            json.get("system"),
+            direction,
+            SegmentKind::SystemPrompt,
+            Some("system".to_string()),
+            Some(prefixed_json_path(prefix, "$.system".to_string())),
+            segments,
+        ),
+        "$.contents[*].parts[*].text" => extract_gemini_contents(json, direction, prefix, segments),
+        "$.systemInstruction.parts[*].text" => {
+            extract_gemini_system_instruction(json, direction, prefix, segments)
+        }
+        "$.inputText" => extract_text_value(
+            json.get("inputText"),
+            direction,
+            SegmentKind::UserPrompt,
+            None,
+            Some(prefixed_json_path(prefix, "$.inputText".to_string())),
+            segments,
+        ),
+        "$.data_sources[*].parameters.role_information" => {
+            extract_azure_role_information(json, direction, prefix, segments)
+        }
         "$.choices[*].message.content" => {
             if let Some(choices) = json.get("choices").and_then(Value::as_array) {
                 for (index, choice) in choices.iter().enumerate() {
@@ -5419,7 +5492,232 @@ fn extract_known_path(
                 }
             }
         }
+        "$.candidates[*].content.parts[*].text" => {
+            extract_gemini_candidates(json, direction, prefix, segments)
+        }
+        // Anthropic Messages non-streaming completion.
+        "$.content[*].text" => extract_content_block_text(
+            json.get("content"),
+            direction,
+            SegmentKind::AssistantMessage,
+            Some("assistant"),
+            "$.content",
+            prefix,
+            segments,
+        ),
+        // Amazon Bedrock Converse. `output` is an object here, so this cannot
+        // collide with the Responses-API `$.output[*].…` array paths above.
+        "$.output.message.content[*].text" => extract_content_block_text(
+            json.get("output")
+                .and_then(|output| output.get("message"))
+                .and_then(|message| message.get("content")),
+            direction,
+            SegmentKind::AssistantMessage,
+            Some("assistant"),
+            "$.output.message.content",
+            prefix,
+            segments,
+        ),
+        // A single Anthropic Messages streaming event delivered as JSON. Live
+        // event streams are handled by [`SSE_DELTA_RESPONSE_PATHS`].
+        "$.content_block_delta.delta.text" => {
+            if json.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+                extract_text_value(
+                    json.get("delta").and_then(|delta| delta.get("text")),
+                    direction,
+                    SegmentKind::AssistantMessage,
+                    Some("assistant".to_string()),
+                    Some(prefixed_json_path(prefix, "$.delta.text".to_string())),
+                    segments,
+                );
+            }
+        }
         _ => {}
+    }
+}
+
+/// Google Gemini / Vertex request turns: `contents[].parts[].text`, the
+/// provider's equivalent of `messages[].content`.
+fn extract_gemini_contents(
+    json: &Value,
+    direction: Direction,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(contents) = json.get("contents").and_then(Value::as_array) else {
+        return;
+    };
+    for (content_index, content) in contents.iter().enumerate() {
+        let role = content.get("role").and_then(Value::as_str);
+        let kind = match role {
+            Some("model") => SegmentKind::AssistantMessage,
+            Some("user") => SegmentKind::UserPrompt,
+            _ => SegmentKind::GenericText,
+        };
+        extract_parts_text(
+            content.get("parts"),
+            direction,
+            kind,
+            role,
+            &prefixed_json_path(prefix, format!("$.contents[{content_index}].parts")),
+            segments,
+        );
+    }
+}
+
+/// Google Gemini / Vertex system instruction. Both the JSON (`systemInstruction`)
+/// and proto (`system_instruction`) casings are read, because either reaches the
+/// model and inspecting only one leaves the other uninspected.
+fn extract_gemini_system_instruction(
+    json: &Value,
+    direction: Direction,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    for key in ["systemInstruction", "system_instruction"] {
+        let Some(instruction) = json.get(key) else {
+            continue;
+        };
+        extract_parts_text(
+            instruction.get("parts"),
+            direction,
+            SegmentKind::SystemPrompt,
+            Some("system"),
+            &prefixed_json_path(prefix, format!("$.{key}.parts")),
+            segments,
+        );
+    }
+}
+
+/// Google Gemini / Vertex response candidates: `candidates[].content.parts[].text`.
+fn extract_gemini_candidates(
+    json: &Value,
+    direction: Direction,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(candidates) = json.get("candidates").and_then(Value::as_array) else {
+        return;
+    };
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let Some(content) = candidate.get("content") else {
+            continue;
+        };
+        extract_parts_text(
+            content.get("parts"),
+            direction,
+            SegmentKind::AssistantMessage,
+            Some("assistant"),
+            &prefixed_json_path(
+                prefix,
+                format!("$.candidates[{candidate_index}].content.parts"),
+            ),
+            segments,
+        );
+    }
+}
+
+/// Azure OpenAI "On Your Data" `data_sources[].parameters.role_information`.
+///
+/// Both the documented snake_case field and the camelCase spelling accepted by
+/// the extensions API are read, at both nesting levels, mirroring
+/// `ai_prompt_shield` and `ai_request_guard`: a body that carries a blank
+/// `role_information` alongside a populated `roleInformation` must not hide the
+/// populated one. Scoped to that exact field — the rest of `parameters` holds
+/// endpoints, keys, and index names that are not model-visible prose.
+fn extract_azure_role_information(
+    json: &Value,
+    direction: Direction,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    for outer_key in ["data_sources", "dataSources"] {
+        let Some(sources) = json.get(outer_key).and_then(Value::as_array) else {
+            continue;
+        };
+        for (source_index, source) in sources.iter().enumerate() {
+            let Some(parameters) = source.get("parameters") else {
+                continue;
+            };
+            for inner_key in ["role_information", "roleInformation"] {
+                let Some(text) = parameters.get(inner_key).and_then(Value::as_str) else {
+                    continue;
+                };
+                push_segment(
+                    direction,
+                    SegmentKind::SystemPrompt,
+                    Some("system".to_string()),
+                    Some(prefixed_json_path(
+                        prefix,
+                        format!("$.{outer_key}[{source_index}].parameters.{inner_key}"),
+                    )),
+                    text,
+                    segments,
+                );
+            }
+        }
+    }
+}
+
+/// Push the `text` of each element of a Gemini-style `parts` array.
+///
+/// Bounded to a single level: a part contributes only its own `text` string and
+/// is never recursed into, so a deeply nested body cannot drive unbounded work.
+fn extract_parts_text(
+    parts: Option<&Value>,
+    direction: Direction,
+    kind: SegmentKind,
+    role: Option<&str>,
+    base_path: &str,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(parts) = parts.and_then(Value::as_array) else {
+        return;
+    };
+    for (part_index, part) in parts.iter().enumerate() {
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        push_segment(
+            direction,
+            kind,
+            role.map(str::to_string),
+            Some(format!("{base_path}[{part_index}].text")),
+            text,
+            segments,
+        );
+    }
+}
+
+/// Push the `text` of each block in a provider content-block array — Anthropic
+/// Messages `content[]` and Bedrock Converse `output.message.content[]`.
+///
+/// Bounded the same way as [`extract_parts_text`]: one level, `text` strings
+/// only. Blocks with no `text` (`tool_use`, `image`, `reasoning`) are skipped.
+fn extract_content_block_text(
+    blocks: Option<&Value>,
+    direction: Direction,
+    kind: SegmentKind,
+    role: Option<&str>,
+    base_path: &str,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(blocks) = blocks.and_then(Value::as_array) else {
+        return;
+    };
+    for (block_index, block) in blocks.iter().enumerate() {
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        push_segment(
+            direction,
+            kind,
+            role.map(str::to_string),
+            Some(prefixed_json_path(prefix, format!("{base_path}[{block_index}].text"))),
+            text,
+            segments,
+        );
     }
 }
 
@@ -6128,6 +6426,18 @@ fn looks_like_json(body: &[u8]) -> bool {
     matches!(first, b'{' | b'[')
 }
 
+/// Whether a request body is an AI body this plugin is meant to govern, even
+/// when the configured extraction paths produced nothing from it.
+///
+/// This is the fail-closed admission test: a body that looks like an AI request
+/// but yields no inspectable segments routes into
+/// `FirewallEngine::handle_uninspectable_body` and honors
+/// `fail_on_uninspectable_body` instead of passing silently. The marker set must
+/// therefore stay a superset of the extraction shapes — a provider shape that is
+/// extractable but unrecognized here would only be a stale entry, while a shape
+/// that is neither extractable nor recognized is a silent bypass
+/// (GHSA-8gc3-h5c8-jjxx). Markers mirror `ai_request_guard`'s provider-native
+/// detection so the two plugins agree on what counts as an AI body.
 fn looks_like_governed_request_json(json: &Value) -> bool {
     const MARKERS: &[&str] = &[
         "messages",
@@ -6139,17 +6449,50 @@ fn looks_like_governed_request_json(json: &Value) -> bool {
         "documents",
         "retrieved_context",
         "tool_results",
+        // Anthropic Messages / Bedrock Converse.
+        "system",
+        "toolConfig",
+        "inferenceConfig",
+        // Google Gemini / Vertex.
+        "contents",
+        "systemInstruction",
+        "system_instruction",
+        "generationConfig",
+        // Amazon Bedrock Titan text generation.
+        "inputText",
+        "textGenerationConfig",
+        // Hugging Face TGI text generation.
+        "inputs",
+        // Azure OpenAI "On Your Data".
+        "data_sources",
+        "dataSources",
+        // Cohere.
+        "preamble",
+        "chat_history",
     ];
     json.as_object()
         .is_some_and(|object| MARKERS.iter().any(|key| object.contains_key(*key)))
 }
 
+/// Response-direction counterpart to [`looks_like_governed_request_json`].
+///
+/// `content` counts only as an array, which is the Anthropic Messages
+/// completion shape; a bare `content` string is too common in unrelated JSON to
+/// treat as an AI response.
 fn looks_like_governed_response_json(json: &Value) -> bool {
-    json.as_object().is_some_and(|object| {
-        ["choices", "output_text", "output"]
-            .iter()
-            .any(|key| object.contains_key(*key))
-    })
+    const MARKERS: &[&str] = &[
+        "choices",
+        "output_text",
+        "output",
+        // Google Gemini / Vertex `generateContent`.
+        "candidates",
+    ];
+    let Some(object) = json.as_object() else {
+        return false;
+    };
+    object.get("content").is_some_and(Value::is_array)
+        || object.get("type").and_then(Value::as_str) == Some("content_block_delta")
+        || MARKERS.iter().any(|key| object.contains_key(*key))
 }
 
 fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
