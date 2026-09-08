@@ -213,6 +213,7 @@ async fn test_db_failover_urls_startup() {
         let identity = mint_failover_identity("db-failover-urls");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -560,6 +561,7 @@ async fn test_db_config_backup_bootstrap() {
         let identity = mint_failover_identity("db-failover-backup");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -700,6 +702,7 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         let identity = mint_failover_identity("db-failover-backup-reject");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -925,6 +928,7 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
 
         let log_file = std::fs::File::create(&log_path).expect("create stderr log");
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -1101,6 +1105,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let identity = mint_failover_identity("db-failover-recovery");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
@@ -1281,6 +1286,7 @@ async fn test_db_read_replica_startup() {
         let identity = mint_failover_identity("db-failover-replica");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &primary_url)
@@ -1428,6 +1434,7 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
         let identity = mint_failover_identity("db-failover-authoritative");
 
         let mut cmd = Command::new(binary_path());
+        cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &primary_url)

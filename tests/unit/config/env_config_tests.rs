@@ -482,6 +482,10 @@ fn test_env_config_dp_mode_missing_grpc_url() {
         &[
             ("FERRUM_MODE", "dp"),
             (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
+            (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
             ),
@@ -502,6 +506,10 @@ fn test_env_config_dp_config_max_stale_defaults_to_one_hour_fail_closed() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -530,6 +538,10 @@ fn test_env_config_dp_config_max_stale_zero_is_the_unbounded_opt_in() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -558,6 +570,10 @@ fn test_env_config_dp_config_stale_action_rejects_case_and_dash_variants() {
         with_env_vars(
             &[
                 ("FERRUM_MODE", "dp"),
+                (
+                    "FERRUM_ADMIN_JWT_SECRET",
+                    "dp-admin-secret-padding-at-least-32-bytes",
+                ),
                 ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
                 (
                     "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -579,6 +595,10 @@ fn test_env_config_dp_config_stale_action_rejects_unknown_values() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -598,6 +618,10 @@ fn test_env_config_dp_mode_missing_jwt_secret() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
         ],
         || {
@@ -2645,6 +2669,10 @@ fn test_env_config_dp_mode_valid() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://control-plane:50051"),
             // Non-loopback http:// CP URL requires the explicit plaintext opt-in.
             ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
@@ -6252,6 +6280,10 @@ fn test_resolved_dp_cp_grpc_urls_single_entry() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://cp1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -6273,6 +6305,10 @@ fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             (
                 "FERRUM_DP_CP_GRPC_URLS",
                 "https://cp1:50051,https://cp2:50051,https://cp3:50051",
@@ -6303,6 +6339,10 @@ fn test_resolved_dp_cp_grpc_urls_trims_whitespace() {
         &[
             ("FERRUM_MODE", "dp"),
             (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
+            (
                 "FERRUM_DP_CP_GRPC_URLS",
                 " https://cp1:50051 , https://cp2:50051 ",
             ),
@@ -6327,6 +6367,10 @@ fn test_resolved_dp_cp_grpc_urls_filters_empty() {
         &[
             ("FERRUM_MODE", "dp"),
             (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
+            (
                 "FERRUM_DP_CP_GRPC_URLS",
                 "https://cp1:50051,,https://cp2:50051,",
             ),
@@ -6350,6 +6394,10 @@ fn test_dp_mode_validation_accepts_urls() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "https://cp1:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -6368,6 +6416,10 @@ fn test_dp_mode_validation_rejects_no_url() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
@@ -6391,6 +6443,10 @@ fn test_dp_cp_failover_primary_retry_secs_default() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
@@ -6411,6 +6467,10 @@ fn test_dp_cp_failover_primary_retry_secs_custom() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
             ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
             (
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",

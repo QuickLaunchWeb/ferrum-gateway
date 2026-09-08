@@ -463,6 +463,7 @@ fn start_gateway_with_extra_env(
         std::path::Path::new(config_path).with_extension(format!("gateway-{http_port}.stderr.log"));
     let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
