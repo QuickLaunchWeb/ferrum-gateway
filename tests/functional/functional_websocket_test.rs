@@ -4126,7 +4126,10 @@ async fn start_ws_reset_after_echo_server(port: u16) {
                             // unread-echo data a RST could otherwise discard on loopback.
                             sleep(Duration::from_millis(300)).await;
                             let stream = ws.into_inner();
-                            let _ = stream.set_linger(Some(Duration::ZERO));
+                            // SO_LINGER=0 through socket2: tokio's own setter
+                            // is deprecated, and a zero linger never blocks.
+                            let _ = socket2::SockRef::from(&stream)
+                                .set_linger(Some(Duration::ZERO));
                             drop(stream);
                             return;
                         }
