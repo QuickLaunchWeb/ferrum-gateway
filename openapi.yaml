@@ -26657,7 +26657,10 @@ components:
         Supports all gRPC timeout units (H, M, S, m, u, n). At least one
         effective rule is required. When both deadline values are configured,
         default_deadline_ms must be less than or equal to max_deadline_ms;
-        runtime validation enforces this cross-field relationship.
+        runtime validation enforces this cross-field relationship. Malformed or
+        zero client values never pass through verbatim: an enforced fallback
+        deadline is rewritten onto the outbound header and invalid client values
+        set bounded transaction-log metadata grpc_timeout_invalid=true.
       anyOf:
         - required: [max_deadline_ms]
         - required: [default_deadline_ms]
