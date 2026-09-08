@@ -6740,11 +6740,8 @@ async fn kubernetes_family_selection_and_duplicate_slices_publish_and_reload() {
     let v4 = registry_slice(serde_json::json!("IPv4"), &["10.0.0.1"], 8080);
     let v6 = registry_slice(serde_json::json!("IPv6"), &["2001:db8::1"], 8080);
     let mut harness = ConsulPipelineHarness::new("kube-family", Vec::new());
-    let mut other_namespace = make_upstream(
-        "kube-family",
-        vec![make_target("10.9.0.1", 8080)],
-        None,
-    );
+    let mut other_namespace =
+        make_upstream("kube-family", vec![make_target("10.9.0.1", 8080)], None);
     other_namespace.namespace = "other".to_string();
     harness.lb_cache.rebuild(&make_config_with_upstreams(vec![
         make_upstream("kube-family", Vec::new(), None),
@@ -6759,7 +6756,10 @@ async fn kubernetes_family_selection_and_duplicate_slices_publish_and_reload() {
             .and(path(
                 "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices",
             ))
-            .and(query_param("labelSelector", "kubernetes.io/service-name=api"))
+            .and(query_param(
+                "labelSelector",
+                "kubernetes.io/service-name=api",
+            ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": items})),
             )
@@ -6846,10 +6846,7 @@ async fn kubernetes_address_type_validation_and_ipv6_only_default() {
     harness
         .apply_snapshot_from("kubernetes", discoverer.discover().await.unwrap())
         .await;
-    let upstream = harness
-        .lb_cache
-        .get_upstream("ferrum", "v6-only")
-        .unwrap();
+    let upstream = harness.lb_cache.get_upstream("ferrum", "v6-only").unwrap();
     assert_eq!(upstream.targets.len(), 2);
     assert_eq!(upstream.targets[0], make_target("2001:db8::2", 8080));
     assert_eq!(upstream.targets[1], make_target("2001:db8::2", 9090));

@@ -321,7 +321,10 @@ async fn reconcile_replaces_kubernetes_task_when_address_family_changes() {
     manager.start(&config, None);
     let first = health::generation_for_test(&task_key("family")).expect("task registered");
     manager.reconcile(&config, None);
-    assert_eq!(health::generation_for_test(&task_key("family")), Some(first));
+    assert_eq!(
+        health::generation_for_test(&task_key("family")),
+        Some(first)
+    );
 
     let mut changed = config.clone();
     changed.upstreams[0]
