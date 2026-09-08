@@ -1068,3 +1068,41 @@ fn mismatched_pretty_printed_response_cannot_use_the_inline_fallback() {
         SseError::ResponseEnvelopeInvalid
     );
 }
+
+#[test]
+fn an_escaped_jsonrpc_version_token_still_matches_the_envelope() {
+    // The raw-byte comparison is a fast path, not the contract: a conforming
+    // peer may spell the fixed "2.0" literal with escapes, and that response
+    // must still be admitted for the identity it names.
+    let broker = broker();
+    broker.ensure_session("escaped").unwrap();
+    let stream = open(&broker, "escaped", "esc-1");
+    let body = b"{\"jsonrpc\":\"\\u0032.0\",\"id\":\"esc-1\",\"result\":{}}";
+    assert_eq!(stream.publish_encoded(body).unwrap(), 1);
+
+    // A different version string is still refused.
+    let other = open(&broker, "escaped", "esc-2");
+    let wrong = br#"{"jsonrpc":"2.1","id":"esc-2","result":{}}"#;
+    assert_eq!(
+        other.publish_encoded(wrong).unwrap_err(),
+        SseError::ResponseEnvelopeInvalid
+    );
+}
+
+#[test]
+fn a_stream_identity_renders_its_json_rpc_id_token() {
+    // The gateway's mismatch refusal names the request through this token.
+    let numeric = StreamIdentity::from_raw_json_rpc_id(
+        &serde_json::value::RawValue::from_string("1.00".to_string()).unwrap(),
+        128,
+    )
+    .unwrap();
+    assert_eq!(numeric.json_rpc_id_token(), "1.00");
+
+    let text = StreamIdentity::from_raw_json_rpc_id(
+        &serde_json::value::RawValue::from_string(r#""abc""#.to_string()).unwrap(),
+        128,
+    )
+    .unwrap();
+    assert_eq!(text.json_rpc_id_token(), "\"abc\"");
+}

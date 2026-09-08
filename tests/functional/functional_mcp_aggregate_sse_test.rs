@@ -1520,6 +1520,14 @@ async fn functional_mcp_aggregate_sse_raw_numeric_correlation_and_cancellation()
     let error: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(error["error"]["code"], -32603);
     assert!(error.get("result").is_none());
+    // The refusal replaces the upstream answer, so it has to name the request
+    // the client is still waiting on — with that request's exact wire token,
+    // not the id the upstream wrongly echoed and not `null`.
+    assert_eq!(
+        wire_id(&body),
+        first_id,
+        "a refusal carrying no id would leave the pending call unresolved"
+    );
 
     // The adjacent id remains independently admissible. A different session's
     // cancellation cannot cancel it, even with the exact same numeric token.

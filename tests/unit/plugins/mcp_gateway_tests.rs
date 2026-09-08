@@ -10949,6 +10949,11 @@ fn transparent_catalog_policy_requires_aggregate_mode() {
         ("discovery", "on_new_tool", json!("hide_until_configured")),
         ("discovery", "on_schema_change", json!("allow")),
         ("discovery", "hide_denied_items", json!(true)),
+        ("discovery", "aggregate_tools", json!(true)),
+        ("discovery", "aggregate_resources", json!(false)),
+        ("discovery", "aggregate_prompts", json!(true)),
+        ("discovery", "namespace_separator", json!(".")),
+        ("discovery", "cache_ttl_seconds", json!(300)),
     ] {
         let mut config = transparent_config("http://127.0.0.1:9/mcp");
         config[section] = json!({});
@@ -10961,10 +10966,28 @@ fn transparent_catalog_policy_requires_aggregate_mode() {
     }
 }
 
+#[test]
+fn a_root_endpoint_path_is_refused_at_admission() {
+    // The endpoint reserves its whole subtree, so `/` would reserve the entire
+    // origin and 404 every other handler on the proxy. That is a total outage
+    // on reload, not a routing preference, so it is refused before it can run.
+    for mode in ["aggregate_router", "transparent_proxy"] {
+        let mut config = transparent_config("http://127.0.0.1:9/mcp");
+        config["mode"] = json!(mode);
+        config["endpoint"]["path"] = json!("/");
+        let error = create_plugin("mcp_gateway", &config).err().unwrap();
+        assert!(error.contains("endpoint.path"), "{error}");
+        assert!(error.contains("sub-path"), "{error}");
+        // A sub-path of the same shape is still admitted.
+        config["endpoint"]["path"] = json!("/mcp");
+        assert!(create_plugin("mcp_gateway", &config).is_ok());
+    }
+}
+
 #[tokio::test]
 async fn endpoint_scope_refuses_descendants_in_both_modes() {
     for mode in ["aggregate_router", "transparent_proxy"] {
-        for endpoint in ["/mcp", "/mcp/", "/"] {
+        for endpoint in ["/mcp", "/mcp/"] {
             let mut config = transparent_config("http://127.0.0.1:9/mcp");
             config["mode"] = json!(mode);
             config["endpoint"]["path"] = json!(endpoint);
@@ -10983,16 +11006,21 @@ async fn endpoint_scope_refuses_descendants_in_both_modes() {
                         reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
                     assert_eq!(status, 404, "{mode} {endpoint} {method} {path}");
                     assert!(ctx.route_override_backend_host.is_none());
+                    // A reserved descendant is denied, exactly like the 405.
+                    assert_eq!(
+                        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+                        Some("deny"),
+                        "{mode} {endpoint} {method} {path}"
+                    );
                 }
             }
-            if endpoint != "/" {
-                let (mut ctx, mut headers) = mcp_ctx(json!({}));
-                ctx.path = "/mcpx".to_string();
-                assert!(matches!(
-                    plugin.before_proxy(&mut ctx, &mut headers).await,
-                    PluginResult::Continue
-                ));
-            }
+            // A sibling path outside the reserved subtree stays available.
+            let (mut ctx, mut headers) = mcp_ctx(json!({}));
+            ctx.path = "/mcpx".to_string();
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
         }
     }
 }
@@ -11102,4 +11130,99 @@ async fn transparent_invalid_batch_preserves_each_reflected_numeric_id() {
     assert_eq!(raw_response_id(responses[1].get()), "18446744073709551617");
     assert_eq!(raw_response_id(responses[2].get()), "null");
     assert!(ctx.route_override_backend_host.is_none());
+}
+
+#[tokio::test]
+async fn mismatched_multiplexed_response_is_refused_under_the_request_id() {
+    // The upstream/policy body names a different id than the request that
+    // opened this identity, so it may be neither published nor returned as a
+    // successful inline answer. The refusal still has to name the request,
+    // otherwise the client's pending call never resolves.
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+    let mut stream = attach_sse_body(&plugin, &session_id).await;
+
+    let (mut ctx, dispatched) =
+        stage_gateway_authored(&plugin, &session_id, json!("wanted-id"), "ping").await;
+    let (status, body, response_headers) = reject_raw(dispatched);
+    assert_eq!(status, 200);
+    assert_eq!(raw_response_id(&body), "\"wanted-id\"");
+
+    let mismatched = br#"{"jsonrpc":"2.0","id":"other-id","result":{}}"#;
+    let refused = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, mismatched)
+        .await;
+    let (status, refused_body, _) = reject_raw(refused);
+    assert_eq!(status, 200);
+    let parsed: Value = serde_json::from_str(&refused_body).unwrap();
+    assert_eq!(parsed["error"]["code"], json!(-32603));
+    assert!(parsed.get("result").is_none());
+    assert_eq!(
+        raw_response_id(&refused_body),
+        "\"wanted-id\"",
+        "the refusal must correlate to the request the client is waiting on"
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.sse.delivery").map(String::as_str),
+        Some("refused")
+    );
+    assert!(!mcp_sse_publication_is_pending_for_test(&ctx));
+
+    // Nothing reached the listener, and the identity's capacity came back.
+    let seen = sse_drain_until(&mut stream, &["other-id"], 2).await;
+    assert!(!seen.contains("other-id"));
+    assert!(!seen.contains("wanted-id"));
+}
+
+#[tokio::test]
+async fn mismatched_multiplexed_response_refusal_keeps_a_numeric_id_token() {
+    // A numeric identity is its exact admitted wire token, so the refusal
+    // cannot round-trip it through f64 either.
+    let plugin = mcp_plugin();
+    let session_id = initialize(&plugin).await;
+    let _stream = attach_sse_body(&plugin, &session_id).await;
+
+    let id = "18446744073709551617";
+    let request = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+    let (mut ctx, mut headers) = mcp_ctx_raw(request.into_bytes());
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let (status, body, response_headers) =
+        reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(raw_response_id(&body), id);
+
+    let mismatched = br#"{"jsonrpc":"2.0","id":18446744073709551616,"result":{}}"#;
+    let refused = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, mismatched)
+        .await;
+    let (_, refused_body, _) = reject_raw(refused);
+    assert_eq!(raw_response_id(&refused_body), id);
+    let parsed: Value = serde_json::from_str(&refused_body).unwrap();
+    assert_eq!(parsed["error"]["code"], json!(-32603));
+}
+
+#[tokio::test]
+async fn an_oversized_reflected_id_is_refused_without_echoing_it() {
+    // The singleton path has no batch response budget, so a multi-kilobyte id
+    // must not be mirrored back at request size.
+    let plugin = create_plugin("mcp_gateway", &aggregate_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
+    let oversized = "z".repeat(5000);
+    let request = format!(r#"{{"jsonrpc":"2.0","id":"{oversized}","method":"ping"}}"#);
+    let (mut ctx, mut headers) = mcp_ctx_raw(request.into_bytes());
+    let (status, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], json!(-32600));
+    assert_eq!(parsed["id"], Value::Null);
+    assert!(!body.contains(&oversized), "the id must not be echoed");
+
+    // An id just inside the bound still round-trips exactly.
+    let bounded = "z".repeat(4000);
+    let request = format!(r#"{{"jsonrpc":"2.0","id":"{bounded}","method":"ping"}}"#);
+    let (mut ctx, mut headers) = mcp_ctx_raw(request.into_bytes());
+    let (status, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(raw_response_id(&body), format!("\"{bounded}\""));
 }

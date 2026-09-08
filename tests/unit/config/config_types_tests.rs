@@ -6541,6 +6541,112 @@ fn an_internally_disabled_mcp_gateway_does_not_block_dedup() {
     );
 }
 
+fn mcp_gateway_at(id: &str, proxy_id: &str, path: &str) -> PluginConfig {
+    let mut plugin = mcp_gateway_plugin_config(id, PluginScope::Proxy, Some(proxy_id));
+    plugin.config["endpoint"]["path"] = serde_json::Value::String(path.to_string());
+    plugin
+}
+
+// An MCP endpoint reserves its whole slash-delimited subtree and answers 404
+// inside it, so a second gateway nested under the first can never be reached.
+// No single instance can see that, which is why it is decided over the merged
+// configuration.
+
+#[test]
+fn nesting_mcp_gateway_endpoint_scopes_on_one_proxy_are_rejected() {
+    for (first, second) in [
+        ("/mcp", "/mcp/v2"),
+        ("/mcp/v2", "/mcp"),
+        ("/mcp", "/mcp"),
+        ("/mcp/", "/mcp"),
+    ] {
+        let mut config = empty_config();
+        config.plugin_configs = vec![
+            mcp_gateway_at("mcp-a", "p1", first),
+            mcp_gateway_at("mcp-b", "p1", second),
+        ];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["mcp-a", "mcp-b"]);
+        config.proxies = vec![proxy];
+
+        let Err(errs) = config.validate_plugin_references() else {
+            panic!("{first} + {second} must be refused");
+        };
+        let joined = errs.join("; ");
+        assert!(joined.contains("nesting"), "{joined}");
+        // Operators need both offending ids and the proxy to act on the error.
+        assert!(
+            joined.contains("mcp-a") && joined.contains("mcp-b") && joined.contains("p1"),
+            "{joined}"
+        );
+    }
+}
+
+#[test]
+fn disjoint_mcp_gateway_endpoint_scopes_on_one_proxy_are_admitted() {
+    // `/mcpx` is a sibling, not a descendant, and nothing about `/tools`
+    // overlaps `/mcp`: both are reachable in every ordering.
+    for (first, second) in [("/mcp", "/tools"), ("/mcp", "/mcpx")] {
+        let mut config = empty_config();
+        config.plugin_configs = vec![
+            mcp_gateway_at("mcp-a", "p1", first),
+            mcp_gateway_at("mcp-b", "p1", second),
+        ];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["mcp-a", "mcp-b"]);
+        config.proxies = vec![proxy];
+
+        assert!(
+            config.validate_plugin_references().is_ok(),
+            "{first} + {second} reserve disjoint subtrees"
+        );
+    }
+}
+
+#[test]
+fn a_disabled_nested_mcp_gateway_does_not_conflict() {
+    // Both switches matter: an outer-disabled instance is never constructed,
+    // and an inner-disabled one returns Continue for every request, so
+    // neither can pre-empt the sibling that actually serves the endpoint.
+    for disable_outer in [true, false] {
+        let mut config = empty_config();
+        let mut nested = mcp_gateway_at("mcp-b", "p1", "/mcp/v2");
+        if disable_outer {
+            nested.enabled = false;
+        } else {
+            nested.config["enabled"] = serde_json::Value::Bool(false);
+        }
+        config.plugin_configs = vec![mcp_gateway_at("mcp-a", "p1", "/mcp"), nested];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["mcp-a", "mcp-b"]);
+        config.proxies = vec![proxy];
+
+        assert!(
+            config.validate_plugin_references().is_ok(),
+            "a disabled nested gateway reserves nothing (outer disabled: {disable_outer})"
+        );
+    }
+}
+
+#[test]
+fn nesting_mcp_gateway_endpoint_scopes_on_separate_proxies_are_admitted() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        mcp_gateway_at("mcp-a", "p1", "/mcp"),
+        mcp_gateway_at("mcp-b", "p2", "/mcp/v2"),
+    ];
+    let mut first = make_proxy("p1", "/api");
+    associate(&mut first, &["mcp-a"]);
+    let mut second = make_proxy("p2", "/other");
+    associate(&mut second, &["mcp-b"]);
+    config.proxies = vec![first, second];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "each proxy resolves its own endpoint scope"
+    );
+}
+
 #[test]
 fn dedup_and_mcp_gateway_on_separate_proxies_are_admitted() {
     // The documented remedy: keep both behaviors by splitting them across

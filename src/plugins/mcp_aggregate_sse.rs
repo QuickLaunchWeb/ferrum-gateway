@@ -437,6 +437,20 @@ impl StreamIdentity {
         Self::from_json_rpc_id(&value, max_bytes)
     }
 
+    /// The identity rendered back as a JSON-RPC `id` wire token.
+    ///
+    /// A numeric identity IS its admitted wire token, so it is returned
+    /// verbatim; a string identity is re-encoded from its decoded form, which
+    /// names the same JSON-RPC id even when the client's escape spelling
+    /// differed. Used only to correlate a gateway-authored refusal back to the
+    /// request that opened this identity — never logged.
+    pub fn json_rpc_id_token(&self) -> String {
+        match self {
+            Self::Number(token) => token.to_string(),
+            Self::Text(text) => Value::String(text.to_string()).to_string(),
+        }
+    }
+
     /// Canonical text form. Internal/equality use only — callers must not log
     /// it, because it is a verbatim client-controlled JSON-RPC id.
     #[allow(dead_code)] // used only by tests/, dead code in the bin target
@@ -1527,6 +1541,16 @@ impl AggregateSseStream {
         ))
     }
 
+    /// The JSON-RPC `id` wire token of the request that opened this stream.
+    ///
+    /// A gateway-authored refusal that replaces an uncorrelatable upstream
+    /// answer still has to name the request it refuses, otherwise the client's
+    /// pending call never resolves. This is the only reader of the lease's
+    /// identity outside the broker, and its result is never logged.
+    pub fn json_rpc_id_token(&self) -> String {
+        self.0.identity.json_rpc_id_token()
+    }
+
     /// Give up the identity without publishing, because this POST answered
     /// inline. Idempotent, and never overwrites a cancellation.
     pub fn settle_inline(&self) {
@@ -1813,13 +1837,15 @@ fn response_matches_stream_identity(
     >(encoded) else {
         return false;
     };
-    if object
-        .get("jsonrpc")
-        .and_then(|value| serde_json::from_str::<String>(value.get()).ok())
-        .as_deref()
-        != Some("2.0")
-        || object.contains_key("result") == object.contains_key("error")
-    {
+    let Some(version) = object.get("jsonrpc") else {
+        return false;
+    };
+    // The overwhelmingly common spelling is the literal token, so compare the
+    // raw bytes first and only decode the escape-bearing spellings that a
+    // conforming peer may still emit. Neither branch allocates on the hot path.
+    let version_is_2_0 = version.get() == "\"2.0\""
+        || serde_json::from_str::<String>(version.get()).is_ok_and(|value| value == "2.0");
+    if !version_is_2_0 || object.contains_key("result") == object.contains_key("error") {
         return false;
     }
     let Some(id) = object.get("id") else {
