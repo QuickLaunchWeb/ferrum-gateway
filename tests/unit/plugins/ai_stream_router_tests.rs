@@ -5094,7 +5094,7 @@ impl Plugin for ProxyAuthorizationReintroducer {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        assert!(ctx.has_ai_stream_router_claim());
+        assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(ctx));
         headers.insert("proxy-authorization".to_string(), "Basic zzz".to_string());
         PluginResult::Continue
     }
@@ -5120,7 +5120,10 @@ async fn final_header_policy_removes_a_later_added_client_credential() {
         headers.get("x-api-key").map(String::as_str),
         Some("client-token")
     );
-    assert_eq!(headers.get("cookie").map(String::as_str), Some("session=abc"));
+    assert_eq!(
+        headers.get("cookie").map(String::as_str),
+        Some("session=abc")
+    );
     assert_eq!(
         headers.get("proxy-authorization").map(String::as_str),
         Some("Basic zzz")
