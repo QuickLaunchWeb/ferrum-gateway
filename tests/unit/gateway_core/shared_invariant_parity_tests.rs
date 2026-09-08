@@ -277,7 +277,10 @@ fn record_probe_neutral(cb: &CircuitBreaker) {
 }
 
 /// Every terminal outcome a dispatch path can record for an admitted probe.
-const PROBE_OUTCOMES: &[(&str, fn(&CircuitBreaker))] = &[
+/// One probe outcome: its label and the breaker call that reports it.
+type ProbeOutcome = (&'static str, fn(&CircuitBreaker));
+
+const PROBE_OUTCOMES: &[ProbeOutcome] = &[
     ("record_success", record_probe_success),
     (
         "record_failure(tripping status)",
