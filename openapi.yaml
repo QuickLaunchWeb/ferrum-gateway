@@ -28987,6 +28987,7 @@ components:
 
     A2aGatewayConfig:
       type: object
+      required: [discovery]
       description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. The implemented A2A protocol version is 0.3.x, whose canonical gRPC service is a2a.v1.A2AService (package a2a.v1); A2A 1.0's lf.a2a.v1.A2AService carries a renumbered AgentCard and is never decoded as 0.3. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP JSON and unary gRPC Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming for non-card traffic, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1. Cannot be composed with request_deduplication on the same proxy while discovery.public_base_url is unset and discovery.trust_forwarded_headers is true; admission rejects that pairing with 400 because the rewritten Agent Card origin is then derived from per-request forwarded headers and the connection's TLS SNI, neither of which a replay fingerprint binds. A configured discovery.public_base_url composes normally."
       properties:
         enabled:
@@ -29063,6 +29064,18 @@ components:
               description: Remove Accept-Encoding on non-streaming A2A HTTP requests whose responses may be parsed or rewritten by the plugin. Enabling this plugin with the default true value marks request headers mutable for all traffic on the proxy.
         discovery:
           type: object
+          anyOf:
+            - required: [rewrite_agent_card_urls]
+              properties:
+                rewrite_agent_card_urls:
+                  enum: [false]
+            - required: [public_base_url]
+            - required: [trust_forwarded_headers, allowed_public_origins]
+              properties:
+                trust_forwarded_headers:
+                  enum: [true]
+                allowed_public_origins:
+                  minItems: 1
           properties:
             rewrite_agent_card_urls:
               type: boolean
@@ -29071,11 +29084,18 @@ components:
             public_base_url:
               type: string
               format: uri
-              description: Optional explicit public gateway origin, for example https://agents.example.com. When omitted and trust_forwarded_headers is true, X-Forwarded-* and Host are used after validating http/https scheme and host-only values. Configuring this value is also what makes the Agent Card rewrite a pure function of configuration, which is required to compose this plugin with request_deduplication on the same proxy.
+              description: Explicit public gateway base URL, for example https://agents.example.com. Rewriting defaults to enabled and requires this value or trust_forwarded_headers=true with nonempty allowed_public_origins. Empty plugin configurations fail admission. Explicit rewrite_agent_card_urls=false selects unchanged backend cards. When deriving an origin, X-Forwarded-* and Host must select an allowed normalized origin; missing, malformed, comma-separated or unlisted origins fail closed before backend dispatch with agent_card_public_origin_unavailable (HTTP 502 or gRPC INTERNAL). Configuring this value is also what makes the Agent Card rewrite a pure function of configuration, which is required to compose this plugin with request_deduplication on the same proxy.
             trust_forwarded_headers:
               type: boolean
               default: false
-              description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. In that request-derived mode the origin also depends on whether the connection carried a TLS SNI hostname, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
+              description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. Requires nonempty allowed_public_origins when rewriting is enabled; the trusted front door must replace forwarded headers. Schemes and ports must match an allowed normalized origin. In that request-derived mode the origin also depends on whether the connection carried a TLS SNI hostname, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
+            allowed_public_origins:
+              type: array
+              default: []
+              items:
+                type: string
+                format: uri
+              description: Allowed absolute HTTP(S) origins for request-derived card URLs, without paths, credentials, queries or fragments. Required with trust_forwarded_headers when rewriting is enabled and public_base_url is absent. Compared after URL origin normalization, including scheme and non-default port. A configured public_base_url takes precedence.
         observability:
           type: object
           properties:
@@ -29092,6 +29112,7 @@ components:
               format: uint64
               default: 1048576
               minimum: 1
+              description: Payload logging byte limit. Task and context identifiers, textual errors and protocol-version metadata are capped at min(max_payload_size, 1024) UTF-8 bytes including a trailing ~ marker, with a companion .truncated flag. Task states are normalized to the protocol state set; unrecognized states become unknown with .unrecognized=true, and normalized states too large for this limit are omitted with .truncated=true. Applies to request hints, JSON replies and SSE completion metadata; does not cap response buffering or alter response bytes.
         policy:
           type: object
           properties:
@@ -29099,6 +29120,7 @@ components:
               type: string
               enum: [allow, deny]
               default: allow
+              description: With deny or any per-method deny rule, unrecognized requests inside the configured endpoint, discovery or gRPC-service scope fail closed, including unsupported payloads, methods, paths and disabled bindings. Known batch members are individually policed. Unrelated sibling paths and services are outside scope.
             methods:
               type: object
               description: >-
