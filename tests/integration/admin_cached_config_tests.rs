@@ -21,9 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[allow(dead_code)]
-#[path = "../scaffolding/ports.rs"]
-mod ports;
+use crate::scaffolding::ports;
 
 /// Test configuration
 #[derive(Clone)]
