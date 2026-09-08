@@ -1511,7 +1511,10 @@ async fn functional_mcp_aggregate_sse_raw_numeric_correlation_and_cancellation()
     });
     let arrival = next_arrival(&mut fixture.arrivals).await;
     assert_eq!(arrival.raw_id, first_id);
-    assert!(!wrong.is_finished(), "the upstream is withholding its answer");
+    assert!(
+        !wrong.is_finished(),
+        "the upstream is withholding its answer"
+    );
     arrival.release.send(()).unwrap();
     let (_, body) = wrong.await.unwrap();
     let error: Value = serde_json::from_str(&body).unwrap();
@@ -1525,9 +1528,7 @@ async fn functional_mcp_aggregate_sse_raw_numeric_correlation_and_cancellation()
         let client = client.clone();
         let session = session.clone();
         async move {
-            let body = format!(
-                r#"{{"jsonrpc":"2.0","id":{second_id},"method":"session/echo"}}"#
-            );
+            let body = format!(r#"{{"jsonrpc":"2.0","id":{second_id},"method":"session/echo"}}"#);
             post_raw_jsonrpc(&client, port, &session, body).await
         }
     });
@@ -1542,7 +1543,10 @@ async fn functional_mcp_aggregate_sse_raw_numeric_correlation_and_cancellation()
     let (status, body) = exact.await.unwrap();
     assert_multiplexed_acknowledgement(status, &body, "exact numeric id");
     let message = listener.next_message().await;
-    assert_eq!(message.event_id, 1, "the mismatched reply consumed no cursor");
+    assert_eq!(
+        message.event_id, 1,
+        "the mismatched reply consumed no cursor"
+    );
     assert_eq!(wire_id(&message.data), second_id);
 
     // Fractional spellings with the same f64 value also remain distinct.

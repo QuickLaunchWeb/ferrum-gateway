@@ -864,7 +864,10 @@ impl McpGateway {
             // Presence matters: even an explicit default must not promise a
             // catalog policy that this mode cannot enforce.
             for (section, fields) in [
-                ("policy", &["default_action", "tools", "hide_denied_tools"][..]),
+                (
+                    "policy",
+                    &["default_action", "tools", "hide_denied_tools"][..],
+                ),
                 (
                     "discovery",
                     &["on_new_tool", "on_schema_change", "hide_denied_items"][..],
@@ -4077,30 +4080,29 @@ impl McpGateway {
         }
 
         if invalid {
-            let response_values =
-                responses
-                    .into_iter()
-                    .zip(envelopes.iter())
-                    .zip(batch.iter())
-                    .filter_map(|((slot, envelope), item)| match envelope {
-                        // A valid notification never receives a JSON-RPC response,
-                        // even when an invalid sibling prevents the whole HTTP
-                        // batch from being forwarded.
-                        Some(envelope)
-                            if matches!(envelope.message_kind, McpMessageKind::Notification) =>
-                        {
-                            None
-                        }
-                        Some(envelope) => Some((
-                            item.raw_id(),
-                            json_rpc_error_value(
-                                envelope.id.clone(),
-                                -32600,
-                                "JSON-RPC batch was not forwarded because a sibling member was invalid",
-                            ),
-                        )),
-                        None => Some((item.raw_id(), slot)),
-                    });
+            let response_values = responses
+                .into_iter()
+                .zip(envelopes.iter())
+                .zip(batch.iter())
+                .filter_map(|((slot, envelope), item)| match envelope {
+                    // A valid notification never receives a JSON-RPC response,
+                    // even when an invalid sibling prevents the whole HTTP
+                    // batch from being forwarded.
+                    Some(envelope)
+                        if matches!(envelope.message_kind, McpMessageKind::Notification) =>
+                    {
+                        None
+                    }
+                    Some(envelope) => Some((
+                        item.raw_id(),
+                        json_rpc_error_value(
+                            envelope.id.clone(),
+                            -32600,
+                            "JSON-RPC batch was not forwarded because a sibling member was invalid",
+                        ),
+                    )),
+                    None => Some((item.raw_id(), slot)),
+                });
             // Apply the response budget while the synthetic array is assembled,
             // not after serializing the entire result. Admitted member ids are
             // bounded by the request/item caps, but their combined reflected
@@ -4613,20 +4615,18 @@ impl McpGateway {
         id: Option<&RawValue>,
         value: Value,
     ) -> Result<(), PluginResult> {
-        let encoded_item = match serde_json::value::to_raw_value(&JsonRpcWithRawId {
-            value: &value,
-            id,
-        }) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return Err(json_rpc_error(
-                    None,
-                    -32600,
-                    "Invalid Request",
-                    Some("JSON-RPC batch response could not be measured".to_string()),
-                ));
-            }
-        };
+        let encoded_item =
+            match serde_json::value::to_raw_value(&JsonRpcWithRawId { value: &value, id }) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Err(json_rpc_error(
+                        None,
+                        -32600,
+                        "Invalid Request",
+                        Some("JSON-RPC batch response could not be measured".to_string()),
+                    ));
+                }
+            };
         let separator_bytes = usize::from(!responses.is_empty());
         let Some(next_response_bytes) = response_bytes
             .checked_add(separator_bytes)

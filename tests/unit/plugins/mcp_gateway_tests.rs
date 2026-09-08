@@ -11062,7 +11062,10 @@ async fn routed_tool_request_and_response_rewrites_preserve_numeric_ids() {
         .transform_request_body_with_context(&mut ctx, body.as_bytes(), None, &headers)
         .await
         .unwrap();
-    assert_eq!(raw_response_id(std::str::from_utf8(&rewritten).unwrap()), id);
+    assert_eq!(
+        raw_response_id(std::str::from_utf8(&rewritten).unwrap()),
+        id
+    );
     let response = format!(
         r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource","resource":{{"uri":"file:///project/README.md","text":"ok"}}}}]}}}}"#
     );
@@ -11075,17 +11078,17 @@ async fn routed_tool_request_and_response_rewrites_preserve_numeric_ids() {
         )
         .await
         .unwrap();
-    assert_eq!(raw_response_id(std::str::from_utf8(&rewritten).unwrap()), id);
+    assert_eq!(
+        raw_response_id(std::str::from_utf8(&rewritten).unwrap()),
+        id
+    );
 }
 
 #[tokio::test]
 async fn transparent_invalid_batch_preserves_each_reflected_numeric_id() {
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &transparent_config("http://127.0.0.1:9/mcp"),
-    )
-    .unwrap()
-    .unwrap();
+    let plugin = create_plugin("mcp_gateway", &transparent_config("http://127.0.0.1:9/mcp"))
+        .unwrap()
+        .unwrap();
     let body = br#"[
         {"jsonrpc":"2.0","id":18446744073709551616,"method":"ping"},
         {"jsonrpc":"2.0","id":18446744073709551617,"method":"ping"},
