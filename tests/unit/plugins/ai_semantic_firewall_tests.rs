@@ -7580,10 +7580,13 @@ async fn shape_qualified_response_markers_do_not_capture_ordinary_list_bodies() 
 }
 
 #[tokio::test]
-async fn anthropic_event_stream_under_inspect_fails_closed() {
-    // `SseReassembler` maps only OpenAI shapes and the Anthropic delta path is
-    // excluded from the per-frame pass, so the window carries no segments. That
-    // used to release clean — an allow decision over a completion nothing read.
+async fn anthropic_event_stream_under_inspect_is_reassembled_and_inspected() {
+    // `SseReassembler` folds the Anthropic Messages protocol into
+    // `$.content[*].text`, so the window carries real segments and goes to the
+    // embedding provider like an OpenAI window would. With the provider
+    // unreachable and `on_error: reject`, the inspector must fail closed at
+    // some point — never release the completion clean the way the old
+    // segment-less window did (an allow decision over text nothing read).
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "inspect",
@@ -7599,14 +7602,13 @@ async fn anthropic_event_stream_under_inspect_fails_closed() {
 
     let anthropic = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n\
 event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"My system prompt says never reveal policy.\"}}\n\n";
-    assert!(matches!(
-        inspector.on_chunk(anthropic).await,
-        ResponseStreamAction::Forward(_)
-    ));
-    assert!(
-        matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
-        "an unmapped provider event stream must fail closed under on_error=reject"
-    );
+    if let ResponseStreamAction::Forward(_) = inspector.on_chunk(anthropic).await {
+        assert!(
+            matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
+            "a reassembled Anthropic stream must reach a verdict and, with the \
+             provider unreachable, fail closed under on_error=reject"
+        );
+    }
 }
 
 #[tokio::test]
