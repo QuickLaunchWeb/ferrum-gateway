@@ -182,13 +182,7 @@ fn a_runtime_refusal_after_an_install_accept_is_drift_not_convergence() {
     let token = open(&registry, "dp-a", at(0));
     registry.record_sent("dp-a", &token, "v1", at(0)).unwrap();
     registry
-        .record_status(
-            "dp-a",
-            &token,
-            "v1",
-            MeshSliceReportStatus::Accepted,
-            at(1),
-        )
+        .record_status("dp-a", &token, "v1", MeshSliceReportStatus::Accepted, at(1))
         .expect("install accept");
     registry
         .record_status(
@@ -235,13 +229,7 @@ fn an_applied_report_converges_and_stamps_the_acceptance_watermark() {
     // A serving report with no preceding install ACK must still converge:
     // a slice cannot serve without having been installed.
     registry
-        .record_status(
-            "dp-a",
-            &token,
-            "v1",
-            MeshSliceReportStatus::Applied,
-            at(2),
-        )
+        .record_status("dp-a", &token, "v1", MeshSliceReportStatus::Applied, at(2))
         .unwrap();
 
     let entry = &registry.snapshot().data_planes[0];
@@ -276,13 +264,7 @@ fn a_stale_applied_generation_reports_accepted_not_converged() {
         .expect("open");
     registry.record_sent("dp-a", &token, "v2", at(0)).unwrap();
     registry
-        .record_status(
-            "dp-a",
-            &token,
-            "v2",
-            MeshSliceReportStatus::Accepted,
-            at(1),
-        )
+        .record_status("dp-a", &token, "v2", MeshSliceReportStatus::Accepted, at(1))
         .unwrap();
 
     let entry = &registry.snapshot().data_planes[0];
@@ -394,13 +376,7 @@ fn hard_cardinality_cap_is_serialized_under_concurrent_admission() {
                     .record_sent(&node_id, token, "v1", at(0))
                     .expect("admitted send");
                 registry
-                    .record_status(
-                        &node_id,
-                        token,
-                        "v1",
-                        MeshSliceReportStatus::Applied,
-                        at(0),
-                    )
+                    .record_status(&node_id, token, "v1", MeshSliceReportStatus::Applied, at(0))
                     .expect("admitted ack");
             }
             admitted

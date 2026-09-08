@@ -1048,7 +1048,9 @@ fn publish_entry(entry: &LiveEntry, now: DateTime<Utc>) -> MeshSliceDriftEntry {
             version: version.clone(),
             at,
             age_seconds: age_seconds(now, at),
-            stage: entry.rejected_stage.unwrap_or(MESH_SLICE_DRIFT_STAGE_INSTALL),
+            stage: entry
+                .rejected_stage
+                .unwrap_or(MESH_SLICE_DRIFT_STAGE_INSTALL),
             reason: entry
                 .rejected_reason
                 .clone()

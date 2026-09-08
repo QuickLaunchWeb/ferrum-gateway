@@ -293,8 +293,7 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         .await
         .expect("json");
     assert_eq!(
-        rejected_body["data_planes"][0]["convergence"],
-        "rejecting",
+        rejected_body["data_planes"][0]["convergence"], "rejecting",
         "a runtime-refused slice must never read as converged"
     );
     assert_eq!(rejected_body["data_planes"][0]["node_id"], "mesh-dp-a");
