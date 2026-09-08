@@ -6689,7 +6689,10 @@ fn dedup_and_request_derived_a2a_gateway_are_rejected() {
             "a2a1",
             PluginScope::Proxy,
             Some("p1"),
-            serde_json::json!({"trust_forwarded_headers": true}),
+            serde_json::json!({
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }),
         ),
     ];
     let mut proxy = make_proxy("p1", "/api");
@@ -6729,7 +6732,10 @@ fn dedup_and_a_global_request_derived_a2a_gateway_are_rejected() {
             "a2a-global",
             PluginScope::Global,
             None,
-            serde_json::json!({"trust_forwarded_headers": true}),
+            serde_json::json!({
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }),
         ),
     ];
     let mut proxy = make_proxy("p1", "/api");
@@ -6758,13 +6764,15 @@ fn dedup_and_a_configured_public_base_a2a_gateway_are_admitted() {
         serde_json::json!({
             "public_base_url": "https://agents.example.com",
             "trust_forwarded_headers": true,
+            "allowed_public_origins": ["https://agents.example.com"],
         }),
-        // Forwarded headers are not trusted, so no public base is derived at all.
-        serde_json::json!({}),
+        // Explicit passthrough needs no public base.
+        serde_json::json!({"rewrite_agent_card_urls": false}),
         // Nothing is rewritten.
         serde_json::json!({
             "rewrite_agent_card_urls": false,
             "trust_forwarded_headers": true,
+            "allowed_public_origins": ["https://agents.example.com"],
         }),
     ] {
         let mut config = empty_config();
@@ -6791,7 +6799,10 @@ fn a_disabled_request_derived_a2a_gateway_does_not_block_dedup() {
             "a2a1",
             PluginScope::Proxy,
             Some("p1"),
-            serde_json::json!({"trust_forwarded_headers": true}),
+            serde_json::json!({
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }),
         );
         if disable == "outer" {
             a2a.enabled = false;
@@ -6824,7 +6835,10 @@ fn a_provable_local_a2a_gateway_shadows_a_request_derived_global_one() {
             "a2a-global",
             PluginScope::Global,
             None,
-            serde_json::json!({"trust_forwarded_headers": true}),
+            serde_json::json!({
+                "trust_forwarded_headers": true,
+                "allowed_public_origins": ["https://agents.example.com"]
+            }),
         ),
         a2a_gateway_plugin_config(
             "a2a-local",

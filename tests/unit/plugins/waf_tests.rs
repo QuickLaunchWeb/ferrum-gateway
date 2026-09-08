@@ -7405,3 +7405,329 @@ async fn multipart_gate_is_unchanged_by_the_suffix_rule() {
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert!(monitored(&request_ctx, "FE-SQLI-001-B"));
 }
+
+// Direction parity is exercised through the public final-body hooks. These
+// fixtures use policy markers so a failure identifies the inspection view.
+async fn scan_wide_direction(
+    plugin: &Waf,
+    response: bool,
+    content_type: &str,
+    body: &[u8],
+) -> (PluginResult, RequestContext) {
+    if !response {
+        return scan_body_with_content_type(plugin, content_type, body).await;
+    }
+    let mut request = ctx("GET", "/waf");
+    // The response's own headers must select the decoder.
+    request
+        .headers
+        .insert("content-type".into(), "text/plain; charset=utf-8".into());
+    let headers = HashMap::from([("content-type".into(), content_type.into())]);
+    let result = plugin
+        .finalize_client_visible_response_body(&mut request, 200, &headers, body)
+        .await;
+    (result, request)
+}
+
+fn wide_parity_waf() -> Waf {
+    Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [
+            {
+                "id": "WIDE-REQUEST", "name": "request marker", "category": "custom",
+                "severity": "high", "target": "body_text", "match_kind": "contains",
+                "pattern": "inspection-marker", "action": "enforce"
+            },
+            {
+                "id": "WIDE-RESPONSE", "name": "response marker", "category": "custom",
+                "severity": "high", "target": "response_body", "match_kind": "contains",
+                "pattern": "inspection-marker", "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap()
+}
+
+fn wide_encodings(text: &str) -> [(&'static str, &'static [u8], Vec<u8>); 4] {
+    [
+        ("utf-16le", UTF16_LE_BOM, encode_utf16(text, false)),
+        ("utf-16be", &[0xFE, 0xFF], encode_utf16(text, true)),
+        ("utf-32le", UTF32_LE_BOM, encode_utf32(text, false)),
+        ("utf-32be", UTF32_BE_BOM, encode_utf32(text, true)),
+    ]
+}
+
+#[tokio::test]
+async fn wide_body_view_policy_matches_in_both_directions() {
+    let plugin = wide_parity_waf();
+    for response in [false, true] {
+        let expected = if response {
+            "WIDE-RESPONSE"
+        } else {
+            "WIDE-REQUEST"
+        };
+        for text in [
+            r#"{"value":"inspection-marker"}"#,
+            r#"{"value":"inspection%2Dmarker"}"#,
+            r#"{"value":"inspection&#45;marker"}"#,
+            r#"{"value":"inspection\u002dmarker"}"#,
+        ] {
+            let (result, _) =
+                scan_wide_direction(&plugin, response, "application/json", text.as_bytes()).await;
+            assert!(matches!(result, PluginResult::Reject { .. }));
+            for (charset, bom, body) in wide_encodings(text) {
+                let declared = format!("application/json; charset={charset}");
+                let bare = format!("application/json; charset={}", &charset[..6]);
+                for (content_type, bytes) in [
+                    ("application/json", body.clone()),
+                    (declared.as_str(), body.clone()),
+                    (bare.as_str(), body.clone()),
+                    ("application/json", with_bom(bom, &body)),
+                    (declared.as_str(), with_bom(bom, &body)),
+                ] {
+                    let (result, request) =
+                        scan_wide_direction(&plugin, response, content_type, &bytes).await;
+                    assert!(
+                        matches!(result, PluginResult::Reject { .. }),
+                        "response={response} charset={charset} type={content_type}"
+                    );
+                    assert_eq!(request.metadata.get("waf.rule_hits").unwrap(), expected);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn undeclared_wide_requests_match_the_default_pack_at_both_paranoia_levels() {
+    for level in [1, 4] {
+        let plugin = Waf::new(&json!({
+            "mode": "enforce", "default_rule_action": "enforce", "paranoia_level": level
+        }))
+        .unwrap();
+        for (_, _, body) in wide_encodings(r#"{"value":"http://169.254.169.254/"}"#) {
+            let (result, request) =
+                scan_body_with_content_type(&plugin, "application/json", &body).await;
+            assert!(matches!(result, PluginResult::Reject { .. }));
+            assert!(monitored(&request, "FE-SSRF-001"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn wide_body_inference_preserves_benign_binary_and_explicit_charset_controls() {
+    let plugin = wide_parity_waf();
+    for response in [false, true] {
+        for (_, _, body) in wide_encodings(r#"{"value":"ordinary Ελληνικά 😀"}"#) {
+            let (result, _) =
+                scan_wide_direction(&plugin, response, "application/json", &body).await;
+            assert!(matches!(result, PluginResult::Continue));
+        }
+        for (_, _, body) in wide_encodings("inspection-marker") {
+            // A declaration is not overridden by signature inference. Binary
+            // and multipart eligibility still precedes charset decoding.
+            for content_type in [
+                "application/json; charset=utf-8",
+                "application/octet-stream",
+                "multipart/form-data; boundary=fixture",
+            ] {
+                let (result, _) = scan_wide_direction(&plugin, response, content_type, &body).await;
+                assert!(matches!(result, PluginResult::Continue));
+            }
+            // Interior wide text is not sufficient to infer an encoding.
+            let mut binary = vec![0x81, 0x82, 0x83, 0x84];
+            binary.extend_from_slice(&body);
+            let (result, _) =
+                scan_wide_direction(&plugin, response, "application/json", &binary).await;
+            assert!(matches!(result, PluginResult::Continue));
+        }
+        // A charset declaration must not remove the raw transformed view.
+        let (result, _) = scan_wide_direction(
+            &plugin,
+            response,
+            "text/plain; charset=utf-16le",
+            b"inspection%2Dmarker",
+        )
+        .await;
+        assert!(matches!(result, PluginResult::Reject { .. }));
+        for short in [&b""[..], &b"\0"[..], &b"a\0b"[..]] {
+            let (result, _) =
+                scan_wide_direction(&plugin, response, "application/json", short).await;
+            assert!(matches!(result, PluginResult::Continue));
+        }
+        // Raw scanning survives inference, including bytes after wide text.
+        let mut mixed = encode_utf16("ordinary text", false);
+        mixed.extend_from_slice(b"inspection-marker");
+        let (result, _) = scan_wide_direction(&plugin, response, "application/json", &mixed).await;
+        assert!(matches!(result, PluginResult::Reject { .. }));
+    }
+}
+
+#[tokio::test]
+async fn wide_encoding_only_packs_share_specials_and_rule_modes() {
+    for (id, marker) in [("FE-ENCODING-001", "%00"), ("FE-ENCODING-002", "%c0%af")] {
+        for action in ["enforce", "monitor"] {
+            // The monitor pass leaves the encoding special the only rule, so
+            // the default 'enforce' mode needs a separate enforcement path to
+            // be admitted. Oversize-body blocking is reachable here because
+            // the encoding specials pull bodies into inspection on their own,
+            // and no fixture body comes near the 1 MiB scan cap.
+            let plugin = Waf::new(&json!({
+                "include_default_rules": false, "on_body_too_large": "block",
+                "response_inspection": true, "response_body_inspection": true,
+                "custom_rules": [{
+                    "id": id, "name": "encoding policy", "category": "encoding_evasion",
+                    "severity": "medium", "target": "full_url", "match_kind": "contains",
+                    "pattern": "unused-url-marker", "action": action
+                }]
+            }))
+            .unwrap();
+            for response in [false, true] {
+                for (charset, _, body) in wide_encodings(marker) {
+                    let declared = format!("text/plain; charset={charset}");
+                    for content_type in ["text/plain", declared.as_str()] {
+                        let (result, request) =
+                            scan_wide_direction(&plugin, response, content_type, &body).await;
+                        assert_eq!(
+                            matches!(result, PluginResult::Reject { .. }),
+                            action == "enforce"
+                        );
+                        assert_eq!(request.metadata.get("waf.rule_hits").unwrap(), id);
+                    }
+                }
+                if id == "FE-ENCODING-001" {
+                    let (result, request) = scan_wide_direction(
+                        &plugin,
+                        response,
+                        "text/plain; charset=utf-7",
+                        b"ordinary encoded text",
+                    )
+                    .await;
+                    assert_eq!(
+                        matches!(result, PluginResult::Reject { .. }),
+                        action == "enforce"
+                    );
+                    assert_eq!(request.metadata.get("waf.rule_hits").unwrap(), id);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn wide_response_conflicts_malformed_units_and_specialized_rules_keep_coverage() {
+    let plugin = wide_parity_waf();
+    for (charset, _, mut body) in wide_encodings("inspection-marker!") {
+        body.pop();
+        let content_type = format!("text/plain; charset={charset}");
+        let (result, _) = scan_wide_direction(&plugin, true, &content_type, &body).await;
+        assert!(matches!(result, PluginResult::Reject { .. }));
+    }
+    for (charset, opposite_bom, body) in [
+        (
+            "utf-16le",
+            &[0xFE, 0xFF][..],
+            encode_utf16("inspection-marker", false),
+        ),
+        (
+            "utf-32le",
+            UTF32_BE_BOM,
+            encode_utf32("inspection-marker", false),
+        ),
+    ] {
+        let content_type = format!("text/plain; charset={charset}");
+        let (result, _) =
+            scan_wide_direction(&plugin, true, &content_type, &with_bom(opposite_bom, &body)).await;
+        assert!(matches!(result, PluginResult::Reject { .. }));
+    }
+    // A luhn rule carries no regex, and the config surface rejects an explicit
+    // empty 'pattern' instead of treating it as absent, so it stays null here.
+    for (kind, pattern, text) in [
+        ("luhn", json!(null), "card=4111 1111 1111 111&#49;"),
+        ("cidr", json!("10.0.0.0/8"), "address=10&#46;2&#46;3&#46;4"),
+    ] {
+        let plugin = Waf::new(&json!({
+            "include_default_rules": false,
+            "response_inspection": true, "response_body_inspection": true,
+            "custom_rules": [{
+                "id": "WIDE-SPECIALIZED", "name": "response policy", "category": "custom",
+                "severity": "high", "target": "response_body", "match_kind": kind,
+                "pattern": pattern, "action": "enforce"
+            }]
+        }))
+        .unwrap();
+        for (_, _, body) in wide_encodings(text) {
+            let (result, request) = scan_wide_direction(&plugin, true, "text/plain", &body).await;
+            assert!(matches!(result, PluginResult::Reject { .. }));
+            assert_eq!(
+                request.metadata.get("waf.rule_hits").unwrap(),
+                "WIDE-SPECIALIZED"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn wide_response_bodyless_and_disabled_inspection_stay_inactive() {
+    let plugin = wide_parity_waf();
+    let headers = HashMap::from([("content-type".into(), "text/plain; charset=utf-16le".into())]);
+    let body = encode_utf16("inspection-marker", false);
+    for (method, status) in [
+        ("HEAD", 200),
+        ("GET", 101),
+        ("GET", 204),
+        ("GET", 205),
+        ("GET", 304),
+    ] {
+        let mut request = ctx(method, "/waf");
+        let result = plugin
+            .finalize_client_visible_response_body(&mut request, status, &headers, &body)
+            .await;
+        assert!(matches!(result, PluginResult::Continue));
+    }
+    let disabled = recommended_enforcing_waf();
+    let (result, _) = scan_wide_direction(&disabled, true, "text/plain", &body).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn wide_body_filters_and_wire_size_limits_still_apply() {
+    for response in [false, true] {
+        let target = if response {
+            "response_body"
+        } else {
+            "body_text"
+        };
+        let plugin = Waf::new(&json!({
+            "include_default_rules": false, "max_scan_bytes": 128,
+            "response_inspection": true, "response_body_inspection": true,
+            "custom_rules": [{
+                "id": "WIDE-POLICY", "name": "bounded marker", "category": "custom",
+                "severity": "high", "target": target, "match_kind": "contains",
+                "pattern": "inspection-marker", "action": "enforce", "fp_filters": ["allowed"]
+            }]
+        }))
+        .unwrap();
+        for (_, _, body) in wide_encodings("allowed inspection%2Dmarker") {
+            let (result, _) = scan_wide_direction(&plugin, response, "text/plain", &body).await;
+            assert!(matches!(result, PluginResult::Continue));
+        }
+        // 32 UTF-32 ASCII units are exactly 128 wire bytes. A benign extra
+        // unit makes the governed body too large even though its UTF-8 view
+        // would be much smaller; decoding cannot evade the wire-byte cap.
+        for (length, blocked) in [(32, false), (33, true)] {
+            let body = encode_utf32(&"a".repeat(length), false);
+            let (result, request) =
+                scan_wide_direction(&plugin, response, "text/plain", &body).await;
+            assert_eq!(matches!(result, PluginResult::Reject { .. }), blocked);
+            if blocked {
+                assert_eq!(
+                    request.metadata.get("waf.block_reason").unwrap(),
+                    "body_too_large"
+                );
+            }
+        }
+    }
+}

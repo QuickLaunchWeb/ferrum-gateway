@@ -375,6 +375,7 @@ async fn test_plugin_creation_all_plugins() {
                 }
             }),
             "a2a_gateway" => json!({
+                "discovery": {"rewrite_agent_card_urls": false},
                 "mode": "transparent_proxy",
                 "endpoint": {
                     "path": "/a2a",
