@@ -2711,6 +2711,10 @@ pub struct RequestContext {
     /// Kept private so request metadata cannot suppress transforms or inspection,
     /// and unrelated synthetic short-circuits cannot opt into the skip.
     pub(crate) finalized_response_replay: bool,
+    /// A semantic-cache hit contains decoded JSON, so its transport encoding
+    /// must be planned after the synthetic response's final header rules.
+    /// Private provenance keeps ordinary rejection responses out of this path.
+    pub(crate) semantic_cache_response_replay: bool,
     /// Response-side runtime-overlay gate provenance, pinned once for this
     /// request (see [`GatePolicyStamp`]).
     ///
@@ -3474,6 +3478,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
             finalized_response_replay: false,
+            semantic_cache_response_replay: false,
             response_policy_stamp: None,
             response_presentation_policy_digest: None,
             serverless_pre_invocation_rejection_owners: HashSet::new(),
@@ -3845,14 +3850,14 @@ impl RequestContext {
         std::mem::take(&mut self.final_body_policy_terminal_replacement)
     }
 
-    /// Adopt the gateway terminals the final request-body hook stage selected on
-    /// the throwaway clone (`clone_for_final_request_body_hooks`).
+    /// Adopt gateway terminals and decoded cache-replay provenance selected by
+    /// the final request-body stage on its throwaway clone.
     ///
-    /// The stage's other results travel back through `metadata`, which a plugin
-    /// can write. These two cannot: they authorize the finalizer to publish a
-    /// gateway-authored error payload unchanged, so they are carried as typed
-    /// state and only ever set, never cleared, by the gateway itself.
+    /// Public metadata cannot authorize either a gateway-authored terminal or
+    /// late transport encoding of a decoded cache hit. These private decisions
+    /// are only ever set, never cleared, when adopting the hook stage's state.
     pub(crate) fn adopt_final_request_body_hook_terminals(&mut self, hook_ctx: &RequestContext) {
+        self.semantic_cache_response_replay |= hook_ctx.semantic_cache_response_replay;
         if hook_ctx.gateway_capacity_response_selected() {
             self.mark_gateway_capacity_response_selected();
         }
@@ -4722,6 +4727,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
             finalized_response_replay: self.finalized_response_replay,
+            semantic_cache_response_replay: self.semantic_cache_response_replay,
             response_policy_stamp: self.response_policy_stamp.clone(),
             response_presentation_policy_digest: self.response_presentation_policy_digest,
             serverless_pre_invocation_rejection_owners: self
