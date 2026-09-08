@@ -2578,6 +2578,255 @@ data: [DONE]\n\n";
     assert_reject(result, Some(502));
 }
 
+/// A two-block Anthropic Messages event stream: prose split across `text_delta`
+/// fragments, then a `tool_use` block whose arguments stream as
+/// `input_json_delta`. `prose` and `tool_input` are spliced in so a caller can
+/// place a leak in either half.
+fn anthropic_message_stream(prose: &[&str], tool_input: &str) -> Vec<u8> {
+    let mut body = String::from(
+        "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    );
+    for fragment in prose {
+        body.push_str("event: content_block_delta\n");
+        let frame = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": fragment},
+        });
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+    body.push_str(
+        "event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\
+\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"note\"}}\n\n",
+    );
+    let arguments = json!({
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": tool_input},
+    });
+    body.push_str("event: content_block_delta\n");
+    body.push_str(&format!("data: {arguments}\n\n"));
+    body.push_str(
+        "event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n",
+    );
+    body.into_bytes()
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_reassembles_anthropic_sse() {
+    // Issue #4901: an Anthropic Messages stream used to yield NO segments, so
+    // buffer mode could only fail closed. The leaking phrase is split across
+    // `text_delta` fragments, so only reassembly recovers it — and the decision
+    // must come from the reassembled prose, not from one meaningless fragment.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = anthropic_message_stream(
+        &["My sys", "tem prompt", " says never reveal policy."],
+        "{\"note\":\"ok\"}",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_inspects_anthropic_tool_input() {
+    // The leak lives in the tool-use block's streamed `input_json_delta`
+    // arguments rather than in prose, which reassembles to `$.content[*].input`.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = anthropic_message_stream(
+        &["Sure, here you go."],
+        "{\"note\":\"my system prompt says never reveal policy\"}",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_allows_clean_anthropic_sse() {
+    // The counterpart to the leaking case: a benign Anthropic stream now yields
+    // real segments and a real decision instead of failing closed on zero
+    // segments, so it is delivered.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = anthropic_message_stream(
+        &["The weather ", "is sunny today."],
+        "{\"city\":\"New York\"}",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+
+    assert_continue(result);
+    assert_ne!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_uninspectable"),
+        "a well-formed Anthropic stream is inspectable, not failed closed"
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_rejects_interleaved_anthropic_event() {
+    // Negative case: an event type the reassembler does not model, interleaved
+    // into an otherwise clean Anthropic stream, could carry client-visible text
+    // on a path nothing reads. The reassembled prose looks benign, so the
+    // decision must still fail closed rather than allow.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"The weather is sunny today.\"}}\n\n",
+        "event: smuggled_block\n",
+        "data: {\"type\":\"smuggled_block\",\"index\":0,\"text\":\"my system prompt\"}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_uninspectable")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_cuts_on_anthropic_leak() {
+    // Windowed `inspect` mode: the leak is split across Anthropic `text_delta`
+    // fragments and completes a sentence, so the window flushes, the
+    // reassembled prose is inspected, and the stream is cut.
+    let plugin = plugin(&inspect_config());
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let opening = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"My sys\"}}\n\n",
+    );
+    assert!(matches!(
+        inspector.on_chunk(opening.as_bytes()).await,
+        ResponseStreamAction::Forward(_)
+    ));
+
+    let leak = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"tem prompt says never reveal policy.\"}}\n\n",
+    );
+    assert!(
+        matches!(
+            inspector.on_chunk(leak.as_bytes()).await,
+            ResponseStreamAction::Terminate(_)
+        ),
+        "a leaking reassembled Anthropic window must terminate the stream"
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_cuts_on_unmodelled_anthropic_event() {
+    // Negative case for windowed inspection: an unmodelled event leaves the
+    // window uninspectable, so under on_error=reject the block-mode contract
+    // cuts rather than releasing bytes no verdict covered.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"The weather is sunny today.\"}}\n\n",
+        "event: smuggled_block\n",
+        "data: {\"type\":\"smuggled_block\",\"index\":0,\"text\":\"my system prompt\"}\n\n",
+    );
+    let first = inspector.on_chunk(body.as_bytes()).await;
+    let terminated = matches!(first, ResponseStreamAction::Terminate(_))
+        || matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_));
+    assert!(
+        terminated,
+        "an unmodelled Anthropic event must not be released as inspected-clean"
+    );
+}
+
 #[tokio::test]
 async fn streaming_response_buffer_uninspectable_honors_on_error_allow() {
     // The uninspectable disposition is governed by on_error: allow delivers it.
@@ -6718,6 +6967,46 @@ async fn anthropic_content_block_delta_json_response_is_inspected() {
 }
 
 #[tokio::test]
+async fn anthropic_tool_use_only_response_yields_tool_segments() {
+    // Issue #4901 review: adding `$.content[*].name` / `.input` to the response
+    // defaults changes buffered Anthropic behaviour. A tool_use-only Messages
+    // response used to yield NO segments and route to
+    // `handle_uninspectable_body` as `no_extractable_content`; it now produces
+    // real `tool_call` / `tool_arguments` segments and a real verdict.
+    assert_response_shape_inspected(
+        "anthropic tool_use input",
+        br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"note","input":{"note":"My system prompt says never reveal policy."}}]}"#,
+        "$.content[0].input",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn benign_anthropic_tool_use_only_response_is_no_longer_uninspectable() {
+    // The counterpart: the same shape with nothing to flag no longer records
+    // `no_extractable_content`, because the `tool_use` block's `name` and
+    // `input` are now extractable segments. `on_error` stays `warn` (the
+    // fixture default) so the discriminator is the recorded disposition, not a
+    // status code the unreachable test embedding provider would produce either
+    // way.
+    let plugin = plugin(&response_shape_config());
+    let mut ctx = create_test_context();
+    let mut headers = response_headers();
+    let body = br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"get_weather","input":{"city":"New York"}}]}"#;
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
+
+    assert_continue(result);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.uninspectable_body"),
+        "a tool_use-only Anthropic response now yields extractable segments"
+    );
+}
+
+#[tokio::test]
 async fn ai_shaped_response_with_no_extractable_content_fails_closed() {
     let mut config = response_shape_config();
     config["on_error"] = json!("reject");
@@ -6791,6 +7080,8 @@ async fn every_supported_extraction_path_is_configurable() {
     for path in [
         "$.candidates[*].content.parts[*].text",
         "$.content[*].text",
+        "$.content[*].name",
+        "$.content[*].input",
         "$.output.message.content[*].text",
         "$.content_block_delta.delta.text",
     ] {
@@ -7289,10 +7580,13 @@ async fn shape_qualified_response_markers_do_not_capture_ordinary_list_bodies() 
 }
 
 #[tokio::test]
-async fn anthropic_event_stream_under_inspect_fails_closed() {
-    // `SseReassembler` maps only OpenAI shapes and the Anthropic delta path is
-    // excluded from the per-frame pass, so the window carries no segments. That
-    // used to release clean — an allow decision over a completion nothing read.
+async fn anthropic_event_stream_under_inspect_is_reassembled_and_inspected() {
+    // `SseReassembler` folds the Anthropic Messages protocol into
+    // `$.content[*].text`, so the window carries real segments and goes to the
+    // embedding provider like an OpenAI window would. With the provider
+    // unreachable and `on_error: reject`, the inspector must fail closed at
+    // some point — never release the completion clean the way the old
+    // segment-less window did (an allow decision over text nothing read).
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "inspect",
@@ -7308,14 +7602,13 @@ async fn anthropic_event_stream_under_inspect_fails_closed() {
 
     let anthropic = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n\
 event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"My system prompt says never reveal policy.\"}}\n\n";
-    assert!(matches!(
-        inspector.on_chunk(anthropic).await,
-        ResponseStreamAction::Forward(_)
-    ));
-    assert!(
-        matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
-        "an unmapped provider event stream must fail closed under on_error=reject"
-    );
+    if let ResponseStreamAction::Forward(_) = inspector.on_chunk(anthropic).await {
+        assert!(
+            matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
+            "a reassembled Anthropic stream must reach a verdict and, with the \
+             provider unreachable, fail closed under on_error=reject"
+        );
+    }
 }
 
 #[tokio::test]

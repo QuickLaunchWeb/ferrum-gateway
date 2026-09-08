@@ -19,8 +19,8 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
-    SseReassembler, SseText, SseTextKind, encode_sse_error_event, last_paragraph_boundary,
-    last_sentence_boundary, parse_sse_data_frames_checked,
+    SseEventName, SseReassembler, SseText, SseTextKind, encode_sse_error_event,
+    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames_checked,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -103,13 +103,15 @@ pub(crate) const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.output[*].arguments",
     // Google Gemini / Vertex `generateContent`.
     "$.candidates[*].content.parts[*].text",
-    // Anthropic Messages non-streaming completion.
+    // Anthropic Messages completion — a buffered response, and the document a
+    // streamed one is reassembled into by `SseReassembler`.
     "$.content[*].text",
+    "$.content[*].name",
+    "$.content[*].input",
     // Amazon Bedrock Converse.
     "$.output.message.content[*].text",
-    // Anthropic Messages streaming text delta event. See
-    // [`SSE_DELTA_RESPONSE_PATHS`] for why a streamed Anthropic body is failed
-    // closed rather than inspected per fragment.
+    // A single Anthropic Messages streaming event delivered as a JSON body. A
+    // live event stream is reassembled instead; see [`SSE_DELTA_RESPONSE_PATHS`].
     "$.content_block_delta.delta.text",
     // Amazon Bedrock Titan text generation.
     "$.results[*].outputText",
@@ -149,25 +151,30 @@ static NEXT_FIREWALL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// `output[*].*`) are not listed here because per-frame extraction handles them
 /// correctly.
 ///
-/// The OpenAI-shaped entries are reassembled across frames by
-/// [`SseReassembler`], so excluding them from the per-frame pass loses nothing.
-/// The provider-native entries are NOT reassembled yet, so excluding them makes
-/// the stream yield no segments and a caller that asked for stream inspection
-/// fail closed through `handle_uninspectable_buffered_stream` (buffered) or the
-/// unmapped-frame branch of `act_on_window` (windowed) instead of allowing on a
-/// fragment:
+/// The OpenAI-shaped entries and `$.content_block_delta.delta.text` are
+/// reassembled across frames by [`SseReassembler`] (the Anthropic Messages
+/// protocol is folded per content block into `$.content[*].text` / `.name` /
+/// `.input`), so excluding them from the per-frame pass loses nothing and
+/// extracting the same fragments again per frame would re-introduce exactly the
+/// meaningless per-fragment segments reassembly exists to avoid. The reassembled
+/// Anthropic paths are deliberately NOT listed: no Anthropic event frame carries
+/// a top-level `content` array, so per-frame extraction of them cannot duplicate
+/// a delta, and keeping them in the per-frame pass preserves coverage of a
+/// non-delta summary event that could otherwise smuggle content past a clean
+/// delta stream.
 ///
-/// * `$.content_block_delta.delta.text` — Anthropic Messages `text_delta`.
-/// * `$.candidates[*].content.parts[*].text` — Gemini/Vertex
-///   `streamGenerateContent?alt=sse`, whose frames are the same
-///   `candidates[].content.parts[].text` shape as the non-streaming response
-///   but carry one incremental fragment each.
+/// `$.candidates[*].content.parts[*].text` — Gemini/Vertex
+/// `streamGenerateContent?alt=sse`, whose frames are the same
+/// `candidates[].content.parts[].text` shape as the non-streaming response but
+/// carry one incremental fragment each — is NOT reassembled yet, so excluding it
+/// makes the stream yield no segments and a caller that asked for stream
+/// inspection fail closed through `handle_uninspectable_buffered_stream`
+/// (buffered) or the unmapped-frame branch of `act_on_window` (windowed) instead
+/// of allowing on a fragment. Reassembling the Gemini stream shape is tracked as
+/// future work ("Gemini stream reassembly", issue #4904).
 ///
-/// Both paths still apply to a non-SSE JSON body carrying that shape; the
-/// exclusion is scoped to the per-frame streaming pass. Reassembling these two
-/// provider streams (so their windows are inspected rather than refused) is
-/// tracked as future work — "Anthropic stream reassembly" and "Gemini stream
-/// reassembly".
+/// Both provider paths still apply to a non-SSE JSON body carrying that shape;
+/// the exclusion is scoped to the per-frame streaming pass.
 const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
     "$.choices[*].text",
     "$.choices[*].delta.content",
@@ -3269,12 +3276,16 @@ fn reassemble_sse_response_segments(
     extraction: &ExtractionConfig,
 ) -> (Vec<TextSegment>, bool) {
     let parsed = parse_sse_data_frames_checked(body);
-    let frames = parsed.frames;
 
     let mut reassembler = SseReassembler::new();
-    for frame in &frames {
-        reassembler.push_frame(frame);
+    for (event, frame) in parsed.reassembly_frames() {
+        reassembler.push_event_frame(event, frame);
     }
+    // An Anthropic stream carrying an event, `delta.type`, or content-block
+    // index the reassembler cannot fold into the document is uninspectable for
+    // the same reason a `data:` payload that will not parse is: it may hold
+    // client-visible text on a path nothing here reads.
+    let fully_inspectable = parsed.fully_parsed && !reassembler.anthropic_stream_uninspectable();
     let mut segments: Vec<TextSegment> = reassembler
         .into_texts()
         .into_iter()
@@ -3292,7 +3303,7 @@ fn reassemble_sse_response_segments(
             request_json_paths: Vec::new(),
             response_json_paths: non_delta_paths,
         };
-        for (index, frame) in frames.iter().enumerate() {
+        for (index, frame) in parsed.frames.iter().enumerate() {
             extract_response_segments_from_json(
                 frame,
                 &non_delta_extraction,
@@ -3302,7 +3313,7 @@ fn reassemble_sse_response_segments(
         }
     }
 
-    (dedupe_segments(segments), parsed.fully_parsed)
+    (dedupe_segments(segments), fully_inspectable)
 }
 
 /// Whether a response JSON path is an incremental streaming path handled by
@@ -3740,16 +3751,21 @@ impl StreamWindowEngine {
 
         let (inspectable, frames, actual_frame_bytes) = if within_budget {
             let parsed = parse_sse_data_frames_checked(&raw);
-            for frame in &parsed.frames {
-                self.reassembler.push_frame(frame);
+            for (event, frame) in parsed.reassembly_frames() {
+                self.reassembler.push_event_frame(event, frame);
             }
             let actual_frame_bytes = if self.store_frames && !parsed.frames.is_empty() {
                 raw_len
             } else {
                 0
             };
+            // A frame the Anthropic path could not fold into the reassembled
+            // document leaves this window uninspectable, so block mode keeps
+            // holding rather than releasing bytes no verdict ever covered.
+            let inspectable =
+                parsed.fully_parsed && !self.reassembler.anthropic_stream_uninspectable();
             (
-                parsed.fully_parsed,
+                inspectable,
                 if self.store_frames {
                     parsed.frames
                 } else {
@@ -4167,7 +4183,14 @@ impl StreamWindowEngine {
 fn frame_is_unmapped_governed(frame: &Value) -> bool {
     let event_type = frame.get("type").and_then(Value::as_str);
     let responses_api_event = event_type.is_some_and(|ty| ty.starts_with("response."));
-    if frame.get("choices").is_some() || responses_api_event {
+    // Anthropic Messages events are reassembled per content block, and a
+    // frame the reassembler could not fold is reported through
+    // `anthropic_stream_uninspectable` instead; a leading `message_start` or
+    // `ping` window must not read as an unmapped provider stream.
+    let anthropic_event = event_type
+        .map(SseEventName::from_name)
+        .is_some_and(|name| matches!(name, SseEventName::Anthropic(_)));
+    if frame.get("choices").is_some() || responses_api_event || anthropic_event {
         return false;
     }
     event_type.is_some() || looks_like_governed_response_json(frame)
@@ -5261,6 +5284,12 @@ impl ResponseStreamInspector for StreamInspector {
 /// so an extraction override that lists only the non-streaming path (e.g.
 /// `$.output_text`, or `$.choices[*].message.content`) still inspects the
 /// streamed equivalent instead of silently dropping it.
+///
+/// The mapping is by KIND, not by the fragment's own `json_path`, which stays
+/// the audit locator. An Anthropic `error` event's `error.message` therefore
+/// arrives as [`SseTextKind::AnthropicText`] attributed to `$.error.message`:
+/// it is inspected whenever Anthropic completion text is, and reported at the
+/// path it actually came from.
 fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<TextSegment> {
     let (path_patterns, kind): (&[&str], SegmentKind) = match text.kind {
         SseTextKind::CompletionText => (&["$.choices[*].text"], SegmentKind::AssistantMessage),
@@ -5287,6 +5316,9 @@ fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<T
             SegmentKind::AssistantMessage,
         ),
         SseTextKind::ResponsesArguments => (&["$.output[*].arguments"], SegmentKind::ToolArguments),
+        SseTextKind::AnthropicText => (&["$.content[*].text"], SegmentKind::AssistantMessage),
+        SseTextKind::AnthropicToolName => (&["$.content[*].name"], SegmentKind::ToolCall),
+        SseTextKind::AnthropicToolInput => (&["$.content[*].input"], SegmentKind::ToolArguments),
     };
 
     let enabled = path_patterns.iter().any(|pattern| {
@@ -5680,6 +5712,26 @@ fn extract_known_path(
             prefix,
             segments,
         ),
+        // Anthropic Messages tool-use blocks, in a buffered response and in the
+        // document a streamed response is reassembled into.
+        "$.content[*].name" => extract_content_block_field(
+            json.get("content"),
+            direction,
+            SegmentKind::ToolCall,
+            "$.content",
+            "name",
+            prefix,
+            segments,
+        ),
+        "$.content[*].input" => extract_content_block_field(
+            json.get("content"),
+            direction,
+            SegmentKind::ToolArguments,
+            "$.content",
+            "input",
+            prefix,
+            segments,
+        ),
         // Amazon Bedrock Converse. `output` is an object here, so this cannot
         // collide with the Responses-API `$.output[*].…` array paths above.
         "$.output.message.content[*].text" => extract_content_block_text(
@@ -5965,6 +6017,42 @@ fn extract_content_block_text(
                 segments,
             );
         }
+    }
+}
+
+/// Push one named field of each block in a provider content-block array —
+/// Anthropic Messages tool-use `name` and `input`. Tool-use blocks are always
+/// the assistant's, so the role is fixed here rather than passed in.
+///
+/// Bounded the same way as [`extract_content_block_text`]: one level, this
+/// block's own field. An `input` object is serialized compactly by
+/// [`extract_text_value`], so a prompt smuggled into tool arguments is still
+/// inspected as text. Blocks without the field (a `text` block has no `name`)
+/// are skipped.
+fn extract_content_block_field(
+    blocks: Option<&Value>,
+    direction: Direction,
+    kind: SegmentKind,
+    base_path: &str,
+    field: &str,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(blocks) = blocks.and_then(Value::as_array) else {
+        return;
+    };
+    for (block_index, block) in blocks.iter().enumerate() {
+        extract_text_value(
+            block.get(field),
+            direction,
+            kind,
+            Some("assistant".to_string()),
+            Some(prefixed_json_path(
+                prefix,
+                format!("{base_path}[{block_index}].{field}"),
+            )),
+            segments,
+        );
     }
 }
 
