@@ -458,6 +458,11 @@ pub struct SseReassembler {
     /// Set once a content-bearing Anthropic event has been seen, so foreign or
     /// unnamed frames interleaved after it can be recognized as out-of-protocol.
     anthropic_stream: bool,
+    /// Free text carried by an Anthropic `error` event's `error.message`. Kept
+    /// out of the content-block accumulators so an error frame can never
+    /// consume a block slot or trip the block ceiling, and so a foreign
+    /// stream's terminal `event: error` frame stays neutral.
+    anthropic_error_text: String,
     /// Set when part of an identified Anthropic stream could not be reassembled
     /// into the paths this type exposes. Sticky for the rest of the stream.
     anthropic_uninspectable: bool,
@@ -488,6 +493,7 @@ impl SseReassembler {
         for (_index, block) in &self.anthropic_blocks {
             combined.push_str(&block.text);
         }
+        combined.push_str(&self.anthropic_error_text);
         combined
     }
 
@@ -508,6 +514,7 @@ impl SseReassembler {
             .saturating_add(content)
             .saturating_add(responses)
             .saturating_add(anthropic)
+            .saturating_add(self.anthropic_error_text.len())
     }
 
     /// Total bytes retained across every reassembled text accumulator (assistant
@@ -557,14 +564,16 @@ impl SseReassembler {
             .saturating_add(responses_text)
             .saturating_add(responses_args)
             .saturating_add(anthropic)
+            .saturating_add(self.anthropic_error_text.len())
     }
 
     /// `true` when a stream identified as Anthropic Messages carried something
     /// this reassembler could not fold into its reassembled document: an
     /// unknown event or `delta.type`, a `content_block_*` event missing its
-    /// `index` / payload, a discriminator that disagrees between the SSE
-    /// `event:` line and the JSON `type` field, an interleaved foreign frame, or
-    /// a block index past [`MAX_ANTHROPIC_CONTENT_BLOCKS`].
+    /// `index` / payload, a discriminator disagreement between the SSE `event:`
+    /// line and the JSON `type` field where both name Anthropic events (or the
+    /// stream had already identified itself as Anthropic), an interleaved
+    /// foreign frame, or a block index past [`MAX_ANTHROPIC_CONTENT_BLOCKS`].
     ///
     /// Such a frame may carry client-visible text on a path nothing here reads,
     /// so a caller that promised inspection must treat the whole stream as
@@ -729,6 +738,7 @@ impl SseReassembler {
         for (_index, block) in &mut self.anthropic_blocks {
             drain_one(&mut block.text, &mut remaining);
         }
+        drain_one(&mut self.anthropic_error_text, &mut remaining);
 
         self.completion_text
             .retain(|(_choice, text)| !text.is_empty());
@@ -850,6 +860,17 @@ impl SseReassembler {
                 });
             }
         }
+        // A mid-stream `error` event's `error.message` is client-visible free
+        // text, so it is reported as assistant prose (its taxonomy) located at
+        // its own path (its true origin) rather than being attributed to a
+        // content block that never existed.
+        if !self.anthropic_error_text.is_empty() {
+            out.push(SseText {
+                kind: SseTextKind::AnthropicText,
+                json_path: "$.error.message".to_string(),
+                text: self.anthropic_error_text,
+            });
+        }
         out
     }
 
@@ -918,11 +939,13 @@ impl SseReassembler {
 
     /// Accumulate one Anthropic Messages event.
     ///
-    /// Coverage: `message_start` (envelope, no content), `content_block_start`
-    /// (block index + `text` seed or `tool_use` name), `content_block_delta`
+    /// Coverage: `message_start` (including a populated `message.content`
+    /// envelope), `content_block_start` (block index + `text` seed, or a
+    /// `tool_use` name plus a non-empty `input` object), `content_block_delta`
     /// with `delta.type` of `text_delta` (prose) or `input_json_delta`
-    /// (tool-input JSON), and the no-content terminals `content_block_stop`,
-    /// `message_delta`, `message_stop`, `ping`, and `error`.
+    /// (tool-input JSON), `error` (`error.message` free text), and the
+    /// no-content terminals `content_block_stop`, `message_delta`,
+    /// `message_stop`, and `ping`.
     ///
     /// Anything else inside an identified Anthropic stream — an unknown event,
     /// an unknown `delta.type` such as extended thinking's `thinking_delta`, a
@@ -939,11 +962,31 @@ impl SseReassembler {
 
         let resolved = match (event, json_event) {
             (Some(from_line), Some(from_json)) if from_line != from_json => {
-                // The two discriminators describe different events, so at most
-                // one of them describes the payload. Neither can be trusted to
-                // route it.
-                self.anthropic_uninspectable = true;
-                return;
+                match (from_line, from_json) {
+                    // Both discriminators name Anthropic events, or the stream
+                    // already identified itself as Anthropic: at most one of
+                    // them describes the payload and neither can be trusted to
+                    // route it, so fail closed.
+                    (SseEventName::Anthropic(_), SseEventName::Anthropic(_)) => {
+                        self.anthropic_uninspectable = true;
+                        return;
+                    }
+                    _ if self.anthropic_stream => {
+                        self.anthropic_uninspectable = true;
+                        return;
+                    }
+                    // Exactly one side names an Anthropic event on a stream
+                    // that has not identified itself as Anthropic. This is the
+                    // ordinary shape of a FOREIGN stream whose own event names
+                    // happen to collide (`event: ping` beside
+                    // `{"type":"heartbeat"}`, or the gateway's own terminal
+                    // `event: error` frame), so route by the Anthropic side
+                    // rather than failing a stream closed on a protocol it
+                    // never claimed. A genuine Anthropic frame mislabeled on
+                    // one discriminator is still folded in.
+                    (name @ SseEventName::Anthropic(_), _) => Some(name),
+                    (_, name) => Some(name),
+                }
             }
             (Some(name), _) => Some(name),
             (None, Some(name)) => Some(name),
@@ -958,9 +1001,31 @@ impl SseReassembler {
         };
 
         match kind {
-            // The envelope's `content` array is empty at `message_start`; the
-            // blocks that fill it arrive as their own events.
-            AnthropicEvent::MessageStart => self.anthropic_stream = true,
+            AnthropicEvent::MessageStart => {
+                self.anthropic_stream = true;
+                // The envelope's `content` array is normally empty here and the
+                // blocks that fill it arrive as their own events — but the
+                // field is client-visible (Anthropic's own SDK seeds its
+                // response snapshot from `message_start.message`), so a
+                // populated envelope is folded in rather than discarded.
+                let Some(message) = frame.get("message") else {
+                    return;
+                };
+                let Some(content) = message.get("content") else {
+                    return;
+                };
+                let Some(blocks) = content.as_array() else {
+                    // `content` present but not an array: outside the protocol
+                    // and possibly carrying text on a path nothing reads.
+                    self.anthropic_uninspectable = true;
+                    return;
+                };
+                for (position, block) in blocks.iter().enumerate() {
+                    if !self.absorb_anthropic_content_block(position, block) {
+                        self.anthropic_uninspectable = true;
+                    }
+                }
+            }
             AnthropicEvent::ContentBlockStart => {
                 self.anthropic_stream = true;
                 let Some(index) = index_field(frame, "index") else {
@@ -971,22 +1036,8 @@ impl SseReassembler {
                     self.anthropic_uninspectable = true;
                     return;
                 };
-                match block.get("type").and_then(Value::as_str) {
-                    // A text block may open with a seed string.
-                    Some("text") => {
-                        let seed = block.get("text").and_then(Value::as_str).unwrap_or("");
-                        self.anthropic_block_mut(index).text.push_str(seed);
-                    }
-                    // Client tool calls and the provider-executed variants all
-                    // announce the invoked name here and stream their arguments
-                    // as `input_json_delta`.
-                    Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                        self.anthropic_block_mut(index).name.push_str(name);
-                    }
-                    // `thinking`, `image`, `redacted_thinking`, or a block type
-                    // added after this code was written.
-                    _ => self.anthropic_uninspectable = true,
+                if !self.absorb_anthropic_content_block(index, block) {
+                    self.anthropic_uninspectable = true;
                 }
             }
             AnthropicEvent::ContentBlockDelta => {
@@ -1030,12 +1081,87 @@ impl SseReassembler {
                     }
                 }
             }
+            // `error.message` is free text the client sees, so it is scanned
+            // like any other client-visible fragment. This arm deliberately
+            // does NOT set `anthropic_stream`: a foreign stream's terminal
+            // `event: error` frame (including the gateway's own) must not
+            // reclassify the rest of that stream as Anthropic.
+            AnthropicEvent::Error => {
+                if let Some(message) = frame
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                {
+                    self.anthropic_error_text.push_str(message);
+                }
+            }
+            // `message_delta.delta.stop_sequence` echoes a request-supplied
+            // stop sequence rather than model output, and `usage` is numeric,
+            // so these terminals carry no client-visible model text.
             AnthropicEvent::ContentBlockStop
             | AnthropicEvent::MessageDelta
             | AnthropicEvent::MessageStop
-            | AnthropicEvent::Ping
-            | AnthropicEvent::Error => {}
+            | AnthropicEvent::Ping => {}
         }
+    }
+
+    /// Fold one Anthropic content block — from a `content_block_start` event or
+    /// from the `message_start` envelope's `content` array — into the
+    /// accumulator for `index`.
+    ///
+    /// `false` means the block is a type this reassembler cannot fold
+    /// (`thinking`, `image`, `redacted_thinking`, or a block type added after
+    /// this code was written), so the caller marks the stream uninspectable.
+    /// Bounded exactly like the delta path: one level, this block's own fields,
+    /// and the [`MAX_ANTHROPIC_CONTENT_BLOCKS`] ceiling applies through
+    /// [`anthropic_block_mut`](Self::anthropic_block_mut).
+    fn absorb_anthropic_content_block(&mut self, index: usize, block: &Value) -> bool {
+        match block.get("type").and_then(Value::as_str) {
+            // A text block may open with a seed string.
+            Some("text") => {
+                let seed = block.get("text").and_then(Value::as_str).unwrap_or("");
+                self.anthropic_block_mut(index).text.push_str(seed);
+                true
+            }
+            // Client tool calls and the provider-executed variants all announce
+            // the invoked name here and stream their arguments as
+            // `input_json_delta`.
+            Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                self.anthropic_block_mut(index).name.push_str(name);
+                self.absorb_anthropic_tool_input(index, block.get("input"))
+            }
+            _ => false,
+        }
+    }
+
+    /// Fold a tool-use block's `input` document into that block's tool-input
+    /// accumulator.
+    ///
+    /// The protocol opens a tool-use block with an empty `input` object and
+    /// streams the real arguments as `input_json_delta` fragments, so an absent
+    /// or empty `input` contributes nothing. A NON-empty object is
+    /// client-visible tool input that the buffered `$.content[*].input` path
+    /// inspects, so it is serialized compactly into the same accumulator the
+    /// deltas append to rather than being discarded. Any other JSON type is
+    /// outside the protocol and returns `false`.
+    fn absorb_anthropic_tool_input(&mut self, index: usize, input: Option<&Value>) -> bool {
+        let Some(input) = input else {
+            return true;
+        };
+        let Some(object) = input.as_object() else {
+            return false;
+        };
+        if object.is_empty() {
+            return true;
+        }
+        let Ok(serialized) = serde_json::to_string(input) else {
+            return false;
+        };
+        self.anthropic_block_mut(index)
+            .input_json
+            .push_str(&serialized);
+        true
     }
 
     /// Accumulator for one Anthropic content-block index, folding indexes at or

@@ -5142,6 +5142,12 @@ impl ResponseStreamInspector for StreamInspector {
 /// so an extraction override that lists only the non-streaming path (e.g.
 /// `$.output_text`, or `$.choices[*].message.content`) still inspects the
 /// streamed equivalent instead of silently dropping it.
+///
+/// The mapping is by KIND, not by the fragment's own `json_path`, which stays
+/// the audit locator. An Anthropic `error` event's `error.message` therefore
+/// arrives as [`SseTextKind::AnthropicText`] attributed to `$.error.message`:
+/// it is inspected whenever Anthropic completion text is, and reported at the
+/// path it actually came from.
 fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<TextSegment> {
     let (path_patterns, kind): (&[&str], SegmentKind) = match text.kind {
         SseTextKind::CompletionText => (&["$.choices[*].text"], SegmentKind::AssistantMessage),

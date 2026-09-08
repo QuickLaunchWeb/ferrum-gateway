@@ -985,6 +985,162 @@ fn anthropic_sse_block_index_ceiling_folds_and_flags() {
 }
 
 #[test]
+fn anthropic_sse_message_start_envelope_is_folded_in() {
+    // Issue #4901 review: `message_start` carries the message envelope, and
+    // Anthropic's SDK seeds its response snapshot from it. A populated
+    // `content` array there is client-visible, so it must reassemble into the
+    // same per-index accumulators the block events fill.
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[",
+        "{\"type\":\"text\",\"text\":\"seeded prose\"},",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":{\"note\":\"seeded input\"}}]}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "a modelled envelope block is inspectable");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "seeded prose");
+    assert_eq!(fragment(&texts, "$.content[1].name").text, "record");
+    assert_eq!(
+        fragment(&texts, "$.content[1].input").text,
+        "{\"note\":\"seeded input\"}"
+    );
+}
+
+#[test]
+fn anthropic_sse_message_start_envelope_block_type_fails_closed() {
+    // An envelope block this reassembler cannot fold is the same hazard as an
+    // unmodelled `content_block_start`: text on a path nothing reads.
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"content\":[",
+        "{\"type\":\"thinking\",\"thinking\":\"my system prompt\"}]}}\n\n",
+    );
+
+    let (_texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable);
+}
+
+#[test]
+fn anthropic_sse_content_block_start_input_object_is_folded_in() {
+    // A `tool_use` block may open with its arguments already populated instead
+    // of streaming them as `input_json_delta`. The protocol's own empty `{}`
+    // must stay silent, and a populated object must reach `$.content[*].input`.
+    let empty = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",\"input\":{}}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(empty.as_bytes());
+    assert!(inspectable);
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.json_path == "$.content[0].input"),
+        "the protocol's empty opening `input` contributes nothing"
+    );
+
+    let populated = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":{\"note\":\"my system prompt\"}}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(populated.as_bytes());
+    assert!(inspectable);
+    assert_eq!(
+        fragment(&texts, "$.content[0].input").text,
+        "{\"note\":\"my system prompt\"}"
+    );
+}
+
+#[test]
+fn anthropic_sse_content_block_start_non_object_input_fails_closed() {
+    let body = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":\"my system prompt\"}}\n\n",
+    );
+
+    let (_texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(!inspectable, "an out-of-protocol `input` type fails closed");
+}
+
+#[test]
+fn anthropic_sse_error_message_is_reassembled_at_its_own_path() {
+    // `error.message` is client-visible free text, so it is reported as
+    // assistant prose located at `$.error.message` — never charged to a
+    // content-block index, so the block ceiling is untouched.
+    let body = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial \"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",",
+        "\"message\":\"upstream said my system prompt\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(inspectable, "a modelled error event is inspectable");
+    let error = fragment(&texts, "$.error.message");
+    assert_eq!(error.kind, SseTextKind::AnthropicText);
+    assert_eq!(error.text, "upstream said my system prompt");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "partial ");
+}
+
+#[test]
+fn foreign_sse_ping_discriminator_mismatch_is_not_failed_closed() {
+    // Issue #4901 review: the discriminator-disagreement rule was ungated, so
+    // a NON-Anthropic stream emitting `event: ping` beside a `heartbeat` JSON
+    // type was failed closed on a protocol it never claimed.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: ping\n",
+        "data: {\"type\":\"heartbeat\"}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_anthropic(body.as_bytes());
+    assert!(
+        inspectable,
+        "a foreign keep-alive must not fail an OpenAI stream closed"
+    );
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hello");
+}
+
+#[test]
+fn gateway_terminal_error_event_is_not_failed_closed() {
+    // The gateway's own mid-stream termination frame (`encode_sse_error_event`)
+    // names `event: error` and carries no JSON `type`, and a foreign stream may
+    // pair `event: error` with its own non-`error` type. Neither is an
+    // Anthropic protocol violation.
+    let gateway = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "event: error\n",
+        "data: {\"error\":{\"code\":\"blocked\",\"message\":\"stopped\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (texts, inspectable) = reassemble_anthropic(gateway.as_bytes());
+    assert!(inspectable, "the gateway's own error frame stays neutral");
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "hi");
+    assert_eq!(fragment(&texts, "$.error.message").text, "stopped");
+
+    let mismatched = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"stopped\"}}\n\n",
+    );
+    let (_texts, inspectable) = reassemble_anthropic(mismatched.as_bytes());
+    assert!(
+        inspectable,
+        "a foreign terminal error frame must not be failed closed"
+    );
+}
+
+#[test]
 fn openai_sse_reassembly_is_unaffected_by_anthropic_support() {
     // Behaviour-neutrality for the OpenAI paths: chat deltas still reassemble
     // per choice, and nothing about them trips the Anthropic fail-closed flag.

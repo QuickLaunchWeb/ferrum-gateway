@@ -1440,6 +1440,165 @@ async fn test_sse_anthropic_event_line_only_is_inspected() {
 }
 
 #[tokio::test]
+async fn test_sse_anthropic_event_line_only_is_inspected_in_scan_all_mode() {
+    // Issue #4901 review: `scan_fields: all` routes detection through
+    // `detect_matches_in_decoded_sse_frames`, which reassembles independently
+    // of the fully-reassembled check. When it dropped the SSE `event:` names,
+    // an event-line-only Anthropic stream reassembled to NOTHING there while
+    // the fully-reassembled flag still reported success, so an SSN split so
+    // that neither the per-frame decoded pass nor the raw-body pass can see it
+    // was delivered.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let mut body = String::new();
+    for text in &["Your SSN is 123-45-", "6789, keep it safe."] {
+        let frame = json!({
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        });
+        body.push_str("event: content_block_delta\n");
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "scan-all must reassemble an event-line-only Anthropic stream too"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_anthropic_message_start_envelope_is_inspected() {
+    // Issue #4901 review: `message_start` carries the message envelope, and
+    // Anthropic's own SDK seeds its response snapshot from
+    // `message_start.message`. A populated `content` array there is
+    // client-visible, so discarding it unvalidated let an exfil block through.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",",
+        "\"content\":[{\"type\":\"text\",\"text\":\"SSN 123-45-6789\"}]}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a populated message_start envelope must be inspected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_anthropic_content_block_start_input_is_inspected() {
+    // Issue #4901 review: a `tool_use` block may open with a non-empty `input`
+    // object instead of streaming it as `input_json_delta`. The buffered path
+    // inspects `$.content[i].input`, so the stream must too.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let body = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"record\",",
+        "\"input\":{\"ssn\":\"123-45-6789\"}}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a non-empty content_block_start input must be inspected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_anthropic_error_message_is_inspected() {
+    // Issue #4901 review: an `error` event is not content-less —
+    // `error.message` is client-visible free text.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let body = concat!(
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",",
+        "\"message\":\"request for 123-45-6789 failed\"}}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an Anthropic error event's message must be inspected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_anthropic_tool_input_and_name_are_redacted_not_rejected() {
+    // Issue #4901 review: redact mode could only rewrite
+    // `content_block_delta.delta.text`, so a match confined to the newly
+    // scanned tool input or block name hard-failed with 502 instead of being
+    // redacted. Both are self-contained in one frame here, so both are
+    // rewritable.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let body_str = concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":",
+        "{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"mail_bob@corp.io\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":",
+        "{\"type\":\"input_json_delta\",",
+        "\"partial_json\":\"{\\\"to\\\":\\\"ann@corp.io\\\"}\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let body = body_str.as_bytes();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
+        .await;
+    assert!(
+        !matches!(result, PluginResult::Reject { .. }),
+        "a rewritable Anthropic tool match must not hard-fail: {result:?}"
+    );
+
+    let transformed = plugin
+        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
+        .await
+        .expect("expected redacted body");
+    let out = String::from_utf8(transformed).unwrap();
+    assert!(!out.contains("ann@corp.io"), "tool input must be redacted");
+    assert!(!out.contains("mail_bob@corp.io"), "name must be redacted");
+    assert!(out.contains("[REDACTED:pii:email]"));
+}
+
+#[tokio::test]
 async fn test_sse_anthropic_unmodelled_event_fails_closed() {
     // Negative case: the reassembled prose is benign, but an interleaved event
     // the reassembler does not model could carry client-visible text on a path

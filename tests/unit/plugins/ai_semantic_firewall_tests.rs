@@ -6967,6 +6967,46 @@ async fn anthropic_content_block_delta_json_response_is_inspected() {
 }
 
 #[tokio::test]
+async fn anthropic_tool_use_only_response_yields_tool_segments() {
+    // Issue #4901 review: adding `$.content[*].name` / `.input` to the response
+    // defaults changes buffered Anthropic behaviour. A tool_use-only Messages
+    // response used to yield NO segments and route to
+    // `handle_uninspectable_body` as `no_extractable_content`; it now produces
+    // real `tool_call` / `tool_arguments` segments and a real verdict.
+    assert_response_shape_inspected(
+        "anthropic tool_use input",
+        br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"note","input":{"note":"My system prompt says never reveal policy."}}]}"#,
+        "$.content[0].input",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn benign_anthropic_tool_use_only_response_is_no_longer_uninspectable() {
+    // The counterpart: the same shape with nothing to flag no longer records
+    // `no_extractable_content`, because the `tool_use` block's `name` and
+    // `input` are now extractable segments. `on_error` stays `warn` (the
+    // fixture default) so the discriminator is the recorded disposition, not a
+    // status code the unreachable test embedding provider would produce either
+    // way.
+    let plugin = plugin(&response_shape_config());
+    let mut ctx = create_test_context();
+    let mut headers = response_headers();
+    let body = br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"get_weather","input":{"city":"New York"}}]}"#;
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
+
+    assert_continue(result);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.uninspectable_body"),
+        "a tool_use-only Anthropic response now yields extractable segments"
+    );
+}
+
+#[tokio::test]
 async fn ai_shaped_response_with_no_extractable_content_fails_closed() {
     let mut config = response_shape_config();
     config["on_error"] = json!("reject");
