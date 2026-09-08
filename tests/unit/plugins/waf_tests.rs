@@ -7569,8 +7569,13 @@ async fn wide_body_inference_preserves_benign_binary_and_explicit_charset_contro
 async fn wide_encoding_only_packs_share_specials_and_rule_modes() {
     for (id, marker) in [("FE-ENCODING-001", "%00"), ("FE-ENCODING-002", "%c0%af")] {
         for action in ["enforce", "monitor"] {
+            // The monitor pass leaves the encoding special the only rule, so
+            // the default 'enforce' mode needs a separate enforcement path to
+            // be admitted. Oversize-body blocking is reachable here because
+            // the encoding specials pull bodies into inspection on their own,
+            // and no fixture body comes near the 1 MiB scan cap.
             let plugin = Waf::new(&json!({
-                "include_default_rules": false,
+                "include_default_rules": false, "on_body_too_large": "block",
                 "response_inspection": true, "response_body_inspection": true,
                 "custom_rules": [{
                     "id": id, "name": "encoding policy", "category": "encoding_evasion",
@@ -7637,9 +7642,11 @@ async fn wide_response_conflicts_malformed_units_and_specialized_rules_keep_cove
             scan_wide_direction(&plugin, true, &content_type, &with_bom(opposite_bom, &body)).await;
         assert!(matches!(result, PluginResult::Reject { .. }));
     }
+    // A luhn rule carries no regex, and the config surface rejects an explicit
+    // empty 'pattern' instead of treating it as absent, so it stays null here.
     for (kind, pattern, text) in [
-        ("luhn", "", "card=4111 1111 1111 111&#49;"),
-        ("cidr", "10.0.0.0/8", "address=10&#46;2&#46;3&#46;4"),
+        ("luhn", json!(null), "card=4111 1111 1111 111&#49;"),
+        ("cidr", json!("10.0.0.0/8"), "address=10&#46;2&#46;3&#46;4"),
     ] {
         let plugin = Waf::new(&json!({
             "include_default_rules": false,
