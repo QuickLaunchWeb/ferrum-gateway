@@ -788,6 +788,30 @@
     "emission": "when_series_present"
   },
   {
+    "name": "ferrum_ai_rate_limit_local_accounting_tokens_total",
+    "type": "counter",
+    "help": "AI tokens charged locally after centralized reconciliation failed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_ai_rate_limit_unaccounted_tokens_total",
+    "type": "counter",
+    "help": "AI tokens not charged because local reconciliation capacity was exhausted.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_ai_tokens_total",
     "type": "counter",
     "help": "Total tokens reported by AI providers.",
