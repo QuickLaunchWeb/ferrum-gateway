@@ -1397,7 +1397,9 @@ async fn expect_no_more_datagrams(listener: &UdpSocket, buffer: &mut [u8], label
 /// nine innocent clients' records were destroyed.
 #[tokio::test]
 async fn test_udp_logging_plain_udp_oversized_record_spares_cobatched_siblings() {
-    let listener = UdpSocket::bind("127.0.0.1:0").await.expect("bind collector");
+    let listener = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
     let addr = listener.local_addr().expect("collector addr");
 
     // `flush_interval_ms` is set far out so only `batch_size` triggers the
@@ -1466,7 +1468,9 @@ async fn test_udp_logging_plain_udp_oversized_record_spares_cobatched_siblings()
 /// Control for the gate: a batch that already fits stays one datagram.
 #[tokio::test]
 async fn test_udp_logging_plain_udp_in_limit_batch_is_still_one_datagram() {
-    let listener = UdpSocket::bind("127.0.0.1:0").await.expect("bind collector");
+    let listener = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
     let addr = listener.local_addr().expect("collector addr");
 
     let plugin = UdpLogging::new(
