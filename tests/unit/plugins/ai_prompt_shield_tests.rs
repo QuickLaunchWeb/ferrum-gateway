@@ -2788,10 +2788,7 @@ async fn test_content_part_type_gate_explicit_missing_and_non_text() {
             "explicit input_text type",
             json!({"type": "input_text", "text": "ssn 123-45-6789"}),
         ),
-        (
-            "no type discriminator",
-            json!({"text": "ssn 123-45-6789"}),
-        ),
+        ("no type discriminator", json!({"text": "ssn 123-45-6789"})),
     ];
     for (label, part) in scanned {
         let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
@@ -2879,7 +2876,10 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
                 "content": [{"type": "input_text", "text": format!("ssn {PII}")}]
             }]}),
         ),
-        ("instructions", json!({"instructions": format!("ssn {PII}")})),
+        (
+            "instructions",
+            json!({"instructions": format!("ssn {PII}")}),
+        ),
         ("system", json!({"system": format!("ssn {PII}")})),
         (
             "inputText (bedrock titan)",
