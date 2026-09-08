@@ -2078,15 +2078,35 @@ async fn a2a_policy_covers_request_shapes_before_any_upstream_connection() {
         .expect("spawn gateway");
     let client = harness.http_client().expect("client");
     for (method, path, content_type, body) in [
-        ("POST", "/a2a/", "application/json", "{\"jsonrpc\":\"2.0\",\"method\":\"message/send\"}"),
+        (
+            "POST",
+            "/a2a/",
+            "application/json",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"message/send\"}",
+        ),
         ("POST", "/a2a/message:send/", "application/json", "{}"),
         ("POST", "/a2a//message:send", "application/json", "{}"),
-        ("POST", "/a2a/tasks/t1/pushNotificationConfigs/", "application/json", "{}"),
-        ("POST", "/a2a/tasks/t1//pushNotificationConfigs", "application/json", "{}"),
+        (
+            "POST",
+            "/a2a/tasks/t1/pushNotificationConfigs/",
+            "application/json",
+            "{}",
+        ),
+        (
+            "POST",
+            "/a2a/tasks/t1//pushNotificationConfigs",
+            "application/json",
+            "{}",
+        ),
         ("GET", "/a2a/tasks/", "application/json", ""),
         ("POST", "/a2a", "application/json", "not-json"),
         ("POST", "/a2a", "application/json", "{}"),
-        ("POST", "/a2a", "text/plain", "{\"method\":\"message/send\"}"),
+        (
+            "POST",
+            "/a2a",
+            "text/plain",
+            "{\"method\":\"message/send\"}",
+        ),
     ] {
         let response = client
             .request(method.parse().expect("method"), &harness.proxy_url(path))
@@ -2109,7 +2129,11 @@ async fn a2a_policy_covers_request_shapes_before_any_upstream_connection() {
     // credential forwarding work with the same policy instance.
     for (method, path, body) in [
         ("GET", "/a2a/tasks/task-1", ""),
-        ("POST", "/a2a", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tasks/get\"}"),
+        (
+            "POST",
+            "/a2a",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tasks/get\"}",
+        ),
     ] {
         let response = client
             .request(method.parse().expect("method"), &harness.proxy_url(path))
@@ -2223,7 +2247,10 @@ async fn a2a_card_public_origin_admission_and_signed_jsonrpc_batch_on_the_wire()
     assert_eq!(response.status(), StatusCode::OK);
     let decoded: serde_json::Value = response.json().await.expect("decode rewritten card batch");
     assert_eq!(decoded[0]["result"]["id"], "task-1");
-    assert_eq!(decoded[1]["result"]["url"], "https://agents.example.com/a2a");
+    assert_eq!(
+        decoded[1]["result"]["url"],
+        "https://agents.example.com/a2a"
+    );
     assert!(decoded[1]["result"].get("signatures").is_none());
     assert_eq!(backend.received_requests().await.len(), 1);
     backend.assert_no_matcher_mismatches().await;

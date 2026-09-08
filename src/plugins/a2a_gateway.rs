@@ -2312,8 +2312,10 @@ fn emit_task_state(ctx: &mut RequestContext, value: &str, limit: usize) {
         ctx.metadata.remove("a2a.task_state.truncated");
     }
     if state == "unknown" && !value.eq_ignore_ascii_case("unknown") {
-        ctx.metadata
-            .insert("a2a.task_state.unrecognized".to_string(), "true".to_string());
+        ctx.metadata.insert(
+            "a2a.task_state.unrecognized".to_string(),
+            "true".to_string(),
+        );
     } else {
         ctx.metadata.remove("a2a.task_state.unrecognized");
     }
@@ -2349,7 +2351,8 @@ fn insert_bounded_metadata(ctx: &mut RequestContext, key: &str, value: &str, lim
         bounded.push('~');
     }
     ctx.metadata.insert(key.to_string(), bounded);
-    ctx.metadata.insert(marker_key.to_string(), "true".to_string());
+    ctx.metadata
+        .insert(marker_key.to_string(), "true".to_string());
 }
 
 fn agent_card_origin_failure(

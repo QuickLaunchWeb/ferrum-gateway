@@ -1703,13 +1703,18 @@ fn agent_card_rewrite_requires_an_admitted_public_origin() {
             .err()
             .expect("must reject");
         assert!(error.contains("discovery.public_base_url"), "{error}");
-        assert!(error.contains("discovery.rewrite_agent_card_urls"), "{error}");
+        assert!(
+            error.contains("discovery.rewrite_agent_card_urls"),
+            "{error}"
+        );
     }
-    assert!(create_plugin(
-        "a2a_gateway",
-        &json!({"discovery": {"rewrite_agent_card_urls": false}}),
-    )
-    .is_ok());
+    assert!(
+        create_plugin(
+            "a2a_gateway",
+            &json!({"discovery": {"rewrite_agent_card_urls": false}}),
+        )
+        .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -4901,11 +4906,31 @@ async fn policy_covers_unrecognized_shapes_and_disabled_bindings() {
             ("GET", "/a2a", "application/json", "{}"),
             ("PATCH", "/a2a/tasks/task-1", "application/json", "{}"),
             ("POST", "/a2a/message:send/", "application/json", "{}"),
-            ("POST", "/a2a/tasks/t1//pushNotificationConfigs", "application/json", "{}"),
-            ("POST", "/a2a/tasks/t1/pushNotificationConfigs/", "application/json", "{}"),
-            ("POST", "/a2a.v1.A2AService/FutureCall", "application/grpc", ""),
+            (
+                "POST",
+                "/a2a/tasks/t1//pushNotificationConfigs",
+                "application/json",
+                "{}",
+            ),
+            (
+                "POST",
+                "/a2a/tasks/t1/pushNotificationConfigs/",
+                "application/json",
+                "{}",
+            ),
+            (
+                "POST",
+                "/a2a.v1.A2AService/FutureCall",
+                "application/grpc",
+                "",
+            ),
             ("GET", "/a2a.v1.A2AService/GetTask", "application/grpc", ""),
-            ("POST", "/lf.a2a.v1.A2AService/FutureCall", "application/grpc", ""),
+            (
+                "POST",
+                "/lf.a2a.v1.A2AService/FutureCall",
+                "application/grpc",
+                "",
+            ),
             ("POST", "/a2a.v1.A2AService/GetTask", "text/plain", ""),
         ] {
             let (mut ctx, _) = rest_ctx(method, path);
@@ -4921,7 +4946,11 @@ async fn policy_covers_unrecognized_shapes_and_disabled_bindings() {
                 "{method} {path} {content_type} {body}"
             );
         }
-        for path in ["/other", "/a2a-sibling", "/a2a.v1.A2AServiceSibling/FutureCall"] {
+        for path in [
+            "/other",
+            "/a2a-sibling",
+            "/a2a.v1.A2AServiceSibling/FutureCall",
+        ] {
             let (mut ctx, mut headers) = rest_ctx("POST", path);
             assert!(matches!(
                 gateway.before_proxy(&mut ctx, &mut headers).await,
@@ -4938,8 +4967,7 @@ async fn policy_covers_unrecognized_shapes_and_disabled_bindings() {
         "detection": {"bindings": ["rest"]},
         "policy": {"default_action": "deny"}
     }));
-    let (mut ctx, mut headers) =
-        jsonrpc_ctx(json!({"jsonrpc": "2.0", "method": "message/send"}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({"jsonrpc": "2.0", "method": "message/send"}));
     assert!(matches!(
         gateway.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Reject { .. }
@@ -5050,8 +5078,7 @@ async fn ordinary_task_metadata_preserves_identifiers_and_normalizes_states() {
 async fn streamed_task_metadata_uses_the_same_bounds_without_changing_bytes() {
     let gateway = plugin(json!({"observability": {"max_payload_size": 16}}));
     let plugins = vec![Arc::clone(&gateway)];
-    let (mut ctx, mut headers) =
-        jsonrpc_ctx(json!({"jsonrpc": "2.0", "method": "message/stream"}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({"jsonrpc": "2.0", "method": "message/stream"}));
     assert!(matches!(
         gateway.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
