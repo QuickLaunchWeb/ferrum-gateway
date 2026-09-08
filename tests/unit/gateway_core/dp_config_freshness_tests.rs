@@ -707,7 +707,10 @@ fn cp_disconnected_seconds_tracks_usable_config_not_transport_connect() {
     let freshness = DpConfigFreshness::new_at(epoch, MAX_STALE, StaleAction::FailClosed);
 
     // Startup without any applied snapshot: outage runs from process start.
-    assert_eq!(freshness.evaluate_at(at(epoch, 30)).cp_disconnected_seconds, 30);
+    assert_eq!(
+        freshness.evaluate_at(at(epoch, 30)).cp_disconnected_seconds,
+        30
+    );
 
     // Transport connects but never delivers usable config — stamp keeps growing.
     freshness.record_cp_connected_at(at(epoch, 60));
@@ -730,14 +733,20 @@ fn cp_disconnected_seconds_tracks_usable_config_not_transport_connect() {
     // A normal reconnect that delivers usable configuration clears the stamp.
     freshness.record_snapshot_applied_at(at(epoch, 160));
     assert_eq!(
-        freshness.evaluate_at(at(epoch, 200)).cp_disconnected_seconds, 0,
+        freshness
+            .evaluate_at(at(epoch, 200))
+            .cp_disconnected_seconds,
+        0,
         "an applied snapshot ends the configuration outage"
     );
 
     // A subsequent disconnect restarts the stamp.
     freshness.record_cp_authority_lost_at(at(epoch, 250));
     assert_eq!(
-        freshness.evaluate_at(at(epoch, 300)).cp_disconnected_seconds, 50,
+        freshness
+            .evaluate_at(at(epoch, 300))
+            .cp_disconnected_seconds,
+        50,
         "a later authority loss must restart the outage clock"
     );
 }
