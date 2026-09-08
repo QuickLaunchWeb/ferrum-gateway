@@ -1292,6 +1292,9 @@ impl AiSemanticCache {
     }
 
     fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
+        if status == "HIT" {
+            ctx.semantic_cache_response_replay = true;
+        }
         ctx.metadata
             .insert(self.meta_status.clone(), status.to_string());
     }

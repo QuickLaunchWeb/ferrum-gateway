@@ -22484,6 +22484,11 @@ async fn run_after_proxy_hooks_on_rejection(
         if !plugin.applies_after_proxy_on_reject() {
             continue;
         }
+        // Decoded semantic-cache hits defer the one transport-planning hook
+        // until final header rules and body policy have accepted the replay.
+        if ctx.semantic_cache_response_replay && plugin.applies_response_transport_encoding() {
+            continue;
+        }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected()
             || ctx
                 .grpc_deadline_at()
@@ -23585,6 +23590,11 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 .iter()
                 .filter(|plugin| response_transform_stage(plugin.as_ref()) == stage)
             {
+                if ctx.semantic_cache_response_replay
+                    && stage == ResponseTransformStage::TransportEncoding
+                {
+                    continue;
+                }
                 let mandatory_replay_transform = ctx.finalized_response_replay
                     && plugin.requires_replay_response_body_transform(ctx);
                 if ctx.finalized_response_replay && !mandatory_replay_transform {
@@ -23835,6 +23845,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
 /// The reject-path `after_proxy` hooks are header-only and do not depend on the
 /// body-hook output (`compression::after_proxy` deliberately no-ops on the
 /// rejection path), so deferring them past the body hooks is safe.
+/// Decoded semantic-cache hits defer transport planning and encoding further,
+/// until this header chain and its plaintext body-policy recheck have finished.
 ///
 /// Because that chain is last, it is also the last thing that can change the
 /// client-visible header map — and the representation fields in that map are
@@ -23944,6 +23956,14 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             final_body_policy_terminal_replacement,
         )
         .await;
+    }
+
+    // A semantic-cache entry holds decoded JSON. Its compression decision must
+    // see the final header rules (including no-transform and strong ETag), and
+    // the encode must follow every plaintext body-policy decision. Other
+    // synthetic responses retain their existing transport behavior.
+    if ctx.semantic_cache_response_replay && (200..300).contains(status) {
+        encode_semantic_cache_replay(plugins, ctx, status, headers, body).await;
     }
 
     // Authoritative final client-visible HEADER policy, AFTER the deliberately
@@ -24095,6 +24115,55 @@ pub(crate) struct AfterProxyReject {
     pub status_code: u16,
     pub body: Bytes,
     pub headers: HashMap<String, String>,
+}
+
+/// Plan and encode a decoded cache replay after the synthetic header chain.
+/// Transport hooks were deferred in both earlier passes, so each runs once.
+async fn encode_semantic_cache_replay(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: &mut u16,
+    headers: &mut HashMap<String, String>,
+    body: &mut Bytes,
+) {
+    let transport_plugins: Vec<_> = plugins
+        .iter()
+        .filter(|plugin| plugin.applies_response_transport_encoding())
+        .cloned()
+        .collect();
+    if transport_plugins.is_empty() {
+        return;
+    }
+    // The whole replay is buffered; use its final size for the live minimum
+    // length policy even though storage stripped the origin's wire length.
+    headers.insert("content-length".to_string(), body.len().to_string());
+    for plugin in &transport_plugins {
+        let result = crate::plugins::await_precommit_response_phase(
+            ctx.precommit_response_phase_bound(),
+            plugin.after_proxy(ctx, *status, headers),
+        )
+        .await
+        .into_plugin_result(ctx);
+        if let Some(reject) = plugin_result_into_reject_parts(result) {
+            install_final_header_policy_rejection(ctx, status, headers, body, reject, true, false);
+            return;
+        }
+        ctx.record_deadline_response_header_plugin(plugin.as_ref(), headers);
+    }
+    // Reuse the bounded producer window, deadline handling, and identity/406
+    // fallback from the shared buffered pipeline. Only transport producers run;
+    // semantic transforms and plaintext policy already ran in the finalizer.
+    transform_buffered_response_body_with_deadline(
+        &transport_plugins,
+        ctx,
+        crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated,
+        status,
+        headers,
+        body,
+        None,
+        &[],
+    )
+    .await;
 }
 
 pub(crate) async fn run_after_proxy_hooks(
