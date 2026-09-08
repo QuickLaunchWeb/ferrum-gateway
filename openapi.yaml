@@ -4358,6 +4358,13 @@ paths:
         Returns the complete gateway configuration as a single JSON document
         suitable for archival or later restoration via `POST /restore`.
 
+        The unmodified JSON can also be provisioned as
+        `FERRUM_DB_CONFIG_BACKUP_PATH` for database-mode startup fallback
+        (stable regular file, at most 64 MiB). Bootstrap admits only the
+        configured namespace's runtime resources and ignores administrative
+        metadata, API specs and gateway trust bundles. Gateway trust remains
+        unresolved until an authoritative database reload.
+
         The output format is compatible with `POST /batch` (additive import)
         and `POST /restore` (full replacement). Consumer credentials are
         included **unredacted** since this is a backup endpoint. Backup

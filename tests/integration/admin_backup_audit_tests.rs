@@ -416,6 +416,37 @@ fn assert_no_secret_canaries(value: &Value) {
 }
 
 #[tokio::test]
+async fn restore_consumer_admission_rejects_conflicts_without_replacing_resources() {
+    let tmp = TempDir::new().unwrap();
+    let db = make_store(&tmp).await;
+    db.create_proxy(&create_test_proxy("retained", "/retained"))
+        .await
+        .unwrap();
+    let (base, _shutdown) = start_admin(admin_state(db)).await;
+    let admin = token("restore-admin", Some("admin"));
+    let response = reqwest::Client::new()
+        .post(format!("{base}/restore?confirm=true"))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "version": "1", "proxies": [], "upstreams": [], "plugin_configs": [],
+            "consumers": [
+                {"id": "a", "username": "shared"},
+                {"id": "b", "username": "shared"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert!(body.to_string().contains("consumer username"));
+    let (status, backup, _) = get_backup(&base, "/backup", &admin, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(backup["proxies"][0]["id"], "retained");
+    assert_eq!(backup["consumers"], json!([]));
+}
+
+#[tokio::test]
 async fn backup_success_writes_audit_with_counts_bytes_and_request_id() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
