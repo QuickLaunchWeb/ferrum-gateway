@@ -7188,13 +7188,15 @@ async fn semantic_cache_compression_replay_encodes_once() {
     use std::io::Read;
 
     let cache = make_plugin(json!({}));
-    let compression =
-        Arc::new(CompressionPlugin::new(&json!({"min_content_length": 10})).unwrap()) as Arc<dyn Plugin>;
+    let compression = Arc::new(CompressionPlugin::new(&json!({"min_content_length": 10})).unwrap())
+        as Arc<dyn Plugin>;
     let request = serde_json::to_string(&semantic_request_body()).unwrap();
     let (mut ctx, result) = run_lookup(&cache, &request, None).await;
     assert!(matches!(result, PluginResult::Continue));
     ctx.headers.insert("accept-encoding".into(), "gzip".into());
-    compression.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    compression
+        .before_proxy(&mut ctx, &mut HashMap::new())
+        .await;
     let response = json!({"answer": "Paris is the capital of France. ".repeat(20)});
     let original = serde_json::to_vec(&response).unwrap();
     let mut status = 200;
@@ -7203,7 +7205,9 @@ async fn semantic_cache_compression_replay_encodes_once() {
         ("content-length".into(), original.len().to_string()),
     ]);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
-    compression.after_proxy(&mut ctx, status, &mut headers).await;
+    compression
+        .after_proxy(&mut ctx, status, &mut headers)
+        .await;
     let mut body = bytes::Bytes::from(original.clone());
     let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[Arc::clone(&compression)],
@@ -7232,7 +7236,9 @@ async fn semantic_cache_compression_replay_encodes_once() {
     };
     assert_eq!(body.as_ref(), original.as_slice());
     assert!(!headers.contains_key("content-encoding"));
-    hit_ctx.headers.insert("accept-encoding".into(), "gzip".into());
+    hit_ctx
+        .headers
+        .insert("accept-encoding".into(), "gzip".into());
     compression
         .before_proxy(&mut hit_ctx, &mut HashMap::new())
         .await;
@@ -7289,7 +7295,12 @@ async fn semantic_cache_encoded_admission_is_bounded_and_fail_closed() {
         ),
         ("gzip", trailing, "application/json", false),
         ("zstd", encoded.clone(), "application/json", false),
-        ("gzip, gzip, gzip", encoded.clone(), "application/json", false),
+        (
+            "gzip, gzip, gzip",
+            encoded.clone(),
+            "application/json",
+            false,
+        ),
         ("gzip", encoded, "text/event-stream", false),
     ] {
         let plugin = make_plugin(json!({"max_entry_size_bytes": 1024}));
@@ -7304,7 +7315,10 @@ async fn semantic_cache_encoded_admission_is_bounded_and_fail_closed() {
             .on_final_response_body(&mut ctx, 200, &headers, &body)
             .await;
         let (_, result) = run_lookup(&plugin, &request, None).await;
-        assert_eq!(matches!(result, PluginResult::RejectBinary { .. }), admitted);
+        assert_eq!(
+            matches!(result, PluginResult::RejectBinary { .. }),
+            admitted
+        );
         if let PluginResult::RejectBinary { headers, body, .. } = result {
             assert_eq!(body.as_ref(), valid);
             for name in ["content-encoding", "etag", "content-length"] {
