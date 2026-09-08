@@ -5520,17 +5520,17 @@ fn extract_known_path(
         ),
         // A single Anthropic Messages streaming event delivered as JSON. Live
         // event streams are handled by [`SSE_DELTA_RESPONSE_PATHS`].
-        "$.content_block_delta.delta.text" => {
-            if json.get("type").and_then(Value::as_str) == Some("content_block_delta") {
-                extract_text_value(
-                    json.get("delta").and_then(|delta| delta.get("text")),
-                    direction,
-                    SegmentKind::AssistantMessage,
-                    Some("assistant".to_string()),
-                    Some(prefixed_json_path(prefix, "$.delta.text".to_string())),
-                    segments,
-                );
-            }
+        "$.content_block_delta.delta.text"
+            if json.get("type").and_then(Value::as_str) == Some("content_block_delta") =>
+        {
+            extract_text_value(
+                json.get("delta").and_then(|delta| delta.get("text")),
+                direction,
+                SegmentKind::AssistantMessage,
+                Some("assistant".to_string()),
+                Some(prefixed_json_path(prefix, "$.delta.text".to_string())),
+                segments,
+            );
         }
         _ => {}
     }
@@ -5714,7 +5714,10 @@ fn extract_content_block_text(
             direction,
             kind,
             role.map(str::to_string),
-            Some(prefixed_json_path(prefix, format!("{base_path}[{block_index}].text"))),
+            Some(prefixed_json_path(
+                prefix,
+                format!("{base_path}[{block_index}].text"),
+            )),
             text,
             segments,
         );
