@@ -664,10 +664,7 @@ impl std::fmt::Display for AcceptRecord {
         write!(
             f,
             "#{} backend_port={} peer={} t=+{}ms",
-            self.index,
-            self.backend_port,
-            self.peer,
-            self.since_start_ms
+            self.index, self.backend_port, self.peer, self.since_start_ms
         )
     }
 }
