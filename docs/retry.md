@@ -355,4 +355,6 @@ This is equivalent to the minimal configuration since `retryable_status_codes` d
 
 ### TCP passthrough connection retries
 
+Both terminating TCP/TCP+TLS and passthrough retries resolve connect timeouts from the currently selected DestinationRule policy port on every dial. The target that successfully connects supplies the relay's TCP idle timeout, including an explicit zero (disabled). A port without overrides falls back to proxy/global defaults, never to the initial target's overrides. Policy ports remain distinct from workload dial ports.
+
 TCP passthrough honors `retry_on_connect_failure` and `max_retries` for DNS, circuit-breaker admission, per-target connection-cap admission, and plain TCP connect failures. Each retry uses the existing healthy-target selection and mesh enforcement, preserves the original stream authorization deadline, and resolves the selected target's per-port connect timeout and connection accounting. The successful target's per-port TCP idle timeout governs the relay. ClientHello peeking and stream-connect plugins run once; outbound PROXY framing and encrypted client bytes are forwarded only after connection setup succeeds. No retry occurs after outbound framing or relay begins.
