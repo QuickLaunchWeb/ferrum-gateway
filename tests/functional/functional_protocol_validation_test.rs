@@ -347,11 +347,9 @@ where
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).await.expect("read chunk size");
-                let size = usize::from_str_radix(
-                    line.trim().split(';').next().expect("chunk size"),
-                    16,
-                )
-                .expect("valid chunk size");
+                let size =
+                    usize::from_str_radix(line.trim().split(';').next().expect("chunk size"), 16)
+                        .expect("valid chunk size");
                 if size == 0 {
                     loop {
                         line.clear();
@@ -369,7 +367,10 @@ where
                     .await
                     .expect("read chunk data");
                 let mut ending = [0u8; 2];
-                reader.read_exact(&mut ending).await.expect("read chunk CRLF");
+                reader
+                    .read_exact(&mut ending)
+                    .await
+                    .expect("read chunk CRLF");
                 assert_eq!(&ending, b"\r\n");
             }
         })
