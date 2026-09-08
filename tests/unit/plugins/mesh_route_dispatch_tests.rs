@@ -2249,11 +2249,8 @@ async fn rewrite_composition_refuses_new_dot_segments_before_publication() {
             ("/api..hidden/users", Some("/v2/..hidden/users")),
             ("/other/users", None),
         ] {
-            let mut ctx = RequestContext::new(
-                "127.0.0.1".to_string(),
-                "GET".to_string(),
-                path.to_string(),
-            );
+            let mut ctx =
+                RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
             let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
             if expected.is_some() || path.starts_with("/other") {
                 assert!(

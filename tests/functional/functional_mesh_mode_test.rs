@@ -20880,13 +20880,8 @@ async fn drive_inbound_authority_policy_matrix() -> Result<(), String> {
         let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
         let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
         let backend_port = start_labeled_echo_backend("authority-workload-ok").await;
-        let mut slice = inbound_authz_slice(
-            &node_id,
-            server_spiffe,
-            client_spiffe,
-            backend_port,
-            true,
-        );
+        let mut slice =
+            inbound_authz_slice(&node_id, server_spiffe, client_spiffe, backend_port, true);
         let canonical = format!("echo:{backend_port}");
         let padded = format!("echo:0{backend_port}");
         let mut rules = Vec::new();
