@@ -2416,10 +2416,8 @@ async fn response_transform_size_policy_admits_the_exact_boundary() {
         let mut ctx = make_ctx();
         ctx.max_response_body_size_bytes = 128;
         let mut status = 200;
-        let mut headers = HashMap::from([(
-            "content-type".to_string(),
-            "application/json".to_string(),
-        )]);
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
         stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
         let mut body = bytes::Bytes::from_static(b"{}");
         let logs = capture_debug_logs(|| async {
@@ -2555,9 +2553,15 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
     assert_eq!(warnings.len(), 1, "{logs}");
     assert!(warnings[0].contains("response_transformer"), "{logs}");
     assert!(warnings[0].contains("proxy_id="), "{logs}");
-    assert!(warnings[0].contains("produced_bytes_at_least=210"), "{logs}");
+    assert!(
+        warnings[0].contains("produced_bytes_at_least=210"),
+        "{logs}"
+    );
     assert!(warnings[0].contains("ceiling=40"), "{logs}");
-    assert!(!logs.contains(&"x".repeat(200)), "payload must not be logged");
+    assert!(
+        !logs.contains(&"x".repeat(200)),
+        "payload must not be logged"
+    );
     assert!(
         !take_buffered_response_capacity_refusal_pending_for_test(&mut loop_ctx),
         "the shared transform loop must consume the pending signal"
