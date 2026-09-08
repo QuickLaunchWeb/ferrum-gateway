@@ -19,31 +19,175 @@ async fn read_bytes(stream: &mut (impl AsyncRead + Unpin), bytes: &mut [u8]) {
 // occupied socket before it is released. Only the supervisor may reconcile it.
 #[tokio::test]
 async fn stream_supervisor_recovers_bind_without_config_change() {
+    let mut bind_races = Vec::new();
+    for attempt in 1..=ports::BIND_DROP_SPAWN_ATTEMPTS {
+        let blocked = ports::reserve_port().await.unwrap();
+        let port = blocked.port;
+        let config = GatewayConfig {
+            proxies: vec![create_stream_proxy("recovery", BackendScheme::Tcp, port)],
+            ..empty_config()
+        };
+        let manager = Arc::new(create_manager(config));
+        assert_eq!(manager.reconcile().await.len(), 1);
+        assert!(!manager.is_ready());
+        assert_eq!(manager.overload_snapshot().bind_failures_total, 1);
+        manager.start_supervisor();
+        manager.start_supervisor(); // Idempotent: there is only one retry owner.
+        tokio::task::yield_now().await;
+        drop(blocked);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::resume();
+        let started = manager.wait_until_started(Duration::from_secs(5)).await;
+        if started.is_err() {
+            let failures = manager.stream_bind_failures();
+            // Prove a competitor owns the released port before retrying. The
+            // original collision snapshot alone could hide a broken supervisor.
+            let probe = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
+            let stolen = probe
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::AddrInUse);
+            manager.shutdown_all().await;
+            assert!(
+                stolen && only_port_collision(&failures, port),
+                "supervisor did not recover port {port}: {started:?}; failures={failures:?}"
+            );
+            bind_races.push(format!("attempt {attempt}, port {port}: {failures:?}"));
+            continue;
+        }
+        assert!(manager.is_ready());
+        assert_eq!(manager.overload_snapshot().bind_failures_total, 0);
+        manager.shutdown_all().await;
+        assert!(!manager.is_ready());
+        return;
+    }
+    panic!("supervisor recovery exhausted fresh-port attempts: {bind_races:?}");
+}
+
+fn only_port_collision(
+    failures: &[ferrum_edge::proxy::stream_listener::StreamBindFailure],
+    port: u16,
+) -> bool {
+    !failures.is_empty()
+        && failures.iter().all(|failure| {
+            failure.listen_port == port
+                && matches!(failure.kind, StreamListenerDegradation::BindFailed)
+                && failure.error.contains("already in use")
+        })
+}
+
+#[tokio::test]
+async fn stream_supervisor_retries_soft_degradation_without_withdrawing_readiness() {
     let blocked = ports::reserve_port().await.unwrap();
-    let port = blocked.port;
+    let mut proxy = create_stream_proxy("deferred", BackendScheme::Tcp, blocked.port);
+    proxy.frontend_tls = true;
     let config = GatewayConfig {
-        proxies: vec![create_stream_proxy("recovery", BackendScheme::Tcp, port)],
+        proxies: vec![proxy],
         ..empty_config()
     };
-    let manager = Arc::new(create_manager(config));
-    assert_eq!(manager.reconcile().await.len(), 1);
-    assert!(!manager.is_ready());
-    assert_eq!(manager.overload_snapshot().bind_failures_total, 1);
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = Arc::new(create_manager_with_config_arc(config_arc.clone(), &config));
+    assert!(manager.reconcile().await.is_empty());
+    assert!(manager.is_ready());
+    assert!(manager.has_degraded_listeners());
     manager.start_supervisor();
-    manager.start_supervisor(); // Idempotent: there is only one retry owner.
     tokio::task::yield_now().await;
-    drop(blocked);
+    // Only the supervisor may reconcile this withdrawal. It must retry soft
+    // degradation even though readiness never went false.
+    config_arc.store(Arc::new(empty_config()));
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(30)).await;
     tokio::time::resume();
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while manager.has_degraded_listeners() {
+            assert!(manager.is_ready());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor must reconcile soft degradation using current config");
     assert!(manager.is_ready());
-    assert_eq!(manager.overload_snapshot().bind_failures_total, 0);
     manager.shutdown_all().await;
-    assert!(!manager.is_ready());
+}
+
+#[tokio::test]
+async fn stream_readiness_grants_pending_bind_grace_but_rejects_exited_task() {
+    let mut bind_races = Vec::new();
+    for attempt in 1..=ports::BIND_DROP_SPAWN_ATTEMPTS {
+        let port = ports::reserve_port().await.unwrap().drop_and_take_port();
+        let mut config = GatewayConfig {
+            proxies: vec![create_stream_proxy("pending", BackendScheme::Tcp, port)],
+            ..empty_config()
+        };
+        let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+        let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        manager.set_global_shutdown_rx(shutdown_rx);
+        let failures = manager.reconcile().await;
+        if failures.is_empty() {
+            // On this current-thread runtime the spawned task has not been
+            // polled yet. A zero-duration startup check proves it is pending.
+            assert!(manager.wait_until_started(Duration::ZERO).await.is_err());
+            assert!(manager.is_ready());
+            assert!(!manager.has_degraded_listeners());
+            let started = manager.wait_until_started(Duration::from_secs(5)).await;
+            if started.is_ok() {
+                assert!(manager.is_ready());
+                // Force a normal runtime restart on the same port. Check each
+                // reconcile suspension, including the old task's planned exit,
+                // so a transient 503 cannot hide behind the final snapshot.
+                config.proxies[0].passthrough = true;
+                config_arc.store(Arc::new(config));
+                let reconcile = manager.reconcile();
+                tokio::pin!(reconcile);
+                let failures = std::future::poll_fn(|cx| {
+                    if manager.stream_bind_failures().is_empty() {
+                        assert!(manager.is_ready(), "readiness flapped before reconcile poll");
+                    }
+                    let result = std::future::Future::poll(reconcile.as_mut(), cx);
+                    if manager.stream_bind_failures().is_empty() {
+                        assert!(manager.is_ready(), "readiness flapped after reconcile poll");
+                    }
+                    result
+                })
+                .await;
+                let restarted = manager.wait_until_started(Duration::from_secs(5)).await;
+                if !failures.is_empty() || restarted.is_err() {
+                    let failures = manager.stream_bind_failures();
+                    manager.shutdown_all().await;
+                    assert!(
+                        only_port_collision(&failures, port),
+                        "runtime restart failed on port {port}: {restarted:?}; {failures:?}"
+                    );
+                    bind_races.push(format!("attempt {attempt}, port {port}: {failures:?}"));
+                    continue;
+                }
+                assert!(manager.is_ready());
+                shutdown_tx.send(true).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while manager.is_ready() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("completed listener task must withdraw readiness");
+                // No manager stop/drain latch or hard error supplies this
+                // verdict: a clean task exit alone must withdraw readiness.
+                assert!(manager.has_degraded_listeners());
+                assert!(manager.stream_bind_failures().is_empty());
+                manager.shutdown_all().await;
+                return;
+            }
+        }
+        let failures = manager.stream_bind_failures();
+        manager.shutdown_all().await;
+        assert!(
+            only_port_collision(&failures, port),
+            "pending-bind fixture failed on port {port}: {failures:?}"
+        );
+        bind_races.push(format!("attempt {attempt}, port {port}: {failures:?}"));
+    }
+    panic!("pending-bind fixture exhausted fresh-port attempts: {bind_races:?}");
 }
 
 #[tokio::test]
@@ -67,15 +211,18 @@ async fn stream_supervisor_does_not_restore_withdrawn_or_shutdown_listener() {
             assert!(manager.reconcile().await.is_empty());
             assert!(manager.is_ready());
         }
-        drop(blocked);
+        // Keep ownership across the tick instead of dropping and rebinding a
+        // port another fixture could steal. Inspect the manager as well so a
+        // stale recovery attempt cannot hide behind this occupied socket.
+        let guard = blocked.into_listener();
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
         tokio::time::resume();
-        // Exclusive bind proves no stale task reclaimed the withdrawn port.
-        let guard = tokio::net::TcpListener::bind(("127.0.0.1", port))
-            .await
-            .unwrap();
+        assert!(manager.active_binds().await.is_empty());
+        if !shutdown {
+            assert!(manager.stream_bind_failures().is_empty());
+        }
         assert!(manager.reconcile().await.is_empty());
         drop(guard);
         manager.shutdown_all().await;

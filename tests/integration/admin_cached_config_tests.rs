@@ -21,6 +21,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[allow(dead_code)]
+#[path = "../scaffolding/ports.rs"]
+mod ports;
+
 /// Test configuration
 #[derive(Clone)]
 struct TestConfig {
@@ -1245,6 +1249,158 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
     assert_eq!(body["ready"], true);
+}
+
+fn stream_readiness_admin_state(
+    tc: &TestConfig,
+    proxy_state: Option<ferrum_edge::proxy::ProxyState>,
+    mode: &str,
+) -> AdminState {
+    AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(tc),
+        metrics_auth: Default::default(),
+        cached_config: None,
+        proxy_state,
+        mode: mode.to_string(),
+        read_only: true,
+        admin_audit_enabled: false,
+        admin_audit_fallback_dir: Some(crate::common::isolated_audit_fallback_dir()),
+        admin_require_namespace_claim: false,
+        startup_ready: Some(Arc::new(AtomicBool::new(true))),
+        serving_degraded: None,
+        serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
+        db_available: None,
+        config_rejected: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "127.0.0.1".to_string(),
+        admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        cached_db_health: Arc::new(ArcSwap::from_pointee(None)),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
+        runtime_config_apply: None,
+    }
+}
+
+/// Exercise handle_admin_request_inner through the real HTTP server with a
+/// full ProxyState. The held port makes the hard failure deterministic; soft
+/// deferral must skip that same occupied port before the bind probe.
+#[tokio::test]
+async fn test_stream_listener_health_and_status_readiness_tiers() {
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::stream_listener::StreamListenerDegradation;
+
+    let tc = TestConfig::default();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for (mode, frontend_tls) in [
+        ("dp", Some(false)),
+        ("dp", Some(true)),
+        ("cp", None),
+        ("node_agent", None),
+    ] {
+        let blocked = ports::reserve_port().await.unwrap();
+        let (runtime_shutdown, runtime_shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut background_tasks = Vec::new();
+        let mut manager = None;
+        let proxy_state = if let Some(frontend_tls) = frontend_tls {
+            let mut proxy = create_test_proxy("stream-readiness", "/", "127.0.0.1", 9999);
+            proxy.listen_path = None;
+            proxy.listen_port = Some(blocked.port);
+            proxy.backend_scheme = Some(BackendScheme::Tcp);
+            proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+            proxy.frontend_tls = frontend_tls;
+            let config = GatewayConfig {
+                proxies: vec![proxy],
+                ..GatewayConfig::default()
+            };
+            let env_config = EnvConfig {
+                stream_proxy_bind_address: "127.0.0.1".to_string(),
+                pool_warmup_enabled: false,
+                ..EnvConfig::default()
+            };
+            let (proxy, tasks) = ProxyState::new(
+                config,
+                DnsCache::new(DnsConfig::default()),
+                env_config,
+                None,
+                Some(runtime_shutdown_rx),
+            )
+            .expect("stream readiness proxy state");
+            background_tasks = tasks;
+            let listeners = proxy.stream_listener_manager.clone();
+            let failures = listeners.reconcile().await;
+            assert_eq!(failures.len(), usize::from(!frontend_tls));
+            let snapshot = listeners.stream_bind_failures();
+            assert_eq!(snapshot.len(), 1);
+            assert!(matches!(
+                (frontend_tls, snapshot[0].kind),
+                (true, StreamListenerDegradation::FrontendTlsDeferred)
+                    | (false, StreamListenerDegradation::BindFailed)
+            ));
+            manager = Some(listeners);
+            Some(proxy)
+        } else {
+            None
+        };
+        let state = stream_readiness_admin_state(&tc, proxy_state, mode);
+        let (base_url, admin_shutdown) = start_test_admin(state).await;
+        let ready = frontend_tls != Some(false);
+        let status = if frontend_tls.is_some() {
+            "degraded"
+        } else {
+            "ok"
+        };
+        for path in ["/health", "/status"] {
+            for detailed in [false, true] {
+                let mut request = client.get(format!("{base_url}{path}"));
+                if detailed {
+                    request = request.bearer_auth(generate_test_token(&tc));
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), if ready { 200 } else { 503 });
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["status"], status);
+                assert_eq!(body["ready"], ready);
+                if detailed {
+                    assert_eq!(body["mode"], mode);
+                } else {
+                    assert_eq!(body, json!({"status": status, "ready": ready}));
+                }
+            }
+        }
+        admin_shutdown.send(true).unwrap();
+        if let Some(manager) = manager {
+            manager.shutdown_all().await;
+        }
+        let _ = runtime_shutdown.send(true);
+        for task in background_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(blocked);
+    }
 }
 
 // ---- Config updates are reflected in cached reads ----

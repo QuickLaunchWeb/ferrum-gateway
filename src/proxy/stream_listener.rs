@@ -1118,7 +1118,7 @@ pub struct StreamListenerManager {
     supervisor_started: AtomicBool,
     reconciled: AtomicBool,
     stopped: AtomicBool,
-    serving_tasks: arc_swap::ArcSwap<Vec<(Arc<AtomicBool>, tokio::task::AbortHandle)>>,
+    serving_tasks: arc_swap::ArcSwap<Vec<tokio::task::AbortHandle>>,
     listeners: Arc<tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>>,
     dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
     stream_backend_metrics: arc_swap::ArcSwap<Vec<StreamBackendMetricEntry>>,
@@ -2332,7 +2332,9 @@ impl StreamListenerManager {
                 if manager.is_stopping() {
                     break;
                 }
-                if manager.reconciled.load(Ordering::Acquire) && !manager.is_ready() {
+                if manager.reconciled.load(Ordering::Acquire)
+                    && (!manager.is_ready() || manager.has_degraded_listeners())
+                {
                     manager.reconcile().await;
                 }
             }
@@ -2350,17 +2352,27 @@ impl StreamListenerManager {
                 .is_some_and(|rx| *rx.borrow())
     }
 
-    /// Current serving truth without locks or I/O. Task completion also catches
-    /// panics, which cannot publish a normal listener failure diagnostic.
+    /// Recoverable readiness without locks or I/O. Soft TLS/DTLS deferrals and
+    /// pending binds do not withdraw a replica whose other listeners can serve.
+    /// Task completion fails readiness regardless of whether it ever started,
+    /// including panics that cannot publish a normal failure diagnostic.
     pub fn is_ready(&self) -> bool {
         !self.stopped.load(Ordering::Acquire)
             && !self.overload.draining.load(Ordering::Acquire)
-            && self.bind_failures.load().is_empty()
-            && self
-                .serving_tasks
+            && !self
+                .bind_failures
                 .load()
                 .iter()
-                .all(|(started, task)| started.load(Ordering::Acquire) && !task.is_finished())
+                .any(|failure| failure.kind.is_hard_bind_failure())
+            && self.serving_tasks.load().iter().all(|task| !task.is_finished())
+    }
+
+    /// Any recorded degradation or exited task, including non-fatal frontend
+    /// TLS/DTLS deferrals. Pending binds alone are not degraded. Used for the
+    /// admin health status and recovery retries independently of readiness.
+    pub fn has_degraded_listeners(&self) -> bool {
+        !self.bind_failures.load().is_empty()
+            || self.serving_tasks.load().iter().any(|task| task.is_finished())
     }
 
     /// Reconcile active listeners against the current config.
@@ -3003,6 +3015,22 @@ impl StreamListenerManager {
         // away, so an old rule cannot outlive its listener. New destinations
         // are not added here — they wait until bind succeeds below.
         let exclude: std::collections::HashSet<String> = to_remove.iter().cloned().collect();
+        if !exclude.is_empty() {
+            // Planned retirement is part of pending-bind grace. Stop tracking
+            // live handles BEFORE signalling them, so their expected exit
+            // cannot flap readiness while reconcile awaits shutdown/rebind.
+            // Already-exited tasks remain failures until replacement is
+            // published at the end of reconcile.
+            self.serving_tasks.store(Arc::new(
+                listeners
+                    .iter()
+                    .filter(|(key, handle)| {
+                        !exclude.contains(*key) || handle.join_handle.is_finished()
+                    })
+                    .map(|(_, handle)| handle.join_handle.abort_handle())
+                    .collect(),
+            ));
+        }
         drop(listeners);
         self.publish_serving_node_waypoint_udp_steering(&exclude)
             .await;
@@ -3813,7 +3841,7 @@ impl StreamListenerManager {
         self.serving_tasks.store(Arc::new(
             listeners
                 .values()
-                .map(|handle| (handle.started.clone(), handle.join_handle.abort_handle()))
+                .map(|handle| handle.join_handle.abort_handle())
                 .collect(),
         ));
         drop(listeners);

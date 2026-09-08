@@ -2644,6 +2644,10 @@ async fn handle_admin_request_inner(
             .proxy_state
             .as_ref()
             .is_some_and(|proxy| !proxy.stream_listener_manager.is_ready());
+        let stream_listeners_degraded = state
+            .proxy_state
+            .as_ref()
+            .is_some_and(|proxy| proxy.stream_listener_manager.has_degraded_listeners());
         let ready = startup_ready
             && !serving_degraded
             && jwks_ready
@@ -2655,7 +2659,7 @@ async fn handle_admin_request_inner(
             && !stream_listeners_not_ready
             && !draining;
         health_status["ready"] = json!(ready);
-        if gateway_listeners_degraded || stream_listeners_not_ready {
+        if gateway_listeners_degraded || stream_listeners_degraded || stream_listeners_not_ready {
             health_status["status"] = json!("degraded");
         }
         // Ports, sanitized error detail, config generation, and occurrence

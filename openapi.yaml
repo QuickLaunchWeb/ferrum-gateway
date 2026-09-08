@@ -328,10 +328,14 @@ paths:
         `listener_failures` snapshot.
 
         **Stream listeners** (TCP/UDP/TLS/DTLS) also have recoverable readiness:
-        a configured listener that is unbound, deferred, or whose task exited
+        a configured listener with a hard bind/backend-TLS failure or whose task exited
         returns `503`, `status: "degraded"`, and `ready: false`. A supervisor
         retries every 30 seconds using current configuration. Readiness recovers
-        when the listener serves or is removed. Initial bind failures remain
+        when the hard failure clears or the listener is removed. Soft frontend
+        TLS/DTLS deferrals and DTLS config-build failures report `status: "degraded"`
+        with HTTP 200 and `ready: true` when otherwise healthy. A pending
+        asynchronous bind alone does not degrade health or withdraw readiness
+        during runtime reconciliation. Initial hard bind failures remain
         fatal in file/database mode and non-fatal in DP mode. Detailed failures
         remain on authenticated `/overload`; `/live` is unaffected.
 
@@ -12474,11 +12478,13 @@ components:
             DestinationRule `trafficPolicy.tls.sni` and Gateway API
             `BackendTLSPolicy` `validation.hostname` both project to this
             field. Enforced at the backend handshake on every path where
-            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, and the
+            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, terminating
+            `tcp`/`tcp_tls` streams that originate backend TLS, and the
             reqwest HTTP/1.1 dial (which carries the override in the request
             URL authority while pinning the socket to the selected target).
-            It also partitions backend connection pools, so two values never
-            share a connection. Must be an exact DNS hostname — not a
+            It also partitions HTTP-family backend connection pools, so two
+            values never share a connection. Stream proxies do not pool
+            connections. Must be an exact DNS hostname — not a
             wildcard and not an IP literal (RFC 6066 §3). Because the reqwest
             HTTP/1.1 dial serves them, this field is accepted alongside
             effective retry, request-body-buffering plugins, and
@@ -13874,8 +13880,12 @@ components:
             audit pipeline cannot durably record committed mutations (see
             `audit_pipeline`), an active remote JWKS store is in grace after
             its refresh interval, or a recoverable dynamic Gateway API listener
-            failure is active. A configured non-serving stream listener also
-            reports `degraded`, always with HTTP 503 and `ready: false`. The
+            failure is active. A configured stream listener with a hard
+            bind/backend-TLS failure or an exited task reports `degraded` with
+            HTTP 503 and `ready: false`. Soft frontend TLS/DTLS deferrals and
+            DTLS config-build failures report `degraded` with HTTP 200 and
+            `ready: true` when otherwise healthy. Pending asynchronous binds
+            alone do not degrade health during runtime reconciliation. The
             other degraded conditions stay ready with HTTP 200 except when
             `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`, which makes
             the Gateway-listener case not ready with HTTP 503 while preserving
@@ -13918,8 +13928,10 @@ components:
         ready:
           type: boolean
           description: |
-            `true` once the gateway has finished startup AND every configured
-            stream listener is currently serving AND no supervised
+            `true` once the gateway has finished startup AND no configured
+            stream listener has a hard bind/backend-TLS failure or an exited
+            task (soft frontend TLS/DTLS deferrals, DTLS config-build failures,
+            and pending asynchronous binds do not withdraw readiness) AND no supervised
             serving listener (or, in control-plane mode, the database config
             poll task) has failed unexpectedly since AND no active remote JWKS
             store is past its maximum-stale deadline AND no service-discovery
