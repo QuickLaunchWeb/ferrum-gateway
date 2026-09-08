@@ -1462,6 +1462,30 @@ upstreams:
 ```
 
 The Kubernetes provider lists `EndpointSlice` objects for the configured service and publishes only lifecycle-eligible endpoints. Semantics match the controller path: `terminating=true` is never routable (even when `ready=true`), explicit `serving=false` is skipped, and omitted `ready`/`serving` follow Kubernetes tri-state defaults. Each poll rebuilds the upstream's load-balancer targets from the latest snapshot, so a draining endpoint is removed from the live set while healthy peers remain. Provider-reported `port` values must be integers in `1..=65535`; malformed or out-of-range entries are skipped without wrapping while valid peers in the same snapshot remain published. A successful HTTP response must decode as a typed EndpointSliceList with a required JSON array `items`. `{}`, `{"items":null}`, `{"items":{}}`, invalid JSON, and incompatible top-level shapes are discovery failures that retain the last admitted targets; only a structurally valid `{"items":[]}` is an authoritative empty snapshot that may withdraw targets.
+
+`service_discovery.kubernetes.address_type` accepts `IPv4` or `IPv6`.
+Omitting it (or setting `null`) automatically chooses IPv4 when the snapshot
+contains lifecycle-eligible, syntactically valid IPv4 targets with a selected
+port, otherwise IPv6. Only one family is published per Service; duplicate
+slices cannot give dual-stack pods an extra share. Explicit selection never
+falls back to the other family; set `IPv6` for gateways that can only dial IPv6.
+Automatic selection is not a connectivity probe and mixed-family endpoints
+that lack an address in the selected family are excluded. Changing this setting
+on reload replaces the discovery task. Every slice must declare `addressType`
+matching its IP literals. Missing/unknown types, FQDN slices, malformed IPs,
+bracketed addresses, and IPv4-mapped IPv6 addresses are skipped. The shared
+backend egress policy still applies before publication.
+
+Consul and Kubernetes snapshots are deduplicated after host/egress validation
+by canonical IP (or validated hostname) and dial port within each upstream.
+Equivalent IPv6 spellings count once; different ports remain distinct. Registry
+IDs and EndpointSlice names do not add traffic weight. Duplicate weights are
+never summed: the lower weight wins; ties use policy port, locality, path, then
+sorted tags in lexical order. One complete record survives, preserving its
+weight and metadata. Static targets still take precedence, including equivalent
+IP spellings. DNS-SD retains its priority-specific tie-breaking, and mesh
+Service/subset/identity targets retain their own multiplicity.
+
 **Consul**:
 ```yaml
 upstreams:

@@ -1960,9 +1960,22 @@ pub struct DnsSdConfig {
     pub poll_interval_seconds: u64,
 }
 
+/// IP family selected from Kubernetes EndpointSlices.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KubernetesAddressType {
+    #[serde(rename = "IPv4")]
+    Ipv4,
+    #[serde(rename = "IPv6")]
+    Ipv6,
+}
+
 /// Kubernetes service discovery configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KubernetesConfig {
+    /// Select one address family. When omitted, prefer IPv4 if eligible IPv4
+    /// targets exist in the snapshot, otherwise use IPv6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_type: Option<KubernetesAddressType>,
     /// Kubernetes namespace. Default: "default".
     #[serde(default = "default_k8s_namespace")]
     pub namespace: String,
