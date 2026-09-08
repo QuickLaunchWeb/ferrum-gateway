@@ -360,6 +360,15 @@ pub enum SseTextKind {
     /// Anthropic Messages tool-use input document, reassembled from the
     /// `input_json_delta` fragments of one content block (`$.content[*].input`).
     AnthropicToolInput,
+    /// Google Gemini / Vertex assistant text, reassembled from the `text` parts
+    /// of one candidate (`$.candidates[*].content.parts[*].text`).
+    GeminiText,
+    /// Google Gemini / Vertex function-call name
+    /// (`$.candidates[*].content.parts[*].functionCall.name`).
+    GeminiFunctionCallName,
+    /// Google Gemini / Vertex function-call arguments, serialized compactly
+    /// (`$.candidates[*].content.parts[*].functionCall.args`).
+    GeminiFunctionCallArgs,
 }
 
 /// Ceiling on the number of distinct Anthropic content blocks one stream may
@@ -374,11 +383,29 @@ pub enum SseTextKind {
 /// silently dropped — while the retained accumulator count stays bounded at
 /// `MAX_ANTHROPIC_CONTENT_BLOCKS + 1`. Folding also marks the stream
 /// uninspectable (see
-/// [`anthropic_stream_uninspectable`](SseReassembler::anthropic_stream_uninspectable))
+/// [`provider_stream_uninspectable`](SseReassembler::provider_stream_uninspectable))
 /// so a caller that promised inspection fails closed on a shape this far
 /// outside the protocol rather than allowing on merged blocks. Real Anthropic
 /// responses use a handful of blocks.
 pub const MAX_ANTHROPIC_CONTENT_BLOCKS: usize = 64;
+
+/// Ceiling on the number of distinct Gemini candidates one stream may open.
+///
+/// Every `streamGenerateContent?alt=sse` frame repeats the whole
+/// `candidates` array, and a candidate's `index` is provider-supplied, so an
+/// unbounded keying map would let a stream of one-byte text parts at
+/// ever-increasing indexes grow the reassembler's per-candidate overhead
+/// without growing the text the callers' byte budgets account for. Candidates
+/// at or beyond this index are folded into a single shared overflow
+/// accumulator, so their content is still reassembled and inspected — never
+/// silently dropped — while the retained accumulator count stays bounded at
+/// `MAX_GEMINI_CANDIDATES + 1`. Folding also marks the stream uninspectable
+/// (see
+/// [`provider_stream_uninspectable`](SseReassembler::provider_stream_uninspectable))
+/// so a caller that promised inspection fails closed on a shape this far
+/// outside the protocol rather than allowing on merged candidates. Real Gemini
+/// responses cap `candidateCount` in the single digits.
+pub const MAX_GEMINI_CANDIDATES: usize = 64;
 
 /// A coherent text fragment reassembled from many streaming-SSE delta frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +438,29 @@ struct AnthropicBlockAccumulator {
 impl AnthropicBlockAccumulator {
     fn is_empty(&self) -> bool {
         self.name.is_empty() && self.text.is_empty() && self.input_json.is_empty()
+    }
+}
+
+/// One Google Gemini / Vertex candidate, reassembled across the
+/// `streamGenerateContent` frames that carry its incremental parts.
+///
+/// A candidate's consecutive `text` parts are concatenated into one prose
+/// string — the way a client renders them — and its `functionCall` parts
+/// contribute the invoked name plus the compactly serialized `args` document,
+/// the Gemini equivalent of an Anthropic `tool_use` name and input.
+#[derive(Debug, Default, Clone)]
+struct GeminiCandidateAccumulator {
+    /// Concatenated `functionCall.name` values.
+    name: String,
+    /// Concatenated `parts[].text` fragments.
+    text: String,
+    /// Concatenated, compactly serialized `functionCall.args` documents.
+    args_json: String,
+}
+
+impl GeminiCandidateAccumulator {
+    fn is_empty(&self) -> bool {
+        self.name.is_empty() && self.text.is_empty() && self.args_json.is_empty()
     }
 }
 
@@ -463,9 +513,15 @@ pub struct SseReassembler {
     /// consume a block slot or trip the block ceiling, and so a foreign
     /// stream's terminal `event: error` frame stays neutral.
     anthropic_error_text: String,
-    /// Set when part of an identified Anthropic stream could not be reassembled
-    /// into the paths this type exposes. Sticky for the rest of the stream.
-    anthropic_uninspectable: bool,
+    /// Gemini candidates keyed by their `candidates[]` index, bounded by
+    /// [`MAX_GEMINI_CANDIDATES`].
+    gemini_candidates: Vec<(usize, GeminiCandidateAccumulator)>,
+    /// Lookup table for `gemini_candidates`, avoiding linear scans over untrusted indexes.
+    gemini_candidate_positions: HashMap<usize, usize>,
+    /// Set when part of an identified provider stream (Anthropic Messages or
+    /// Gemini `streamGenerateContent`) could not be reassembled into the paths
+    /// this type exposes. Sticky for the rest of the stream.
+    provider_uninspectable: bool,
 }
 
 impl SseReassembler {
@@ -493,6 +549,9 @@ impl SseReassembler {
         for (_index, block) in &self.anthropic_blocks {
             combined.push_str(&block.text);
         }
+        for (_index, candidate) in &self.gemini_candidates {
+            combined.push_str(&candidate.text);
+        }
         combined.push_str(&self.anthropic_error_text);
         combined
     }
@@ -510,10 +569,16 @@ impl SseReassembler {
             .iter()
             .map(|(_, block)| block.text.len())
             .sum();
+        let gemini: usize = self
+            .gemini_candidates
+            .iter()
+            .map(|(_, candidate)| candidate.text.len())
+            .sum();
         completion_text
             .saturating_add(content)
             .saturating_add(responses)
             .saturating_add(anthropic)
+            .saturating_add(gemini)
             .saturating_add(self.anthropic_error_text.len())
     }
 
@@ -558,29 +623,51 @@ impl SseReassembler {
                     .saturating_add(block.input_json.len())
             })
             .sum::<usize>();
+        let gemini = self
+            .gemini_candidates
+            .iter()
+            .map(|(_, candidate)| {
+                candidate
+                    .name
+                    .len()
+                    .saturating_add(candidate.text.len())
+                    .saturating_add(candidate.args_json.len())
+            })
+            .sum::<usize>();
         completion_text
             .saturating_add(content)
             .saturating_add(tool_calls)
             .saturating_add(responses_text)
             .saturating_add(responses_args)
             .saturating_add(anthropic)
+            .saturating_add(gemini)
             .saturating_add(self.anthropic_error_text.len())
     }
 
-    /// `true` when a stream identified as Anthropic Messages carried something
-    /// this reassembler could not fold into its reassembled document: an
-    /// unknown event or `delta.type`, a `content_block_*` event missing its
-    /// `index` / payload, a discriminator disagreement between the SSE `event:`
-    /// line and the JSON `type` field where both name Anthropic events (or the
-    /// stream had already identified itself as Anthropic), an interleaved
-    /// foreign frame, or a block index past [`MAX_ANTHROPIC_CONTENT_BLOCKS`].
+    /// `true` when a stream identified as a provider protocol this reassembler
+    /// models carried something it could not fold into its reassembled
+    /// document.
+    ///
+    /// Anthropic Messages: an unknown event or `delta.type`, a
+    /// `content_block_*` event missing its `index` / payload, a discriminator
+    /// disagreement between the SSE `event:` line and the JSON `type` field
+    /// where both name Anthropic events (or the stream had already identified
+    /// itself as Anthropic), an interleaved foreign frame, or a block index
+    /// past [`MAX_ANTHROPIC_CONTENT_BLOCKS`].
+    ///
+    /// Gemini `streamGenerateContent`: a non-array `candidates`, a candidate or
+    /// part that is not an object, a non-array `content.parts`, a non-string
+    /// `text`, a part kind this reassembler cannot fold (`inlineData`,
+    /// `fileData`, `executableCode`, `codeExecutionResult`, a `thought`
+    /// summary, or a kind added later), a malformed `functionCall`, or a
+    /// candidate index past [`MAX_GEMINI_CANDIDATES`].
     ///
     /// Such a frame may carry client-visible text on a path nothing here reads,
     /// so a caller that promised inspection must treat the whole stream as
     /// uninspectable and fail closed rather than deliver a clean verdict over
     /// content it never scanned. Sticky once set.
-    pub fn anthropic_stream_uninspectable(&self) -> bool {
-        self.anthropic_uninspectable
+    pub fn provider_stream_uninspectable(&self) -> bool {
+        self.provider_uninspectable
     }
 
     /// Reassembled fragments as of now, **without** consuming the accumulator —
@@ -627,7 +714,11 @@ impl SseReassembler {
             || self
                 .anthropic_blocks
                 .iter()
-                .any(|(_index, block)| !block.name.is_empty());
+                .any(|(_index, block)| !block.name.is_empty())
+            || self
+                .gemini_candidates
+                .iter()
+                .any(|(_index, candidate)| !candidate.name.is_empty());
         let has_arguments = self
             .tool_calls
             .iter()
@@ -639,7 +730,11 @@ impl SseReassembler {
             || self
                 .anthropic_blocks
                 .iter()
-                .any(|(_index, block)| !block.input_json.is_empty());
+                .any(|(_index, block)| !block.input_json.is_empty())
+            || self
+                .gemini_candidates
+                .iter()
+                .any(|(_index, candidate)| !candidate.args_json.is_empty());
         let argument_budget = if has_names && has_arguments {
             keep_total.div_ceil(2)
         } else if has_arguments {
@@ -662,12 +757,18 @@ impl SseReassembler {
         for (_index, block) in self.anthropic_blocks.iter_mut().rev() {
             retain_tail_within_budget(&mut block.input_json, &mut argument_remaining);
         }
+        for (_index, candidate) in self.gemini_candidates.iter_mut().rev() {
+            retain_tail_within_budget(&mut candidate.args_json, &mut argument_remaining);
+        }
         let mut name_remaining = name_budget;
         for (_key, accum) in self.tool_calls.iter_mut().rev() {
             retain_tail_within_budget(&mut accum.name, &mut name_remaining);
         }
         for (_index, block) in self.anthropic_blocks.iter_mut().rev() {
             retain_tail_within_budget(&mut block.name, &mut name_remaining);
+        }
+        for (_index, candidate) in self.gemini_candidates.iter_mut().rev() {
+            retain_tail_within_budget(&mut candidate.name, &mut name_remaining);
         }
 
         self.tool_calls
@@ -683,6 +784,7 @@ impl SseReassembler {
             self.responses_args_positions.insert(*output, position);
         }
         self.compact_anthropic_blocks();
+        self.compact_gemini_candidates();
     }
 
     /// Drop fully-drained Anthropic content blocks and rebuild their lookup
@@ -695,6 +797,19 @@ impl SseReassembler {
         self.anthropic_block_positions.clear();
         for (position, (index, _block)) in self.anthropic_blocks.iter().enumerate() {
             self.anthropic_block_positions.insert(*index, position);
+        }
+    }
+
+    /// Drop fully-drained Gemini candidates and rebuild their lookup table.
+    /// A candidate is retained while ANY of its three accumulators still holds
+    /// bytes, so trimming tool state cannot evict a candidate whose prose is
+    /// still awaiting inspection (or vice versa).
+    fn compact_gemini_candidates(&mut self) {
+        self.gemini_candidates
+            .retain(|(_index, candidate)| !candidate.is_empty());
+        self.gemini_candidate_positions.clear();
+        for (position, (index, _candidate)) in self.gemini_candidates.iter().enumerate() {
+            self.gemini_candidate_positions.insert(*index, position);
         }
     }
 
@@ -738,6 +853,9 @@ impl SseReassembler {
         for (_index, block) in &mut self.anthropic_blocks {
             drain_one(&mut block.text, &mut remaining);
         }
+        for (_index, candidate) in &mut self.gemini_candidates {
+            drain_one(&mut candidate.text, &mut remaining);
+        }
         drain_one(&mut self.anthropic_error_text, &mut remaining);
 
         self.completion_text
@@ -757,6 +875,7 @@ impl SseReassembler {
             self.responses_text_positions.insert(*key, position);
         }
         self.compact_anthropic_blocks();
+        self.compact_gemini_candidates();
     }
 
     /// Accumulate one already-parsed SSE `data:` frame whose `event:` name is
@@ -772,6 +891,7 @@ impl SseReassembler {
         self.push_chat_completion_deltas(frame);
         self.push_responses_deltas(frame);
         self.push_anthropic_events(event, frame);
+        self.push_gemini_frame(frame);
     }
 
     /// Consume the accumulator and return the reassembled fragments, dropping any
@@ -857,6 +977,37 @@ impl SseReassembler {
                     kind: SseTextKind::AnthropicToolInput,
                     json_path: format!("$.content[{index}].input"),
                     text: block.input_json,
+                });
+            }
+        }
+        // Gemini candidates reassemble into the same document shape the
+        // buffered `generateContent` response has, so
+        // `$.candidates[*].content.parts[*].text` / `.functionCall.name` /
+        // `.functionCall.args` read a streamed response with no provider
+        // branching at the caller. The `parts[*]` locator is literal: a
+        // candidate's consecutive text parts are joined into one prose string
+        // (the way a client renders them), so the fragment spans the parts
+        // rather than naming one of them.
+        for (index, candidate) in self.gemini_candidates {
+            if !candidate.text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::GeminiText,
+                    json_path: format!("$.candidates[{index}].content.parts[*].text"),
+                    text: candidate.text,
+                });
+            }
+            if !candidate.name.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::GeminiFunctionCallName,
+                    json_path: format!("$.candidates[{index}].content.parts[*].functionCall.name"),
+                    text: candidate.name,
+                });
+            }
+            if !candidate.args_json.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::GeminiFunctionCallArgs,
+                    json_path: format!("$.candidates[{index}].content.parts[*].functionCall.args"),
+                    text: candidate.args_json,
                 });
             }
         }
@@ -950,7 +1101,7 @@ impl SseReassembler {
     /// Anything else inside an identified Anthropic stream — an unknown event,
     /// an unknown `delta.type` such as extended thinking's `thinking_delta`, a
     /// `content_block_*` event missing its `index` or payload, or an
-    /// interleaved foreign frame — sets [`anthropic_uninspectable`] instead of
+    /// interleaved foreign frame — sets [`provider_uninspectable`] instead of
     /// being ignored: it may carry client-visible text on a path this
     /// reassembler does not read, and silently skipping it would let a caller
     /// stamp a clean verdict over content nothing scanned.
@@ -968,11 +1119,11 @@ impl SseReassembler {
                     // them describes the payload and neither can be trusted to
                     // route it, so fail closed.
                     (SseEventName::Anthropic(_), SseEventName::Anthropic(_)) => {
-                        self.anthropic_uninspectable = true;
+                        self.provider_uninspectable = true;
                         return;
                     }
                     _ if self.anthropic_stream => {
-                        self.anthropic_uninspectable = true;
+                        self.provider_uninspectable = true;
                         return;
                     }
                     // Exactly one side names an Anthropic event on a stream
@@ -995,7 +1146,7 @@ impl SseReassembler {
 
         let Some(SseEventName::Anthropic(kind)) = resolved else {
             if self.anthropic_stream {
-                self.anthropic_uninspectable = true;
+                self.provider_uninspectable = true;
             }
             return;
         };
@@ -1017,37 +1168,37 @@ impl SseReassembler {
                 let Some(blocks) = content.as_array() else {
                     // `content` present but not an array: outside the protocol
                     // and possibly carrying text on a path nothing reads.
-                    self.anthropic_uninspectable = true;
+                    self.provider_uninspectable = true;
                     return;
                 };
                 for (position, block) in blocks.iter().enumerate() {
                     if !self.absorb_anthropic_content_block(position, block) {
-                        self.anthropic_uninspectable = true;
+                        self.provider_uninspectable = true;
                     }
                 }
             }
             AnthropicEvent::ContentBlockStart => {
                 self.anthropic_stream = true;
                 let Some(index) = index_field(frame, "index") else {
-                    self.anthropic_uninspectable = true;
+                    self.provider_uninspectable = true;
                     return;
                 };
                 let Some(block) = frame.get("content_block") else {
-                    self.anthropic_uninspectable = true;
+                    self.provider_uninspectable = true;
                     return;
                 };
                 if !self.absorb_anthropic_content_block(index, block) {
-                    self.anthropic_uninspectable = true;
+                    self.provider_uninspectable = true;
                 }
             }
             AnthropicEvent::ContentBlockDelta => {
                 self.anthropic_stream = true;
                 let Some(index) = index_field(frame, "index") else {
-                    self.anthropic_uninspectable = true;
+                    self.provider_uninspectable = true;
                     return;
                 };
                 let Some(delta) = frame.get("delta") else {
-                    self.anthropic_uninspectable = true;
+                    self.provider_uninspectable = true;
                     return;
                 };
                 match delta.get("type").and_then(Value::as_str) {
@@ -1055,7 +1206,7 @@ impl SseReassembler {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             self.anthropic_block_mut(index).text.push_str(text);
                         } else {
-                            self.anthropic_uninspectable = true;
+                            self.provider_uninspectable = true;
                         }
                     }
                     Some("input_json_delta") => {
@@ -1064,7 +1215,7 @@ impl SseReassembler {
                                 .input_json
                                 .push_str(fragment);
                         } else {
-                            self.anthropic_uninspectable = true;
+                            self.provider_uninspectable = true;
                         }
                     }
                     // `thinking_delta`, `signature_delta`, an absent
@@ -1077,7 +1228,7 @@ impl SseReassembler {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             self.anthropic_block_mut(index).text.push_str(text);
                         }
-                        self.anthropic_uninspectable = true;
+                        self.provider_uninspectable = true;
                     }
                 }
             }
@@ -1172,7 +1323,7 @@ impl SseReassembler {
     /// inspection fail closed on it.
     fn anthropic_block_mut(&mut self, index: usize) -> &mut AnthropicBlockAccumulator {
         let key = if index >= MAX_ANTHROPIC_CONTENT_BLOCKS {
-            self.anthropic_uninspectable = true;
+            self.provider_uninspectable = true;
             MAX_ANTHROPIC_CONTENT_BLOCKS
         } else {
             index
@@ -1188,6 +1339,165 @@ impl SseReassembler {
             }
         };
         &mut self.anthropic_blocks[pos].1
+    }
+
+    /// Accumulate one Google Gemini / Vertex `streamGenerateContent?alt=sse`
+    /// frame.
+    ///
+    /// Every frame is a complete `GenerateContentResponse` whose
+    /// `candidates[i].content.parts[j]` carry one incremental piece each, so
+    /// reassembly concatenates them per candidate index into the same document
+    /// shape a buffered `generateContent` response has. Sibling envelope fields
+    /// (`usageMetadata`, `promptFeedback`, `modelVersion`, `finishReason`,
+    /// `safetyRatings`) carry no free model text and are ignored.
+    ///
+    /// Gemini frames carry no event discriminator, so the shape itself selects
+    /// the path (see [`is_gemini_stream_frame`]) and a frame that also carries
+    /// `choices` or a `type` is left to the OpenAI / Anthropic paths rather
+    /// than being read twice. A frame that names Gemini's shape but violates it
+    /// — a non-array `candidates`, a non-object candidate or part, a non-array
+    /// `content.parts`, a non-string `text`, an unfoldable part kind, or a
+    /// candidate index past [`MAX_GEMINI_CANDIDATES`] — sets
+    /// [`provider_uninspectable`]: it may carry client-visible text on a path
+    /// this reassembler does not read.
+    fn push_gemini_frame(&mut self, frame: &Value) {
+        if !is_gemini_stream_frame(frame) {
+            return;
+        }
+        let Some(candidates) = frame.get("candidates").and_then(Value::as_array) else {
+            // `candidates` present but not an array: outside the protocol and
+            // possibly carrying text on a path nothing reads.
+            self.provider_uninspectable = true;
+            return;
+        };
+        for (positional, candidate) in candidates.iter().enumerate() {
+            let Some(object) = candidate.as_object() else {
+                self.provider_uninspectable = true;
+                continue;
+            };
+            // A candidate repeats its own `index` on every frame, which is what
+            // ties a later fragment back to the prose it continues; fall back to
+            // position only when the provider omits it.
+            let index = index_field(candidate, "index").unwrap_or(positional);
+            // A blocked or finished candidate legitimately carries no `content`
+            // (or a `content` with no `parts`) and contributes nothing.
+            let Some(content) = object.get("content") else {
+                continue;
+            };
+            let Some(content) = content.as_object() else {
+                self.provider_uninspectable = true;
+                continue;
+            };
+            let Some(parts) = content.get("parts") else {
+                continue;
+            };
+            let Some(parts) = parts.as_array() else {
+                self.provider_uninspectable = true;
+                continue;
+            };
+            for part in parts {
+                if !self.absorb_gemini_part(index, part) {
+                    self.provider_uninspectable = true;
+                }
+            }
+        }
+    }
+
+    /// Fold one Gemini `content.parts[]` entry into the accumulator for
+    /// `index`.
+    ///
+    /// `false` means the part is a kind this reassembler cannot fold —
+    /// `inlineData`, `fileData`, `executableCode`, `codeExecutionResult`,
+    /// `functionResponse`, a `thought` summary, or a part kind added after this
+    /// code was written — so the caller marks the stream uninspectable, exactly
+    /// as an Anthropic `thinking` block does. A thought part's prose is still
+    /// absorbed where it exists, so nothing is dropped from what is scanned.
+    fn absorb_gemini_part(&mut self, index: usize, part: &Value) -> bool {
+        let Some(object) = part.as_object() else {
+            return false;
+        };
+        // A `thought` part is the model's internal reasoning summary rather
+        // than the client-visible answer; it is scanned but never treated as a
+        // fully modelled part.
+        if object.contains_key("thought") {
+            if let Some(text) = object.get("text").and_then(Value::as_str) {
+                self.gemini_candidate_mut(index).text.push_str(text);
+            }
+            return false;
+        }
+        if let Some(text) = object.get("text") {
+            let Some(text) = text.as_str() else {
+                return false;
+            };
+            self.gemini_candidate_mut(index).text.push_str(text);
+            return true;
+        }
+        if let Some(call) = object.get("functionCall") {
+            return self.absorb_gemini_function_call(index, call);
+        }
+        false
+    }
+
+    /// Fold a `functionCall` part's invoked name and `args` document into that
+    /// candidate's tool accumulators — the Gemini equivalent of an Anthropic
+    /// `tool_use` block's `name` and `input`.
+    ///
+    /// An absent or empty `args` object contributes nothing; a populated one is
+    /// serialized compactly into the same accumulator so the buffered
+    /// `functionCall.args` path reads the streamed form unchanged. Any other
+    /// JSON type for `name` or `args` is outside the protocol and returns
+    /// `false`.
+    fn absorb_gemini_function_call(&mut self, index: usize, call: &Value) -> bool {
+        let Some(object) = call.as_object() else {
+            return false;
+        };
+        if let Some(name) = object.get("name") {
+            let Some(name) = name.as_str() else {
+                return false;
+            };
+            self.gemini_candidate_mut(index).name.push_str(name);
+        }
+        let Some(args) = object.get("args") else {
+            return true;
+        };
+        let Some(map) = args.as_object() else {
+            return false;
+        };
+        if map.is_empty() {
+            return true;
+        }
+        let Ok(serialized) = serde_json::to_string(args) else {
+            return false;
+        };
+        self.gemini_candidate_mut(index)
+            .args_json
+            .push_str(&serialized);
+        true
+    }
+
+    /// Accumulator for one Gemini candidate index, folding indexes at or beyond
+    /// [`MAX_GEMINI_CANDIDATES`] into a single shared overflow bucket so the
+    /// retained accumulator count cannot grow with a provider-chosen index.
+    /// Folded content is still reassembled and inspected; the stream is marked
+    /// uninspectable so callers that promised inspection fail closed on it.
+    fn gemini_candidate_mut(&mut self, index: usize) -> &mut GeminiCandidateAccumulator {
+        let key = if index >= MAX_GEMINI_CANDIDATES {
+            self.provider_uninspectable = true;
+            MAX_GEMINI_CANDIDATES
+        } else {
+            index
+        };
+        let pos = match self.gemini_candidate_positions.get(&key).copied() {
+            Some(pos) => pos,
+            None => {
+                let pos = self.gemini_candidates.len();
+                self.gemini_candidates
+                    .push((key, GeminiCandidateAccumulator::default()));
+                self.gemini_candidate_positions.insert(key, pos);
+                pos
+            }
+        };
+        &mut self.gemini_candidates[pos].1
     }
 
     fn completion_text_mut(&mut self, choice: usize) -> &mut String {
@@ -1256,6 +1566,26 @@ impl SseReassembler {
         };
         &mut self.responses_args[pos].1
     }
+}
+
+/// Whether one parsed SSE `data:` frame is a Google Gemini / Vertex
+/// `streamGenerateContent?alt=sse` frame that [`SseReassembler`] reassembles.
+///
+/// Gemini streams carry no `event:` line and no JSON `type` discriminator —
+/// every frame is a complete `GenerateContentResponse` — so the shape itself is
+/// the signal: a `candidates` member with neither an OpenAI `choices` array nor
+/// an event `type` beside it. Detection is by the MEMBER, not by its JSON type,
+/// so a frame claiming the shape while violating it (a non-array `candidates`)
+/// is still routed here and fails the stream closed rather than slipping past
+/// every provider path unread.
+///
+/// Callers that decide whether an otherwise segment-less window is a governed
+/// provider stream this build cannot map use this to exclude the frames that
+/// ARE now mapped.
+pub fn is_gemini_stream_frame(frame: &Value) -> bool {
+    frame.get("candidates").is_some()
+        && frame.get("choices").is_none()
+        && frame.get("type").is_none()
 }
 
 /// Read a non-negative integer index field (`index`, `output_index`, ...) as a

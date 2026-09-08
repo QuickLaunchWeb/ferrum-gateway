@@ -20,7 +20,8 @@ use super::utils::body_transform::{is_event_stream_content_type, is_json_content
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
     SseEventName, SseReassembler, SseText, SseTextKind, encode_sse_error_event,
-    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames_checked,
+    is_gemini_stream_frame, last_paragraph_boundary, last_sentence_boundary,
+    parse_sse_data_frames_checked,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -101,8 +102,12 @@ pub(crate) const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.output_text",
     "$.output[*].content[*].text",
     "$.output[*].arguments",
-    // Google Gemini / Vertex `generateContent`.
+    // Google Gemini / Vertex `generateContent` — a buffered response, and the
+    // document a streamed `streamGenerateContent?alt=sse` response is
+    // reassembled into by `SseReassembler`.
     "$.candidates[*].content.parts[*].text",
+    "$.candidates[*].content.parts[*].functionCall.name",
+    "$.candidates[*].content.parts[*].functionCall.args",
     // Anthropic Messages completion — a buffered response, and the document a
     // streamed one is reassembled into by `SseReassembler`.
     "$.content[*].text",
@@ -163,17 +168,16 @@ static NEXT_FIREWALL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// non-delta summary event that could otherwise smuggle content past a clean
 /// delta stream.
 ///
-/// `$.candidates[*].content.parts[*].text` — Gemini/Vertex
-/// `streamGenerateContent?alt=sse`, whose frames are the same
-/// `candidates[].content.parts[].text` shape as the non-streaming response but
-/// carry one incremental fragment each — is NOT reassembled yet, so excluding it
-/// makes the stream yield no segments and a caller that asked for stream
-/// inspection fail closed through `handle_uninspectable_buffered_stream`
-/// (buffered) or the unmapped-frame branch of `act_on_window` (windowed) instead
-/// of allowing on a fragment. Reassembling the Gemini stream shape is tracked as
-/// future work ("Gemini stream reassembly", issue #4904).
+/// The three Gemini/Vertex entries are excluded for the same reason as the
+/// OpenAI ones, and unlike the Anthropic ones: a `streamGenerateContent?alt=sse`
+/// frame carries the SAME `candidates[].content.parts[]` shape as the
+/// non-streaming response, one incremental fragment at a time, so leaving them
+/// in the per-frame pass would extract exactly the per-fragment segments
+/// reassembly exists to avoid. `SseReassembler` folds a candidate's parts into
+/// `$.candidates[*].content.parts[*].text` prose plus its `functionCall` name
+/// and `args`, so the exclusion loses nothing.
 ///
-/// Both provider paths still apply to a non-SSE JSON body carrying that shape;
+/// Every provider path still applies to a non-SSE JSON body carrying that shape;
 /// the exclusion is scoped to the per-frame streaming pass.
 const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
     "$.choices[*].text",
@@ -182,6 +186,8 @@ const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
     "$.choices[*].delta.tool_calls[*].function.arguments",
     "$.content_block_delta.delta.text",
     "$.candidates[*].content.parts[*].text",
+    "$.candidates[*].content.parts[*].functionCall.name",
+    "$.candidates[*].content.parts[*].functionCall.args",
 ];
 
 /// Metadata key recording how a streamed response was handled. Set on the
@@ -3282,10 +3288,11 @@ fn reassemble_sse_response_segments(
         reassembler.push_event_frame(event, frame);
     }
     // An Anthropic stream carrying an event, `delta.type`, or content-block
-    // index the reassembler cannot fold into the document is uninspectable for
-    // the same reason a `data:` payload that will not parse is: it may hold
-    // client-visible text on a path nothing here reads.
-    let fully_inspectable = parsed.fully_parsed && !reassembler.anthropic_stream_uninspectable();
+    // index the reassembler cannot fold into the document — or a Gemini stream
+    // carrying a malformed `candidates` frame or an unfoldable part kind — is
+    // uninspectable for the same reason a `data:` payload that will not parse
+    // is: it may hold client-visible text on a path nothing here reads.
+    let fully_inspectable = parsed.fully_parsed && !reassembler.provider_stream_uninspectable();
     let mut segments: Vec<TextSegment> = reassembler
         .into_texts()
         .into_iter()
@@ -3763,7 +3770,7 @@ impl StreamWindowEngine {
             // document leaves this window uninspectable, so block mode keeps
             // holding rather than releasing bytes no verdict ever covered.
             let inspectable =
-                parsed.fully_parsed && !self.reassembler.anthropic_stream_uninspectable();
+                parsed.fully_parsed && !self.reassembler.provider_stream_uninspectable();
             (
                 inspectable,
                 if self.store_frames {
@@ -4013,13 +4020,16 @@ impl StreamWindowEngine {
     /// reassembler nor the per-frame non-delta pass could map to a segment.
     ///
     /// A window with no segments is normally benign — role-only chat deltas,
-    /// lifecycle events, keep-alives — and is released clean. But an Anthropic
-    /// or Gemini event stream produces exactly the same empty window because
-    /// its incremental paths are excluded from the per-frame pass
-    /// ([`SSE_DELTA_RESPONSE_PATHS`]) and nothing reassembles them yet, so
-    /// releasing it clean stamps an allow decision over a completion nothing
-    /// read. `act_on_window` uses this to tell the two apart and honor
-    /// `on_error` for the second.
+    /// lifecycle events, keep-alives — and is released clean. But a governed
+    /// provider stream this build does not model produces exactly the same
+    /// empty window, because its incremental paths are excluded from the
+    /// per-frame pass ([`SSE_DELTA_RESPONSE_PATHS`]) and nothing reassembles
+    /// them, so releasing it clean stamps an allow decision over a completion
+    /// nothing read. `act_on_window` uses this to tell the two apart and honor
+    /// `on_error` for the second. The Anthropic and Gemini protocols ARE
+    /// reassembled, so their frames are not flagged here; a frame either of
+    /// them could not fold is reported through
+    /// [`SseReassembler::provider_stream_uninspectable`] instead.
     fn pending_unmapped_governed(&self) -> bool {
         self.retained_frames().any(frame_is_unmapped_governed)
     }
@@ -4173,24 +4183,31 @@ impl StreamWindowEngine {
 /// Whether one parsed SSE frame is a provider event that [`SseReassembler`]
 /// does not understand, yet plainly belongs to a governed AI stream.
 ///
-/// The reassembler maps two families: chat-completions frames (a `choices`
-/// array) and Responses-API events (a `type` starting `response.`). Anything
-/// else that carries an event `type` — Anthropic's `message_start` /
-/// `content_block_delta`, a future provider's events — or that
-/// [`looks_like_governed_response_json`] recognises (a Gemini `candidates`
-/// frame) is content this build cannot inspect. Role-only chat deltas and
+/// The reassembler maps three families: chat-completions frames (a `choices`
+/// array), Responses-API events (a `type` starting `response.`), and the two
+/// provider-native protocols — Anthropic Messages events and Gemini
+/// `streamGenerateContent` frames. Anything else that carries an event `type` —
+/// a future provider's events — or that [`looks_like_governed_response_json`]
+/// recognises is content this build cannot inspect. Role-only chat deltas and
 /// keep-alive frames stay reassembler-shaped and are NOT flagged.
 fn frame_is_unmapped_governed(frame: &Value) -> bool {
     let event_type = frame.get("type").and_then(Value::as_str);
     let responses_api_event = event_type.is_some_and(|ty| ty.starts_with("response."));
     // Anthropic Messages events are reassembled per content block, and a
     // frame the reassembler could not fold is reported through
-    // `anthropic_stream_uninspectable` instead; a leading `message_start` or
+    // `provider_stream_uninspectable` instead; a leading `message_start` or
     // `ping` window must not read as an unmapped provider stream.
     let anthropic_event = event_type
         .map(SseEventName::from_name)
         .is_some_and(|name| matches!(name, SseEventName::Anthropic(_)));
-    if frame.get("choices").is_some() || responses_api_event || anthropic_event {
+    // Gemini frames are reassembled per candidate for exactly the same reason,
+    // and a frame that claims the shape while violating it is likewise reported
+    // through `provider_stream_uninspectable`, not here.
+    if frame.get("choices").is_some()
+        || responses_api_event
+        || anthropic_event
+        || is_gemini_stream_frame(frame)
+    {
         return false;
     }
     event_type.is_some() || looks_like_governed_response_json(frame)
@@ -5319,6 +5336,18 @@ fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<T
         SseTextKind::AnthropicText => (&["$.content[*].text"], SegmentKind::AssistantMessage),
         SseTextKind::AnthropicToolName => (&["$.content[*].name"], SegmentKind::ToolCall),
         SseTextKind::AnthropicToolInput => (&["$.content[*].input"], SegmentKind::ToolArguments),
+        SseTextKind::GeminiText => (
+            &["$.candidates[*].content.parts[*].text"],
+            SegmentKind::AssistantMessage,
+        ),
+        SseTextKind::GeminiFunctionCallName => (
+            &["$.candidates[*].content.parts[*].functionCall.name"],
+            SegmentKind::ToolCall,
+        ),
+        SseTextKind::GeminiFunctionCallArgs => (
+            &["$.candidates[*].content.parts[*].functionCall.args"],
+            SegmentKind::ToolArguments,
+        ),
     };
 
     let enabled = path_patterns.iter().any(|pattern| {
@@ -5702,6 +5731,24 @@ fn extract_known_path(
         "$.candidates[*].content.parts[*].text" => {
             extract_gemini_candidates(json, direction, prefix, segments)
         }
+        // Gemini / Vertex function calls, in a buffered response and in the
+        // document a streamed response is reassembled into.
+        "$.candidates[*].content.parts[*].functionCall.name" => extract_gemini_function_calls(
+            json,
+            direction,
+            "name",
+            SegmentKind::ToolCall,
+            prefix,
+            segments,
+        ),
+        "$.candidates[*].content.parts[*].functionCall.args" => extract_gemini_function_calls(
+            json,
+            direction,
+            "args",
+            SegmentKind::ToolArguments,
+            prefix,
+            segments,
+        ),
         // Anthropic Messages non-streaming completion.
         "$.content[*].text" => extract_content_block_text(
             json.get("content"),
@@ -5882,6 +5929,53 @@ fn extract_gemini_candidates(
             ),
             segments,
         );
+    }
+}
+
+/// Google Gemini / Vertex `candidates[].content.parts[].functionCall.<field>`.
+///
+/// Bounded exactly like [`extract_gemini_candidates`]: one level, this part's
+/// own `functionCall` object, no recursion. `args` is a JSON object, which
+/// [`extract_text_value`] serializes compactly — the same form the streaming
+/// reassembler accumulates, so a buffered and a streamed call are inspected as
+/// the same text.
+fn extract_gemini_function_calls(
+    json: &Value,
+    direction: Direction,
+    field: &str,
+    kind: SegmentKind,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(candidates) = json.get("candidates").and_then(Value::as_array) else {
+        return;
+    };
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let Some(parts) = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for (part_index, part) in parts.iter().enumerate() {
+            let Some(call) = part.get("functionCall") else {
+                continue;
+            };
+            extract_text_value(
+                call.get(field),
+                direction,
+                kind,
+                Some("assistant".to_string()),
+                Some(prefixed_json_path(
+                    prefix,
+                    format!(
+                        "$.candidates[{candidate_index}].content.parts[{part_index}].functionCall.{field}"
+                    ),
+                )),
+                segments,
+            );
+        }
     }
 }
 

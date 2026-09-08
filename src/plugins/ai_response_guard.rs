@@ -1419,19 +1419,22 @@ impl AiResponseGuard {
     /// - Anthropic: the Messages event protocol, reassembled per content-block
     ///   `index` by the shared reassembler into `$.content[*].text` prose and
     ///   `$.content[*].input` tool-use argument JSON
-    /// - Gemini: `candidates[].content.parts[].text` keyed by candidate position
+    /// - Gemini: `streamGenerateContent?alt=sse` frames, reassembled per
+    ///   candidate `index` by the shared reassembler into
+    ///   `$.candidates[*].content.parts[*].text` prose plus the candidate's
+    ///   `functionCall` name and compactly serialized `args`
     ///
     /// Returns one accumulated `String` per choice/block index, ordered by
     /// index (BTreeMap keeps output deterministic across runs). Accumulated
     /// tool/function argument strings additionally contribute their decoded
     /// JSON tokens so escapes cannot hide content from detection.
     ///
-    /// Also reports whether the stream was FULLY reassembled. `false` means an
-    /// Anthropic Messages stream carried an event, a `delta.type`, or a
-    /// content-block index the reassembler could not fold into its document, so
-    /// the accumulated texts do not necessarily cover every client-visible
-    /// byte; an enforcing caller must fail closed instead of clearing the
-    /// response.
+    /// Also reports whether the stream was FULLY reassembled. `false` means a
+    /// provider stream carried something the reassembler could not fold into
+    /// its document — an Anthropic event, `delta.type`, or content-block index,
+    /// or a malformed / unfoldable Gemini `candidates` frame — so the
+    /// accumulated texts do not necessarily cover every client-visible byte; an
+    /// enforcing caller must fail closed instead of clearing the response.
     ///
     /// `events` are the SSE `event:` names of `frames`, in the same order and
     /// of the same length (exactly what `SseParse` produces). The parameter
@@ -1450,8 +1453,9 @@ impl AiResponseGuard {
 
         for (frame_index, frame) in frames.iter().enumerate() {
             // Shared OpenAI chat/completions + Responses API + Anthropic
-            // Messages reassembly covers prose, tool/function names and
-            // arguments, Responses deltas, and Anthropic content blocks.
+            // Messages + Gemini `streamGenerateContent` reassembly covers
+            // prose, tool/function names and arguments, Responses deltas,
+            // Anthropic content blocks, and Gemini candidate parts.
             let event = events.get(frame_index).copied().flatten();
             reassembler.push_event_frame(event, frame);
 
@@ -1514,33 +1518,17 @@ impl AiResponseGuard {
                     .or_default()
                     .push_str(delta);
             }
-
-            // Gemini: candidates[].content.parts[].text
-            if let Some(candidates) = frame.get("candidates").and_then(|c| c.as_array()) {
-                for (idx, candidate) in candidates.iter().enumerate() {
-                    if let Some(parts) = candidate
-                        .get("content")
-                        .and_then(|c| c.get("parts"))
-                        .and_then(|p| p.as_array())
-                    {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                provider_texts.entry((1, idx)).or_default().push_str(text);
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         let mut texts: Vec<String> = Vec::new();
-        let fully_reassembled = !reassembler.anthropic_stream_uninspectable();
+        let fully_reassembled = !reassembler.provider_stream_uninspectable();
         for sse_text in reassembler.into_texts() {
             if matches!(
                 sse_text.kind,
                 SseTextKind::ChatToolArguments
                     | SseTextKind::ResponsesArguments
                     | SseTextKind::AnthropicToolInput
+                    | SseTextKind::GeminiFunctionCallArgs
             ) {
                 append_decoded_argument_texts(&sse_text.text, &mut texts);
             }
@@ -1648,22 +1636,50 @@ impl AiResponseGuard {
             _ => {}
         }
 
-        // Gemini: candidates[].content.parts[].text
+        // Gemini `streamGenerateContent`. The reassembler scans a candidate's
+        // `text` parts, its `functionCall` name, and its `functionCall.args`
+        // document, so redact mode has to be able to rewrite all three or a
+        // match confined to one would hard-fail instead of being redacted. A
+        // match that exists only ACROSS frames is not rewritable in any single
+        // frame and still fails closed through the residual re-scan.
         if let Some(candidates) = frame.get_mut("candidates").and_then(Value::as_array_mut) {
             for candidate in candidates {
-                if let Some(parts) = candidate
+                let Some(parts) = candidate
                     .get_mut("content")
-                    .and_then(|c| c.get_mut("parts"))
-                    .and_then(|p| p.as_array_mut())
-                {
-                    for part in parts {
-                        if let Some(text) = part.get_mut("text") {
-                            self.redact_string_value(text);
-                        }
+                    .and_then(|content| content.get_mut("parts"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                for part in parts {
+                    if let Some(text) = part.get_mut("text") {
+                        self.redact_string_value(text);
+                    }
+                    let Some(call) = part.get_mut("functionCall") else {
+                        continue;
+                    };
+                    if let Some(name) = call.get_mut("name") {
+                        self.redact_string_value(name);
+                    }
+                    if let Some(args) = call.get_mut("args") {
+                        self.redact_decoded_arguments_value(args);
                     }
                 }
             }
         }
+    }
+
+    /// Value-safe redaction of an ALREADY-decoded tool-argument document.
+    ///
+    /// Gemini's `functionCall.args` is a JSON object on the wire rather than
+    /// the serialized string OpenAI and Anthropic use, so it needs the decoded
+    /// branch of [`redact_arguments_value`](Self::redact_arguments_value)
+    /// without the parse step, under the same rule: object member names and
+    /// non-string scalars are left alone, so a match confined to one of those
+    /// is not rewritten into an invalid document and still fails closed through
+    /// the residual re-scan.
+    fn redact_decoded_arguments_value(&self, value: &mut Value) {
+        redact_json_strings(value, &self.pii_patterns, &self.blocked_phrases, false);
     }
 
     /// Rewrite one SSE event's JSON `data:` payload into `output`, or report
@@ -3362,13 +3378,15 @@ impl Plugin for AiResponseGuard {
             let (accumulated, fully_reassembled) =
                 self.extract_sse_completion_texts_checked(&frames, &events);
             if !fully_reassembled {
-                // An Anthropic Messages stream carried an event, a delta type,
-                // or a content-block index reassembly could not cover, so the
-                // accumulated text is not proof the whole response is clean.
+                // A provider stream carried something reassembly could not
+                // cover — an Anthropic event, delta type, or content-block
+                // index, or a malformed / unfoldable Gemini `candidates` frame
+                // — so the accumulated text is not proof the whole response is
+                // clean.
                 return self.respond_to_uninspectable(
                     ctx,
                     "uninspectable_sse",
-                    "SSE contains an unsupported Anthropic streaming event",
+                    "SSE contains an unsupported provider streaming event",
                 );
             }
 
