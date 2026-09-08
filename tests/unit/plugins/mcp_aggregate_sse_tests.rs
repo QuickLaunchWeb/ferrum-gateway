@@ -384,8 +384,8 @@ fn invalid_response_envelope_falls_back_and_releases_capacity() {
     let refused = stream.publish_encoded(&encode(&mismatched));
     assert_eq!(refused.unwrap_err(), SseError::ResponseEnvelopeInvalid);
 
-    // Refusal is terminal and returns the one stream slot, so the bad response
-    // is answered inline and a fresh identity can be admitted immediately.
+    // Refusal is terminal and returns the one stream slot, so the gateway can
+    // reject the bad response and admit a fresh identity immediately.
     let _next = open(&broker, "sess-id-match", "next");
     let reopen = broker.open_stream("sess-id-match", &text_id("expected"));
     assert_eq!(reopen.unwrap_err(), SseError::StreamCompleted);
@@ -1014,4 +1014,57 @@ fn every_error_reason_is_a_fixed_low_cardinality_token() {
         assert!(!error.as_static_reason().is_empty());
         assert!((400..=599).contains(&error.http_status()));
     }
+}
+
+#[test]
+fn raw_numeric_identities_are_injective_and_responses_must_match() {
+    let ids = [
+        "18446744073709551616",
+        "18446744073709551617",
+        "1.00000000000000001",
+        "1.00000000000000002",
+        "1e0",
+        "1.0",
+        "-0",
+        "0",
+        "\"0\"",
+    ];
+    let identities: Vec<StreamIdentity> = ids
+        .iter()
+        .map(|id| {
+            let raw = serde_json::value::RawValue::from_string((*id).to_string()).unwrap();
+            StreamIdentity::from_raw_json_rpc_id(&raw, 128).unwrap()
+        })
+        .collect();
+    for (index, identity) in identities.iter().enumerate() {
+        for other in &identities[index + 1..] {
+            assert_ne!(identity, other);
+        }
+    }
+    for reserve in [false, true] {
+        let broker = broker();
+        broker.ensure_session("exact").unwrap();
+        let wrong = broker.open_stream("exact", &identities[0]).unwrap();
+        let response = format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#, ids[1]);
+        let error = if reserve {
+            wrong.reserve_encoded(response.as_bytes()).err().unwrap()
+        } else {
+            wrong.publish_encoded(response.as_bytes()).unwrap_err()
+        };
+        assert_eq!(error, SseError::ResponseEnvelopeInvalid);
+        let correct = broker.open_stream("exact", &identities[1]).unwrap();
+        assert_eq!(correct.publish_encoded(response.as_bytes()).unwrap(), 1);
+    }
+}
+
+#[test]
+fn mismatched_pretty_printed_response_cannot_use_the_inline_fallback() {
+    let broker = broker();
+    broker.ensure_session("pretty").unwrap();
+    let stream = open(&broker, "pretty", "expected");
+    let body = b"{\n\"jsonrpc\":\"2.0\",\"id\":\"wrong\",\"result\":{}}";
+    assert_eq!(
+        stream.reserve_encoded(body).err().unwrap(),
+        SseError::ResponseEnvelopeInvalid
+    );
 }
