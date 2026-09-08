@@ -4128,8 +4128,8 @@ async fn start_ws_reset_after_echo_server(port: u16) {
                             let stream = ws.into_inner();
                             // SO_LINGER=0 through socket2: tokio's own setter
                             // is deprecated, and a zero linger never blocks.
-                            let _ = socket2::SockRef::from(&stream)
-                                .set_linger(Some(Duration::ZERO));
+                            let _ =
+                                socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO));
                             drop(stream);
                             return;
                         }
