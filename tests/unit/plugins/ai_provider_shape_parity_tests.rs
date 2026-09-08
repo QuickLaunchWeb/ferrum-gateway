@@ -268,7 +268,10 @@ async fn non_ai_body_is_not_enforced_by_any_plugin_in_the_table() {
     });
 
     for (plugin, result) in [
-        ("ai_semantic_firewall", semantic_firewall_result(&body).await),
+        (
+            "ai_semantic_firewall",
+            semantic_firewall_result(&body).await,
+        ),
         ("ai_prompt_shield", prompt_shield_result(&body).await),
         ("ai_request_guard", request_guard_result(&body).await),
     ] {

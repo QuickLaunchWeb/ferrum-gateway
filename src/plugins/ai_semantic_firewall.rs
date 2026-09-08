@@ -5714,7 +5714,10 @@ fn extract_content_block_text(
             direction,
             kind,
             role.map(str::to_string),
-            Some(prefixed_json_path(prefix, format!("{base_path}[{block_index}].text"))),
+            Some(prefixed_json_path(
+                prefix,
+                format!("{base_path}[{block_index}].text"),
+            )),
             text,
             segments,
         );
