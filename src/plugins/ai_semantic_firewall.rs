@@ -19,8 +19,8 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
-    SseReassembler, SseText, SseTextKind, encode_sse_error_event, last_paragraph_boundary,
-    last_sentence_boundary, parse_sse_data_frames_checked,
+    SseEventName, SseReassembler, SseText, SseTextKind, encode_sse_error_event,
+    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames_checked,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
