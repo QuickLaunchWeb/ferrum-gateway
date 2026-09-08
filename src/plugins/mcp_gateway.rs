@@ -589,8 +589,8 @@ fn rewrite_response_id(
     // be megabytes, and re-parsing plus re-serializing it to reach an identical
     // result is pure cost. The shallow field scan borrows, so nothing but the
     // token itself is materialized.
-    let already_emitted = raw_json_rpc_field(body.as_bytes(), "id")
-        .is_some_and(|current| current.get() == id.get());
+    let already_emitted =
+        raw_json_rpc_field(body.as_bytes(), "id").is_some_and(|current| current.get() == id.get());
     if already_emitted {
         return PluginResult::Reject {
             status_code,
