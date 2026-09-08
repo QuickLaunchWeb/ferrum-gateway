@@ -1009,7 +1009,11 @@ mod vendored_established_hook {
         let probe = sockets
             .iter()
             .map(probe_socket)
-            .find(|probe| probe.local_addr().is_ok_and(|local| local.port() == reused_port))
+            .find(|probe| {
+                probe
+                    .local_addr()
+                    .is_ok_and(|local| local.port() == reused_port)
+            })
             .expect("the reused connection must have been reported");
         assert_eq!(
             probe.peer_addr().expect("peer address").port(),
