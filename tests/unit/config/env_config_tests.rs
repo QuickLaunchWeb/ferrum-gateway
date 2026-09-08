@@ -1844,6 +1844,9 @@ fn test_env_config_http3_defaults() {
             remove_var("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW");
             remove_var("FERRUM_HTTP3_RECEIVE_WINDOW");
             remove_var("FERRUM_HTTP3_SEND_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_SEND_WINDOW");
             remove_var("FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE");
             remove_var("FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE");
             remove_var("FERRUM_FRONTEND_H2_MAX_FRAME_SIZE");
@@ -1856,6 +1859,10 @@ fn test_env_config_http3_defaults() {
             assert_eq!(config.http3_stream_receive_window, 262_144);
             assert_eq!(config.http3_receive_window, 2_097_152);
             assert_eq!(config.http3_send_window, 2_097_152);
+            // Backend H3 defaults (throughput-tuned, trusted upstream plane)
+            assert_eq!(config.http3_backend_stream_receive_window, 8_388_608);
+            assert_eq!(config.http3_backend_receive_window, 33_554_432);
+            assert_eq!(config.http3_backend_send_window, 8_388_608);
             assert_eq!(config.http3_connections_per_backend, 4);
             assert_eq!(config.http3_pool_idle_timeout_seconds, 120);
             assert_eq!(config.http3_request_body_channel_capacity, 32);
@@ -2271,6 +2278,135 @@ fn test_http3_flush_interval_ceiling() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.http3_flush_interval_micros, 100_000);
+        },
+    );
+}
+
+/// Backend H3 flow-control windows parse from their own variables and do not
+/// disturb the hardened frontend triple (issue #4755).
+#[test]
+fn test_http3_backend_windows_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW", "16777216"),
+            ("FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW", "67108864"),
+            ("FERRUM_HTTP3_BACKEND_SEND_WINDOW", "16777216"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_SEND_WINDOW");
+
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_backend_stream_receive_window, 16_777_216);
+            assert_eq!(config.http3_backend_receive_window, 67_108_864);
+            assert_eq!(config.http3_backend_send_window, 16_777_216);
+            // Frontend triple untouched.
+            assert_eq!(config.http3_stream_receive_window, 262_144);
+            assert_eq!(config.http3_receive_window, 2_097_152);
+            assert_eq!(config.http3_send_window, 2_097_152);
+        },
+    );
+}
+
+/// Raising the frontend windows must not move the backend plane either.
+#[test]
+fn test_http3_frontend_windows_do_not_move_the_backend_plane() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW", "1048576"),
+            ("FERRUM_HTTP3_RECEIVE_WINDOW", "4194304"),
+            ("FERRUM_HTTP3_SEND_WINDOW", "4194304"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_BACKEND_SEND_WINDOW");
+
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_stream_receive_window, 1_048_576);
+            assert_eq!(config.http3_receive_window, 4_194_304);
+            assert_eq!(config.http3_send_window, 4_194_304);
+            assert_eq!(config.http3_backend_stream_receive_window, 8_388_608);
+            assert_eq!(config.http3_backend_receive_window, 33_554_432);
+            assert_eq!(config.http3_backend_send_window, 8_388_608);
+        },
+    );
+}
+
+/// A zero QUIC flow-control window grants no credit at all, so it is refused
+/// on BOTH trust planes rather than silently installed.
+#[test]
+fn test_http3_zero_flow_control_window_rejected() {
+    for key in [
+        "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_SEND_WINDOW",
+        "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_BACKEND_SEND_WINDOW",
+    ] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                (key, "0"),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .err()
+                    .unwrap_or_else(|| panic!("{key}=0 must be refused"));
+                assert!(err.contains(key), "refusal must name {key}: {err}");
+            },
+        );
+    }
+}
+
+/// A receive window above the QUIC variable-length integer range used to be
+/// swallowed at connection-setup time and replaced by the compiled default.
+#[test]
+fn test_http3_receive_window_above_varint_range_rejected() {
+    for key in [
+        "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW",
+        "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW",
+    ] {
+        // QUIC_VARINT_MAX_U64 + 1.
+        let over = (1u64 << 62).to_string();
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                (key, over.as_str()),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .err()
+                    .unwrap_or_else(|| panic!("{key} above the varint range must be refused"));
+                assert!(err.contains(key), "refusal must name {key}: {err}");
+            },
+        );
+    }
+}
+
+/// The varint bound itself is admitted — the refusal is strictly above it.
+#[test]
+fn test_http3_receive_window_at_varint_max_accepted() {
+    let at_max = ((1u64 << 62) - 1).to_string();
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW", at_max.as_str()),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_backend_receive_window, (1u64 << 62) - 1);
         },
     );
 }
