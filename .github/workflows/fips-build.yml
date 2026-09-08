@@ -378,12 +378,9 @@ jobs:
       - uses: ./.github/actions/setup-sccache
 
       # Cargo fingerprints the resolved rustc-wrapper executable, including
-      # its runner-local path and metadata. setup-sccache deliberately installs
-      # into a fresh private directory, so carrying that wrapper identity into
-      # Cargo would invalidate every restored Rust artifact on the next job or
-      # runner. The exact target handoff is the compiler cache for this gate;
-      # clear the wrapper before any Cargo/cache operation so its artifacts
-      # retain the native rustc identity across trusted restores.
+      # its runner-local path and metadata. Clear the wrapper before any
+      # Cargo/cache operation so restored artifacts retain the native rustc
+      # identity across trusted restores.
       - name: Stabilize Cargo compiler identity for exact-target reuse
         run: |
           set -euo pipefail

@@ -196,10 +196,10 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
-        # setup-sccache deliberately installs the verified wrapper under a fresh
-        # runner-private path. Hide that runner-unique identity only from the
-        # nested rust-cache key calculation; setup-sccache still publishes the
-        # verified path through GITHUB_ENV for the benchmark steps below.
+        # setup-rust-ci already omits the verified wrapper from its nested
+        # rust-cache key. Hide any restored wrapper again for this step scope
+        # so Cargo's own compiler identity stays on the fixed performance path
+        # copied below; setup-sccache still publishes FERRUM_SCCACHE_BIN.
         env:
           RUSTC_WRAPPER: ""
           CARGO_BUILD_RUSTC_WRAPPER: ""

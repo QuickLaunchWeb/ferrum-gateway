@@ -238,6 +238,17 @@ runs:
       with:
         install-linux-packages: "false"
 
+    - name: Omit rustc wrapper from rust-cache key
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Swatinem/rust-cache hashes every non-empty RUST*/CARGO* variable into
+        # its environment key (#4643). setup-sccache publishes the verified
+        # wrapper path through GITHUB_ENV; hide it only during rust-cache so
+        # restore keys stay identical across runs with the same toolchain and
+        # lockfile. FERRUM_SCCACHE_BIN is preserved for restoration below.
+        printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+
     - name: Cache Rust dependencies
       id: rust-cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -246,6 +257,19 @@ runs:
         workspaces: ${{ inputs.workspaces }}
         cache-on-failure: ${{ inputs.save == 'true' && inputs.cache-on-failure == 'true' }}
         save-if: ${{ inputs.save == 'true' && github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
+
+    - name: Restore compiler wrapper after cache
+      shell: bash
+      run: |
+        set -euo pipefail
+        sccache_bin="${FERRUM_SCCACHE_BIN:-}"
+        if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+          printf '%s\n' \
+            "RUSTC_WRAPPER=${sccache_bin}" \
+            "CARGO_BUILD_RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"
+        else
+          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+        fi
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
       shell: bash

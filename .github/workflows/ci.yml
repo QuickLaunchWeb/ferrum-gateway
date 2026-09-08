@@ -6318,6 +6318,11 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
+      - name: Omit rustc wrapper from rust-cache key
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+
       - name: Cache eBPF Rust dependencies and compiler outputs
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -6325,6 +6330,18 @@ jobs:
           workspaces: |
             ebpf -> target
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Restore compiler wrapper after cache
+        run: |
+          set -euo pipefail
+          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            printf '%s\n' \
+              "RUSTC_WRAPPER=${sccache_bin}" \
+              "CARGO_BUILD_RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"
+          else
+            printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+          fi
 
       - name: Install bpf-linker
         uses: ./.github/actions/setup-bpf-linker
@@ -6763,6 +6780,11 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
+      - name: Omit rustc wrapper from rust-cache key
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         # Cache restore/save is a build-time optimization, not a correctness
@@ -6781,6 +6803,18 @@ jobs:
           # Restore-only: the repository cache quota is reserved for the
           # PR-facing `ci-debug` / `ci-lint` lanes and the main-only fuzz lane.
           save-if: "false"
+
+      - name: Restore compiler wrapper after cache
+        run: |
+          set -euo pipefail
+          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            printf '%s\n' \
+              "RUSTC_WRAPPER=${sccache_bin}" \
+              "CARGO_BUILD_RUSTC_WRAPPER=${sccache_bin}" >> "$GITHUB_ENV"
+          else
+            printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+          fi
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'

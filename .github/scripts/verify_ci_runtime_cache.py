@@ -2396,6 +2396,75 @@ def check_setup_sccache_verified_activation(
     )
 
 
+def check_setup_sccache_stable_install_root(
+    text: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    """Keep runner-unique mktemp suffixes out of the exported wrapper path."""
+
+    require(
+        'install_root="${RUNNER_TEMP}/ferrum-sccache-bin"' in text,
+        f"{source} must install sccache to a fixed runner-temp root (#4643)",
+        failures,
+    )
+    require(
+        "ferrum-sccache-bin.XXXXXX" not in text,
+        f"{source} must not randomize the rustc-wrapper install root with mktemp (#4643)",
+        failures,
+    )
+
+
+def check_setup_rust_ci_rust_cache_wrapper_isolation(
+    text: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    """Keep the verified rustc wrapper out of rust-cache's environment hash."""
+
+    omit_step = "Omit rustc wrapper from rust-cache key"
+    restore_step = "Restore compiler wrapper after cache"
+    require(
+        omit_step in text and restore_step in text,
+        f"{source} must omit the rustc wrapper from rust-cache keys (#4643)",
+        failures,
+    )
+    omit_body = text.split(omit_step, 1)[1].split(restore_step, 1)[0]
+    restore_body = text.split(restore_step, 1)[1]
+    omit_contract = (
+        "RUSTC_WRAPPER=",
+        "CARGO_BUILD_RUSTC_WRAPPER=",
+        '>> "$GITHUB_ENV"',
+    )
+    restore_contract = (
+        "FERRUM_SCCACHE_BIN",
+        "RUSTC_WRAPPER=${sccache_bin}",
+        "CARGO_BUILD_RUSTC_WRAPPER=${sccache_bin}",
+        '>> "$GITHUB_ENV"',
+    )
+    require(
+        all(contract in omit_body for contract in omit_contract),
+        f"{source} must clear rustc-wrapper env vars before rust-cache (#4643)",
+        failures,
+    )
+    require(
+        all(contract in restore_body for contract in restore_contract),
+        f"{source} must restore the verified wrapper from FERRUM_SCCACHE_BIN after rust-cache",
+        failures,
+    )
+    cache_position = text.find('id: rust-cache')
+    omit_position = text.find(omit_step)
+    restore_position = text.find(restore_step)
+    require(
+        cache_position >= 0
+        and omit_position >= 0
+        and restore_position >= 0
+        and omit_position < cache_position < restore_position,
+        f"{source} must clear the wrapper before rust-cache and restore it immediately after",
+        failures,
+    )
+
+
 def check_performance_cache_wrapper_key(
     workflow: str,
     source: str,
@@ -4749,6 +4818,7 @@ def check_shared_actions(failures: list[str]) -> None:
     rust_ci = SETUP_RUST.read_text(encoding="utf-8")
     sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
     check_completed_rust_cache_save(rust_ci, failures)
+    check_setup_rust_ci_rust_cache_wrapper_isolation(rust_ci, "setup-rust-ci", failures)
     require(
         "cache-hit:" in rust_ci,
         "setup-rust-ci must expose rust-cache hit/miss as an action output",
@@ -4762,6 +4832,7 @@ def check_shared_actions(failures: list[str]) -> None:
     )
     check_credential_absence_assertion(sccache, "setup-sccache", failures)
     check_setup_sccache_verified_activation(sccache, "setup-sccache", failures)
+    check_setup_sccache_stable_install_root(sccache, "setup-sccache", failures)
     require(
         SCCACHE_RELEASE_DOWNLOAD in sccache,
         "setup-sccache must download a pinned mozilla/sccache GitHub release",
@@ -6780,6 +6851,48 @@ def self_test() -> int:
         not verified_failures,
         "self-test: exact verified sccache activation should pass: "
         + "; ".join(verified_failures),
+        failures,
+    )
+
+    stable_install_failures: list[str] = []
+    check_setup_sccache_stable_install_root(
+        'install_root="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache-bin.XXXXXX")"',
+        "self-test-mktemp-install-root",
+        stable_install_failures,
+    )
+    require(
+        any("fixed runner-temp root" in item for item in stable_install_failures),
+        "self-test: mktemp install root must fail stable-install check",
+        failures,
+    )
+    stable_install_good = (
+        'install_root="${RUNNER_TEMP}/ferrum-sccache-bin"\n'
+        'work_dir="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache.XXXXXX")"\n'
+    )
+    stable_install_good_failures: list[str] = []
+    check_setup_sccache_stable_install_root(
+        stable_install_good,
+        "self-test-stable-install-root",
+        stable_install_good_failures,
+    )
+    require(
+        not stable_install_good_failures,
+        "self-test: fixed install root should pass: "
+        + "; ".join(stable_install_good_failures),
+        failures,
+    )
+
+    wrapper_isolation_good = SETUP_RUST.read_text(encoding="utf-8")
+    wrapper_isolation_good_failures: list[str] = []
+    check_setup_rust_ci_rust_cache_wrapper_isolation(
+        wrapper_isolation_good,
+        "self-test-setup-rust-ci-wrapper-isolation",
+        wrapper_isolation_good_failures,
+    )
+    require(
+        not wrapper_isolation_good_failures,
+        "self-test: setup-rust-ci wrapper isolation should pass: "
+        + "; ".join(wrapper_isolation_good_failures),
         failures,
     )
 
