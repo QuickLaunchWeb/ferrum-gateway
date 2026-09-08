@@ -129,7 +129,7 @@ fn backup_preserves_canonical_secrets_and_custom_schema_fields() {
 #[test]
 fn backup_quarantines_identity_conflicts_while_file_admission_still_rejects() {
     use ferrum_edge::config::BackendEgressPolicy;
-    use ferrum_edge::config::file_loader::decode_and_validate_config_document;
+    use ferrum_edge::config::file_loader::load_config_from_file;
     use ferrum_edge::config::types::GatewayConfig;
 
     for (first_field, second_field) in [
@@ -163,10 +163,11 @@ fn backup_quarantines_identity_conflicts_while_file_admission_still_rejects() {
             serde_json::to_value(&loaded.consumers).unwrap(),
             serde_json::to_value(&database_candidate.consumers).unwrap()
         );
-        let error = decode_and_validate_config_document(
-            &value.to_string(),
+        let error = load_config_from_file(
+            &path,
             30,
             &BackendEgressPolicy::unrestricted(),
+            "ferrum",
         )
         .unwrap_err();
         assert!(error.to_string().contains("consumer identity"));
