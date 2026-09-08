@@ -6622,7 +6622,11 @@ async fn fail_closed_admission_refuses_when_enforcement_is_unavailable() {
 #[tokio::test]
 async fn redis_unavailable_stream_reconcile_charges_local_window_and_finalizes_reservation() {
     let plugin = Arc::new(
-        AiRateLimiter::new(&unreachable_redis_ai_config(None), PluginHttpClient::default()).unwrap(),
+        AiRateLimiter::new(
+            &unreachable_redis_ai_config(None),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
     );
     let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
     let before = registry

@@ -3659,7 +3659,8 @@ impl MetricsRegistry {
             (
                 "ferrum_ai_rate_limit_unaccounted_tokens_total",
                 "AI tokens not charged because local reconciliation capacity was exhausted.",
-                self.ai_rate_limit_unaccounted_tokens.load(Ordering::Relaxed),
+                self.ai_rate_limit_unaccounted_tokens
+                    .load(Ordering::Relaxed),
             ),
         ] {
             output.push_str(&format!("# HELP {name} {help}\n"));

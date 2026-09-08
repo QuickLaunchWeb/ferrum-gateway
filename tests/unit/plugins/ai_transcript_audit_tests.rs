@@ -5778,14 +5778,19 @@ async fn malformed_and_valid_tool_arguments_are_redacted_in_buffered_audit_recor
     let wire = serde_json::to_string(&records).unwrap();
     assert!(!wire.contains("hiddenbroken"));
     assert!(!wire.contains("hiddenvalid"));
-    let request: Value = serde_json::from_str(records[0]["request_body"].as_str().unwrap()).unwrap();
+    let request: Value =
+        serde_json::from_str(records[0]["request_body"].as_str().unwrap()).unwrap();
     let calls = &request["messages"][0]["tool_calls"];
     assert_eq!(calls[0]["function"]["arguments"], "[UNPARSEABLE]");
     assert_eq!(calls[0]["function"]["arguments_redaction_failed"], true);
     let valid: Value =
         serde_json::from_str(calls[1]["function"]["arguments"].as_str().unwrap()).unwrap();
     assert!(valid["password"].as_str().unwrap().contains("REDACTED"));
-    assert!(calls[1]["function"].get("arguments_redaction_failed").is_none());
+    assert!(
+        calls[1]["function"]
+            .get("arguments_redaction_failed")
+            .is_none()
+    );
 }
 
 #[tokio::test]
