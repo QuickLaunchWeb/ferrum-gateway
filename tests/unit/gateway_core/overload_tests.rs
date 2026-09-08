@@ -838,13 +838,25 @@ fn fd_count_timeout_warning_is_rate_limited() {
 
 #[test]
 fn repeated_shutdown_signals_escalate_then_acknowledge() {
-    assert_eq!(classify_shutdown_signal(1), ShutdownSignalAction::InitiateDrain);
+    assert_eq!(
+        classify_shutdown_signal(1),
+        ShutdownSignalAction::InitiateDrain
+    );
     assert_eq!(classify_shutdown_signal(2), ShutdownSignalAction::Escalate);
-    assert_eq!(classify_shutdown_signal(3), ShutdownSignalAction::AlreadyEscalated);
-    assert_eq!(classify_shutdown_signal(9), ShutdownSignalAction::AlreadyEscalated);
+    assert_eq!(
+        classify_shutdown_signal(3),
+        ShutdownSignalAction::AlreadyEscalated
+    );
+    assert_eq!(
+        classify_shutdown_signal(9),
+        ShutdownSignalAction::AlreadyEscalated
+    );
     // Defensive: the counter is incremented before classification, so 0 is
     // unreachable, but it must not panic on the shutdown path.
-    assert_eq!(classify_shutdown_signal(0), ShutdownSignalAction::InitiateDrain);
+    assert_eq!(
+        classify_shutdown_signal(0),
+        ShutdownSignalAction::InitiateDrain
+    );
 }
 
 #[tokio::test]

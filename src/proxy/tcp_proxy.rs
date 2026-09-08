@@ -10005,8 +10005,8 @@ static IO_URING_SPLICE_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 /// semaphore it sized cannot be resized without losing outstanding permits.
 #[cfg(target_os = "linux")]
 pub fn initialize_io_uring_splice_limit(blocking_threads: Option<usize>) {
-    let _ = IO_URING_SPLICE_MAX_CONCURRENT
-        .set(derive_io_uring_splice_max_concurrent(blocking_threads));
+    let _ =
+        IO_URING_SPLICE_MAX_CONCURRENT.set(derive_io_uring_splice_max_concurrent(blocking_threads));
 }
 
 /// No-op on non-Linux targets, where io_uring splice does not exist.
@@ -10015,8 +10015,7 @@ pub fn initialize_io_uring_splice_limit(_blocking_threads: Option<usize>) {}
 
 #[cfg(target_os = "linux")]
 fn io_uring_splice_max_concurrent() -> usize {
-    *IO_URING_SPLICE_MAX_CONCURRENT
-        .get_or_init(|| derive_io_uring_splice_max_concurrent(None))
+    *IO_URING_SPLICE_MAX_CONCURRENT.get_or_init(|| derive_io_uring_splice_max_concurrent(None))
 }
 
 #[cfg(target_os = "linux")]
