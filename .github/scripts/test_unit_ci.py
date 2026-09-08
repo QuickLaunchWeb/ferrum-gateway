@@ -46,7 +46,8 @@ STEPS = {
 # Steps that only one shard executes carry exactly this condition line
 # (immediately after `- name:`); every other phase step is unconditional.
 STEP_CONDITIONS = {
-    "default-lib": "if: matrix.shard == 'core'",
+    "default-lib": "if: matrix.shard == 'lib'",
+    "default-unit": "if: matrix.shard != 'lib'",
 }
 STEP_JOBS = {
     "default-build": "test-unit",
@@ -117,8 +118,9 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
         for line in body.splitlines()
         if not line.lstrip().startswith("#")
     )
-    if 'precompile: "--lib --test unit_tests"' not in jobs["test-unit"]:
-        errors.append("test-unit core shard must precompile the lib and unit_tests targets together")
+    for shard_line in ('precompile: "--lib"', 'precompile: "--test unit_tests"'):
+        if shard_line not in jobs["test-unit"]:
+            errors.append(f"test-unit matrix must keep the `{shard_line}` shard")
     for target in ("unit_tests", "unit_plugins_a_tests", "unit_plugins_b_tests", "unit_gateway_core_tests"):
         if f"target: {target}\n" not in jobs["test-unit"]:
             errors.append(f"test-unit matrix must run the {target} target")
@@ -287,9 +289,10 @@ class ContractTests(unittest.TestCase):
     def test_monolith_rebuild_missing_target_or_feature_gate_are_rejected(self):
         self.assertTrue(self.check(workflow=self.workflow.replace("--test acme_dns01_tests", "--test unit_tests")))
         for before, after in (
-            ('precompile: "--lib --test unit_tests"', 'precompile: "--test unit_tests"'),
+            ('precompile: "--lib"', 'precompile: "--tests"'),
             ("target: unit_plugins_b_tests\n", "target: unit_tests\n"),
-            ("if: matrix.shard == 'core'\n        # Covers", "if: false\n        # Covers"),
+            ("if: matrix.shard == 'lib'\n        # Covers", "if: false\n        # Covers"),
+            ("if: matrix.shard != 'lib'\n        run: |", "if: matrix.shard == 'core'\n        run: |"),
         ):
             with self.subTest(before=before):
                 self.assertTrue(self.check(workflow=self.workflow.replace(before, after, 1)))
