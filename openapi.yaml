@@ -31257,11 +31257,17 @@ components:
 
     MeshSliceDriftSummary:
       type: object
-      required: [tracked, connected, converged, drifted, rejecting, pending, disconnected]
+      required: [tracked, connected, converged, accepted, drifted, rejecting, pending, disconnected]
       properties:
         tracked: { type: integer, minimum: 0 }
         connected: { type: integer, minimum: 0 }
         converged: { type: integer, minimum: 0 }
+        accepted:
+          type: integer
+          minimum: 0
+          description: >
+            Data planes that accepted the desired slice at install time but have
+            not reported it as the serving generation (issue #4812).
         drifted: { type: integer, minimum: 0 }
         rejecting: { type: integer, minimum: 0 }
         pending: { type: integer, minimum: 0 }
@@ -31289,12 +31295,26 @@ components:
         sent:
           $ref: "#/components/schemas/MeshSliceVersionStamp"
         acknowledged:
-          $ref: "#/components/schemas/MeshSliceVersionStamp"
+          allOf:
+            - $ref: "#/components/schemas/MeshSliceVersionStamp"
+          description: >
+            Data-plane INSTALL-time acceptance watermark: the slice became the
+            DP's received slice. Not proof it is serving.
+        applied:
+          allOf:
+            - $ref: "#/components/schemas/MeshSliceVersionStamp"
+          description: >
+            Data-plane PROXY-RUNTIME acceptance watermark: the generation the DP
+            reported as actually serving (issue #4812).
         rejected:
           $ref: "#/components/schemas/MeshSliceRejectedStamp"
         convergence:
           type: string
-          enum: [converged, drifted, rejecting, pending, disconnected]
+          enum: [converged, accepted, drifted, rejecting, pending, disconnected]
+          description: >
+            `converged` requires the desired version to be applied by the DP's
+            proxy runtime. `accepted` means the DP acknowledged the desired
+            version at install time but has not reported it as serving.
         drift:
           $ref: "#/components/schemas/MeshSliceDriftFlags"
 
@@ -31311,7 +31331,7 @@ components:
 
     MeshSliceRejectedStamp:
       type: object
-      required: [version, at, age_seconds, reason]
+      required: [version, at, age_seconds, stage, reason]
       properties:
         version:
           type: string
@@ -31319,19 +31339,40 @@ components:
           description: Exact opaque version; runtime enforces a 256 UTF-8 byte cap, no controls, and no surrounding whitespace.
         at: { type: string, format: date-time }
         age_seconds: { type: integer, format: int64, minimum: 0 }
+        stage:
+          type: string
+          enum: [install, runtime]
+          description: >
+            Which data-plane gate refused the slice: `install` (receive,
+            subscription-binding and config-revision gates) or `runtime` (the
+            proxy runtime, after a successful install).
         reason:
           type: string
-          enum: [reported_rejection]
+          enum:
+            - install_refused
+            - runtime_config_build
+            - runtime_proxy_refused
+            - runtime_trust_unusable
+            - runtime_tls_reload
+            - runtime_dtls_candidate
           maxLength: 64
-          description: Fixed control-safe label. Caller-supplied NACK text is discarded and never retained.
+          description: >
+            Closed control-safe label mapped from the data plane's wire enum.
+            The data plane never sends free rejection text, so no caller bytes
+            are ever retained here.
 
     MeshSliceDriftFlags:
       type: object
-      required: [desired_vs_sent, desired_vs_acknowledged, sent_vs_acknowledged]
+      required: [desired_vs_sent, desired_vs_acknowledged, sent_vs_acknowledged, desired_vs_applied]
       properties:
         desired_vs_sent: { type: boolean }
         desired_vs_acknowledged: { type: boolean }
         sent_vs_acknowledged: { type: boolean }
+        desired_vs_applied:
+          type: boolean
+          description: >
+            The desired generation is not the one the DP's proxy runtime
+            reported as serving (issue #4812).
 
     ConnectedDpNode:
       type: object
