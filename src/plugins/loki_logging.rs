@@ -87,8 +87,6 @@ const LOKI_MIN_RESOURCE_BYTES: usize = 1024;
 const LOKI_MAX_LABEL_NAME_CHARS: usize = 1024;
 const LOKI_MAX_LABEL_VALUE_CHARS: usize = 2048;
 const LOKI_DROP_WARN_EVERY: u64 = 100;
-/// Fixed `plugin` label for this sink's process-wide loss accounting.
-const LOKI_PLUGIN_NAME: &str = "loki_logging";
 const LOKI_EMITTER_LABEL: &str = "ferrum_emitter";
 // Random prefix (32 hex bytes), separator, and fixed-width u64 counter (16 hex bytes).
 // A fixed width keeps construction-time and runtime label accounting identical.
