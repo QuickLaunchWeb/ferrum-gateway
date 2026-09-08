@@ -2884,7 +2884,7 @@ Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP 
 
 Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, SAML 2.0 assertion validation with XMLDSIG signature verification, timestamp freshness checks, and nonce replay protection.
 
-The plugin buffers governed SOAP request bodies as raw bytes and decodes supported XML character encodings before parsing the `wsse:Security` header. Supported encodings are UTF-8 and UTF-16 (little- and big-endian). Encoding is resolved from an optional BOM and the `Content-Type` `charset` parameter; a BOM, charset, and XML declaration must agree, `charset=utf-16` without an endian BOM is rejected as ambiguous, and malformed or truncated byte sequences fail closed. Unsupported charsets return HTTP `415`; conflicting or malformed encodings return HTTP `415`/`400` respectively. Diagnostics never log the request body or credentials. The original wire bytes are forwarded unchanged to the backend so signature and representation semantics stay intact.
+The plugin buffers governed SOAP request bodies as raw bytes and decodes supported XML character encodings before parsing the `wsse:Security` header. Supported encodings are UTF-8 and UTF-16 (little- and big-endian). Encoding is resolved from an optional BOM and the `Content-Type` `charset` parameter; a BOM, charset, and XML declaration must agree, `charset=utf-16` without an endian BOM is rejected as ambiguous, and malformed or truncated byte sequences fail closed. Unsupported charsets return HTTP `415`; conflicting or malformed encodings return HTTP `415`/`400` respectively. Malformed XML returns HTTP `400` with a fixed parser category, without tag names, entity names, namespace names, or positions. Diagnostics never log the request body, raw parser details, or credentials. The original wire bytes are forwarded unchanged to the backend so signature and representation semantics stay intact.
 
 #### Which requests are governed
 
@@ -4232,7 +4232,7 @@ Configuration must be a top-level object. Unknown top-level and per-rule keys ar
 
 | Proxy `listen_path` | Rule `path` semantics | Example |
 |---|---|---|
-| Prefix (e.g. `/api/v1`) | Relative after stripping the prefix. A request exactly equal to that prefix matches `/`. | Request `/api/v1/users` → rule `/users` |
+| Prefix (e.g. `/api/v1` or `/api/v1/`) | Relative after stripping the prefix with trailing slashes trimmed. A request exactly equal to that prefix matches `/`. | Request `/api/v1/users` → rule `/users` |
 | Exact (`=/api/v1`) | Full request path (no stripping). A rule of `/` does **not** match `/api/v1`. | Request `/api/v1` → rule `/api/v1` |
 | Regex (`~/api/v[0-9]+`) | Full request path (no literal prefix to strip). | Request `/api/v1/users` → rule `/api/v1/users` |
 | Root (`/`) | Full request path (stripping `/` would corrupt paths). | Request `/users` → rule `/users` |
@@ -4373,6 +4373,7 @@ config:
 - Unknown top-level keys and unknown header/query/body rule keys are rejected with path-qualified diagnostics (for example `config.rules[0]`).
 - Unknown operations and unknown targets are rejected.
 - Header and query operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints.
+- Header `add`/`update` destinations and `rename` destinations reject gateway-owned names (case-insensitive): `Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, `Keep-Alive`, `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`, `Expect`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Ferrum-Original-Content-Encoding`, and `X-Grpc-Web-Mode`. Use `preserve_host_header` for Host or trusted-proxy configuration for forwarding identity. Removal and rename sources remain allowed; query/body keys are unaffected.
 - Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
 - Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF keep a dedicated diagnostic and other forbidden control bytes (NUL, DEL, …) fail construction instead of being dropped later at a protocol boundary. Route-level request header transforms (`mesh_route_dispatch` → `apply_route_overrides`) apply the same value gate.
 
@@ -4436,6 +4437,7 @@ config:
 - Unknown top-level keys and unknown header/body rule keys are rejected with path-qualified diagnostics (for example `config.rules[0]`).
 - Unknown operations and unknown targets (valid here: `header` or `body`) are rejected.
 - Header operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints.
+- Header `rename` rejects `Set-Cookie` as either source or destination (case-insensitive), including a rename to itself. Its multi-value representation must retain its header name. This applies regardless of cookie count, including a single cookie; other cookie operations and ordinary header renames remain available.
 - Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
 - Protocol-managed hop-by-hop and framing destinations are rejected for `add`/`update` and as rename destinations: `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, and `Content-Length` (case-insensitive). `remove` of those names remains allowed. Multiple instances and mesh `response_transform` route overrides share the same destination contract so a later hook cannot reintroduce a framing field after an earlier local check. The gateway's final client-wire sanitizer still strips hop-by-hop / Connection-listed fields and derives or repairs `Content-Length` from the actual body/status/method after every mutable response hook and before every H1/H2/H3 builder. See [Final response framing](#final-response-framing) for exactly which lengths that boundary keeps.
 - Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF, DEL, and other forbidden control bytes fail construction instead of being dropped later at a protocol boundary.

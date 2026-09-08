@@ -588,7 +588,7 @@ async fn test_plugin_complex_configurations() {
                 "rules": [
                     {"operation": "add", "target": "header", "key": "X-Request-ID", "value": "{{request_id}}"},
                     {"operation": "add", "target": "header", "key": "X-Timestamp", "value": "{{timestamp}}"},
-                    {"operation": "add", "target": "header", "key": "X-Forwarded-For", "value": "{{client_ip}}"},
+                    {"operation": "add", "target": "header", "key": "X-Client-Label", "value": "test-client"},
                     {"operation": "remove", "target": "header", "key": "X-Internal"},
                     {"operation": "remove", "target": "header", "key": "X-Debug"}
                 ]

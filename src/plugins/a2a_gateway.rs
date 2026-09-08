@@ -1815,7 +1815,7 @@ fn deny_response(detection: &A2aDetection) -> PluginResult {
         },
         A2aBinding::Grpc => PluginResult::Reject {
             status_code: 403,
-            body: "A2A method denied by gateway policy".to_string(),
+            body: json!({"error": "A2A method denied by gateway policy"}).to_string(),
             headers: HashMap::new(),
         },
     }
