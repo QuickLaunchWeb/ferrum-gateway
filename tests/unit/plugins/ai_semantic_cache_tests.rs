@@ -7173,10 +7173,12 @@ async fn semantic_identity_ignores_json_wire_length() {
         .on_final_response_body(&mut first, 200, &headers, br#"{"answer":"Paris"}"#)
         .await;
     let (_, result) = run_lookup(&plugin, &pretty, None).await;
-    let PluginResult::RejectBinary { headers, .. } = result else {
+    let PluginResult::RejectBinary { headers, body, .. } = result else {
         panic!("equivalent JSON must hit despite different Content-Length");
     };
-    assert_eq!(headers.get("x-ai-cache-match").unwrap(), "exact");
+    assert_eq!(headers.get("x-ai-cache-status").unwrap(), "HIT");
+    assert!(!headers.contains_key("x-ai-cache-match"));
+    assert_eq!(body.as_ref(), br#"{"answer":"Paris"}"#);
 }
 
 #[tokio::test]
@@ -7194,8 +7196,9 @@ async fn semantic_cache_compression_replay_encodes_once() {
     let (mut ctx, result) = run_lookup(&cache, &request, None).await;
     assert!(matches!(result, PluginResult::Continue));
     ctx.headers.insert("accept-encoding".into(), "gzip".into());
+    let mut request_headers = ctx.headers.clone();
     compression
-        .before_proxy(&mut ctx, &mut HashMap::new())
+        .before_proxy(&mut ctx, &mut request_headers)
         .await;
     let response = json!({"answer": "Paris is the capital of France. ".repeat(20)});
     let original = serde_json::to_vec(&response).unwrap();
@@ -7239,8 +7242,9 @@ async fn semantic_cache_compression_replay_encodes_once() {
     hit_ctx
         .headers
         .insert("accept-encoding".into(), "gzip".into());
+    let mut hit_request_headers = hit_ctx.headers.clone();
     compression
-        .before_proxy(&mut hit_ctx, &mut HashMap::new())
+        .before_proxy(&mut hit_ctx, &mut hit_request_headers)
         .await;
     compression
         .after_proxy(&mut hit_ctx, status, &mut headers)
