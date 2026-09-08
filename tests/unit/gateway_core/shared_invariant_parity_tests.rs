@@ -276,10 +276,10 @@ fn record_probe_neutral(cb: &CircuitBreaker) {
     cb.record_neutral(true);
 }
 
-/// Every terminal outcome a dispatch path can record for an admitted probe.
 /// One probe outcome: its label and the breaker call that reports it.
 type ProbeOutcome = (&'static str, fn(&CircuitBreaker));
 
+/// Every terminal outcome a dispatch path can record for an admitted probe.
 const PROBE_OUTCOMES: &[ProbeOutcome] = &[
     ("record_success", record_probe_success),
     (
