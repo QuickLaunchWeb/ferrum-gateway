@@ -2835,6 +2835,96 @@ async fn test_content_part_type_gate_explicit_missing_and_non_text() {
     }
 }
 
+#[tokio::test]
+async fn test_content_mode_cohere_preamble_honors_exclude_roles() {
+    // Cohere v1 spells the system prompt `preamble`, so `exclude_roles:
+    // [system]` has to suppress it exactly as it suppresses the Anthropic
+    // top-level `system` field — otherwise one operator setting would mean
+    // different things on two providers.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "exclude_roles": ["system"]
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "preamble": "operator sample 123-45-6789",
+        "message": "clean request"
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_content_mode_cohere_chat_history_honors_exclude_roles_case_insensitively() {
+    // Cohere spells roles `USER` / `CHATBOT` / `SYSTEM` / `TOOL` while
+    // `exclude_roles` is configured in the OpenAI lower-case spelling, so an
+    // exact set hit alone would silently ignore the operator's filter on every
+    // Cohere body.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "exclude_roles": ["chatbot"]
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "chat_history": [{"role": "CHATBOT", "message": "prior turn 123-45-6789"}],
+        "message": "clean request"
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // A turn whose role is not excluded is still scanned.
+    let mut ctx = make_post_ctx(&json!({
+        "chat_history": [{"role": "USER", "message": "prior turn 123-45-6789"}]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_tool_result_blocks_inherit_the_message_role_filter() {
+    // A tool-result block rides inside its message, so `exclude_roles` filters
+    // it exactly like that message's own text. Documented behavior, asserted
+    // so the fall-through added for tool results cannot quietly widen past the
+    // role filter.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "exclude_roles": ["user"]
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": "lookup said 123-45-6789"}]
+            }]
+        }]
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_content_mode_nested_block_extraction_is_bounded_to_one_level() {
+    // Tool-result extraction contributes each element's own string or `text`
+    // and never recurses, so a chained tool result cannot drive unbounded work
+    // — and a value hidden a second level down is deliberately not scanned in
+    // Content mode (`scan_fields: all` covers it).
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "user",
+            "content": [{"toolResult": {
+                "toolUseId": "tooluse_1",
+                "content": [{"json": {"nested": {"deeper": "123-45-6789"}}}]
+            }}]
+        }]
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
 /// Everything the Content-mode detector walks, the Content-mode redactor must
 /// rewrite.
 ///
@@ -2910,6 +3000,92 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
                 "type": "AzureCognitiveSearch",
                 "parameters": {"roleInformation": format!("ssn {PII}")}
             }]}),
+        ),
+        (
+            "messages[].content[].toolResult.content[].text (bedrock converse)",
+            json!({"messages": [{
+                "role": "user",
+                "content": [{"toolResult": {
+                    "toolUseId": "tooluse_1",
+                    "content": [{"text": format!("ssn {PII}")}]
+                }}]
+            }]}),
+        ),
+        (
+            "messages[].content[].toolResult.content[] string (bedrock converse)",
+            json!({"messages": [{
+                "role": "user",
+                "content": [{"toolResult": {
+                    "toolUseId": "tooluse_1",
+                    "content": [format!("ssn {PII}")]
+                }}]
+            }]}),
+        ),
+        (
+            "messages[].content[].guardContent nested text (bedrock converse)",
+            json!({"messages": [{
+                "role": "user",
+                "content": [{"guardContent": {"text": {"text": format!("ssn {PII}")}}}]
+            }]}),
+        ),
+        (
+            "messages[].content[].guardContent flat text (bedrock converse)",
+            json!({"messages": [{
+                "role": "user",
+                "content": [{"guardContent": {"text": format!("ssn {PII}")}}]
+            }]}),
+        ),
+        (
+            "messages[].content[] tool_result array content (anthropic)",
+            json!({"messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{"type": "text", "text": format!("ssn {PII}")}]
+                }]
+            }]}),
+        ),
+        (
+            "messages[].content[] tool_result string content (anthropic)",
+            json!({"messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": format!("ssn {PII}")
+                }]
+            }]}),
+        ),
+        (
+            "message (cohere v1 current turn)",
+            json!({"message": format!("ssn {PII}")}),
+        ),
+        (
+            "preamble (cohere v1 system prompt)",
+            json!({"preamble": format!("ssn {PII}")}),
+        ),
+        (
+            "chat_history[].message (cohere v1)",
+            json!({"chat_history": [
+                {"role": "CHATBOT", "message": "clean"},
+                {"role": "USER", "message": format!("ssn {PII}")}
+            ]}),
+        ),
+        (
+            "inputs string (huggingface tgi)",
+            json!({"inputs": format!("ssn {PII}")}),
+        ),
+        (
+            "inputs array of strings (huggingface tgi)",
+            json!({"inputs": ["clean", format!("ssn {PII}")]}),
+        ),
+        (
+            "instances[].prompt (vertex legacy predict)",
+            json!({"instances": [
+                {"prompt": "clean"},
+                {"prompt": format!("ssn {PII}")}
+            ]}),
         ),
     ];
 

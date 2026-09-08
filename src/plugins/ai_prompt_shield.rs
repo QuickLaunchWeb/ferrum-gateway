@@ -84,11 +84,35 @@ const NUMERIC_LLM_PARAMETER_KEYS: &[&str] = &[
 /// request shapes. Scanned in `ScanMode::Content` in addition to
 /// `messages[].content`: OpenAI legacy completions use `prompt`, the
 /// Responses API and embeddings use `input`, OpenAI Responses uses
-/// `instructions`, Anthropic carries a top-level `system` string, and Amazon
-/// Bedrock Titan text-generation carries its entire prompt in `inputText`.
+/// `instructions`, Anthropic carries a top-level `system` string, Amazon
+/// Bedrock Titan text-generation carries its entire prompt in `inputText`,
+/// Cohere v1 `/chat` carries the current turn in `message` and the system
+/// prompt in `preamble`, and Hugging Face TGI carries its prompt in `inputs`.
 /// Each may be a string, an array of strings, or an array of
 /// `{type:"text", text:"..."}` parts.
-const CONTENT_SCAN_FIELDS: &[&str] = &["prompt", "input", "instructions", "system", "inputText"];
+///
+/// Mirrors the request-side field list the sibling `ai_semantic_firewall`
+/// inspects, so a provider shape one plugin reads is not silently invisible to
+/// the other (issue #4792).
+const CONTENT_SCAN_FIELDS: &[&str] = &[
+    "prompt",
+    "input",
+    "instructions",
+    "system",
+    "inputText",
+    "message",
+    "preamble",
+    "inputs",
+];
+
+/// Whether a [`CONTENT_SCAN_FIELDS`] entry is applied by the provider as a
+/// system prompt, and is therefore suppressed when `exclude_roles` excludes
+/// `system`. Anthropic/Bedrock spell it `system`; Cohere v1 spells the same
+/// thing `preamble`, so the long-standing `system` carve-out has to cover both
+/// or `exclude_roles: [system]` would mean different things per provider.
+fn is_system_prompt_scan_field(field: &str) -> bool {
+    matches!(field, "system" | "preamble")
+}
 
 /// Every accepted top-level configuration property. Configuration is parsed
 /// manually from `serde_json::Value`, so this allow-list is the fail-closed
@@ -389,11 +413,17 @@ impl AiPromptShield {
                             texts.push(content);
                         }
                         // Array content (multimodal, and Bedrock Converse
-                        // content blocks, which carry no `type` at all).
+                        // content blocks, which carry no `type` at all). A
+                        // block that is not itself a text part may still carry
+                        // model-visible text one level down — a Converse
+                        // `toolResult`/`guardContent`, or an Anthropic
+                        // `tool_result` — so it falls through to
+                        // `collect_content_block_nested_text`.
                         if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
                             for part in parts {
-                                if let Some(text) = text_content_part_text(part) {
-                                    texts.push(text);
+                                match text_content_part_text(part) {
+                                    Some(text) => texts.push(text),
+                                    None => collect_content_block_nested_text(part, &mut texts),
                                 }
                             }
                         }
@@ -407,7 +437,7 @@ impl AiPromptShield {
                 // those endpoints. Each field may be a string, an array of
                 // strings, or an array of `{type:"text", text:"..."}` parts.
                 for field in CONTENT_SCAN_FIELDS {
-                    if *field == "system" && self.exclude_roles.contains("system") {
+                    if is_system_prompt_scan_field(field) && self.exclude_roles.contains("system") {
                         continue;
                     }
                     if let Some(value) = json.get(field) {
@@ -425,6 +455,14 @@ impl AiPromptShield {
                 // scan it so a PII/jailbreak payload smuggled there does not slip
                 // past Content mode. See `collect_azure_role_information_text`.
                 collect_azure_role_information_text(json, &mut texts);
+                // Cohere v1 `/chat` keeps the prior turns in
+                // `chat_history[].message`, which no [`CONTENT_SCAN_FIELDS`]
+                // entry reaches. See `collect_cohere_chat_history_text`.
+                collect_cohere_chat_history_text(json, &self.exclude_roles, &mut texts);
+                // Google Vertex legacy `predict` carries its prompt in
+                // `instances[].prompt`. See
+                // `collect_vertex_instance_prompts`.
+                collect_vertex_instance_prompts(json, &self.exclude_roles, &mut texts);
                 texts
             }
         }
@@ -497,7 +535,7 @@ impl AiPromptShield {
         }
 
         for field in CONTENT_SCAN_FIELDS {
-            if *field == "system" && self.exclude_roles.contains("system") {
+            if is_system_prompt_scan_field(field) && self.exclude_roles.contains("system") {
                 continue;
             }
             if let Some(value) = json.get(field) {
@@ -957,10 +995,14 @@ impl AiPromptShield {
 
                 // Array content (multimodal, and Bedrock Converse content
                 // blocks). Mirrors the `extract_scan_text` walk exactly, via
-                // the shared `text_content_part_text` gate.
+                // the shared `text_content_part_text` gate, then the same
+                // fall-through to the nested tool-result / guarded text a
+                // non-text block can still carry.
                 if let Some(parts) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
                     for part in parts.iter_mut() {
-                        redact_content_part_text(part, &|text| self.redact_text(text));
+                        if !redact_content_part_text(part, &|text| self.redact_text(text)) {
+                            redact_content_block_nested_text(part, &|text| self.redact_text(text));
+                        }
                     }
                 }
             }
@@ -971,7 +1013,7 @@ impl AiPromptShield {
         // symmetric — otherwise PII in `prompt`/`input`/`system` would be
         // reported as redacted but forwarded unredacted (a fail-open bypass).
         for field in CONTENT_SCAN_FIELDS {
-            if *field == "system" && self.exclude_roles.contains("system") {
+            if is_system_prompt_scan_field(field) && self.exclude_roles.contains("system") {
                 continue;
             }
             if let Some(value) = json.get_mut(field) {
@@ -986,6 +1028,10 @@ impl AiPromptShield {
         // otherwise Redact mode would report the PII removed while forwarding it
         // unredacted (a fail-open bypass).
         redact_azure_role_information(json, &|text| self.redact_text(text));
+        // Same symmetry contract for the Cohere history and Vertex legacy
+        // `predict` instances scanned above.
+        redact_cohere_chat_history_text(json, &self.exclude_roles, &|text| self.redact_text(text));
+        redact_vertex_instance_prompts(json, &self.exclude_roles, &|text| self.redact_text(text));
     }
 
     /// Replace all PII pattern matches in the text with the redaction placeholder.
@@ -1913,8 +1959,11 @@ fn is_text_content_part_type(part_type: &str) -> bool {
 ///
 /// A part that *declares* a string `type` must declare a text one
 /// ([`is_text_content_part_type`]), which keeps `tool_use`, `image`,
-/// `image_url`, `reasoning`, and `tool_result` blocks out of the scan exactly
-/// as before. A part with **no** `type` discriminator is accepted when it
+/// `image_url`, `reasoning`, and `tool_result` blocks out of THIS gate exactly
+/// as before. (A `tool_result` block carries no `text` of its own; its nested
+/// `content` is picked up separately by
+/// [`collect_content_block_nested_text`].) A part with **no** `type`
+/// discriminator is accepted when it
 /// carries a string `text`: Amazon Bedrock Converse sends
 /// `messages[].content[]` as bare `{"text": "..."}` blocks and Google Gemini
 /// sends `parts[]` as bare `{"text": "..."}` entries, so gating on a
@@ -1958,6 +2007,145 @@ fn redact_content_part_text(part: &mut Value, redact: &impl Fn(&str) -> String) 
         object.insert("text".to_string(), Value::String(redacted));
     }
     true
+}
+
+/// Model-visible text a content block carries somewhere other than its own
+/// `text` — the shapes [`text_content_part_text`] deliberately answers `None`
+/// for because the block is not itself a text part:
+///
+/// * Amazon Bedrock Converse `{"toolResult": {"content": [{"text": "..."}]}}`
+/// * Anthropic `{"type": "tool_result", "content": <string | [parts]>}`
+/// * Amazon Bedrock Converse `{"guardContent": {"text": {"text": "..."}}}`,
+///   and the flat `{"guardContent": {"text": "..."}}` spelling — either
+///   reaches the model, so reading only one leaves the other unscanned.
+///
+/// Tool-result content is text the model reads verbatim from a third party,
+/// which is exactly where a smuggled payload hides; the sibling
+/// `ai_semantic_firewall` reads the same two spellings, so leaving them out
+/// here made the shield the weaker of the pair on identical bodies. The block
+/// inherits its enclosing message's `role`, so `exclude_roles` filters it
+/// exactly like that message's own text — this is called only for a message
+/// the role filter already admitted.
+///
+/// Bounded to one level below the block: an array element contributes its own
+/// string or `text`, and nothing recurses, so a chained tool result cannot
+/// drive unbounded work. The mutating counterpart is
+/// [`redact_content_block_nested_text`].
+fn collect_content_block_nested_text<'a>(block: &'a Value, texts: &mut Vec<&'a str>) {
+    if let Some(tool_result) = block.get("toolResult") {
+        collect_tool_result_content_text(tool_result.get("content"), texts);
+    } else if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+        collect_tool_result_content_text(block.get("content"), texts);
+    } else if let Some(text) = block.get("guardContent").and_then(guard_content_text) {
+        texts.push(text);
+    }
+}
+
+/// Redact every string [`collect_content_block_nested_text`] scans, so
+/// Content-mode detection and redaction cannot drift on tool-result or
+/// guarded text (an asymmetry there is a fail-open bypass: the PII reported
+/// removed while the provider receives the original block).
+fn redact_content_block_nested_text(block: &mut Value, redact: &impl Fn(&str) -> String) {
+    if let Some(tool_result) = block.get_mut("toolResult") {
+        redact_tool_result_content_text(tool_result.get_mut("content"), redact);
+        return;
+    }
+    if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+        redact_tool_result_content_text(block.get_mut("content"), redact);
+        return;
+    }
+    if let Some(guard_content) = block.get_mut("guardContent") {
+        redact_guard_content_text(guard_content, redact);
+    }
+}
+
+/// The text payload of a tool-result block: a bare string, or an array whose
+/// elements each contribute their own string or `text`. One level, never
+/// recursive — matching the bound `ai_semantic_firewall`'s
+/// `extract_tool_result_content` keeps.
+fn collect_tool_result_content_text<'a>(content: Option<&'a Value>, texts: &mut Vec<&'a str>) {
+    match content {
+        Some(Value::String(text)) => texts.push(text.as_str()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item {
+                    Value::String(text) => texts.push(text.as_str()),
+                    Value::Object(object) => {
+                        if let Some(text) = object.get("text").and_then(Value::as_str) {
+                            texts.push(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mutable mirror of [`collect_tool_result_content_text`], visiting exactly the
+/// same strings in the same order.
+fn redact_tool_result_content_text(content: Option<&mut Value>, redact: &impl Fn(&str) -> String) {
+    match content {
+        Some(Value::String(text)) => redact_string_in_place(text, redact),
+        Some(Value::Array(items)) => {
+            for item in items.iter_mut() {
+                match item {
+                    Value::String(text) => redact_string_in_place(text, redact),
+                    Value::Object(object) => redact_object_string_field(object, "text", redact),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The guarded text of a Bedrock Converse `guardContent` block, under both the
+/// nested (`{"text": {"text": "..."}}`) and flat (`{"text": "..."}`)
+/// spellings. Mirrors the sibling `ai_semantic_firewall`'s
+/// `extract_guard_content_text`.
+fn guard_content_text(guard_content: &Value) -> Option<&str> {
+    match guard_content.get("text") {
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(Value::Object(object)) => object.get("text").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+/// Mutable mirror of [`guard_content_text`], rewriting whichever of the two
+/// spellings the block used.
+fn redact_guard_content_text(guard_content: &mut Value, redact: &impl Fn(&str) -> String) {
+    match guard_content.get_mut("text") {
+        Some(Value::String(text)) => redact_string_in_place(text, redact),
+        Some(Value::Object(object)) => redact_object_string_field(object, "text", redact),
+        _ => {}
+    }
+}
+
+/// Rewrite a `String` held in place, leaving it untouched when redaction is a
+/// no-op so an unchanged body is never needlessly reallocated.
+fn redact_string_in_place(text: &mut String, redact: &impl Fn(&str) -> String) {
+    let redacted = redact(text.as_str());
+    if redacted != *text {
+        *text = redacted;
+    }
+}
+
+/// Rewrite one string-valued field of a JSON object. A missing or non-string
+/// value is left alone, matching the read side, which never scans one.
+fn redact_object_string_field(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    redact: &impl Fn(&str) -> String,
+) {
+    let Some(text) = object.get(key).and_then(Value::as_str) else {
+        return;
+    };
+    let redacted = redact(text);
+    if redacted != text {
+        object.insert(key.to_string(), Value::String(redacted));
+    }
 }
 
 /// Collect scannable text from a top-level LLM content field
@@ -2266,6 +2454,118 @@ fn redact_azure_role_information(json: &mut Value, redact: &impl Fn(&str) -> Str
                     }
                 }
             }
+        }
+    }
+}
+
+/// Whether a Cohere `chat_history[].role` is excluded by `exclude_roles`.
+///
+/// Cohere spells its roles in upper case (`USER`, `CHATBOT`, `SYSTEM`,
+/// `TOOL`) while `exclude_roles` is configured in the OpenAI lower-case
+/// spelling, so an exact `HashSet` hit alone would silently ignore the
+/// operator's filter on every Cohere body. The fallback compares
+/// case-insensitively without allocating per turn; `exclude_roles` is an
+/// operator-sized set (usually empty or one entry), so the linear scan is not
+/// a hot-path cost.
+fn cohere_role_excluded(role: Option<&str>, exclude_roles: &HashSet<String>) -> bool {
+    let Some(role) = role else {
+        return false;
+    };
+    if exclude_roles.contains(role) {
+        return true;
+    }
+    let matches_role = |excluded: &str| excluded.eq_ignore_ascii_case(role);
+    exclude_roles.iter().map(String::as_str).any(matches_role)
+}
+
+/// Collect Cohere v1 `/chat` history text for Content-mode scanning:
+/// `chat_history[].message`, the prior turns of the conversation. The current
+/// turn (`message`) and the system prompt (`preamble`) are ordinary
+/// [`CONTENT_SCAN_FIELDS`] entries; the history is an array of
+/// `{role, message}` objects that no top-level field reaches, so without this
+/// every turn but the last passed Content mode unscanned.
+///
+/// Each turn's `role` is filtered through [`cohere_role_excluded`] exactly as
+/// `messages[].role` is filtered, and the message value accepts the same
+/// string / array-of-strings / content-part shapes as any other prompt field.
+fn collect_cohere_chat_history_text<'a>(
+    json: &'a Value,
+    exclude_roles: &HashSet<String>,
+    texts: &mut Vec<&'a str>,
+) {
+    let Some(history) = json.get("chat_history").and_then(Value::as_array) else {
+        return;
+    };
+    for turn in history {
+        if cohere_role_excluded(turn.get("role").and_then(Value::as_str), exclude_roles) {
+            continue;
+        }
+        if let Some(message) = turn.get("message") {
+            collect_field_text(message, exclude_roles, texts);
+        }
+    }
+}
+
+/// Redact every Cohere history turn scanned by
+/// [`collect_cohere_chat_history_text`], keeping Content-mode detection and
+/// redaction symmetric.
+fn redact_cohere_chat_history_text(
+    json: &mut Value,
+    exclude_roles: &HashSet<String>,
+    redact: &impl Fn(&str) -> String,
+) {
+    let Some(history) = json.get_mut("chat_history").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for turn in history.iter_mut() {
+        if cohere_role_excluded(turn.get("role").and_then(Value::as_str), exclude_roles) {
+            continue;
+        }
+        if let Some(message) = turn.get_mut("message") {
+            redact_field_text(message, exclude_roles, redact);
+        }
+    }
+}
+
+/// Collect Google Vertex legacy `predict` prompt text for Content-mode
+/// scanning: `instances[].prompt`. These bodies carry no `messages` array and
+/// none of the [`CONTENT_SCAN_FIELDS`], so the whole prompt passed Content
+/// mode unscanned (`ScanMode::All` already covered it via full-body
+/// recursion).
+///
+/// Scoped to each instance's `prompt` rather than the whole instance object:
+/// the surrounding instance fields are prediction inputs and identifiers, not
+/// model-visible prose, which matches how the sibling `ai_semantic_firewall`
+/// reads `$.instances[*].prompt`.
+fn collect_vertex_instance_prompts<'a>(
+    json: &'a Value,
+    exclude_roles: &HashSet<String>,
+    texts: &mut Vec<&'a str>,
+) {
+    let Some(instances) = json.get("instances").and_then(Value::as_array) else {
+        return;
+    };
+    for instance in instances {
+        if let Some(prompt) = instance.get("prompt") {
+            collect_field_text(prompt, exclude_roles, texts);
+        }
+    }
+}
+
+/// Redact every Vertex instance prompt scanned by
+/// [`collect_vertex_instance_prompts`], keeping Content-mode detection and
+/// redaction symmetric.
+fn redact_vertex_instance_prompts(
+    json: &mut Value,
+    exclude_roles: &HashSet<String>,
+    redact: &impl Fn(&str) -> String,
+) {
+    let Some(instances) = json.get_mut("instances").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for instance in instances.iter_mut() {
+        if let Some(prompt) = instance.get_mut("prompt") {
+            redact_field_text(prompt, exclude_roles, redact);
         }
     }
 }
