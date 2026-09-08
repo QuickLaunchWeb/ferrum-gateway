@@ -27557,6 +27557,7 @@ components:
                   - "$.content_block_delta.delta.text"
                   - "$.results[*].outputText"
                   - "$.text"
+                  - "$.chat_history[*].message"
                   - "$.response"
                   - "$[*].generated_text"
               default:
@@ -27580,6 +27581,7 @@ components:
                 - "$.content_block_delta.delta.text"
                 - "$.results[*].outputText"
                 - "$.text"
+                - "$.chat_history[*].message"
                 - "$.response"
                 - "$[*].generated_text"
               description: Supported simple response extraction paths. When configured, this list replaces the defaults.

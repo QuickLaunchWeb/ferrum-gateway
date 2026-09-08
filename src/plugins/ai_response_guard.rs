@@ -40,7 +40,7 @@ use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
     AnthropicEvent, SseEventName, SseReassembler, SseTextKind, is_text_event_stream_media_type,
-    original_response_is_event_stream, parse_sse_data_frames_checked,
+    is_tgi_stream_frame, original_response_is_event_stream, parse_sse_data_frames_checked,
 };
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -551,7 +551,10 @@ impl AiResponseGuard {
     /// Anthropic text blocks / Gemini parts) are joined into one fragment, so
     /// detection and length enforcement see the logical completion the client
     /// renders rather than each part in isolation. Tool/function `arguments`
-    /// contribute both the raw string and its decoded JSON tokens.
+    /// contribute both the raw string and its decoded JSON tokens; a tool
+    /// document that arrives already decoded (an Anthropic `tool_use` block's
+    /// `input`, a Gemini `functionCall`'s `args`) contributes its decoded
+    /// tokens the same way.
     ///
     /// The last two arms cover the shapes that are not an OpenAI-style object:
     /// Cohere v1's top-level `text` / echoed `chat_history[]`, and Hugging Face
@@ -613,6 +616,20 @@ impl AiResponseGuard {
                 }),
                 &mut texts,
             );
+            // Anthropic tool-use blocks: the invoked `name` and the `input`
+            // document the client executes. Both are model-authored and
+            // client-visible, and `input` is executable content — a leaked
+            // account number in a tool argument reaches the tool caller just as
+            // surely as one in prose. Read untyped, exactly as
+            // `ai_semantic_firewall`'s `$.content[*].name` / `$.content[*].input`
+            // are, so the `tool_use` / `server_tool_use` / `mcp_tool_use`
+            // spellings (and any added later) are all covered. One level: a
+            // block contributes its own two fields and nothing recurses back
+            // into the content array.
+            for block in content {
+                collect_string_value(block.get("name"), &mut texts);
+                collect_decoded_argument_value(block.get("input"), &mut texts);
+            }
         }
 
         // Google Gemini: candidates[].content.parts[].text, joined per candidate.
@@ -629,9 +646,33 @@ impl AiResponseGuard {
                             .map(|part| part.get("text").and_then(|t| t.as_str())),
                         &mut texts,
                     );
+                    // Gemini's spelling of a tool call: the invoked name plus
+                    // the `args` document, which arrives already decoded rather
+                    // than as the serialized string OpenAI and Anthropic use.
+                    // The streamed path has reassembled both since #4905; this
+                    // is the buffered `generateContent` counterpart.
+                    for part in parts {
+                        let Some(call) = part.get("functionCall") else {
+                            continue;
+                        };
+                        collect_string_value(call.get("name"), &mut texts);
+                        collect_decoded_argument_value(call.get("args"), &mut texts);
+                    }
                 }
             }
         }
+
+        // Amazon Bedrock Titan text generation: `results[].outputText`. One
+        // level — a result contributes its own completion string.
+        if let Some(results) = json.get("results").and_then(Value::as_array) {
+            for result in results {
+                collect_string_value(result.get("outputText"), &mut texts);
+            }
+        }
+
+        // Ollama `/api/generate`: the whole completion is the top-level
+        // `response` string.
+        collect_string_value(json.get("response"), &mut texts);
 
         collect_cohere_completion_texts(json, &mut texts);
         collect_tgi_generated_texts(json, &mut texts);
@@ -1244,7 +1285,10 @@ impl AiResponseGuard {
             self.redact_content_value(content);
         }
 
-        // Anthropic: content[].text
+        // Anthropic: content[].text, plus a tool-use block's `name` and its
+        // decoded `input` document. Field-for-field mirror of the extraction
+        // above, so a match the detector found in a tool block is rewritable
+        // rather than a hard failure.
         if let Some(content) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
             for block in content.iter_mut() {
                 if block.get("type").and_then(|t| t.as_str()) == Some("text")
@@ -1255,10 +1299,18 @@ impl AiResponseGuard {
                         block["text"] = Value::String(redacted);
                     }
                 }
+                if let Some(name) = block.get_mut("name") {
+                    self.redact_string_value(name);
+                }
+                if let Some(input) = block.get_mut("input") {
+                    self.redact_decoded_arguments_value(input);
+                }
             }
         }
 
-        // Google Gemini: candidates[].content.parts[].text
+        // Google Gemini: candidates[].content.parts[].text, plus a
+        // `functionCall` part's name and decoded `args` document — the same
+        // three fields `redact_sse_frame` rewrites on the streamed form.
         if let Some(candidates) = json.get_mut("candidates").and_then(Value::as_array_mut) {
             for candidate in candidates {
                 if let Some(parts) = candidate
@@ -1270,9 +1322,32 @@ impl AiResponseGuard {
                         if let Some(text) = part.get_mut("text") {
                             self.redact_string_value(text);
                         }
+                        let Some(call) = part.get_mut("functionCall") else {
+                            continue;
+                        };
+                        if let Some(name) = call.get_mut("name") {
+                            self.redact_string_value(name);
+                        }
+                        if let Some(args) = call.get_mut("args") {
+                            self.redact_decoded_arguments_value(args);
+                        }
                     }
                 }
             }
+        }
+
+        // Amazon Bedrock Titan: results[].outputText.
+        if let Some(results) = json.get_mut("results").and_then(Value::as_array_mut) {
+            for result in results {
+                if let Some(text) = result.get_mut("outputText") {
+                    self.redact_string_value(text);
+                }
+            }
+        }
+
+        // Ollama `/api/generate`: the top-level `response` completion string.
+        if let Some(response) = json.get_mut("response") {
+            self.redact_string_value(response);
         }
 
         // Cohere v1: top-level `text` and the echoed `chat_history[].message`
@@ -1453,6 +1528,9 @@ impl AiResponseGuard {
     ///   candidate `index` by the shared reassembler into
     ///   `$.candidates[*].content.parts[*].text` prose plus the candidate's
     ///   `functionCall` name and compactly serialized `args`
+    /// - Hugging Face TGI: `/generate_stream` frames, whose `token.text`
+    ///   fragments the shared reassembler concatenates into the buffered
+    ///   document's `$[*].generated_text`
     ///
     /// Returns one accumulated `String` per choice/block index, ordered by
     /// index (BTreeMap keeps output deterministic across runs). Accumulated
@@ -1464,7 +1542,10 @@ impl AiResponseGuard {
     /// its document — an Anthropic event, `delta.type`, or content-block index,
     /// or a malformed / unfoldable Gemini `candidates` frame — so the
     /// accumulated texts do not necessarily cover every client-visible byte; an
-    /// enforcing caller must fail closed instead of clearing the response.
+    /// enforcing caller must fail closed instead of clearing the response. A
+    /// TGI frame whose `token` / `generated_text` violate the shape, or which
+    /// carries alternative-token text outside the reconstructed completion,
+    /// reports the same way.
     ///
     /// `events` are the SSE `event:` names of `frames`, in the same order and
     /// of the same length (exactly what `SseParse` produces). The parameter
@@ -1695,6 +1776,22 @@ impl AiResponseGuard {
                         self.redact_decoded_arguments_value(args);
                     }
                 }
+            }
+        }
+
+        // Hugging Face TGI `/generate_stream`. The reassembler scans a frame's
+        // `token.text` fragment and the terminal `generated_text`, so redact
+        // mode has to be able to rewrite both or a match confined to one would
+        // hard-fail instead of being redacted. A match that exists only ACROSS
+        // frames is not rewritable in any single frame and still fails closed
+        // through the residual re-scan.
+        if is_tgi_stream_frame(frame) {
+            let token_text = frame.get_mut("token").and_then(|t| t.get_mut("text"));
+            if let Some(text) = token_text {
+                self.redact_string_value(text);
+            }
+            if let Some(generated) = frame.get_mut("generated_text") {
+                self.redact_string_value(generated);
             }
         }
     }
@@ -4666,6 +4763,20 @@ fn collect_argument_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, 
                 .map(|token| Cow::Owned(token.into_owned())),
         );
     }
+}
+
+/// Decoded-document variant of [`collect_argument_value`] for the tool
+/// arguments providers deliver as JSON rather than as a serialized string — an
+/// Anthropic `tool_use` block's `input` and a Gemini `functionCall`'s `args`.
+///
+/// There is no string to parse and no raw form the client ever sees, so only
+/// the decoded tokens are collected. Strings stay borrowed from the response
+/// document; nothing is allocated for the common case.
+fn collect_decoded_argument_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, str>>) {
+    let Some(value) = value else {
+        return;
+    };
+    collect_decoded_json_strings(value, texts);
 }
 
 /// String-accumulator variant of [`collect_argument_value`] for the SSE path,
