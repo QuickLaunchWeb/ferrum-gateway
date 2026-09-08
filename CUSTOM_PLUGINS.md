@@ -1426,17 +1426,17 @@ CustomPluginMigration {
 # Apply all pending migrations (core + plugin)
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
-  cargo run
+  cargo run -- run
 
 # Dry run — show what would be applied without making changes
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up FERRUM_MIGRATE_DRY_RUN=true \
   FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
-  cargo run
+  cargo run -- run
 
 # Check migration status (core + plugin)
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=status \
   FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
-  cargo run
+  cargo run -- run
 ```
 
 Example output:

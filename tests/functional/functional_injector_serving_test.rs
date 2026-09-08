@@ -126,6 +126,7 @@ async fn try_start_injector(
     let trust_domain = format!("injector-probe-{}-{port}.test", std::process::id());
 
     let mut command = Command::new(gateway_binary_path());
+    command.arg("run");
     command
         .env("FERRUM_MODE", "injector")
         // Exercise shared startup shard normalization in the injector's real
