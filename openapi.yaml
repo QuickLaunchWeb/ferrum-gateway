@@ -28403,7 +28403,7 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: "Which response fields to scan: 'content' scans supported completion and tool/function-call fields (OpenAI chat/Responses, Anthropic content[], Gemini candidates[].content.parts[], and Bedrock Converse output.message.content[]), 'all' scans the entire response body"
+          description: "Which response fields to scan: 'content' scans supported completion and tool/function-call fields (OpenAI chat/Responses, Anthropic content[], Gemini candidates[].content.parts[], Bedrock Converse output.message.content[], Cohere v1 text and chat_history[].message, and Hugging Face TGI's top-level array of generated_text objects), 'all' scans the entire response body"
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"
