@@ -14654,9 +14654,11 @@ components:
           type: integer
           format: uint64
           description: >
-            How long every CP has been unreachable. `0` while connected.
-            Diagnostic only — the staleness boundary is the applied-snapshot
-            age, so repeated failed CP cycles cannot postpone it.
+            How long the DP has been without usable applied configuration.
+            `0` once a snapshot has been accepted and applied. Transport connect
+            alone does not clear it. Diagnostic only — the staleness boundary is
+            the applied-snapshot age, so repeated failed CP cycles cannot
+            postpone it.
         max_stale_seconds:
           type: integer
           format: uint64
