@@ -3641,6 +3641,12 @@ async fn functional_cli_spec_discovery_preserves_every_explicit_layer() {
     }
 }
 
+/// Smallest file-mode spec that actually loads. `GatewayConfig::plugin_configs`
+/// has no serde default (unlike `consumers` / `upstreams`), so a spec that lists
+/// only `version` and `proxies` fails deserialization and the gateway exits 1
+/// during startup — long before any listener binds.
+const MINIMAL_FILE_SPEC: &str = "version: '1'\nproxies: []\nplugin_configs: []\n";
+
 #[ignore]
 #[tokio::test]
 async fn functional_cli_dp_admin_secret_and_listener_admission_match_run() {
@@ -3661,7 +3667,10 @@ async fn functional_cli_dp_admin_secret_and_listener_admission_match_run() {
                 }
                 _ => {
                     let spec = directory.path().join("valid.yaml");
-                    std::fs::write(&spec, "version: '1'\nproxies: []\n").unwrap();
+                    // `plugin_configs` carries no serde default, so a spec that
+                    // omits it is rejected at load. Keep the fixture genuinely
+                    // valid so each case fails on the surface it names.
+                    std::fs::write(&spec, MINIMAL_FILE_SPEC).unwrap();
                     command
                         .env("FERRUM_MODE", "file")
                         .env("FERRUM_FILE_CONFIG_PATH", spec);
@@ -3917,7 +3926,7 @@ async fn functional_cli_health_uses_secret_endpoint_for_tls_gateway() {
     let mut gateway = crate::common::TestGateway::builder()
         .skip_auto_build()
         .clear_env()
-        .mode_file("version: '1'\nproxies: []\n")
+        .mode_file(MINIMAL_FILE_SPEC)
         .env("FERRUM_ADMIN_TLS_CERT_PATH", cert_path.to_str().unwrap())
         .env("FERRUM_ADMIN_TLS_KEY_PATH", key_path.to_str().unwrap())
         .env_ephemeral_port("FERRUM_ADMIN_HTTPS_PORT")
