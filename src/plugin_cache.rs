@@ -2163,6 +2163,10 @@ impl Plugin for PluginInstanceWrapper {
 const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
     ("api_chargeback", "shared /charges registry is exactly-once"),
     (
+        "api_chargeback_sink",
+        "independent event_id dedup keys would duplicate durable billing rows",
+    ),
+    (
         "load_testing",
         "one detached run cohort is admitted per policy",
     ),

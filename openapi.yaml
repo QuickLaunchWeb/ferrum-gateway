@@ -2057,7 +2057,9 @@ paths:
         `api_chargeback_sink` plugin-config ID: aggregate queue/spool/export
         totals plus per-instance batch, retry, queue, spool, and export counters
         ordered by `plugin_config_id`. Validation throwaways, uncommitted staged
-        reloads, and superseded generations are excluded. Requires a valid admin
+        reloads, and superseded generations are excluded from instances. Cumulative
+        process totals include retired workers and survive reload/removal. Per-event
+        pending rows are memory exposure, not a persistence guarantee. Requires a valid admin
         JWT because sink status can expose billing topology and ClickHouse
         endpoint metadata. Credentials and URL user-info are never returned.
       tags: [Metrics]
@@ -29476,7 +29478,9 @@ components:
         Ordinary HTTP uses the wire status. Native gRPC and translated
         gRPC-Web use the final client-visible grpc-status mapped to the
         canonical effective HTTP status; missing/malformed/unknown terminal
-        status fails closed to 500.
+        status fails closed to 500. Explicitly zero-priced tiers still meter calls.
+        Successful H1/H2/H3 WebSocket handshakes share the 101 pricing tier;
+        rejected handshakes retain their error status.
         At least one of `pricing_tiers`, `bandwidth_pricing`, or
         `stream_connection_pricing` must be configured.
         Unknown top-level keys and unknown `pricing_tiers[]` keys are
@@ -29663,13 +29667,19 @@ components:
       additionalProperties: false
       required: [clickhouse]
       description: |
-        Plugin: api_chargeback_sink — Durable ClickHouse charge export. Uses the
+        Plugin: api_chargeback_sink — Durable ClickHouse charge export. At most one
+        effective sink is admitted per proxy after scope merging; independent
+        event_id keys would otherwise duplicate durable billing rows. Uses the
         same `pricing_tiers`, `bandwidth_pricing`, `stream_connection_pricing`,
         and `currency` fields as `api_chargeback`, then exports either
         per-transaction events (`mode: per_event`) or periodic accumulator
         deltas (`mode: snapshot`) to ClickHouse. Ordinary HTTP uses its wire
         status for pricing. Native gRPC and translated gRPC-Web use the final
         normalized grpc-status mapped to the canonical effective HTTP status.
+        Explicitly zero-priced tiers still count matching calls. Successful H1/H2/H3
+        WebSocket handshakes use the 101 tier and ws protocol label; rejected
+        handshakes retain their error status. Admission into memory is not durable:
+        pending batches and spool handoffs can be lost on abrupt process termination.
         Durable events preserve that billable status, the raw HTTP status, and
         the normalized gRPC status separately. Snapshot mode aggregates by every
         exported categorical dimension (namespace, consumer_id, consumer_name,
@@ -30020,7 +30030,7 @@ components:
                 of consuming the remaining channel slots.
             buffer_max_bytes:
               type: integer
-              minimum: 9312
+              minimum: 9440
               maximum: 268435456
               default: 16777216
               description: >-
@@ -30403,6 +30413,33 @@ components:
                           type: number
                           description: Accumulated per-connection charge.
 
+    ChargebackSinkEventAccounting:
+      type: object
+      description: |
+        Newly emitted per-event rows at bounded admission (including refusals).
+        Received equals persisted plus dropped plus pending at a settled observation.
+        Retries share one lifetime owner; replay of an already-spooled row and
+        snapshot accumulator deltas are excluded. Process totals include retired
+        workers; instance values are generation-local. Sampling is not transactional.
+        SIGKILL/crashes cannot flush memory or increment final loss counters.
+      required: [received_total, persisted_total, dropped_total, pending]
+      properties:
+        received_total:
+          type: integer
+          minimum: 0
+        persisted_total:
+          type: integer
+          minimum: 0
+          description: Rows acknowledged by ClickHouse or written to spool at least once; the explicit lossy async opt-in weakens acknowledgement durability.
+        dropped_total:
+          type: integer
+          minimum: 0
+          description: Rows whose last memory owner was dropped before acknowledgement or spooling, including refusal, failed delivery, and cancellation.
+        pending:
+          type: integer
+          minimum: 0
+          description: Rows still awaiting acknowledgement or spooling, including pending batches and asynchronous spool handoffs.
+
     ChargebackSinkStatusResponse:
       type: object
       description: |
@@ -30410,7 +30447,8 @@ components:
         accepted generation for every stable `api_chargeback_sink` plugin-config
         ID plus process-wide totals. Instances are ordered by ascending
         `plugin_config_id`. Validation throwaways, uncommitted staged reloads,
-        and superseded generations are excluded.
+        and superseded generations are excluded from instances. Cumulative totals
+        include retired workers and survive reload/removal until process restart.
       required: [enabled, instance_count, snapshot_finalizations_pending, snapshot_finalizations_pending_bytes, snapshot_finalizations_oldest_age_secs, snapshot_finalization_recovery_policy, totals, instances]
       properties:
         enabled:
@@ -30441,12 +30479,18 @@ components:
             count or bytes exceed budget.
         totals:
           type: object
-          description: Aggregates across every accepted live instance.
-          required: [queue, spool, export]
+          description: Live-instance gauges and process-lifetime cumulative counters.
+          required: [queue, spool, export, per_event]
           properties:
+            per_event:
+              $ref: "#/components/schemas/ChargebackSinkEventAccounting"
             queue:
               type: object
               properties:
+                outstanding:
+                  type: integer
+                  minimum: 0
+                  description: Queued, batched, and exporting rows for current instances; retired worker exposure is in per_event.pending.
                 depth:
                   type: integer
                   minimum: 0
@@ -30560,6 +30604,7 @@ components:
         - queue
         - spool
         - export
+        - per_event
       properties:
         plugin_config_id:
           type: string
@@ -30613,9 +30658,15 @@ components:
               maximum: 60000
             jitter:
               type: boolean
+        per_event:
+          $ref: "#/components/schemas/ChargebackSinkEventAccounting"
         queue:
           type: object
           properties:
+            outstanding:
+              type: integer
+              minimum: 0
+              description: Queued, batched, and exporting rows in this generation.
             depth:
               type: integer
             capacity:

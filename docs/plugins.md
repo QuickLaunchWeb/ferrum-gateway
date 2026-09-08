@@ -1919,6 +1919,8 @@ are HTTP/gRPC only).
 
 **Priority:** 9350
 
+An explicit zero-price tier still counts matching calls. Successful H1, H2, and H3 WebSocket handshakes all use the `101` call-pricing tier; H2/H3 retain their raw 2xx status in durable sink events.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance on a distinct proxy stamps its own currency onto the charges it records and emits it per row. Multiple effective instances on one proxy are rejected (exactly-once `/charges` accounting) |
