@@ -95,6 +95,7 @@ mod unit {
         mod udp_logging_tests;
         mod udp_rate_limiting_tests;
         mod validator_diagnostic_redaction_tests;
+        mod waf_body_charset_parity_tests;
         mod waf_tests;
         mod workload_metrics_custom_env_tags_tests;
         mod ws_frame_logging_tests;
