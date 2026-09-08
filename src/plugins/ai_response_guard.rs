@@ -588,6 +588,15 @@ impl AiResponseGuard {
             }
         }
 
+        // Amazon Bedrock Converse: output.message.content[].text. Here `output`
+        // is an object, not the Responses API array handled just above, so
+        // `Value::get` on a key cannot confuse the two shapes. Converse content
+        // blocks carry no `type` discriminator, which `content_part_text`
+        // already accepts.
+        if let Some(message) = json.get("output").and_then(|output| output.get("message")) {
+            collect_content_value(message.get("content"), &mut texts);
+        }
+
         // Anthropic: content[].text, joining adjacent text blocks.
         if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
             push_joined_adjacent_texts(
@@ -1208,6 +1217,16 @@ impl AiResponseGuard {
                     self.redact_content_value(content);
                 }
             }
+        }
+
+        // Amazon Bedrock Converse: output.message.content[].text. Mirrors the
+        // extraction above so detection and redaction stay symmetric.
+        if let Some(content) = json
+            .get_mut("output")
+            .and_then(|output| output.get_mut("message"))
+            .and_then(|message| message.get_mut("content"))
+        {
+            self.redact_content_value(content);
         }
 
         // Anthropic: content[].text

@@ -28154,7 +28154,7 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, and system (completions/responses/embeddings/Anthropic-system shapes), including matches split across adjacent text parts. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
+          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, system, and inputText (completions/responses/embeddings/Anthropic-system/Bedrock-Titan shapes), Google Gemini contents[].parts[].text and systemInstruction/system_instruction parts, and Azure On Your Data role_information — including content blocks that carry no type discriminator (Bedrock Converse) and matches split across adjacent text parts. Detection and redaction cover the same field set. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
@@ -28318,7 +28318,7 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: "Which response fields to scan: 'content' scans supported completion and tool/function-call fields, 'all' scans the entire response body"
+          description: "Which response fields to scan: 'content' scans supported completion and tool/function-call fields (OpenAI chat/Responses, Anthropic content[], Gemini candidates[].content.parts[], and Bedrock Converse output.message.content[]), 'all' scans the entire response body"
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"

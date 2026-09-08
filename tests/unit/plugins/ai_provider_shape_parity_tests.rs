@@ -15,6 +15,10 @@
 //! provider gap in one plugin should force a look at the same shape in its
 //! siblings.
 //!
+//! Every request-side cell is currently `Extracts`: the firewall's gaps closed
+//! with GHSA-8gc3-h5c8-jjxx, and `ai_prompt_shield`'s Gemini / Bedrock Titan /
+//! Bedrock Converse gaps closed after them.
+//!
 //! Out of scope here: `ai_tool_governor` (governs tool-call and tool-definition
 //! shapes, not prompt text — its provider parity is covered by its own tests
 //! from #4165) and `ai_response_guard` (response direction).
@@ -45,6 +49,12 @@ enum Coverage {
     Extracts,
     /// The plugin does not read this shape. Closing the gap means flipping this
     /// cell — do not delete the row.
+    ///
+    /// Currently unconstructed: every request-side cell is [`Coverage::Extracts`]
+    /// (see `every_request_plugin_covers_every_shape_in_the_table`). The variant
+    /// and its assertion arms stay so the next provider shape added to the table
+    /// can be recorded honestly instead of being left out of it.
+    #[allow(dead_code)]
     Gap(&'static str),
 }
 
@@ -64,9 +74,7 @@ fn provider_shapes() -> Vec<ProviderShape> {
                 "contents": [{"role": "user", "parts": [{"text": MARKER}]}]
             }),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap(
-                "Content mode scans messages[]/prompt/input/instructions/system only",
-            ),
+            prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
         },
         ProviderShape {
@@ -75,7 +83,7 @@ fn provider_shapes() -> Vec<ProviderShape> {
                 "systemInstruction": {"parts": [{"text": MARKER}]}
             }),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap("systemInstruction is not in CONTENT_SCAN_FIELDS"),
+            prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
         },
         ProviderShape {
@@ -85,7 +93,7 @@ fn provider_shapes() -> Vec<ProviderShape> {
                 "textGenerationConfig": {"maxTokenCount": 128}
             }),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap("inputText is not in CONTENT_SCAN_FIELDS"),
+            prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
         },
         ProviderShape {
@@ -113,9 +121,7 @@ fn provider_shapes() -> Vec<ProviderShape> {
                 "messages": [{"role": "user", "content": [{"text": MARKER}]}]
             }),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap(
-                "Converse content blocks carry no `type`, which both shield scans require",
-            ),
+            prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
         },
         ProviderShape {
@@ -243,17 +249,27 @@ async fn every_enforcing_request_plugin_matches_its_recorded_provider_shape_cove
 }
 
 #[test]
-fn ai_semantic_firewall_covers_every_shape_in_the_table() {
-    // GHSA-8gc3-h5c8-jjxx: the firewall was the sole provider-blind plugin in
-    // the AI family. Assert that directly, so a future shape added to the table
-    // as a sibling-only gap cannot quietly re-open it here.
+fn every_request_plugin_covers_every_shape_in_the_table() {
+    // GHSA-8gc3-h5c8-jjxx left `ai_semantic_firewall` provider-blind, and
+    // `ai_prompt_shield`'s default Content mode carried the same defect on the
+    // Gemini, Bedrock Titan, and Bedrock Converse shapes. Both are closed, so
+    // the request-side table is all-`Extracts`. Assert that directly rather
+    // than only per-row, so a regression on any one plugin cannot be papered
+    // over by re-recording its cell as a gap: demoting a cell here has to be a
+    // deliberate, reviewed edit to this test.
     for shape in provider_shapes() {
-        assert_eq!(
-            shape.semantic_firewall,
-            Coverage::Extracts,
-            "ai_semantic_firewall must extract every provider shape in this table ({})",
-            shape.name
-        );
+        for (plugin, coverage) in [
+            ("ai_semantic_firewall", shape.semantic_firewall),
+            ("ai_prompt_shield", shape.prompt_shield),
+            ("ai_request_guard", shape.request_guard),
+        ] {
+            assert_eq!(
+                coverage,
+                Coverage::Extracts,
+                "{plugin} must extract every provider shape in this table ({})",
+                shape.name
+            );
+        }
     }
 }
 

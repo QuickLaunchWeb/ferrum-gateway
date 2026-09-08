@@ -84,10 +84,11 @@ const NUMERIC_LLM_PARAMETER_KEYS: &[&str] = &[
 /// request shapes. Scanned in `ScanMode::Content` in addition to
 /// `messages[].content`: OpenAI legacy completions use `prompt`, the
 /// Responses API and embeddings use `input`, OpenAI Responses uses
-/// `instructions`, and Anthropic carries a top-level `system` string. Each may
-/// be a string, an array of strings, or an array of `{type:"text", text:"..."}`
-/// parts.
-const CONTENT_SCAN_FIELDS: &[&str] = &["prompt", "input", "instructions", "system"];
+/// `instructions`, Anthropic carries a top-level `system` string, and Amazon
+/// Bedrock Titan text-generation carries its entire prompt in `inputText`.
+/// Each may be a string, an array of strings, or an array of
+/// `{type:"text", text:"..."}` parts.
+const CONTENT_SCAN_FIELDS: &[&str] = &["prompt", "input", "instructions", "system", "inputText"];
 
 /// Every accepted top-level configuration property. Configuration is parsed
 /// manually from `serde_json::Value`, so this allow-list is the fail-closed
@@ -387,15 +388,11 @@ impl AiPromptShield {
                         if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                             texts.push(content);
                         }
-                        // Array content (multimodal)
+                        // Array content (multimodal, and Bedrock Converse
+                        // content blocks, which carry no `type` at all).
                         if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
                             for part in parts {
-                                if part
-                                    .get("type")
-                                    .and_then(|t| t.as_str())
-                                    .is_some_and(is_text_content_part_type)
-                                    && let Some(text) = part.get("text").and_then(|t| t.as_str())
-                                {
+                                if let Some(text) = text_content_part_text(part) {
                                     texts.push(text);
                                 }
                             }
@@ -417,6 +414,12 @@ impl AiPromptShield {
                         collect_field_text(value, &self.exclude_roles, &mut texts);
                     }
                 }
+                // Google Gemini / Vertex carries no `messages` array at all:
+                // turns live in `contents[].parts[].text` and the system prompt
+                // in `systemInstruction.parts[].text`. Without this, Content
+                // mode passed every Gemini prompt through unscanned. See
+                // `collect_gemini_prompt_text`.
+                collect_gemini_prompt_text(json, &self.exclude_roles, &mut texts);
                 // Azure OpenAI "On Your Data" carries a per-data-source
                 // instruction the backend applies as a de-facto system prompt;
                 // scan it so a PII/jailbreak payload smuggled there does not slip
@@ -502,6 +505,14 @@ impl AiPromptShield {
             }
         }
 
+        // Gemini concatenates the `parts[]` of one turn into a single prompt
+        // exactly as OpenAI concatenates adjacent text content parts, so give
+        // them the same boundary-crossing pass — otherwise a value split across
+        // two adjacent `parts` entries would evade Content mode.
+        for_each_gemini_parts(json, &self.exclude_roles, &mut |parts| {
+            self.mark_adjacent_text_part_hits(parts, &mut hit);
+        });
+
         hit.iter()
             .enumerate()
             .filter_map(|(idx, &matched)| {
@@ -561,14 +572,7 @@ impl AiPromptShield {
         let mut part_count = 0usize;
 
         for item in items {
-            let text = item
-                .get("type")
-                .and_then(Value::as_str)
-                .filter(|part_type| is_text_content_part_type(part_type))
-                .and_then(|_| item.get("text"))
-                .and_then(Value::as_str);
-
-            let Some(text) = text else {
+            let Some(text) = text_content_part_text(item) else {
                 if part_count > 1 {
                     self.mark_joined_boundary_hits(&joined, &boundaries, hit);
                 }
@@ -951,20 +955,12 @@ impl AiPromptShield {
                     }
                 }
 
-                // Array content (multimodal)
+                // Array content (multimodal, and Bedrock Converse content
+                // blocks). Mirrors the `extract_scan_text` walk exactly, via
+                // the shared `text_content_part_text` gate.
                 if let Some(parts) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
                     for part in parts.iter_mut() {
-                        if part
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .is_some_and(is_text_content_part_type)
-                            && let Some(text) = part.get("text").and_then(|t| t.as_str())
-                        {
-                            let redacted = self.redact_text(text);
-                            if redacted != text {
-                                part["text"] = Value::String(redacted);
-                            }
-                        }
+                        redact_content_part_text(part, &|text| self.redact_text(text));
                     }
                 }
             }
@@ -982,6 +978,9 @@ impl AiPromptShield {
                 redact_field_text(value, &self.exclude_roles, &|text| self.redact_text(text));
             }
         }
+        // Same symmetry contract for the Gemini turns and system instruction
+        // scanned by `collect_gemini_prompt_text`.
+        redact_gemini_prompt_text(json, &self.exclude_roles, &|text| self.redact_text(text));
         // Keep redaction symmetric with detection: `extract_scan_text` scans
         // Azure "On Your Data" `role_information`, so redact it here too —
         // otherwise Redact mode would report the PII removed while forwarding it
@@ -1909,12 +1908,64 @@ fn is_text_content_part_type(part_type: &str) -> bool {
     matches!(part_type, "text" | "input_text" | "output_text")
 }
 
+/// The model-visible prompt text of one content part / content block, or `None`
+/// when the part carries none.
+///
+/// A part that *declares* a string `type` must declare a text one
+/// ([`is_text_content_part_type`]), which keeps `tool_use`, `image`,
+/// `image_url`, `reasoning`, and `tool_result` blocks out of the scan exactly
+/// as before. A part with **no** `type` discriminator is accepted when it
+/// carries a string `text`: Amazon Bedrock Converse sends
+/// `messages[].content[]` as bare `{"text": "..."}` blocks and Google Gemini
+/// sends `parts[]` as bare `{"text": "..."}` entries, so gating on a
+/// discriminator those providers never emit left their entire prompt
+/// unscanned. `text` must be a string — a non-string `text` is not prompt text
+/// and is never scanned or rewritten.
+///
+/// A part whose `type` is present but not a string is treated as undeclared and
+/// scanned: the fail-closed direction, so a malformed discriminator cannot be
+/// used to hide prompt text from the shield.
+///
+/// Bounded to the part itself: nothing here recurses into nested arrays, so a
+/// deeply nested body cannot drive unbounded work.
+fn text_content_part_text(part: &Value) -> Option<&str> {
+    match part.get("type") {
+        // A declared, recognized non-text block type: skip, as before.
+        Some(Value::String(part_type)) if !is_text_content_part_type(part_type) => None,
+        _ => part.get("text").and_then(Value::as_str),
+    }
+}
+
+/// Rewrite one content part's `text` through `redact`, returning whether the
+/// value was a text-bearing content part at all.
+///
+/// The `true`/`false` verdict is exactly [`text_content_part_text`]'s
+/// `Some`/`None`, so the redactor can never treat a part as non-text that the
+/// detector scanned as text (which would be a fail-open bypass: PII reported
+/// as redacted but forwarded). A part whose text needs no rewrite still
+/// reports `true` — it was scanned, it just had nothing to change.
+fn redact_content_part_text(part: &mut Value, redact: &impl Fn(&str) -> String) -> bool {
+    let replacement = match text_content_part_text(part) {
+        None => return false,
+        Some(text) => {
+            let redacted = redact(text);
+            (redacted != text).then_some(redacted)
+        }
+    };
+    if let Some(redacted) = replacement
+        && let Some(object) = part.as_object_mut()
+    {
+        object.insert("text".to_string(), Value::String(redacted));
+    }
+    true
+}
+
 /// Collect scannable text from a top-level LLM content field
-/// (`prompt`/`input`/`instructions`/`system`). Handles a plain string, an array
-/// of strings, an array of `{type: text|input_text|output_text, text}` content
-/// parts, and the structured OpenAI Responses `input` shape — an array of
-/// message objects `{role, content: <string | array of parts>}` — by recursing
-/// into each message's `content`.
+/// (`prompt`/`input`/`instructions`/`system`/`inputText`). Handles a plain
+/// string, an array of strings, an array of content parts (see
+/// [`text_content_part_text`]), and the structured OpenAI Responses `input`
+/// shape — an array of message objects `{role, content: <string | array of
+/// parts>}` — by recursing into each message's `content`.
 fn collect_field_text<'a>(
     value: &'a Value,
     exclude_roles: &HashSet<String>,
@@ -1927,14 +1978,8 @@ fn collect_field_text<'a>(
                 match item {
                     Value::String(s) => texts.push(s.as_str()),
                     Value::Object(obj) => {
-                        if obj
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .is_some_and(is_text_content_part_type)
-                        {
-                            if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
-                                texts.push(text);
-                            }
+                        if let Some(text) = text_content_part_text(item) {
+                            texts.push(text);
                         } else if let Some(content) = obj.get("content") {
                             if obj
                                 .get("role")
@@ -1970,10 +2015,11 @@ fn collect_field_text<'a>(
 }
 
 /// Redact PII in a top-level LLM field that may be a string, an array of
-/// strings, or an array of `{type:"text", text:"..."}` content parts (e.g.
-/// `prompt`, `input`, `instructions`, `system`). Mirrors `collect_field_text`
-/// so detection and redaction stay symmetric — anything scanned for PII is
-/// also rewritten.
+/// strings, or an array of content parts (e.g. `prompt`, `input`,
+/// `instructions`, `system`, `inputText`). Mirrors `collect_field_text` so
+/// detection and redaction stay symmetric — anything scanned for PII is also
+/// rewritten. Both sides gate content parts through
+/// [`text_content_part_text`], so neither can drift from the other.
 fn redact_field_text(
     value: &mut Value,
     exclude_roles: &HashSet<String>,
@@ -1988,36 +2034,34 @@ fn redact_field_text(
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                match item {
-                    Value::String(s) => {
-                        let redacted = redact(s);
-                        if redacted != *s {
-                            *s = redacted;
-                        }
+                if let Value::String(s) = item {
+                    let redacted = redact(s);
+                    if redacted != *s {
+                        *s = redacted;
                     }
-                    Value::Object(obj) => {
-                        if obj
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .is_some_and(is_text_content_part_type)
-                        {
-                            if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
-                                let redacted = redact(text);
-                                if redacted != text {
-                                    obj.insert("text".to_string(), Value::String(redacted));
-                                }
-                            }
-                        } else if obj
-                            .get("role")
-                            .and_then(|r| r.as_str())
-                            .is_some_and(|role| exclude_roles.contains(role))
-                        {
-                            continue;
-                        } else if let Some(content) = obj.get_mut("content") {
-                            redact_field_text(content, exclude_roles, redact);
-                        }
-                    }
-                    _ => {}
+                    continue;
+                }
+                if !item.is_object() {
+                    continue;
+                }
+                // A text-bearing content part (explicit `type`, or a Bedrock
+                // Converse block that carries none) contributes its own `text`
+                // and is never recursed into, matching `collect_field_text`.
+                if redact_content_part_text(item, redact) {
+                    continue;
+                }
+                let Some(obj) = item.as_object_mut() else {
+                    continue;
+                };
+                if obj
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .is_some_and(|role| exclude_roles.contains(role))
+                {
+                    continue;
+                }
+                if let Some(content) = obj.get_mut("content") {
+                    redact_field_text(content, exclude_roles, redact);
                 }
             }
         }
@@ -2031,6 +2075,119 @@ fn redact_field_text(
             }
         }
         _ => {}
+    }
+}
+
+/// Visit every Google Gemini / Vertex `parts` array that carries model-visible
+/// prompt text: each in-scope `contents[]` turn, plus the system instruction
+/// under BOTH the JSON (`systemInstruction`) and proto (`system_instruction`)
+/// casings — either reaches the model, so inspecting only one leaves the other
+/// uninspected. Mirrors the dual-casing extraction the sibling
+/// `ai_semantic_firewall` and `ai_request_guard` plugins already perform.
+///
+/// `exclude_roles` filters `contents[].role` the same way it filters
+/// `messages[].role`, and suppresses the system instruction when `system` is
+/// excluded — matching the `system` carve-out in [`CONTENT_SCAN_FIELDS`].
+///
+/// Read-only traversal shared by the fragment scan and the boundary-aware
+/// cross-part scan; the mutating counterpart is [`redact_gemini_prompt_text`].
+fn for_each_gemini_parts<'a>(
+    json: &'a Value,
+    exclude_roles: &HashSet<String>,
+    visit: &mut impl FnMut(&'a [Value]),
+) {
+    if let Some(contents) = json.get("contents").and_then(Value::as_array) {
+        for content in contents {
+            if content
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| exclude_roles.contains(role))
+            {
+                continue;
+            }
+            if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+                visit(parts.as_slice());
+            }
+        }
+    }
+    if exclude_roles.contains("system") {
+        return;
+    }
+    for key in ["systemInstruction", "system_instruction"] {
+        if let Some(parts) = json
+            .get(key)
+            .and_then(|instruction| instruction.get("parts"))
+            .and_then(Value::as_array)
+        {
+            visit(parts.as_slice());
+        }
+    }
+}
+
+/// Collect Gemini / Vertex prompt text for Content-mode scanning:
+/// `contents[].parts[].text` (the provider's equivalent of
+/// `messages[].content`) and `systemInstruction.parts[].text`. Gemini bodies
+/// carry no `messages` array and none of the [`CONTENT_SCAN_FIELDS`], so
+/// without this the whole prompt passed Content mode unscanned
+/// (`ScanMode::All` already covered it via full-body recursion).
+///
+/// Bounded to one level per part, matching the sibling plugins' extraction: a
+/// part contributes only its own `text` string and is never recursed into.
+fn collect_gemini_prompt_text<'a>(
+    json: &'a Value,
+    exclude_roles: &HashSet<String>,
+    texts: &mut Vec<&'a str>,
+) {
+    for_each_gemini_parts(json, exclude_roles, &mut |parts| {
+        for part in parts {
+            if let Some(text) = text_content_part_text(part) {
+                texts.push(text);
+            }
+        }
+    });
+}
+
+/// Redact PII in every Gemini / Vertex prompt part scanned by
+/// [`collect_gemini_prompt_text`], keeping Content-mode detection and
+/// redaction symmetric. Without this, Redact mode would report the PII removed
+/// while forwarding the original `parts[].text` unchanged (a fail-open
+/// bypass). The traversal — both casings, the same `exclude_roles` filtering,
+/// one level per part — is the mutable mirror of [`for_each_gemini_parts`].
+fn redact_gemini_prompt_text(
+    json: &mut Value,
+    exclude_roles: &HashSet<String>,
+    redact: &impl Fn(&str) -> String,
+) {
+    if let Some(contents) = json.get_mut("contents").and_then(Value::as_array_mut) {
+        for content in contents.iter_mut() {
+            if content
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| exclude_roles.contains(role))
+            {
+                continue;
+            }
+            redact_parts_text(content.get_mut("parts"), redact);
+        }
+    }
+    if exclude_roles.contains("system") {
+        return;
+    }
+    for key in ["systemInstruction", "system_instruction"] {
+        if let Some(instruction) = json.get_mut(key) {
+            redact_parts_text(instruction.get_mut("parts"), redact);
+        }
+    }
+}
+
+/// Redact the `text` of each element of a Gemini-style `parts` array, gated by
+/// the same [`text_content_part_text`] contract the scan uses.
+fn redact_parts_text(parts: Option<&mut Value>, redact: &impl Fn(&str) -> String) {
+    let Some(parts) = parts.and_then(Value::as_array_mut) else {
+        return;
+    };
+    for part in parts.iter_mut() {
+        redact_content_part_text(part, redact);
     }
 }
 

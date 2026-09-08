@@ -5594,3 +5594,48 @@ async fn window_capacity_refusal_selects_capacity_not_restricted_content_502() {
          collapsing it into residual=true"
     );
 }
+
+// ─── Bedrock Converse buffered response shape (#4792 sibling sweep) ──────
+
+#[tokio::test]
+async fn test_content_mode_scans_bedrock_converse_output_message() {
+    // Amazon Bedrock Converse returns `output.message.content[]` — an OBJECT
+    // `output`, not the Responses API `output` array, and blocks with no
+    // `type` discriminator. Content mode previously read neither, so a Converse
+    // completion passed the guard entirely unscanned.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = serde_json::to_vec(&json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": "ssn 123-45-6789"}]}},
+        "stopReason": "end_turn"
+    }))
+    .unwrap();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "Bedrock Converse completion must be scanned, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_redact_mode_rewrites_bedrock_converse_output_message() {
+    // Detection and redaction must stay symmetric on the new shape too.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "redact"}));
+    let body = serde_json::to_vec(&json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": "ssn 123-45-6789"}]}}
+    }))
+    .unwrap();
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("expected a redacted Converse body");
+    let out = String::from_utf8(transformed).unwrap();
+    assert!(!out.contains("123-45-6789"), "not redacted: {out}");
+    assert!(out.contains("[REDACTED:pii:ssn]"), "no placeholder: {out}");
+}
