@@ -7300,7 +7300,10 @@ async fn semantic_cache_compression_replay_encodes_once() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
-    assert_eq!(headers.get("content-length").unwrap(), &body.len().to_string());
+    assert_eq!(
+        headers.get("content-length").unwrap(),
+        &body.len().to_string()
+    );
     let mut decoded = Vec::new();
     flate2::read::GzDecoder::new(body.as_ref())
         .read_to_end(&mut decoded)
