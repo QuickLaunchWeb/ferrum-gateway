@@ -980,23 +980,31 @@ async fn functional_protocol_validation_pipelined_parse_reject_preserves_first_r
 
     let reservation = reserve_port().await.expect("reserve backend port");
     let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
-        .steps([
-            HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/PROOF")),
-            HttpStep::Sleep(Duration::from_secs(1)),
-            HttpStep::RespondStatus {
-                status: 200,
-                reason: "OK".into(),
-            },
-            HttpStep::RespondHeader {
-                name: "Content-Length".into(),
-                value: "5".into(),
-            },
-            HttpStep::RespondHeader {
-                name: "X-Backend-Marker".into(),
-                value: "proof".into(),
-            },
-            HttpStep::RespondBodyChunk(b"PROOF".to_vec()),
-            HttpStep::RespondBodyEnd,
+        .connection_scripts([
+            vec![
+                HttpStep::ExpectRequest(RequestMatcher::custom(|request| {
+                    request.raw_prelude.as_slice() == b"PRI * HTTP/2.0"
+                })),
+                HttpStep::CloseBeforeStatus,
+            ],
+            vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/PROOF")),
+                HttpStep::Sleep(Duration::from_secs(1)),
+                HttpStep::RespondStatus {
+                    status: 200,
+                    reason: "OK".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Content-Length".into(),
+                    value: "5".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "X-Backend-Marker".into(),
+                    value: "proof".into(),
+                },
+                HttpStep::RespondBodyChunk(b"PROOF".to_vec()),
+                HttpStep::RespondBodyEnd,
+            ],
         ])
         .spawn()
         .expect("start scripted backend");
@@ -1007,6 +1015,25 @@ async fn functional_protocol_validation_pipelined_parse_reject_preserves_first_r
         .spawn()
         .await
         .expect("start gateway");
+
+    // File mode probes h2c even with pool warmup disabled. The scripted H1
+    // parser records its preface as a request. Verify that exact startup
+    // record before sending client traffic; all subsequent records must be
+    // application requests, so neither retries nor malformed heads are hidden.
+    let startup_requests = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let requests = backend.received_requests().await;
+            if !requests.is_empty() {
+                break requests;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("startup h2c probe did not reach backend");
+    assert_eq!(startup_requests.len(), 1, "{startup_requests:?}");
+    assert_eq!(startup_requests[0].raw_prelude.as_slice(), b"PRI * HTTP/2.0");
+    backend.assert_no_matcher_mismatches().await;
 
     let valid = b"GET /PROOF HTTP/1.1\r\nHost: app.example\r\n\r\n";
     let malformed_heads: [(&[u8], &str); 3] = [
@@ -1031,6 +1058,11 @@ async fn functional_protocol_validation_pipelined_parse_reject_preserves_first_r
         assert_eq!(control.status_code, 400);
         assert_eq!(control.body, diagnostic);
         assert_eq!(raw_header(&control, "connection"), Some("close"));
+        assert_eq!(
+            backend.received_requests().await.len(),
+            expected_requests + 1,
+            "fresh malformed head must not reach the origin: {diagnostic}"
+        );
 
         for separate_writes in [false, true] {
             let stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
@@ -1045,7 +1077,7 @@ async fn functional_protocol_validation_pipelined_parse_reject_preserves_first_r
                 // Observe origin dispatch before sending the malformed head;
                 // the backend delays its first response byte for one second.
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while backend.received_requests().await.len() < expected_requests {
+                    while backend.received_requests().await.len() < expected_requests + 1 {
                         sleep(Duration::from_millis(5)).await;
                     }
                 })
@@ -1078,10 +1110,16 @@ async fn functional_protocol_validation_pipelined_parse_reject_preserves_first_r
             let requests = backend.received_requests().await;
             assert_eq!(
                 requests.len(),
-                expected_requests,
-                "one origin hit per pipeline"
+                expected_requests + 1,
+                "one startup probe plus one origin hit per pipeline: \
+                 {diagnostic}, separate_writes={separate_writes}, requests={requests:?}"
             );
-            assert!(requests.iter().all(|request| request.path == "/PROOF"));
+            assert!(
+                requests[1..]
+                    .iter()
+                    .all(|request| request.method == "GET" && request.path == "/PROOF"),
+                "unexpected application request: {requests:?}"
+            );
         }
     }
     backend.assert_no_matcher_mismatches().await;
