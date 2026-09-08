@@ -1676,6 +1676,16 @@ pub mod _test_support {
         crate::proxy::x_gateway_error_for_backend_failure(connection_error, status)
     }
 
+    pub fn response_policy_observability_for_test(
+        ctx: &crate::plugins::RequestContext,
+        status: u16,
+    ) -> (Option<crate::retry::ErrorClass>, Option<&'static str>) {
+        (
+            ctx.response_policy_error_class(None),
+            crate::proxy::x_gateway_error_for_response(ctx, false, status),
+        )
+    }
+
     pub fn apply_authoritative_backend_gateway_error_header_for_test(
         response_headers: &mut HashMap<String, String>,
         connection_error: bool,

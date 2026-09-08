@@ -2028,6 +2028,8 @@ pub(crate) enum BoundedResponseBodyConstruction {
     Unchanged,
     /// The producer claimed a rewrite, but the ceiling-bounded sink refused.
     CapacityRefused,
+    /// JSON output reached this length before the bounded sink stopped writing.
+    SizeLimitExceeded(usize),
 }
 
 impl BoundedResponseBodyConstruction {
@@ -2043,6 +2045,11 @@ impl BoundedResponseBodyConstruction {
                 ctx.mark_buffered_response_capacity_refusal_pending();
                 None
             }
+            Self::SizeLimitExceeded(produced_bytes) => {
+                ctx.response_transform_size_refusal_pending = Some(produced_bytes);
+                ctx.mark_buffered_response_capacity_refusal_pending();
+                None
+            }
         }
     }
 
@@ -2052,7 +2059,7 @@ impl BoundedResponseBodyConstruction {
     pub(crate) fn into_option(self) -> Option<Vec<u8>> {
         match self {
             Self::Replaced(bytes) => Some(bytes),
-            Self::Unchanged | Self::CapacityRefused => None,
+            Self::Unchanged | Self::CapacityRefused | Self::SizeLimitExceeded(_) => None,
         }
     }
 }
@@ -2374,7 +2381,8 @@ pub struct RequestContext {
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
     /// Whether the gateway selected the health-neutral retained-response
-    /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) for this request.
+    /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) or its deterministic
+    /// JSON output-policy counterpart (`502`) for this request.
     /// Once set, later body hooks, transforms, final validators, cache stores,
     /// and trailer reframes must preserve that terminal rather than treating
     /// normalize's rewrite bool as an ordinary body rewrite
@@ -2411,6 +2419,11 @@ pub struct RequestContext {
     /// preflight scans); taken when the shared installer runs so it cannot
     /// leak into another phase or retry generation (GHSA-pwcm-6rh8-f2gh).
     buffered_response_capacity_refusal_pending: bool,
+    /// Size evidence from the bounded JSON writer; consumed before the generic
+    /// pending bit so deterministic policy and aggregate capacity stay distinct.
+    response_transform_size_refusal_pending: Option<usize>,
+    /// Refines the shared terminal fence with gateway output-policy provenance.
+    response_transform_size_refusal_selected: bool,
     /// Monotonic request-global proof that at least one response-caching
     /// instance served a HIT or REVALIDATED response. Kept outside public
     /// metadata so sibling/custom plugins cannot clear or forge the signal
@@ -3438,6 +3451,8 @@ impl RequestContext {
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
             buffered_response_capacity_refusal_pending: false,
+            response_transform_size_refusal_pending: None,
+            response_transform_size_refusal_selected: false,
             response_cache_hit: false,
             origin_http_response_status: None,
             request_wire_transport: None,
@@ -3861,6 +3876,8 @@ impl RequestContext {
         if hook_ctx.gateway_capacity_response_selected() {
             self.mark_gateway_capacity_response_selected();
         }
+        self.response_transform_size_refusal_selected |=
+            hook_ctx.response_transform_size_refusal_selected;
         if hook_ctx.gateway_representation_response_selected() {
             self.mark_gateway_representation_response_selected();
         }
@@ -3875,7 +3892,32 @@ impl RequestContext {
 
     /// Take the one-shot capacity-refusal pending bit.
     pub(crate) fn take_buffered_response_capacity_refusal_pending(&mut self) -> bool {
+        self.response_transform_size_refusal_pending = None;
         std::mem::take(&mut self.buffered_response_capacity_refusal_pending)
+    }
+
+    pub(crate) fn take_response_transform_size_refusal_pending(&mut self) -> Option<usize> {
+        self.response_transform_size_refusal_pending.take()
+    }
+
+    pub(crate) fn mark_response_transform_size_refusal_selected(&mut self) {
+        self.response_transform_size_refusal_selected = true;
+    }
+
+    /// Private gateway provenance; plugin/backend headers cannot forge this decision.
+    pub(crate) fn response_transform_size_refusal_selected(&self) -> bool {
+        self.response_transform_size_refusal_selected
+    }
+
+    pub(crate) fn response_policy_error_class(
+        &self,
+        backend_class: Option<crate::retry::ErrorClass>,
+    ) -> Option<crate::retry::ErrorClass> {
+        if self.response_transform_size_refusal_selected {
+            Some(crate::retry::ErrorClass::DispatchPolicyRejected)
+        } else {
+            backend_class
+        }
     }
 
     /// Remaining whole-millisecond gRPC budget, rounded up so a positive
@@ -4652,6 +4694,8 @@ impl RequestContext {
             // original context instead of duplicating it into this compatibility
             // clone, where it could be consumed or copied back spuriously.
             buffered_response_capacity_refusal_pending: false,
+            response_transform_size_refusal_pending: None,
+            response_transform_size_refusal_selected: self.response_transform_size_refusal_selected,
             response_cache_hit: self.response_cache_hit,
             origin_http_response_status: self.origin_http_response_status,
             request_wire_transport: self.request_wire_transport,
@@ -7735,8 +7779,8 @@ pub async fn log_with_mirror(
     // trailers-only), gRPC-Web, H1/H2/H3, the HBONE relay, and the WebSocket
     // upgrade summary — so no call site has to remember to carry it.
     //
-    // Clone only to stamp a missing trigger carrier or the detected WebSocket
-    // flavor. Ordinary untriggered HTTP keeps the allocation-free path.
+    // Clone only to stamp a missing trigger carrier, detected WebSocket flavor,
+    // or a gateway output-policy refusal. Ordinary HTTP stays allocation-free.
     // Keep the conditional clone out of this async future's inline state. A
     // `TransactionSummary` is deliberately broad; storing it inline here grows
     // every request future (including the allocation-free, untriggered case)
@@ -7746,12 +7790,15 @@ pub async fn log_with_mirror(
     let stamp_triggers =
         ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty();
     let stamp_websocket = matches!(ctx.request_http_flavor(), HttpFlavor::WebSocket);
-    let mut stamped = if stamp_triggers || stamp_websocket {
+    let policy_error_class = ctx.response_policy_error_class(summary.error_class);
+    let stamp_policy = policy_error_class != summary.error_class;
+    let mut stamped = if stamp_triggers || stamp_websocket || stamp_policy {
         Some(Box::new(summary.clone()))
     } else {
         None
     };
     if let Some(stamped) = stamped.as_deref_mut() {
+        stamped.error_class = policy_error_class;
         if stamp_triggers {
             stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
         }
