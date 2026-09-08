@@ -28040,7 +28040,7 @@ components:
           description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
         max_prompt_characters:
           type: integer
-          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, document/RAG fields (including Anthropic text document source.data), and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
+          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, Bedrock Converse messages[].content[].toolResult content and guardContent text, tools, tool arguments, document/RAG fields (including Anthropic text document source.data), Google Vertex legacy predict instances[].prompt, and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
         temperature_range:
           type: array
           items:
@@ -28235,13 +28235,13 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, system, and inputText (completions/responses/embeddings/Anthropic-system/Bedrock-Titan shapes), Google Gemini contents[].parts[].text and systemInstruction/system_instruction parts, and Azure On Your Data role_information — including content blocks that carry no type discriminator (Bedrock Converse) and matches split across adjacent text parts. Detection and redaction cover the same field set. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
+          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, system, inputText, message, preamble, and inputs (completions/responses/embeddings/Anthropic-system/Bedrock-Titan/Cohere-v1/HuggingFace-TGI shapes), Google Gemini contents[].parts[].text and systemInstruction/system_instruction parts, Cohere chat_history[].message, Google Vertex legacy predict instances[].prompt, Bedrock Converse messages[].content[].toolResult content and guardContent text, Anthropic tool_result block content, and Azure On Your Data role_information — including content blocks that carry no type discriminator (Bedrock Converse) and matches split across adjacent text parts. Detection and redaction cover the same field set. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
             type: string
           default: []
-          description: Message roles to skip scanning
+          description: "Message roles to skip scanning. Filters messages[].role, Gemini contents[].role, and Cohere chat_history[].role (matched case-insensitively, since Cohere spells roles USER/CHATBOT/SYSTEM/TOOL); the value 'system' additionally suppresses the top-level system field, the Cohere preamble, and the Gemini system instruction"
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"

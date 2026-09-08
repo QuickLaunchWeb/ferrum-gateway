@@ -16,8 +16,12 @@
 //! siblings.
 //!
 //! Every request-side cell is currently `Extracts`: the firewall's gaps closed
-//! with GHSA-8gc3-h5c8-jjxx, and `ai_prompt_shield`'s Gemini / Bedrock Titan /
-//! Bedrock Converse gaps closed after them.
+//! with GHSA-8gc3-h5c8-jjxx, `ai_prompt_shield`'s Gemini / Bedrock Titan /
+//! Bedrock Converse-text gaps closed after them, and the remaining
+//! `ai_prompt_shield` / `ai_request_guard` gaps — Converse `toolResult` and
+//! `guardContent`, Anthropic `tool_result` blocks, Cohere v1
+//! `message`/`preamble`/`chat_history`, Hugging Face TGI `inputs`, and Vertex
+//! legacy `instances[].prompt` — closed last.
 //!
 //! Out of scope here: `ai_tool_governor` (governs tool-call and tool-definition
 //! shapes, not prompt text — its provider parity is covered by its own tests
@@ -153,12 +157,25 @@ fn provider_shapes() -> Vec<ProviderShape> {
                 }]
             }),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap(
-                "Converse content blocks carry no `type`, which both shield scans require",
-            ),
-            request_guard: Coverage::Gap(
-                "count_text_value has no `toolResult` arm, so the block counts zero characters",
-            ),
+            prompt_shield: Coverage::Extracts,
+            request_guard: Coverage::Extracts,
+        },
+        ProviderShape {
+            // Bedrock Converse guarded text: the block nests its prompt two
+            // levels down under a key no `content[].text` reader visits, and
+            // the API also accepts the flat `{"guardContent": {"text": "..."}}`
+            // spelling, so a reader that learns only one still leaves the other
+            // uninspected.
+            name: "bedrock converse messages[].content[].guardContent",
+            body: json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{"guardContent": {"text": {"text": MARKER}}}]
+                }]
+            }),
+            semantic_firewall: Coverage::Extracts,
+            prompt_shield: Coverage::Extracts,
+            request_guard: Coverage::Extracts,
         },
         ProviderShape {
             // Anthropic's spelling of the same injection. It rides inside a
@@ -176,31 +193,29 @@ fn provider_shapes() -> Vec<ProviderShape> {
                 }]
             }),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap(
-                "tool_result is not a text part type, so the block is skipped",
-            ),
+            prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
         },
         ProviderShape {
             name: "cohere v1 chat message",
             body: json!({"message": MARKER, "preamble": "Be helpful."}),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap("message is not in CONTENT_SCAN_FIELDS"),
+            prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
         },
         ProviderShape {
             name: "huggingface tgi inputs",
             body: json!({"inputs": MARKER, "parameters": {"max_new_tokens": 64}}),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap("inputs is not in CONTENT_SCAN_FIELDS"),
+            prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
         },
         ProviderShape {
             name: "vertex legacy predict instances[].prompt",
             body: json!({"instances": [{"prompt": MARKER}]}),
             semantic_firewall: Coverage::Extracts,
-            prompt_shield: Coverage::Gap("instances is not in CONTENT_SCAN_FIELDS"),
-            request_guard: Coverage::Gap("count_prompt_characters has no `instances` arm"),
+            prompt_shield: Coverage::Extracts,
+            request_guard: Coverage::Extracts,
         },
     ]
 }
@@ -317,25 +332,30 @@ async fn every_enforcing_request_plugin_matches_its_recorded_provider_shape_cove
 #[test]
 fn every_request_plugin_covers_every_shape_in_the_table() {
     // GHSA-8gc3-h5c8-jjxx left `ai_semantic_firewall` provider-blind, and
-    // `ai_prompt_shield`'s default Content mode carried the same defect on the
-    // Gemini, Bedrock Titan, and Bedrock Converse text shapes. Both are closed.
-    // The firewall row is asserted all-`Extracts` directly rather than only
-    // per-row, so a regression cannot be papered over by re-recording its cell
-    // as a gap: demoting a cell here has to be a deliberate, reviewed edit.
+    // `ai_prompt_shield`'s default Content mode carried the same defect — first
+    // on the Gemini, Bedrock Titan, and Bedrock Converse text shapes, then on
+    // the tool-result / guarded-text / Cohere / TGI / Vertex shapes the #4900
+    // review round added to this table. `ai_request_guard` carried it on
+    // Converse `toolResult` and Vertex `instances[].prompt`. All of them are
+    // closed.
     //
-    // `ai_prompt_shield` and `ai_request_guard` still record gaps on the
-    // shapes the #4900 review round added (Converse `toolResult`, Anthropic
-    // `tool_result` blocks, Cohere `message`, TGI `inputs`, Vertex
-    // `instances`); those cells are exercised per row above and are tracked
-    // for closure in the parity-gaps follow-up, after which this loop widens
-    // to all three plugins again.
+    // Every column is asserted all-`Extracts` directly rather than only
+    // per-row, so a regression cannot be papered over by re-recording a cell
+    // as a gap: demoting one here has to be a deliberate, reviewed edit that
+    // shows up in this loop as well as in its row.
     for shape in provider_shapes() {
-        assert_eq!(
-            shape.semantic_firewall,
-            Coverage::Extracts,
-            "ai_semantic_firewall must extract every provider shape in this table ({})",
-            shape.name
-        );
+        for (plugin, coverage) in [
+            ("ai_semantic_firewall", shape.semantic_firewall),
+            ("ai_prompt_shield", shape.prompt_shield),
+            ("ai_request_guard", shape.request_guard),
+        ] {
+            assert_eq!(
+                coverage,
+                Coverage::Extracts,
+                "{plugin} must extract every provider shape in this table ({})",
+                shape.name
+            );
+        }
     }
 }
 
