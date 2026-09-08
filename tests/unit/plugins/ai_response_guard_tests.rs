@@ -1698,7 +1698,10 @@ async fn test_sse_gemini_multi_candidate_split_is_inspected() {
     let mut ctx = ctx_with_content_type("POST", "text/event-stream");
 
     let mut body = String::new();
-    for (first, second) in [("The weather ", "Your SSN is 123-"), ("is fine.", "45-6789")] {
+    for (first, second) in [
+        ("The weather ", "Your SSN is 123-"),
+        ("is fine.", "45-6789"),
+    ] {
         let frame = json!({
             "candidates": [
                 {"index": 0, "content": {"role": "model", "parts": [{"text": first}]}},

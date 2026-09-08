@@ -1292,7 +1292,10 @@ fn gemini_sse_malformed_shapes_are_uninspectable_and_never_panic() {
     ] {
         let body = format!("data: {frame}\n\n");
         let (_texts, inspectable) = reassemble_gemini(body.as_bytes());
-        assert!(!inspectable, "malformed Gemini frame must fail closed: {frame}");
+        assert!(
+            !inspectable,
+            "malformed Gemini frame must fail closed: {frame}"
+        );
     }
 }
 
