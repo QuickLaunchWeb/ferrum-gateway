@@ -206,7 +206,7 @@ mod tests {
             panic!("expected a NACK outcome for an error message");
         };
         assert!(
-            message.len() <= super::MAX_XDS_LOG_VALUE_CHARS + "(truncated)".len(),
+            message.len() <= crate::xds::MAX_XDS_LOG_VALUE_CHARS + "(truncated)".len(),
             "the NACK message must be bounded, got {} bytes",
             message.len()
         );
