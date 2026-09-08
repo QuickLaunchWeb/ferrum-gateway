@@ -81,6 +81,8 @@ There is one transport-level exception that applies to **every** admin endpoint,
 
 ### `/health`, `/status` — readiness + diagnostics (tiered)
 
+A configured TCP/UDP/TLS/DTLS stream listener that is unbound, deferred, or whose task has exited makes `/health` and `/status` return 503 with `status: "degraded"` and `ready: false`. A supervisor retries every 30 seconds using current configuration; readiness recovers when the listener serves or is withdrawn. Healthy listeners continue serving, and `/live` is unaffected. Detailed failures remain on authenticated `/overload`; no port or failure detail is added to unauthenticated health. Initial bind failure remains fatal in file/database mode and non-fatal in DP mode.
+
 ```bash
 # Unauthenticated (LB / readiness probe): status + ready only.
 curl http://localhost:9000/health

@@ -9637,6 +9637,7 @@ impl ProxyState {
                 trusted_proxies.clone(),
             ),
         );
+        stream_listener_manager.start_supervisor();
         // Raw TCP / TCP+TLS stream listeners own a dedicated backend socket per
         // relay session, so they must admit on the SAME per-destination lane as
         // WebSocket, the pooled multiplexed transports, and reqwest. Attached

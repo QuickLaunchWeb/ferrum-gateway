@@ -2640,6 +2640,10 @@ async fn handle_admin_request_inner(
             .as_ref()
             .is_some_and(|proxy| proxy.overload.draining.load(Ordering::Acquire));
         let draining = crate::overload::shutdown_drain_announced() || instance_draining;
+        let stream_listeners_not_ready = state
+            .proxy_state
+            .as_ref()
+            .is_some_and(|proxy| !proxy.stream_listener_manager.is_ready());
         let ready = startup_ready
             && !serving_degraded
             && jwks_ready
@@ -2648,9 +2652,10 @@ async fn handle_admin_request_inner(
             && !cp_trust_blocked
             && !replay_authority_unavailable
             && !gateway_listeners_not_ready
+            && !stream_listeners_not_ready
             && !draining;
         health_status["ready"] = json!(ready);
-        if gateway_listeners_degraded {
+        if gateway_listeners_degraded || stream_listeners_not_ready {
             health_status["status"] = json!("degraded");
         }
         // Ports, sanitized error detail, config generation, and occurrence
@@ -2950,7 +2955,7 @@ async fn handle_admin_request_inner(
                 "draining"
             } else if lost_authority {
                 "unavailable"
-            } else if gateway_listeners_not_ready {
+            } else if gateway_listeners_not_ready || stream_listeners_not_ready {
                 "degraded"
             } else {
                 "starting"
