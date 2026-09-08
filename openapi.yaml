@@ -15418,7 +15418,7 @@ components:
           properties:
             file_descriptors:
               type: object
-              required: [current, max, ratio]
+              required: [current, max, ratio, enforced]
               properties:
                 current:
                   type: integer
@@ -15426,10 +15426,20 @@ components:
                 max:
                   type: integer
                   format: uint64
+                  description: >-
+                    Enforceable per-process FD ceiling. `0` means no enforceable ceiling could be
+                    determined (non-Unix platform, `getrlimit` failure, or an unlimited hard cap
+                    with no published platform ceiling), and FD-based shedding is disabled.
                 ratio:
                   type: number
                   format: double
-                  description: current / max (0.0–1.0)
+                  description: current / max (0.0–1.0). Always 0.0 when `enforced` is false
+                enforced:
+                  type: boolean
+                  description: >-
+                    False when FD-based load shedding is disabled because no enforceable ceiling
+                    could be determined. Distinguishes "this tier is off" from "FD pressure at 0%".
+                    Connection- and request-based shedding are unaffected.
             connections:
               type: object
               required: [current, max, ratio]

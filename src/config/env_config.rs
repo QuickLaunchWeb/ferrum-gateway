@@ -6605,6 +6605,27 @@ impl EnvConfig {
             ));
         }
 
+        // Graceful-shutdown budgets (issue #4829). Both knobs are refused at
+        // the configuration boundary rather than clamped: a value large enough
+        // to matter is always a typo, and discovering it during an incident —
+        // as a process that only SIGKILL can stop — is exactly the outcome
+        // `ferrum-edge validate` exists to prevent. `0` stays meaningful for
+        // both (skip the drain wait / no pre-drain window).
+        if self.shutdown_drain_seconds > crate::overload::MAX_SHUTDOWN_DRAIN_SECONDS {
+            return Err(format!(
+                "FERRUM_SHUTDOWN_DRAIN_SECONDS must be at most {} seconds (0 skips the drain \
+                 wait)",
+                crate::overload::MAX_SHUTDOWN_DRAIN_SECONDS
+            ));
+        }
+        if self.shutdown_predrain_seconds > crate::overload::MAX_SHUTDOWN_PREDRAIN_SECONDS {
+            return Err(format!(
+                "FERRUM_SHUTDOWN_PREDRAIN_SECONDS must be at most {} seconds (0 disables the \
+                 pre-drain window)",
+                crate::overload::MAX_SHUTDOWN_PREDRAIN_SECONDS
+            ));
+        }
+
         self.validate_h3_connect_udp_limits()?;
         self.validate_mesh_app_probe_limits()?;
 

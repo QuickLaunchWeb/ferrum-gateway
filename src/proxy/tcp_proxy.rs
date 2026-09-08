@@ -9961,16 +9961,68 @@ fn classify_splice_worker_failure(
     }
 }
 
+/// Tokio's default `max_blocking_threads`, used when `FERRUM_BLOCKING_THREADS`
+/// is unset. Mirrors the value the runtime builder itself defaults to.
+pub const DEFAULT_BLOCKING_THREADS: usize = 512;
+
+/// Divisor applied to the blocking pool to size the io_uring splice relay cap.
+///
+/// Each admitted relay holds TWO blocking threads (one per direction) for the
+/// whole connection lifetime, so a cap of `pool / 4` relays consumes at most
+/// half the pool at saturation and always leaves half for everything else —
+/// including the overload monitor's open-FD count and config reload, which run
+/// on the same pool (issue #4786). Relays beyond the cap transparently fall
+/// back to the async splice path rather than queueing.
+///
+/// At the default 512-thread pool this reproduces the previous hardcoded 128,
+/// so nothing changes for a deployment that never touched
+/// `FERRUM_BLOCKING_THREADS`; a smaller pool now shrinks the cap with it
+/// instead of letting relays claim the whole thing.
+const IO_URING_SPLICE_POOL_DIVISOR: usize = 4;
+
+/// Derive the concurrent io_uring splice relay cap from the configured
+/// blocking pool size.
+///
+/// Never returns 0: a one-thread pool still admits a single relay, because the
+/// alternative is silently disabling io_uring splice on a configuration that
+/// asked for it.
+pub fn derive_io_uring_splice_max_concurrent(blocking_threads: Option<usize>) -> usize {
+    let pool = blocking_threads.unwrap_or(DEFAULT_BLOCKING_THREADS).max(1);
+    (pool / IO_URING_SPLICE_POOL_DIVISOR).max(1)
+}
+
 #[cfg(target_os = "linux")]
-const IO_URING_SPLICE_MAX_CONCURRENT: usize = 128;
+static IO_URING_SPLICE_MAX_CONCURRENT: OnceLock<usize> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 static IO_URING_SPLICE_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+/// Seed the relay cap from the process configuration.
+///
+/// Called once from startup, before any listener is bound, so the first relay
+/// observes the derived value. Idempotent: a later call (or a relay that
+/// arrived first) leaves the already-published cap in place, because the
+/// semaphore it sized cannot be resized without losing outstanding permits.
+#[cfg(target_os = "linux")]
+pub fn initialize_io_uring_splice_limit(blocking_threads: Option<usize>) {
+    let _ = IO_URING_SPLICE_MAX_CONCURRENT
+        .set(derive_io_uring_splice_max_concurrent(blocking_threads));
+}
+
+/// No-op on non-Linux targets, where io_uring splice does not exist.
+#[cfg(not(target_os = "linux"))]
+pub fn initialize_io_uring_splice_limit(_blocking_threads: Option<usize>) {}
+
+#[cfg(target_os = "linux")]
+fn io_uring_splice_max_concurrent() -> usize {
+    *IO_URING_SPLICE_MAX_CONCURRENT
+        .get_or_init(|| derive_io_uring_splice_max_concurrent(None))
+}
+
 #[cfg(target_os = "linux")]
 fn io_uring_splice_limit() -> Arc<Semaphore> {
     IO_URING_SPLICE_LIMIT
-        .get_or_init(|| Arc::new(Semaphore::new(IO_URING_SPLICE_MAX_CONCURRENT)))
+        .get_or_init(|| Arc::new(Semaphore::new(io_uring_splice_max_concurrent())))
         .clone()
 }
 
@@ -10027,7 +10079,7 @@ async fn bidirectional_splice_io_uring_bounded_or_async(
         .await
     } else {
         debug!(
-            max_concurrent = IO_URING_SPLICE_MAX_CONCURRENT,
+            max_concurrent = io_uring_splice_max_concurrent(),
             "io_uring splice concurrency limit reached; falling back to async splice"
         );
         bidirectional_splice(

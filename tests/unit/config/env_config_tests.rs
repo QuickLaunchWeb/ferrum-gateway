@@ -7587,3 +7587,91 @@ fn main_resolves_predrain_through_the_shared_mode_gate() {
          loops close"
     );
 }
+
+// ── Graceful-shutdown drain bounds (issue #4829) ──────────────────────
+
+#[test]
+fn test_env_config_shutdown_drain_seconds_accepts_zero_default_and_maximum() {
+    for (value, expected) in [("0", 0u64), ("30", 30), ("86400", 86_400)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_DRAIN_SECONDS", value),
+            ],
+            || {
+                assert_eq!(
+                    EnvConfig::from_env().unwrap().shutdown_drain_seconds,
+                    expected
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_drain_seconds_rejects_values_above_the_maximum() {
+    for value in ["86401", "31536000"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_DRAIN_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    error.contains("FERRUM_SHUTDOWN_DRAIN_SECONDS"),
+                    "unexpected error for {value}: {error}"
+                );
+                assert!(
+                    error.contains("86400"),
+                    "error should name the documented maximum: {error}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_predrain_seconds_accepts_zero_and_maximum() {
+    for (value, expected) in [("0", 0u64), ("3600", 3_600)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_PREDRAIN_SECONDS", value),
+            ],
+            || {
+                assert_eq!(
+                    EnvConfig::from_env().unwrap().shutdown_predrain_seconds,
+                    expected
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_shutdown_predrain_seconds_rejects_values_above_the_maximum() {
+    for value in ["3601", "86400"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_SHUTDOWN_PREDRAIN_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    error.contains("FERRUM_SHUTDOWN_PREDRAIN_SECONDS"),
+                    "unexpected error for {value}: {error}"
+                );
+                assert!(
+                    error.contains("3600"),
+                    "error should name the documented maximum: {error}"
+                );
+            },
+        );
+    }
+}

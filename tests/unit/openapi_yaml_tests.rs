@@ -6748,6 +6748,7 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
                 current: 10,
                 max: 100,
                 ratio: 0.1,
+                enforced: true,
             },
             connections: ConnPressure {
                 current: 2,
