@@ -163,13 +163,9 @@ fn backup_quarantines_identity_conflicts_while_file_admission_still_rejects() {
             serde_json::to_value(&loaded.consumers).unwrap(),
             serde_json::to_value(&database_candidate.consumers).unwrap()
         );
-        let error = load_config_from_file(
-            &path,
-            30,
-            &BackendEgressPolicy::unrestricted(),
-            "ferrum",
-        )
-        .unwrap_err();
+        let error =
+            load_config_from_file(&path, 30, &BackendEgressPolicy::unrestricted(), "ferrum")
+                .unwrap_err();
         assert!(error.to_string().contains("consumer identity"));
     }
 }
