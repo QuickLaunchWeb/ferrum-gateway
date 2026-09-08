@@ -56,6 +56,7 @@ use tracing::warn;
 
 use super::utils::byte_budget::{ProcessByteReservation, RetainedByteCeiling, process_ceiling};
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
+use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, LoggerHooks, PluginHttpClient, RetryPolicy,
 };
@@ -88,6 +89,8 @@ pub const HARD_MAX_QUEUE_MAX_KBYTES: u32 = 262_144;
 pub const DEFAULT_MESSAGE_MAX_BYTES: u32 = 1_048_576;
 pub const HARD_MAX_MESSAGE_MAX_BYTES: u32 = 4_194_304;
 
+/// Fixed `plugin` label for this sink's process-wide loss accounting.
+const KAFKA_PLUGIN_NAME: &str = "kafka_logging";
 const DELIVERY_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const SATURATION_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const ADMISSION_DRAIN_POLL: Duration = Duration::from_millis(1);
@@ -632,12 +635,14 @@ impl KafkaDeliveryMetrics {
     }
 
     fn record_entry_oversize(&self) {
+        sink_loss::record_dropped(KAFKA_PLUGIN_NAME, SinkLossReason::RecordTooLarge, 1);
         self.entry_oversize.fetch_add(1, Ordering::Relaxed);
         self.ferrum_dropped.fetch_add(1, Ordering::Relaxed);
         self.warn_saturation("entry exceeded max_entry_bytes", "entry_oversize");
     }
 
     fn record_byte_budget_exhausted(&self) {
+        sink_loss::record_dropped(KAFKA_PLUGIN_NAME, SinkLossReason::ByteBudget, 1);
         self.byte_budget_exhausted.fetch_add(1, Ordering::Relaxed);
         self.ferrum_dropped.fetch_add(1, Ordering::Relaxed);
         self.warn_saturation("retained-byte budget exhausted", "byte_budget");
@@ -1109,6 +1114,7 @@ impl KafkaAdmission {
                 self.metrics.record_entry_oversize();
             } else {
                 warn!("kafka_logging: failed to serialize log entry: {error}");
+                sink_loss::record_dropped(KAFKA_PLUGIN_NAME, SinkLossReason::SinkError, 1);
                 self.metrics.record_ferrum_drop("serialize_failed");
             }
             return None;
@@ -1130,6 +1136,7 @@ impl KafkaAdmission {
             Ok(payload) => Arc::<str>::from(payload),
             Err(error) => {
                 warn!("kafka_logging: serialized entry was not UTF-8: {error}");
+                sink_loss::record_dropped(KAFKA_PLUGIN_NAME, SinkLossReason::SinkError, 1);
                 self.metrics.record_ferrum_drop("serialize_failed");
                 return None;
             }
@@ -1776,6 +1783,10 @@ impl KafkaLogging {
             // ownership of the shed decision so high-water / full-buffer paths
             // report DiversionAccepted rather than leaving the item unowned.
             on_overflow: Some(Arc::new(move |_item, reason| {
+                // Shedding takes ownership, so the batching layer reports
+                // DiversionAccepted and records no loss. Count it here or the
+                // shed record disappears from the published family.
+                sink_loss::record_dropped(KAFKA_PLUGIN_NAME, SinkLossReason::QueueFull, 1);
                 metrics_for_hooks.record_ferrum_drop(reason);
                 true
             })),

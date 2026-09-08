@@ -1796,6 +1796,45 @@ async fn sampling_rate_zero_still_captures_on_guardrail() {
     assert_eq!(records[0]["capture_reason"], "guardrail");
 }
 
+/// GHSA-8gc3-h5c8-jjxx: `ai_semantic_firewall` records an AI body it could not
+/// inspect under `*.uninspectable_body`. Under `fail_on_uninspectable_body:
+/// false` or `on_error: allow` it writes NO decision key at all, so without
+/// these keys in `guardrail_fired` the one transaction an operator most needs
+/// captured — an AI body that went to the model unread — is invisible to
+/// `always_capture_on_guardrail`.
+#[tokio::test]
+async fn sampling_rate_zero_captures_on_semantic_firewall_uninspectable_body() {
+    for key in [
+        "ai_semantic_firewall.uninspectable_body",
+        "ai_semantic_firewall.request.uninspectable_body",
+        "ai_semantic_firewall.response.uninspectable_body",
+    ] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let config = config_with_sink(
+            &endpoint,
+            json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
+        );
+        let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        let headers = json_headers();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        ctx.metadata
+            .insert(key.to_string(), "no_extractable_content".to_string());
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "{key} must force capture despite rate 0");
+        assert_eq!(records[0]["capture_reason"], "guardrail", "{key}");
+    }
+}
+
 #[tokio::test]
 async fn sampling_rate_zero_captures_non_empty_guardrail_metadata() {
     let server = mock_sink().await;

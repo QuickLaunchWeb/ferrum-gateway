@@ -76,6 +76,7 @@ mod unit {
         mod route_header_finalization_tests;
         mod security_headers_tests;
         mod serverless_function_tests;
+        mod sink_loss_metric_tests;
         mod soap_ws_security_tests;
         mod spec_expose_tests;
         mod spiffe_identity_tests;
@@ -95,6 +96,7 @@ mod unit {
         mod udp_logging_tests;
         mod udp_rate_limiting_tests;
         mod validator_diagnostic_redaction_tests;
+        mod waf_body_charset_parity_tests;
         mod waf_tests;
         mod workload_metrics_custom_env_tags_tests;
         mod ws_frame_logging_tests;

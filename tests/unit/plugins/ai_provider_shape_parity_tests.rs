@@ -130,6 +130,72 @@ fn provider_shapes() -> Vec<ProviderShape> {
             prompt_shield: Coverage::Extracts,
             request_guard: Coverage::Extracts,
         },
+        ProviderShape {
+            // A tool-result injection: the block carries no `text` of its own
+            // and no `type` discriminator, so every reader that stops at
+            // `content[].text` skips it while the model still sees it.
+            name: "bedrock converse messages[].content[].toolResult",
+            body: json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "toolResult": {
+                            "toolUseId": "tooluse_1",
+                            "content": [{"text": MARKER}]
+                        }
+                    }]
+                }]
+            }),
+            semantic_firewall: Coverage::Extracts,
+            prompt_shield: Coverage::Gap(
+                "Converse content blocks carry no `type`, which both shield scans require",
+            ),
+            request_guard: Coverage::Gap(
+                "count_text_value has no `toolResult` arm, so the block counts zero characters",
+            ),
+        },
+        ProviderShape {
+            // Anthropic's spelling of the same injection. It rides inside a
+            // `role: "user"` message, so the firewall must additionally
+            // attribute it `ToolResult` rather than `UserPrompt`.
+            name: "anthropic messages[].content[] tool_result block",
+            body: json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "text", "text": MARKER}]
+                    }]
+                }]
+            }),
+            semantic_firewall: Coverage::Extracts,
+            prompt_shield: Coverage::Gap(
+                "tool_result is not a text part type, so the block is skipped",
+            ),
+            request_guard: Coverage::Extracts,
+        },
+        ProviderShape {
+            name: "cohere v1 chat message",
+            body: json!({"message": MARKER, "preamble": "Be helpful."}),
+            semantic_firewall: Coverage::Extracts,
+            prompt_shield: Coverage::Gap("message is not in CONTENT_SCAN_FIELDS"),
+            request_guard: Coverage::Extracts,
+        },
+        ProviderShape {
+            name: "huggingface tgi inputs",
+            body: json!({"inputs": MARKER, "parameters": {"max_new_tokens": 64}}),
+            semantic_firewall: Coverage::Extracts,
+            prompt_shield: Coverage::Gap("inputs is not in CONTENT_SCAN_FIELDS"),
+            request_guard: Coverage::Extracts,
+        },
+        ProviderShape {
+            name: "vertex legacy predict instances[].prompt",
+            body: json!({"instances": [{"prompt": MARKER}]}),
+            semantic_firewall: Coverage::Extracts,
+            prompt_shield: Coverage::Gap("instances is not in CONTENT_SCAN_FIELDS"),
+            request_guard: Coverage::Gap("count_prompt_characters has no `instances` arm"),
+        },
     ]
 }
 

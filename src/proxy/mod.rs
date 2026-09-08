@@ -18220,6 +18220,42 @@ pub(crate) fn ws_idle_timeout_policy_close_frame() -> CloseFrame {
     }
 }
 
+/// Defined RFC 6455 Close for a transport- or protocol-level relay failure.
+///
+/// Maps the already-computed `ErrorClass` to a wire code (issue #4770): 1002
+/// for a protocol violation, 1011 for a transport failure, or 1001 while the
+/// gateway is draining. The reason is a fixed literal so no peer-controlled or
+/// secret material is ever echoed and the frame stays within the 123-byte
+/// control-frame budget.
+pub(crate) fn ws_relay_failure_close_frame(
+    error_class: retry::ErrorClass,
+    draining: bool,
+) -> CloseFrame {
+    let (code, reason) = if draining {
+        (CloseCode::Away, "gateway draining")
+    } else if error_class == retry::ErrorClass::ProtocolError {
+        (CloseCode::Protocol, "protocol error")
+    } else {
+        (CloseCode::Error, "relay error")
+    };
+    CloseFrame {
+        code,
+        reason: reason.into(),
+    }
+}
+
+/// Whether the gateway is draining (graceful shutdown or overload drain).
+///
+/// Mirrors the drain test in `wait_for_websocket_session_stop` so a transport
+/// failure that races a shutdown publishes the same 1001 "going away" Close a
+/// policy stop would, instead of a 1011 backend failure.
+fn ws_websocket_is_draining(
+    overload: &crate::overload::OverloadState,
+    shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    overload.draining.load(Ordering::Acquire) || shutdown.is_some_and(|receiver| *receiver.borrow())
+}
+
 fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
     use tokio_tungstenite::tungstenite::Error;
 
@@ -19040,6 +19076,10 @@ where
     let ws_idle_tracker_btc = ws_idle_tracker;
     let size_limits_ctb = Arc::clone(&effective_size_limits);
     let size_limits_btc = effective_size_limits;
+    let overload_ctb = Arc::clone(&overload);
+    let overload_btc = Arc::clone(&overload);
+    let shutdown_rx_ctb = shutdown_rx.clone();
+    let shutdown_rx_btc = shutdown_rx.clone();
 
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
@@ -19372,7 +19412,24 @@ where
                                 retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from client: {}", e);
-                                retry::classify_boxed_error(&e)
+                                let class = retry::classify_boxed_error(&e);
+                                // A client protocol violation or transport failure
+                                // must still publish a defined policy Close so the
+                                // surviving peer learns why the session ended
+                                // instead of observing 1005/1006 (issue #4770).
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(ws_relay_failure_close_frame(
+                                        class,
+                                        ws_websocket_is_draining(
+                                            &overload_ctb,
+                                            shutdown_rx_ctb.as_ref(),
+                                        ),
+                                    )),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                class
                             };
                             // Read-side failure on the c2b path means the client
                             // dropped / reset the socket.
@@ -19679,7 +19736,26 @@ where
                                 retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from backend: {}", e);
-                                retry::classify_boxed_error(&e)
+                                let class = retry::classify_boxed_error(&e);
+                                // A backend protocol violation, reset, or other
+                                // transport failure must still publish a defined
+                                // policy Close and write it to the surviving peer
+                                // (the client) instead of a bare EOF/1006 and an
+                                // empty Close into the dead backend sink
+                                // (issue #4770).
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(ws_relay_failure_close_frame(
+                                        class,
+                                        ws_websocket_is_draining(
+                                            &overload_btc,
+                                            shutdown_rx_btc.as_ref(),
+                                        ),
+                                    )),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                class
                             };
                             // Read-side failure on the b2c path means the
                             // backend closed / reset the socket.
@@ -24518,6 +24594,19 @@ pub(crate) fn x_gateway_error_for_backend_failure(
     crate::retry::http_observability_error_class(connection_error, status)
 }
 
+/// A gateway output-ceiling decision overrides the original backend outcome.
+pub(crate) fn x_gateway_error_for_response(
+    ctx: &RequestContext,
+    connection_error: bool,
+    status: u16,
+) -> Option<&'static str> {
+    if ctx.response_transform_size_refusal_selected() && status >= 500 {
+        Some("overload")
+    } else {
+        x_gateway_error_for_backend_failure(connection_error, status)
+    }
+}
+
 /// Insert or replace the gateway-owned `X-Gateway-Error` value after generic
 /// response policy has run. Policy may decorate a 5xx, but it must not
 /// remove, replace, or duplicate this observability token.
@@ -25784,6 +25873,13 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
 ) {
     use crate::proxy::response_buffer_budget as budget;
 
+    let policy_refusal = ctx.response_transform_size_refusal_selected();
+    let message = if policy_refusal {
+        "Response body too large"
+    } else {
+        budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE
+    };
+
     let owned_grpc_web_response_content_type =
         crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
     let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
@@ -25802,7 +25898,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         let mut response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            message,
         );
         response.headers.extend(response_headers.drain());
         finalize_grpc_web_error_response_headers_with_policy_source(
@@ -25817,7 +25913,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         insert_grpc_error_metadata(
             &mut ctx.metadata,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            message,
         );
     } else if native_grpc_request {
         ctx.retain_deadline_response_gateway_headers(response_headers);
@@ -25828,7 +25924,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         grpc_proxy::finalize_grpc_error_response_headers(
             response_headers,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            message,
             &[],
         );
         *response_body = Bytes::new();
@@ -25837,7 +25933,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         insert_grpc_error_metadata(
             &mut ctx.metadata,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            message,
         );
     } else {
         // Plain HTTP keeps the narrower discipline: drop exactly the fields that
@@ -25858,8 +25954,18 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
                 .iter()
                 .any(|stale| name.eq_ignore_ascii_case(stale))
         });
-        *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
-        *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+        if policy_refusal {
+            *response_status = StatusCode::BAD_GATEWAY.as_u16();
+            *response_body = Bytes::from(crate::plugins::utils::size_limit::rejection_body(
+                "Response body too large",
+                ctx.retained_response_body_ceiling() as u128,
+            ));
+            crate::plugins::invalidate_content_bound_response_headers(response_headers);
+            restore_authoritative_gateway_error_header(response_headers, "overload");
+        } else {
+            *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
+            *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+        }
         response_headers.insert("content-type".to_string(), "application/json".to_string());
         response_headers.insert(
             "content-length".to_string(),
@@ -25876,9 +25982,8 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
     ctx.record_deadline_response_header_mutations(response_headers);
 }
 
-/// If a response-body inspector marked a one-shot retained-response capacity
-/// refusal pending, install the shared health-neutral terminal and return
-/// `true` so the enclosing `on_response_body` loop stops later hooks.
+/// Consume a one-shot construction refusal, distinguishing deterministic JSON
+/// output policy from aggregate capacity, and stop subsequent body hooks.
 pub(crate) fn install_pending_buffered_response_capacity_refusal(
     ctx: &mut RequestContext,
     response_status: &mut u16,
@@ -25886,8 +25991,19 @@ pub(crate) fn install_pending_buffered_response_capacity_refusal(
     response_body: &mut Bytes,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
 ) -> bool {
+    let produced_bytes = ctx.take_response_transform_size_refusal_pending();
     if !ctx.take_buffered_response_capacity_refusal_pending() {
         return false;
+    }
+    if let Some(produced_bytes) = produced_bytes {
+        ctx.mark_response_transform_size_refusal_selected();
+        warn!(
+            proxy_id = ctx.matched_proxy.as_ref().map(|proxy| proxy.id.as_str()),
+            plugin = "response_transformer",
+            produced_bytes_at_least = produced_bytes,
+            ceiling = ctx.retained_response_body_ceiling(),
+            "Response body transform refused: output exceeds response size policy"
+        );
     }
     replace_buffered_response_with_capacity_refusal_with_policy_source(
         ctx,
@@ -28188,7 +28304,22 @@ async fn finalize_upload_deadline_rejection(
     response
 }
 
-fn release_circuit_breaker_probe_on_admission_reject(
+/// Release a HALF_OPEN probe slot `check_circuit_breaker` admitted, for a
+/// request the gateway rejects before it ever reaches the backend.
+///
+/// A gateway-side refusal is neither a backend success nor a backend failure,
+/// so the slot is released NEUTRAL: the breaker's health is unchanged and the
+/// next probe can be admitted instead of the breaker wedging OPEN forever.
+///
+/// Siblings that share this invariant and MUST route through this one
+/// implementation (issue #4792): the H1/H2/WebSocket/gRPC handler in this
+/// module, [`crate::http3::server::release_h3_circuit_breaker_probe_on_admission_reject`],
+/// and [`crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject`].
+/// The gRPC dispatch block additionally carries `GrpcProbeReleaseGuard`, an RAII
+/// wrapper over the same NEUTRAL release for its many early returns. When one of
+/// these changes, change them together —
+/// `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts they agree.
+pub(crate) fn release_circuit_breaker_probe_on_admission_reject(
     state: &ProxyState,
     proxy: &Proxy,
     target_key: Option<&str>,
@@ -38944,7 +39075,7 @@ async fn handle_proxy_request_inner(
                 latency_gateway_overhead_ms: gateway_overhead_ms,
                 request_user_agent: ctx.headers.get("user-agent").cloned(),
                 response_streamed: is_streaming_response,
-                error_class: backend_error_class,
+                error_class: ctx.response_policy_error_class(backend_error_class),
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
                 grpc_request_messages,
@@ -39139,7 +39270,7 @@ async fn handle_proxy_request_inner(
     // so a late phase cannot spoof or duplicate the token beside the builder
     // write. Classification is the original dispatch signal; status is final.
     let gateway_error_token =
-        x_gateway_error_for_backend_failure(backend_resp.connection_error, response_status);
+        x_gateway_error_for_response(&ctx, backend_resp.connection_error, response_status);
     response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
     resp_builder =
         headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);

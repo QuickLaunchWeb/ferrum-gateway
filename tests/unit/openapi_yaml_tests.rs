@@ -10853,3 +10853,57 @@ fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
         assert_eq!(schema_fields, runtime_fields, "{schema_name} key drift");
     }
 }
+
+/// Three-way parity for the `ai_semantic_firewall` extraction-path allowlist.
+///
+/// The same list exists in three places — the Rust constants that
+/// `validate_extraction_paths` admits and `extract_known_path` dispatches on,
+/// the `enum` + `default` arrays `openapi.yaml` publishes, and the
+/// "Supported provider shapes" tables in `docs/plugins.md`. A provider shape
+/// added to the code but not the schema is silently unconfigurable, and one
+/// added to the schema but not the code is accepted at config load and then
+/// extracts nothing — the exact silent-bypass class GHSA-8gc3-h5c8-jjxx was.
+/// Order is asserted too, so the published defaults stay the declared defaults.
+#[test]
+fn ai_semantic_firewall_extraction_paths_match_openapi_and_docs() {
+    let (request_paths, response_paths) =
+        ferrum_edge::_test_support::ai_semantic_firewall_extraction_paths_for_test();
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let extraction = spec
+        .pointer("/components/schemas/AiSemanticFirewallConfig/properties/extraction/properties")
+        .expect("AiSemanticFirewallConfig extraction properties");
+
+    for (field, runtime) in [
+        ("request_json_paths", request_paths),
+        ("response_json_paths", response_paths),
+    ] {
+        let expected: Vec<serde_json::Value> = runtime
+            .iter()
+            .map(|path| serde_json::Value::String((*path).to_string()))
+            .collect();
+        let enum_values = extraction[field]["items"]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} items.enum"));
+        assert_eq!(
+            enum_values, &expected,
+            "{field} enum must equal the runtime allowlist, in order"
+        );
+        let defaults = extraction[field]["default"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} default"));
+        assert_eq!(
+            defaults, &expected,
+            "{field} default must equal the runtime default set, in order"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    for path in request_paths.iter().chain(response_paths.iter()) {
+        assert!(
+            plugin_docs.contains(&format!("`{path}`")),
+            "docs/plugins.md must document the supported extraction path {path}"
+        );
+    }
+}
