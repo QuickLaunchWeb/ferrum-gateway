@@ -134,8 +134,9 @@ cost of more false positives. Loud rules retuned to `paranoia_min: 2` or `3`
 Attackers hide payloads behind encodings a raw-byte scan never sees. Before
 matching request and response bodies, the WAF also scans **decoded variants**:
 
-- UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request bodies admitted by the
-  body content-type gates, using an explicit `charset` or a byte-order mark
+- UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request and response bodies
+  admitted by the direction's body content-type gates, using an explicit
+  `charset`, a byte-order mark, or an undeclared wide-text prefix signature
   (bare `utf-16` / `utf-32` without a BOM tries both endiannesses)
 - JSON / JavaScript unicode escapes — `\uXXXX`, `\u{...}`, `\xXX`
 - HTML entities — `&lt;`, `&#60;`, `&#x3c;`
@@ -147,7 +148,7 @@ So a `<script>` written as `<script>`, `&lt;script&gt;`, or
 escape decoders are content-type-agnostic (an attacker controls the declared
 `Content-Type`) and bounded to a small number of variants.
 
-UTF-16 / UTF-32 transcoding does **not** decide whether a request body is
+UTF-16 / UTF-32 transcoding does **not** decide whether a body is
 scanned. The existing `body_content_types`, `inspect_multipart`, and
 `inspect_binary_body` gates run first and remain authoritative; an excluded
 body is not admitted merely because it declares a UTF-16 or UTF-32 charset or
@@ -167,9 +168,28 @@ reading is used. `00 00 FE FF` is not a UTF-16 BOM prefix and is
 unambiguous. Bare `charset=utf-16` / `charset=utf-32` with no
 BOM does not invent an endianness (IANA leaves both unspecified without a
 BOM). Both little-endian and big-endian decodes are scanned by the
-request-body rules, and the existing raw/lossy view is still scanned. Bare
+direction's body rules, and the existing raw/lossy view is still scanned. Bare
 `utf-16` / `utf-32` stays endianness-unspecified rather than defaulting to
 little-endian as WHATWG does, which is the more conservative choice.
+
+Without a charset or BOM, inference requires a four-byte prefix containing
+one non-NUL ASCII UTF-32 unit or two non-NUL ASCII UTF-16 units in the
+corresponding NUL positions. Interior NULs alone do not select a decoder.
+The prefix selects a width; both endians and the raw/lossy text are scanned
+within the existing two-wide-view cap. Ordinary UTF-8 and binary data without
+that prefix gain no transcoded view. An explicit charset retains its existing
+resolution policy.
+
+Raw/lossy text and its bounded transformations are always retained, including
+when a declaration resolves one wide view. Requests and responses share the
+same raw-byte, wide-text, layered decoding,
+encoding-special, Luhn, and CIDR pipeline, including packs with only encoding
+specials. Response decoding uses the final response Content-Type before
+transport compression. Rule conditions, false-positive filters, per-rule modes,
+body size limits, and scan budgets still apply. HTTP responses that omit a body
+(HEAD and bodyless statuses) remain outside body inspection; response inspection
+must still be enabled. Request JSON-path rules retain their scalar-local
+normalization policy.
 
 Wide decoding is **lossy**. A malformed code unit — a length that is not a
 multiple of the code-unit size, an unpaired surrogate, or a UTF-32 unit in
