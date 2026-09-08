@@ -2889,17 +2889,39 @@ pub struct EnvConfig {
     pub http3_idle_timeout: u64,
     /// HTTP/3 max concurrent streams (default: 1000)
     pub http3_max_streams: u32,
-    /// HTTP/3 per-stream receive window in bytes (default: 8 MiB).
-    /// Controls how much data a peer can send on a single QUIC stream
-    /// before the receiver must send a flow-control credit update.
+    /// HTTP/3 **frontend** per-stream receive window in bytes (default:
+    /// 256 KiB, [`crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW`]).
+    /// Controls how much data an untrusted client can send on a single QUIC
+    /// stream before the receiver must send a flow-control credit update.
+    /// Backend pools use `http3_backend_stream_receive_window` instead.
     pub http3_stream_receive_window: u64,
-    /// HTTP/3 connection-level receive window in bytes (default: 32 MiB).
+    /// HTTP/3 **frontend** connection-level receive window in bytes (default:
+    /// 2 MiB, [`crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW`]).
     /// Aggregate budget shared across all concurrent streams on one QUIC connection.
     pub http3_receive_window: u64,
-    /// HTTP/3 per-connection send window in bytes (default: 8 MiB).
+    /// HTTP/3 **frontend** per-connection send window in bytes (default:
+    /// 2 MiB, [`crate::http3::config::H3_FRONTEND_SEND_WINDOW`]).
     /// Controls how much data can be in flight (sent but unacknowledged)
     /// across all streams on a single QUIC connection.
     pub http3_send_window: u64,
+    /// HTTP/3 **backend** per-stream receive window in bytes (default: 8 MiB,
+    /// [`crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT`]).
+    ///
+    /// Separate from the frontend window because the two sit on different
+    /// trust planes (issue #4755): the frontend listener serves untrusted
+    /// clients and is deliberately conservative, while the backend pools dial
+    /// operator-configured upstreams and are tuned for throughput. One shared
+    /// knob meant restoring backend throughput also re-opened the frontend
+    /// amplification exposure.
+    pub http3_backend_stream_receive_window: u64,
+    /// HTTP/3 **backend** connection-level receive window in bytes (default:
+    /// 32 MiB, [`crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT`]). This is
+    /// the aggregate governor for every multiplexed stream on one backend QUIC
+    /// connection.
+    pub http3_backend_receive_window: u64,
+    /// HTTP/3 **backend** per-connection send window in bytes (default: 8 MiB,
+    /// [`crate::http3::config::H3_SEND_WINDOW_DEFAULT`]).
+    pub http3_backend_send_window: u64,
     /// Number of QUIC connections to maintain per HTTP/3 backend (default: 4).
     /// Multiple connections distribute QUIC frame processing across driver tasks.
     pub http3_connections_per_backend: usize,
@@ -4019,6 +4041,10 @@ impl Default for EnvConfig {
             http3_stream_receive_window: crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW,
             http3_receive_window: crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW,
             http3_send_window: crate::http3::config::H3_FRONTEND_SEND_WINDOW,
+            http3_backend_stream_receive_window:
+                crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+            http3_backend_receive_window: crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+            http3_backend_send_window: crate::http3::config::H3_SEND_WINDOW_DEFAULT,
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
             http3_coalesce_min_bytes: crate::http3::config::H3_COALESCE_MAX_DEFAULT,
@@ -4621,6 +4647,9 @@ impl EnvConfig {
             http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW;
             http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW;
             http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => crate::http3::config::H3_FRONTEND_SEND_WINDOW;
+            http3_backend_stream_receive_window: u64 = "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW" => crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT;
+            http3_backend_receive_window: u64 = "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW" => crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT;
+            http3_backend_send_window: u64 = "FERRUM_HTTP3_BACKEND_SEND_WINDOW" => crate::http3::config::H3_SEND_WINDOW_DEFAULT;
             http3_connections_per_backend: usize = "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND" => 4usize, max(1usize);
             http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
             http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);
@@ -5452,6 +5481,9 @@ impl EnvConfig {
             http3_stream_receive_window,
             http3_receive_window,
             http3_send_window,
+            http3_backend_stream_receive_window,
+            http3_backend_receive_window,
+            http3_backend_send_window,
             http3_connections_per_backend,
             http3_pool_idle_timeout_seconds,
             http3_coalesce_min_bytes,
@@ -6692,7 +6724,29 @@ impl EnvConfig {
             ));
         }
 
+        // Graceful-shutdown budgets (issue #4829). Both knobs are refused at
+        // the configuration boundary rather than clamped: a value large enough
+        // to matter is always a typo, and discovering it during an incident —
+        // as a process that only SIGKILL can stop — is exactly the outcome
+        // `ferrum-edge validate` exists to prevent. `0` stays meaningful for
+        // both (skip the drain wait / no pre-drain window).
+        if self.shutdown_drain_seconds > crate::overload::MAX_SHUTDOWN_DRAIN_SECONDS {
+            return Err(format!(
+                "FERRUM_SHUTDOWN_DRAIN_SECONDS must be at most {} seconds (0 skips the drain \
+                 wait)",
+                crate::overload::MAX_SHUTDOWN_DRAIN_SECONDS
+            ));
+        }
+        if self.shutdown_predrain_seconds > crate::overload::MAX_SHUTDOWN_PREDRAIN_SECONDS {
+            return Err(format!(
+                "FERRUM_SHUTDOWN_PREDRAIN_SECONDS must be at most {} seconds (0 disables the \
+                 pre-drain window)",
+                crate::overload::MAX_SHUTDOWN_PREDRAIN_SECONDS
+            ));
+        }
+
         self.validate_h3_connect_udp_limits()?;
+        self.validate_h3_flow_control_windows()?;
         self.validate_mesh_app_probe_limits()?;
 
         // Issue #4261: the HTTP/3 frontend derives BOTH its advertised
@@ -7994,6 +8048,70 @@ impl EnvConfig {
                  Disable the profile or run on Linux or macOS.";
             return Err(UNSUPPORTED_TARGET.to_string());
         }
+        Ok(())
+    }
+
+    /// Refuse HTTP/3 QUIC flow-control windows that cannot govern a
+    /// connection (issue #4755).
+    ///
+    /// Both trust planes are held to the SAME bounds: the frontend triple
+    /// (`FERRUM_HTTP3_STREAM_RECEIVE_WINDOW`, `FERRUM_HTTP3_RECEIVE_WINDOW`,
+    /// `FERRUM_HTTP3_SEND_WINDOW`) and the backend triple
+    /// (`FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW`,
+    /// `FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW`, `FERRUM_HTTP3_BACKEND_SEND_WINDOW`).
+    ///
+    /// `0` is refused because a zero credit budget deadlocks the connection in
+    /// that direction rather than "disabling" anything, and the four receive
+    /// windows are refused above [`crate::http3::config::QUIC_VARINT_MAX_U64`]
+    /// because they travel the wire as QUIC variable-length integers. Without
+    /// this the unrepresentable value was silently replaced at connection-setup
+    /// time by the compiled default, so the transport ran a budget the operator
+    /// never configured.
+    pub fn validate_h3_flow_control_windows(&self) -> Result<(), String> {
+        fn nonzero(key: &str, value: u64) -> Result<(), String> {
+            if value == 0 {
+                return Err(format!(
+                    "{key} must be greater than 0: a zero QUIC flow-control window grants no \
+                     credit and stalls the connection in that direction"
+                ));
+            }
+            Ok(())
+        }
+
+        fn varint(key: &str, value: u64) -> Result<(), String> {
+            nonzero(key, value)?;
+            if value > crate::http3::config::QUIC_VARINT_MAX_U64 {
+                // Key-tied for the same reason as `FERRUM_HTTP3_INITIAL_MTU`
+                // above: the rejected value is re-rendered from its parsed
+                // `u64`, so a secret-backed literal is not echoed verbatim.
+                return Err(format!(
+                    "{} ({}) exceeds the largest QUIC variable-length integer {}",
+                    key,
+                    crate::secrets::report_env_field(key, &value.to_string()),
+                    crate::http3::config::QUIC_VARINT_MAX_U64,
+                ));
+            }
+            Ok(())
+        }
+
+        varint(
+            "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW",
+            self.http3_stream_receive_window,
+        )?;
+        varint("FERRUM_HTTP3_RECEIVE_WINDOW", self.http3_receive_window)?;
+        nonzero("FERRUM_HTTP3_SEND_WINDOW", self.http3_send_window)?;
+        varint(
+            "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW",
+            self.http3_backend_stream_receive_window,
+        )?;
+        varint(
+            "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW",
+            self.http3_backend_receive_window,
+        )?;
+        nonzero(
+            "FERRUM_HTTP3_BACKEND_SEND_WINDOW",
+            self.http3_backend_send_window,
+        )?;
         Ok(())
     }
 

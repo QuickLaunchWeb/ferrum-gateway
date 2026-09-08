@@ -9563,24 +9563,34 @@ impl ProxyState {
                             "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
                         );
                         // io_uring splice spawns 2 `spawn_blocking` tasks per relayed
-                        // TCP connection (one per direction), but concurrent io_uring
-                        // relays are semaphore-capped at IO_URING_SPLICE_MAX_CONCURRENT
-                        // (128) in tcp_proxy.rs — beyond the cap, additional relays
+                        // TCP connection (one per direction), and concurrent io_uring
+                        // relays are semaphore-capped at a quarter of the blocking
+                        // pool in `tcp_proxy::derive_io_uring_splice_max_concurrent`
+                        // (issue #4786) — beyond the cap, additional relays
                         // transparently fall back to the async splice path instead of
                         // queueing on the blocking pool. Worst-case io_uring usage is
-                        // therefore 256 blocking threads. Warn only when the configured
-                        // pool is smaller than the default 512: 256 io_uring threads
-                        // would then crowd out other `spawn_blocking` users.
-                        let effective_blocking_threads =
-                            env_config_arc.blocking_threads.unwrap_or(512);
-                        if effective_blocking_threads < 512 {
+                        // therefore half the pool. Warn only when the configured pool
+                        // is smaller than the default 512: the remaining half is what
+                        // every other `spawn_blocking` user has to share.
+                        let effective_blocking_threads = env_config_arc
+                            .blocking_threads
+                            .unwrap_or(tcp_proxy::DEFAULT_BLOCKING_THREADS);
+                        if effective_blocking_threads < tcp_proxy::DEFAULT_BLOCKING_THREADS {
+                            let max_relays = tcp_proxy::derive_io_uring_splice_max_concurrent(
+                                env_config_arc.blocking_threads,
+                            );
                             tracing::warn!(
                                 blocking_threads = effective_blocking_threads,
+                                max_concurrent_relays = max_relays,
                                 "FERRUM_IO_URING_SPLICE_ENABLED=true with FERRUM_BLOCKING_THREADS={} below the 512 default; \
-                             io_uring splice can occupy up to 256 blocking threads (128 concurrent relays x 2 directions; \
-                             further relays fall back to async splice). \
-                             Recommended: FERRUM_BLOCKING_THREADS >= 512 so other spawn_blocking work keeps headroom.",
-                                effective_blocking_threads
+                             io_uring splice can occupy up to {} blocking threads ({} concurrent relays x 2 directions; \
+                             further relays fall back to async splice). Everything else that uses the blocking pool shares \
+                             what is left — including the overload monitor's open-FD count, whose result feeds the \
+                             load-shedding flags, and config reload. \
+                             Recommended: FERRUM_BLOCKING_THREADS >= 512 so that work keeps headroom.",
+                                effective_blocking_threads,
+                                max_relays * 2,
+                                max_relays
                             );
                         }
                     } else {
@@ -9637,6 +9647,7 @@ impl ProxyState {
                 trusted_proxies.clone(),
             ),
         );
+        stream_listener_manager.start_supervisor();
         // Raw TCP / TCP+TLS stream listeners own a dedicated backend socket per
         // relay session, so they must admit on the SAME per-destination lane as
         // WebSocket, the pooled multiplexed transports, and reqwest. Attached

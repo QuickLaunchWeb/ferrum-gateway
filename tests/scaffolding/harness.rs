@@ -582,6 +582,15 @@ fn apply_env_overrides(
             "FERRUM_HTTP3_SEND_WINDOW" => {
                 env_config.http3_send_window = parse_numeric(k, v)?;
             }
+            "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW" => {
+                env_config.http3_backend_stream_receive_window = parse_numeric(k, v)?;
+            }
+            "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW" => {
+                env_config.http3_backend_receive_window = parse_numeric(k, v)?;
+            }
+            "FERRUM_HTTP3_BACKEND_SEND_WINDOW" => {
+                env_config.http3_backend_send_window = parse_numeric(k, v)?;
+            }
             // Unknown vars: ignored. Add cases as tests need them.
             _ => {}
         }

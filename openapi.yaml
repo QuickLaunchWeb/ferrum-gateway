@@ -327,6 +327,18 @@ paths:
         same sticky state; authenticated responses include a sanitized
         `listener_failures` snapshot.
 
+        **Stream listeners** (TCP/UDP/TLS/DTLS) also have recoverable readiness:
+        a configured listener with a hard bind/backend-TLS failure or whose task exited
+        returns `503`, `status: "degraded"`, and `ready: false`. A supervisor
+        retries every 30 seconds using current configuration. Readiness recovers
+        when the hard failure clears or the listener is removed. Soft frontend
+        TLS/DTLS deferrals and DTLS config-build failures report `status: "degraded"`
+        with HTTP 200 and `ready: true` when otherwise healthy. A pending
+        asynchronous bind alone does not degrade health or withdraw readiness
+        during runtime reconciliation. Initial hard bind failures remain
+        fatal in file/database mode and non-fatal in DP mode. Detailed failures
+        remain on authenticated `/overload`; `/live` is unaffected.
+
         **Dynamic Gateway API listener ports** (`file`, `database`, and
         data-plane modes) are reported separately and are **recoverable**. A
         Gateway listener port that cannot be bound — occupied, reserved by
@@ -12475,11 +12487,13 @@ components:
             DestinationRule `trafficPolicy.tls.sni` and Gateway API
             `BackendTLSPolicy` `validation.hostname` both project to this
             field. Enforced at the backend handshake on every path where
-            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, and the
+            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, terminating
+            `tcp`/`tcp_tls` streams that originate backend TLS, and the
             reqwest HTTP/1.1 dial (which carries the override in the request
             URL authority while pinning the socket to the selected target).
-            It also partitions backend connection pools, so two values never
-            share a connection. Must be an exact DNS hostname — not a
+            It also partitions HTTP-family backend connection pools, so two
+            values never share a connection. Stream proxies do not pool
+            connections. Must be an exact DNS hostname — not a
             wildcard and not an IP literal (RFC 6066 §3). Because the reqwest
             HTTP/1.1 dial serves them, this field is accepted alongside
             effective retry, request-body-buffering plugins, and
@@ -13884,7 +13898,13 @@ components:
             audit pipeline cannot durably record committed mutations (see
             `audit_pipeline`), an active remote JWKS store is in grace after
             its refresh interval, or a recoverable dynamic Gateway API listener
-            failure is active. These stay ready with HTTP 200 except when
+            failure is active. A configured stream listener with a hard
+            bind/backend-TLS failure or an exited task reports `degraded` with
+            HTTP 503 and `ready: false`. Soft frontend TLS/DTLS deferrals and
+            DTLS config-build failures report `degraded` with HTTP 200 and
+            `ready: true` when otherwise healthy. Pending asynchronous binds
+            alone do not degrade health during runtime reconciliation. The
+            other degraded conditions stay ready with HTTP 200 except when
             `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`, which makes
             the Gateway-listener case not ready with HTTP 503 while preserving
             `status: "degraded"`. Intentional read-only mode does NOT set
@@ -13926,7 +13946,10 @@ components:
         ready:
           type: boolean
           description: |
-            `true` once the gateway has finished startup AND no supervised
+            `true` once the gateway has finished startup AND no configured
+            stream listener has a hard bind/backend-TLS failure or an exited
+            task (soft frontend TLS/DTLS deferrals, DTLS config-build failures,
+            and pending asynchronous binds do not withdraw readiness) AND no supervised
             serving listener (or, in control-plane mode, the database config
             poll task) has failed unexpectedly since AND no active remote JWKS
             store is past its maximum-stale deadline AND no service-discovery
@@ -15429,7 +15452,7 @@ components:
           properties:
             file_descriptors:
               type: object
-              required: [current, max, ratio]
+              required: [current, max, ratio, enforced]
               properties:
                 current:
                   type: integer
@@ -15437,10 +15460,20 @@ components:
                 max:
                   type: integer
                   format: uint64
+                  description: >-
+                    Enforceable per-process FD ceiling. `0` means no enforceable ceiling could be
+                    determined (non-Unix platform, `getrlimit` failure, or an unlimited hard cap
+                    with no published platform ceiling), and FD-based shedding is disabled.
                 ratio:
                   type: number
                   format: double
-                  description: current / max (0.0–1.0)
+                  description: current / max (0.0–1.0). Always 0.0 when `enforced` is false
+                enforced:
+                  type: boolean
+                  description: >-
+                    False when FD-based load shedding is disabled because no enforceable ceiling
+                    could be determined. Distinguishes "this tier is off" from "FD pressure at 0%".
+                    Connection- and request-based shedding are unaffected.
             connections:
               type: object
               required: [current, max, ratio]
@@ -26762,7 +26795,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults. Redacted captures replace malformed function.arguments JSON with [UNPARSEABLE] and set arguments_redaction_failed=true on the captured function object; valid arguments retain member-name redaction. Explicit full_body raw capture is unchanged."
       properties:
         mode:
           type: string
@@ -27941,7 +27974,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate is a conservative chars/4 heuristic, not provider tokenizer parity. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate is a conservative chars/4 heuristic, not provider tokenizer parity. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. When Redis is unavailable at terminal reconciliation, actual usage is charged locally within the existing identity cap and the reservation lifecycle is finalized, including zero-token reservations and committed streams. Successful fallback sets instance-scoped ai_ratelimit_locally_accounted=true. Local usage is not replayed to Redis. Process counters ferrum_ai_rate_limit_local_accounting_tokens_total and ferrum_ai_rate_limit_unaccounted_tokens_total expose fallback charges and capacity-limited accounting gaps. Admission remains fail closed; buffered/federated successful responses still receive 503 and committed streams retain their response."
       required: [token_limit]
       properties:
         token_limit:
@@ -31224,11 +31257,17 @@ components:
 
     MeshSliceDriftSummary:
       type: object
-      required: [tracked, connected, converged, drifted, rejecting, pending, disconnected]
+      required: [tracked, connected, converged, accepted, drifted, rejecting, pending, disconnected]
       properties:
         tracked: { type: integer, minimum: 0 }
         connected: { type: integer, minimum: 0 }
         converged: { type: integer, minimum: 0 }
+        accepted:
+          type: integer
+          minimum: 0
+          description: >
+            Data planes that accepted the desired slice at install time but have
+            not reported it as the serving generation (issue #4812).
         drifted: { type: integer, minimum: 0 }
         rejecting: { type: integer, minimum: 0 }
         pending: { type: integer, minimum: 0 }
@@ -31256,12 +31295,26 @@ components:
         sent:
           $ref: "#/components/schemas/MeshSliceVersionStamp"
         acknowledged:
-          $ref: "#/components/schemas/MeshSliceVersionStamp"
+          allOf:
+            - $ref: "#/components/schemas/MeshSliceVersionStamp"
+          description: >
+            Data-plane INSTALL-time acceptance watermark: the slice became the
+            DP's received slice. Not proof it is serving.
+        applied:
+          allOf:
+            - $ref: "#/components/schemas/MeshSliceVersionStamp"
+          description: >
+            Data-plane PROXY-RUNTIME acceptance watermark: the generation the DP
+            reported as actually serving (issue #4812).
         rejected:
           $ref: "#/components/schemas/MeshSliceRejectedStamp"
         convergence:
           type: string
-          enum: [converged, drifted, rejecting, pending, disconnected]
+          enum: [converged, accepted, drifted, rejecting, pending, disconnected]
+          description: >
+            `converged` requires the desired version to be applied by the DP's
+            proxy runtime. `accepted` means the DP acknowledged the desired
+            version at install time but has not reported it as serving.
         drift:
           $ref: "#/components/schemas/MeshSliceDriftFlags"
 
@@ -31278,7 +31331,7 @@ components:
 
     MeshSliceRejectedStamp:
       type: object
-      required: [version, at, age_seconds, reason]
+      required: [version, at, age_seconds, stage, reason]
       properties:
         version:
           type: string
@@ -31286,19 +31339,40 @@ components:
           description: Exact opaque version; runtime enforces a 256 UTF-8 byte cap, no controls, and no surrounding whitespace.
         at: { type: string, format: date-time }
         age_seconds: { type: integer, format: int64, minimum: 0 }
+        stage:
+          type: string
+          enum: [install, runtime]
+          description: >
+            Which data-plane gate refused the slice: `install` (receive,
+            subscription-binding and config-revision gates) or `runtime` (the
+            proxy runtime, after a successful install).
         reason:
           type: string
-          enum: [reported_rejection]
+          enum:
+            - install_refused
+            - runtime_config_build
+            - runtime_proxy_refused
+            - runtime_trust_unusable
+            - runtime_tls_reload
+            - runtime_dtls_candidate
           maxLength: 64
-          description: Fixed control-safe label. Caller-supplied NACK text is discarded and never retained.
+          description: >
+            Closed control-safe label mapped from the data plane's wire enum.
+            The data plane never sends free rejection text, so no caller bytes
+            are ever retained here.
 
     MeshSliceDriftFlags:
       type: object
-      required: [desired_vs_sent, desired_vs_acknowledged, sent_vs_acknowledged]
+      required: [desired_vs_sent, desired_vs_acknowledged, sent_vs_acknowledged, desired_vs_applied]
       properties:
         desired_vs_sent: { type: boolean }
         desired_vs_acknowledged: { type: boolean }
         sent_vs_acknowledged: { type: boolean }
+        desired_vs_applied:
+          type: boolean
+          description: >
+            The desired generation is not the one the DP's proxy runtime
+            reported as serving (issue #4812).
 
     ConnectedDpNode:
       type: object

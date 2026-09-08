@@ -5722,6 +5722,78 @@ async fn reassembled_sse_excerpt(frames: &[&str]) -> String {
 }
 
 #[tokio::test]
+async fn malformed_tool_arguments_never_reach_the_stream_audit_sink() {
+    for arguments in [
+        r#"{"password":"prefixfreecredential""#,
+        "benign but incomplete",
+    ] {
+        let frame = json!({
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_a",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": arguments}
+            }]}}]
+        })
+        .to_string();
+        let excerpt = reassembled_sse_excerpt(&[&frame, "[DONE]"]).await;
+        assert!(!excerpt.contains("prefixfreecredential"));
+        assert!(!excerpt.contains("benign but incomplete"));
+        let parsed: Value = serde_json::from_str(&excerpt).unwrap();
+        let function = &parsed["tool_calls"]["0"][0]["function"];
+        assert_eq!(function["name"], "lookup");
+        assert_eq!(function["arguments"], "[UNPARSEABLE]");
+        assert_eq!(function["arguments_redaction_failed"], true);
+    }
+}
+
+#[tokio::test]
+async fn malformed_and_valid_tool_arguments_are_redacted_in_buffered_audit_records() {
+    let server = mock_sink().await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&format!("{}/ingest", server.uri()), json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "assistant", "tool_calls": [
+            {"function": {"name": "broken", "arguments": "{\"password\":\"hiddenbroken\""}},
+            {"function": {"name": "valid", "arguments": "{\"password\":\"hiddenvalid\"}"}}
+        ]}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &body)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &json_headers(), b"{}")
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let wire = serde_json::to_string(&records).unwrap();
+    assert!(!wire.contains("hiddenbroken"));
+    assert!(!wire.contains("hiddenvalid"));
+    let request: Value =
+        serde_json::from_str(records[0]["request_body"].as_str().unwrap()).unwrap();
+    let calls = &request["messages"][0]["tool_calls"];
+    assert_eq!(calls[0]["function"]["arguments"], "[UNPARSEABLE]");
+    assert_eq!(calls[0]["function"]["arguments_redaction_failed"], true);
+    let valid: Value =
+        serde_json::from_str(calls[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert!(valid["password"].as_str().unwrap().contains("REDACTED"));
+    assert!(
+        calls[1]["function"]
+            .get("arguments_redaction_failed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn malformed_tool_call_array_element_does_not_force_raw_frame_fallback() {
     // A non-object `tool_calls` element carries no fragment at all, so it must
     // neither abort reassembly (per-frame redaction cannot see the email split

@@ -135,9 +135,11 @@ mod meta {
     /// The authoritative actual-token *charge* path does NOT *consult* this
     /// marker before charging (that path runs at most once per request, and
     /// `adjust_usage` advances sliding-window bookkeeping, so gating it would
-    /// drop a legitimate usage record). It *does* set the marker afterwards so a
-    /// subsequent release is a clean no-op.
+    /// drop a legitimate usage record). It *does* set the marker before the
+    /// terminal charge so a subsequent release is a clean no-op on every exit.
     pub const RESERVATION_RELEASED: &str = "ai_ratelimit_reservation_reconciled";
+    /// Actual usage was charged to the local window after centralized failure.
+    pub const LOCALLY_ACCOUNTED: &str = "ai_ratelimit_locally_accounted";
     /// This instance classified the request as an AI call. Gate for the
     /// `on_unmetered_response` policy AND for response-body/stream inspection:
     /// a non-AI response is never buffered, inspected, charged, or rejected.
@@ -205,6 +207,7 @@ struct InstanceKeys {
     unmetered_action: String,
     federation_tokens_recorded: String,
     reservation_released: String,
+    locally_accounted: String,
     ai_request: String,
     compressed_ai_request: String,
     deferred_compressed_classification: String,
@@ -227,6 +230,7 @@ impl InstanceKeys {
             unmetered_action: scoped(meta::UNMETERED_ACTION),
             federation_tokens_recorded: scoped(meta::FEDERATION_TOKENS_RECORDED),
             reservation_released: scoped(meta::RESERVATION_RELEASED),
+            locally_accounted: scoped(meta::LOCALLY_ACCOUNTED),
             ai_request: scoped(meta::AI_REQUEST),
             compressed_ai_request: scoped(meta::COMPRESSED_AI_REQUEST),
             deferred_compressed_classification: scoped(meta::DEFERRED_COMPRESSED_CLASSIFICATION),
@@ -1065,10 +1069,15 @@ impl AiRateLimiter {
         // two by their own guards. It must NOT *consult* the release-dedup marker
         // below before charging: `adjust_usage` advances the sliding window's
         // running-sum/eviction bookkeeping (via `current_usage`), so suppressing a
-        // legitimate usage record would corrupt the window accounting. After a
-        // successful charge, though, the marker IS set so a later release path
+        // legitimate usage record would corrupt the window accounting. For a
+        // terminal charge, though, the marker IS set so a later release path
         // (`actual_tokens == None`) cannot double-adjust the same reservation.
         if let Some(actual_tokens) = actual_tokens {
+            // Terminal ownership must survive every exit, including a failed
+            // centralized charge. Redis reservations then expire by their TTL;
+            // a later release must not subtract them a second time.
+            ctx.metadata
+                .insert(self.keys.reservation_released.clone(), "true".to_string());
             ctx.metadata
                 .insert(self.keys.actual_tokens.clone(), actual_tokens.to_string());
             if let Some(outcome) = self
@@ -1082,24 +1091,40 @@ impl AiRateLimiter {
                 )
                 .await
             {
-                // The authoritative charge could not be recorded: centralized
-                // enforcement went away between admission/reservation and this
-                // post-response reconcile, and `redis_failure_policy` is
-                // `fail_closed`. Delivering the upstream 2xx would hand the
-                // client a completion whose tokens nothing charged — the exact
-                // budget bypass the fail-closed default exists to prevent — so
-                // refuse with the same generic 503 admission uses.
-                //
-                // Only for a successful response. When the response is already
-                // non-2xx the charge/release failure is a conservative
-                // over-count against this consumer's own budget, and replacing
-                // an error response with a different error buys nothing.
-                //
-                // No warning here: the failover backend already emits one
-                // bounded operational warning per outage, and this path runs
-                // once per request. Leave the release marker unset so a later
-                // retryable path can still attempt reconciliation.
                 if outcome.enforcement_unavailable {
+                    // Usage already happened, even if committed stream headers
+                    // make the refusal below ineffective. Account locally using
+                    // the original reservation provenance, so a Redis estimate
+                    // is never subtracted from an unrelated local reservation.
+                    let local = self.limiter.check_local_at_with_capacity(
+                        self.rate_key(ctx),
+                        &AiRateLimitOp::AdjustUsage {
+                            reservation_id,
+                            reserved_window_index,
+                            reservation_backend,
+                            actual_tokens,
+                            delta: Self::reservation_delta(actual_tokens, reserved_tokens),
+                        },
+                        Instant::now(),
+                        MAX_STATE_ENTRIES,
+                    );
+                    let registry = super::prometheus_metrics::global_registry();
+                    if let Some(local) = local {
+                        self.store_metadata(ctx, &local);
+                        ctx.metadata
+                            .insert(self.keys.locally_accounted.clone(), "true".to_string());
+                        registry
+                            .ai_rate_limit_local_accounting_tokens
+                            .fetch_add(actual_tokens, Ordering::Relaxed);
+                    } else {
+                        // Keep the hard identity cap even during an outage and
+                        // expose any charge it prevents without identity labels.
+                        registry
+                            .ai_rate_limit_unaccounted_tokens
+                            .fetch_add(actual_tokens, Ordering::Relaxed);
+                    }
+                    // Preserve the buffered/federated fail-closed response
+                    // contract; streamed callers cannot replace sent headers.
                     if (200..300).contains(&response_status) {
                         return self.reject_enforcement_unavailable();
                     }
@@ -1111,11 +1136,6 @@ impl AiRateLimiter {
                 // not the pre-request admission estimate (#2261).
                 self.store_metadata(ctx, &outcome);
             }
-            // Authoritative charge consumed this reservation's lifecycle: mark
-            // it reconciled so a subsequent release (gateway rejection, non-2xx
-            // body hook, streamed unmetered policy) is a clean no-op.
-            ctx.metadata
-                .insert(self.keys.reservation_released.clone(), "true".to_string());
             return PluginResult::Continue;
         }
 
@@ -2633,6 +2653,13 @@ impl Plugin for AiRateLimiter {
                     .get("ai_federation_status")
                     .and_then(|value| value.parse::<u16>().ok())
                     .unwrap_or(response_status);
+                // A failed centralized reconcile can still charge locally.
+                // Claim this usage before any return so reject-hook replay
+                // cannot apply the same terminal charge a second time.
+                ctx.metadata.insert(
+                    self.keys.federation_tokens_recorded.clone(),
+                    "true".to_string(),
+                );
                 let result = self
                     .reconcile_usage(
                         ctx,
@@ -2644,10 +2671,6 @@ impl Plugin for AiRateLimiter {
                 if !matches!(result, PluginResult::Continue) {
                     return result;
                 }
-                ctx.metadata.insert(
-                    self.keys.federation_tokens_recorded.clone(),
-                    "true".to_string(),
-                );
             }
         } else if self.should_release_gateway_rejection(ctx) {
             let result = self
