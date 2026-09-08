@@ -259,9 +259,12 @@ struct UdpSession {
     /// cannot race ahead of the response budget.
     /// Updated on each policy-accepted request; read on each backend→client response.
     last_request_size: AtomicU64,
-    /// Remaining backend→client payload bytes for the current admitted request.
-    /// Charged by every response datagram until the next client request resets
-    /// it. Lives on the session (not the backend) so weighted multi-backend
+    /// Remaining backend→client payload-byte budget. Each policy-admitted
+    /// client datagram **accrues** its per-request budget onto this slot
+    /// (saturating, capped at a fixed multiple of one request's budget) and
+    /// every response datagram charges it, so an in-flight reply is charged
+    /// against the budget its request earned rather than a later request's.
+    /// Lives on the session (not the backend) so weighted multi-backend
     /// selection cannot reset or multiply the budget.
     response_budget_remaining: AtomicU64,
     /// Copied from the proxy at session admission. `None` skips the guard.
