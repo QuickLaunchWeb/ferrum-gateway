@@ -653,12 +653,37 @@ fn snapshot_includes_node_waypoint_drop_counters() {
     assert_eq!(snap.node_waypoint_drops.hash_mismatch, 0);
 }
 
-#[test]
-fn overload_fd_sample_runs_on_blocking_pool() {
+/// FD sampling must never run on the thread driving the runtime. The monitor
+/// now takes its sample through the bounded `sample_open_fd_count` helper
+/// (issue #4786) instead of calling `spawn_blocking(count_open_fds)` inline, so
+/// this asserts the behaviour — the closure observes a different thread — plus
+/// the fact that the monitor still feeds `count_open_fds` into that helper.
+#[tokio::test]
+async fn overload_fd_sample_runs_on_blocking_pool() {
+    // `#[tokio::test]` builds a current-thread runtime, so the async body runs
+    // on this very thread: a matching thread id would mean the count blocked
+    // the runtime worker rather than the blocking pool.
+    let worker = std::thread::current().id();
+    let (sampled_on_tx, sampled_on_rx) = std::sync::mpsc::channel();
+    let sample = sample_open_fd_count(Duration::from_secs(5), 7, move || {
+        let _ = sampled_on_tx.send(std::thread::current().id());
+        42
+    })
+    .await;
+    assert_eq!(sample.current, 42);
+    assert!(!sample.timed_out);
+    let sampled_on = sampled_on_rx
+        .recv()
+        .expect("the counting closure must run and report its thread");
+    assert_ne!(
+        sampled_on, worker,
+        "FD sampling must leave the tokio worker via spawn_blocking"
+    );
+
     let src = include_str!("../../../src/overload.rs");
     assert!(
-        src.contains("tokio::task::spawn_blocking(count_open_fds)"),
-        "FD sampling must leave the tokio worker via spawn_blocking"
+        src.contains("sample_open_fd_count(interval, previous_fd_current, count_open_fds)"),
+        "the monitor must take its FD sample through the bounded blocking-pool helper"
     );
     assert!(
         src.contains("linux_fd_count_from_stat"),
