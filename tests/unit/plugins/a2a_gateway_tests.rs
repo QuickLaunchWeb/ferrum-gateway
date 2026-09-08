@@ -939,16 +939,52 @@ async fn rest_detection_is_scoped_to_configured_endpoint_path() {
 
 #[tokio::test]
 async fn rest_post_tasks_is_not_classified_as_list_tasks() {
-    let plugin = plugin(json!({
-        "policy": {
-            "default_action": "deny"
-        }
-    }));
-    let (mut ctx, mut headers) = rest_ctx("POST", "/a2a/v1/tasks");
+    // A2A 0.3 section 3.5.6 maps send/create to POST /v1/message:send and
+    // list to GET /v1/tasks. POST /v1/tasks is not a supported operation.
+    let gateway = plugin(json!({}));
+    for path in ["/a2a/tasks", "/a2a/v1/tasks"] {
+        let (mut ctx, mut headers) = rest_ctx("POST", path);
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Continue));
-    assert!(!ctx.metadata.contains_key("a2a.enabled"));
+        let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(!ctx.metadata.contains_key("a2a.enabled"));
+        assert!(!ctx.metadata.contains_key("a2a.method"));
+    }
+
+    // Allowing both plausible misclassifications must not admit an unknown
+    // operation in a protected scope, even with an explicit unknown allow.
+    for policy in [
+        json!({"default_action": "deny", "methods": {
+            "tasks/list": {"action": "allow"},
+            "message/send": {"action": "allow"},
+            "unknown": {"action": "allow"}
+        }}),
+        json!({"methods": {"tasks/cancel": {"action": "deny"}}}),
+    ] {
+        let gateway = plugin(json!({"policy": policy}));
+        for path in ["/a2a/tasks", "/a2a/v1/tasks"] {
+            let (mut ctx, mut headers) = rest_ctx("POST", path);
+            let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+            assert!(matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ));
+            assert_eq!(ctx.metadata["a2a.method"], "unknown");
+            assert_eq!(ctx.metadata["a2a.error"], "request_body_uninspectable");
+        }
+        for (method, path, expected) in [
+            ("GET", "/a2a/v1/tasks", "tasks/list"),
+            ("POST", "/a2a/v1/message:send", "message/send"),
+        ] {
+            let (mut ctx, mut headers) = rest_ctx(method, path);
+            let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+            assert!(matches!(result, PluginResult::Continue));
+            assert_eq!(ctx.metadata["a2a.method"], expected);
+        }
+    }
 }
 
 #[tokio::test]

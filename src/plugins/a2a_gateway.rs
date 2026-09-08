@@ -2371,7 +2371,7 @@ fn agent_card_origin_failure(
     }
     PluginResult::Reject {
         status_code: 502,
-        body: "{\"error\":\"agent_card_public_origin_unavailable\"}".to_string(),
+        body: r#"{"error":"agent_card_public_origin_unavailable"}"#.to_string(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
     }
 }
