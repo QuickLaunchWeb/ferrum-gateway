@@ -6629,6 +6629,16 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
         "ai_shield_warnings",
         "ai_response_guard_warning",
         "ai_request_guard.uninspectable_body",
+        // `ai_semantic_firewall` records an AI body it could not inspect here
+        // (GHSA-8gc3-h5c8-jjxx). Under `fail_on_uninspectable_body: false` or
+        // `on_error: allow` no decision key is written at all, so without these
+        // the uninspected body is invisible to `always_capture_on_guardrail` —
+        // exactly the transaction an operator most needs captured. The
+        // direction-scoped spellings are what the plugin writes when
+        // `metadata_direction_scoped` is on.
+        "ai_semantic_firewall.uninspectable_body",
+        "ai_semantic_firewall.request.uninspectable_body",
+        "ai_semantic_firewall.response.uninspectable_body",
     ] {
         if metadata
             .get(key)

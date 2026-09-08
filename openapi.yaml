@@ -27441,6 +27441,13 @@ components:
                   - "$.systemInstruction.parts[*].text"
                   - "$.inputText"
                   - "$.data_sources[*].parameters.role_information"
+                  - "$.message"
+                  - "$.preamble"
+                  - "$.chat_history[*].message"
+                  - "$.inputs"
+                  - "$.content"
+                  - "$.instances[*].prompt"
+                  - "$.requests[*].params"
               default:
                 - "$.messages[*].content"
                 - "$.messages[*].function_call.name"
@@ -27462,6 +27469,13 @@ components:
                 - "$.systemInstruction.parts[*].text"
                 - "$.inputText"
                 - "$.data_sources[*].parameters.role_information"
+                - "$.message"
+                - "$.preamble"
+                - "$.chat_history[*].message"
+                - "$.inputs"
+                - "$.content"
+                - "$.instances[*].prompt"
+                - "$.requests[*].params"
               description: Supported simple request extraction paths. When configured, this list replaces the defaults.
             response_json_paths:
               type: array
@@ -27482,6 +27496,10 @@ components:
                   - "$.content[*].text"
                   - "$.output.message.content[*].text"
                   - "$.content_block_delta.delta.text"
+                  - "$.results[*].outputText"
+                  - "$.text"
+                  - "$.response"
+                  - "$[*].generated_text"
               default:
                 - "$.choices[*].text"
                 - "$.choices[*].message.content"
@@ -27497,6 +27515,10 @@ components:
                 - "$.content[*].text"
                 - "$.output.message.content[*].text"
                 - "$.content_block_delta.delta.text"
+                - "$.results[*].outputText"
+                - "$.text"
+                - "$.response"
+                - "$[*].generated_text"
               description: Supported simple response extraction paths. When configured, this list replaces the defaults.
         allow_topics:
           type: array

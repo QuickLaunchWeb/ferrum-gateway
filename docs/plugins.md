@@ -6294,36 +6294,60 @@ Request paths:
 | Path | Shape |
 |---|---|
 | `$.messages[*].content` | OpenAI chat content, and — because content-block arrays are recursed — Anthropic Messages and Bedrock Converse `messages[].content[].text` |
-| `$.messages[*].function_call.name` / `.arguments` | Legacy OpenAI function call in message history |
-| `$.messages[*].tool_calls[*].function.name` / `.arguments` | OpenAI tool calls in message history |
+| `$.messages[*].function_call.name`, `$.messages[*].function_call.arguments` | Legacy OpenAI function call in message history |
+| `$.messages[*].tool_calls[*].function.name`, `$.messages[*].tool_calls[*].function.arguments` | OpenAI tool calls in message history |
 | `$.prompt` | Legacy Completions prompt |
 | `$.input` | Responses API / embeddings input, including structured message arrays |
 | `$.instructions` | Responses API developer instructions |
-| `$.tools[*].function.name` / `.description` / `.parameters` | OpenAI tool definitions; the `function` wrapper is optional, so Anthropic `tools[].name` / `.description` are covered |
+| `$.tools[*].function.name`, `$.tools[*].function.description`, `$.tools[*].function.parameters` | OpenAI tool definitions; the `function` wrapper is optional, so Anthropic `tools[].name` / `.description` are covered |
 | `$.context`, `$.documents[*].text`, `$.retrieved_context[*].content`, `$.tool_results[*].content` | RAG context, documents, and tool results |
 | `$.system` | Anthropic Messages and Bedrock Converse top-level system prompt, as a string or an array of text blocks |
 | `$.contents[*].parts[*].text` | Google Gemini / Vertex prompt turns |
 | `$.systemInstruction.parts[*].text` | Google Gemini / Vertex system instruction (the `system_instruction` proto casing is read too) |
 | `$.inputText` | Amazon Bedrock Titan text generation |
 | `$.data_sources[*].parameters.role_information` | Azure OpenAI "On Your Data" per-data-source instruction (the `dataSources` / `roleInformation` casings are read too) |
+| `$.message`, `$.preamble`, `$.chat_history[*].message` | Cohere v1 `/chat` turn, system preamble, and history (kind follows `chat_history[].role`: `USER`, `CHATBOT`, `SYSTEM`, `TOOL`) |
+| `$.inputs` | Hugging Face TGI text generation, as a prompt string or an array of prompt strings |
+| `$.content` | OpenAI Assistants `POST /v1/threads/{id}/messages`. Read **only** when the body also carries a string `role` sibling; `content` alone is too common in unrelated JSON |
+| `$.instances[*].prompt` | Google Vertex legacy `predict` |
+| `$.requests[*].params` | Anthropic Message Batches. Each entry's `params` object is re-scanned once with every other configured request path, prefixed `$.requests[i].params.…`. Bounded to one level: a batch nested inside a batch is not expanded again |
 
 Response paths:
 
 | Path | Shape |
 |---|---|
 | `$.choices[*].text`, `$.choices[*].message.content`, `$.choices[*].delta.content` | OpenAI-compatible completion and streamed delta text |
-| `$.choices[*].message.tool_calls[*].function.*`, `$.choices[*].delta.tool_calls[*].function.*` | OpenAI-compatible response tool calls |
+| `$.choices[*].message.tool_calls[*].function.name`, `$.choices[*].message.tool_calls[*].function.arguments`, `$.choices[*].delta.tool_calls[*].function.name`, `$.choices[*].delta.tool_calls[*].function.arguments` | OpenAI-compatible response tool calls |
 | `$.output_text`, `$.output[*].content[*].text`, `$.output[*].arguments` | Responses API output text and function-call arguments |
 | `$.candidates[*].content.parts[*].text` | Google Gemini / Vertex `generateContent` |
 | `$.content[*].text` | Anthropic Messages non-streaming completion |
 | `$.output.message.content[*].text` | Amazon Bedrock Converse |
 | `$.content_block_delta.delta.text` | An Anthropic Messages streaming text-delta event delivered as a JSON body |
+| `$.results[*].outputText` | Amazon Bedrock Titan text generation |
+| `$.text` | Cohere v1 `/chat` and `/generate` completion text |
+| `$.response` | Ollama `/api/generate` completion text |
+| `$[*].generated_text` | Hugging Face TGI, whose completion is a top-level JSON **array** rather than an object |
 
-Extraction is bounded at every path: `parts[]` and content-block arrays contribute only each element's own `text` string and are never recursed into. An explicit extraction array must not be empty when that direction has active rules.
+Extraction is bounded at every path: `parts[]`, content-block arrays, and tool-result payloads contribute only each element's own `text` string and are never recursed into.
 
-**Unrecognized AI bodies fail closed.** A request or response body that looks like an AI body but yields no inspectable segments — a provider shape the extraction paths do not cover, or one the operator's `extraction` override excluded — is routed through `fail_on_uninspectable_body` (default `true`, so `on_error: reject` rejects it) and records `ai_semantic_firewall.uninspectable_body=no_extractable_content` rather than passing silently. AI-body recognition keys off the provider-native top-level markers `messages`, `prompt`, `input`, `instructions`, `tools`, `context`, `documents`, `retrieved_context`, `tool_results`, `system`, `toolConfig`, `inferenceConfig`, `contents`, `systemInstruction`, `system_instruction`, `generationConfig`, `inputText`, `textGenerationConfig`, `inputs`, `data_sources`, `dataSources`, `preamble`, and `chat_history` on the request side, and `choices`, `output_text`, `output`, `candidates`, an array `content`, or a `content_block_delta` event on the response side. A genuinely non-AI JSON body on a shared proxy still passes through untouched.
+Content blocks additionally yield their tool-result and guardrail text. An Anthropic `{"type": "tool_result", "content": …}` block and a Bedrock Converse `{"toolResult": {"content": [...]}}` block are attributed `ToolResult` — not `UserPrompt` — even though they ride inside a `role: "user"` message, so the `indirect_prompt_injection` built-in (which applies to `RagContext`, `Document`, `ToolResult`) fires on a poisoned tool result. A Converse `{"guardContent": {"text": {"text": …}}}` block is read as message content, in both the nested and the flat `{"guardContent": {"text": …}}` spelling.
 
-Anthropic Messages **event streams** are not delta-reassembled, so their `text_delta` fragments are deliberately not inspected per frame — scoring one fragment would stamp a clean allow decision over content nothing read. Under `streaming_response: buffer` an Anthropic stream therefore yields no segments and fails closed through `on_error`; use `streaming_response: reject` if you need those clients to fall back to non-streaming, inspectable responses.
+The generic top-level fields (`$.system`, `$.inputs`, `$.message`, `$.preamble`, `$.content`, `$.inputText`, `$.text`, `$.response`, and the per-element `prompt` / `outputText` / `generated_text`) are read only when the value is a **string or an array**. An object value — `{"system": {"tenant": "acme", "api_key": "…"}}` — yields no segment, so unrelated structured data is never stringified into a prompt segment and shipped to the embedding provider; the body is then treated as uninspectable instead. `$.context` and `$.tools[*].function.parameters` are the two paths that deliberately do stringify an object, because a tool-parameter schema is model-visible.
+
+An explicit extraction array must not be empty when that direction has active rules.
+
+**Unrecognized AI bodies fail closed.** A request or response body that looks like an AI body but yields no inspectable segments — a provider shape the extraction paths do not cover, or one the operator's `extraction` override excluded — is routed through `fail_on_uninspectable_body` (default `true`, so `on_error: reject` rejects it) and records `ai_semantic_firewall.uninspectable_body=no_extractable_content` rather than passing silently. That marker is also one of the keys `ai_transcript_audit`'s `always_capture_on_guardrail` treats as a fired guardrail, so an uninspected AI body is captured even under `fail_on_uninspectable_body: false` or `on_error: allow`.
+
+AI-body recognition keys off these top-level markers:
+
+- **Request:** `messages`, `prompt`, `input`, `instructions`, `tools`, `context`, `documents`, `retrieved_context`, `tool_results`, `system`, `contents`, `systemInstruction`, `system_instruction`, `inputText`, `inputs`, `data_sources`, `dataSources`, `message`, `preamble`, `chat_history`, `instances`; plus an array `requests` with at least one entry carrying an object `params` (Anthropic Message Batches).
+- **Response:** `choices`, `output_text`, `output`, `candidates`; a `type` of `content_block_delta`; an array `content` with at least one **object** element carrying `text` or `type` (so a Spring-Data `Page` such as `{"content": [{"id": 1}], "totalPages": 3}` is not an AI response); an array `results` with at least one object element carrying `outputText` or `completionReason` (Bedrock Titan, rather than every paginated `{"results": []}` endpoint); or a top-level JSON **array** with an element carrying `generated_text` (Hugging Face TGI).
+
+Config-only siblings (`toolConfig`, `inferenceConfig`, `generationConfig`, `textGenerationConfig`) are deliberately **not** markers: none can occur without `messages`, `contents`, or `inputText`, so listing them would widen what a non-AI body must avoid without recognising one extra AI body. Every marker above has a matching extraction path, so a recognised body is refused only when the marker is present but carries no extractable text (a non-string `system`, an image-only `contents`, a `candidates` entry with only a `functionCall`).
+
+**Blast radius on a shared proxy.** Under the defaults (`mode: enforce`, `on_error: reject`, `fail_on_uninspectable_body: true`, `inspect.response: true`) a **non-AI** JSON body carrying one of the markers above and no extractable text is **rejected**, not passed through: `{"system": true}` and `{"inputs": {"a": 1}}` and `{"contents": [{"id": 1}]}` become `400`, and the response-side equivalents become `502`. A marker whose value *is* text is inspected and sent to the embedding provider — `{"system": "inventory"}` is scored as a system prompt, and the deliberately marker-less response paths `$.text` and `$.response` mean a plain `{"status": "ok", "text": "…"}` reply has that string inspected too. `message` is likewise a broad marker: Cohere v1 needs it, and an ordinary `{"message": "…"}` body gets that string inspected. Scope the plugin to AI routes, trim `extraction.request_json_paths` / `response_json_paths` to the shapes your backends actually speak, or set `fail_on_uninspectable_body: false` if a shared proxy must keep non-AI JSON flowing.
+
+**Provider event streams are not delta-reassembled.** Anthropic Messages `text_delta` events and Gemini `streamGenerateContent?alt=sse` frames are deliberately not inspected per frame — each frame carries one fragment, so scoring it inflates embedding cost, lets a phrase split across two frames evade every rule, and stamps a clean allow decision over content nothing read as a whole. Both `streaming_response: buffer` and `streaming_response: inspect` therefore yield no segments for those streams and fail closed through `on_error` (`buffer` via the uninspectable-stream path; `inspect` via a window whose frames are recognisably governed but unmapped). An OpenAI-shaped stream is unaffected: its role-only and lifecycle frames still release clean. Use `streaming_response: reject` if you need those clients to fall back to non-streaming, inspectable responses. Reassembling the Anthropic and Gemini stream shapes so their windows are inspected rather than refused is tracked as future work ("Anthropic stream reassembly", "Gemini stream reassembly").
 
 **Built-in packs:**
 
