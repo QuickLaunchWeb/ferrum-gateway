@@ -302,7 +302,8 @@ fn every_probe_outcome_kind_releases_the_half_open_slot() {
         let cb = breaker_holding_one_probe();
         record(&cb);
         assert_eq!(
-            cb.half_open_in_flight(), 0,
+            cb.half_open_in_flight(),
+            0,
             "{label} must release the HALF_OPEN probe slot"
         );
     }
@@ -346,7 +347,8 @@ fn all_three_target_health_layers_prune_from_one_live_snapshot() {
         ".health_checker.remove_stale_passive_targets_for_proxy(",
     ] {
         assert_eq!(
-            proxy.matches(layer).count(), body.matches(layer).count(),
+            proxy.matches(layer).count(),
+            body.matches(layer).count(),
             "every `{layer}` call site in src/proxy/mod.rs must live inside \
              prune_stale_target_health, against the one live snapshot"
         );
@@ -358,7 +360,10 @@ fn discovery_publication_prunes_both_layers_together() {
     // The other place a target set is published: a service-discovery refresh.
     // Both health layers are pruned there too, against the same snapshot.
     let discovery = source("src/service_discovery/mod.rs");
-    for layer in ["remove_stale_passive_targets_for_proxy(", "prune_stale_targets_for_proxy("] {
+    for layer in [
+        "remove_stale_passive_targets_for_proxy(",
+        "prune_stale_targets_for_proxy(",
+    ] {
         assert!(
             discovery.contains(layer),
             "a discovery snapshot publication must prune `{layer}` alongside its sibling layer"
@@ -430,7 +435,8 @@ fn every_protocol_nack_consumer_routes_through_the_shared_predicate() {
 fn the_protocol_nack_predicate_has_exactly_one_implementation() {
     let retry = source("src/retry.rs");
     assert_eq!(
-        retry.matches("h2::Reason::REFUSED_STREAM").count(), 1,
+        retry.matches("h2::Reason::REFUSED_STREAM").count(),
+        1,
         "the RFC 9113 rejection proof must live in exactly one predicate"
     );
     let body = item_body(
@@ -616,7 +622,8 @@ fn every_registry_provider_dedups_its_snapshot_by_dial_identity() {
             BackendEgressPolicy::unrestricted(),
         );
         assert_eq!(
-            admitted.len(), 2,
+            admitted.len(),
+            2,
             "{provider} must collapse duplicate dial identities before publication"
         );
         let identities: BTreeSet<(String, u16)> = admitted
@@ -678,7 +685,8 @@ fn the_shared_helper_clamps_every_shard_override_to_a_workable_minimum() {
         );
     }
     assert_eq!(
-        pool_shard_amount(1), 2,
+        pool_shard_amount(1),
+        2,
         "an explicit override of one must round up in the helper"
     );
 }
