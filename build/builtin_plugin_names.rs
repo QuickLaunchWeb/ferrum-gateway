@@ -60,14 +60,13 @@ pub fn format_builtin_name_collision_errors(
 ) -> Vec<String> {
     plugin_sources
         .iter()
-        .filter_map(|(stem, path)| {
-            builtin_names.contains(stem).then(|| {
-                format!(
-                    "custom plugin file {} shadows built-in plugin \"{}\"",
-                    path.display(),
-                    stem
-                )
-            })
+        .filter(|(stem, _)| builtin_names.contains(stem))
+        .map(|(stem, path)| {
+            format!(
+                "custom plugin file {} shadows built-in plugin \"{}\"",
+                path.display(),
+                stem
+            )
         })
         .collect()
 }
