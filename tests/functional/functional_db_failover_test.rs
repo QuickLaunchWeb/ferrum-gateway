@@ -401,7 +401,10 @@ async fn test_db_config_backup_authenticated_export_roundtrip() {
         .namespace("tenant-a")
         .env("FERRUM_DB_URL", &unavailable_url)
         .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "2")
-        .env("FERRUM_DB_CONFIG_BACKUP_PATH", backup_path.to_string_lossy())
+        .env(
+            "FERRUM_DB_CONFIG_BACKUP_PATH",
+            backup_path.to_string_lossy(),
+        )
         .spawn()
         .await
         .expect("boot from the unmodified authenticated export");
@@ -455,7 +458,10 @@ async fn test_db_config_backup_authenticated_export_roundtrip() {
         .namespace("tenant-a")
         .env("FERRUM_DB_URL", unavailable_url)
         .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "2")
-        .env("FERRUM_DB_CONFIG_BACKUP_PATH", backup_path.to_string_lossy())
+        .env(
+            "FERRUM_DB_CONFIG_BACKUP_PATH",
+            backup_path.to_string_lossy(),
+        )
         .spawn_expect_failure(Duration::from_secs(30))
         .await
         .expect("invalid backup must refuse startup");
@@ -466,7 +472,10 @@ async fn test_db_config_backup_authenticated_export_roundtrip() {
     let healthy = TestGateway::builder()
         .clear_env()
         .namespace("tenant-a")
-        .env("FERRUM_DB_CONFIG_BACKUP_PATH", backup_path.to_string_lossy())
+        .env(
+            "FERRUM_DB_CONFIG_BACKUP_PATH",
+            backup_path.to_string_lossy(),
+        )
         .capture_output()
         .spawn()
         .await
