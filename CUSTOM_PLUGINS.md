@@ -99,6 +99,13 @@ on_stream_disconnect()          ── fire-and-forget (logging, metrics)
 
 Create a new `.rs` file in the `custom_plugins/` directory at the project root. The file name becomes the plugin name (e.g., `my_header_injector.rs` → plugin name `my_header_injector`).
 
+A custom plugin file stem must not match any built-in plugin name from
+`BUILTIN_PLUGIN_REGISTRATIONS` (for example `cors.rs` or `jwt_auth.rs`). The
+build fails with a collision error naming the file and the built-in it shadows.
+Built-in names always win at runtime, so a colliding custom plugin would compile
+and register but never run, would still apply any `plugin_migrations()`, and
+would appear twice in `available_plugins()`.
+
 Each plugin file must export a `create_plugin` factory function that returns
 `Result` and a `failure_policy` metadata function:
 

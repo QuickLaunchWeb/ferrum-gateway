@@ -2,6 +2,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod builtin_plugin_names {
+    include!("build/builtin_plugin_names.rs");
+}
+
 mod protoc_preflight {
     include!("build/protoc_preflight.rs");
 }
@@ -144,6 +148,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 unresolved.join(", ")
             );
         }
+    }
+
+    let builtin_names = builtin_plugin_names::builtin_plugin_name_set_from_mod_rs(
+        Path::new("src/plugins/mod.rs"),
+    )
+    .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
+    let collisions =
+        builtin_plugin_names::format_builtin_name_collision_errors(&plugin_sources, &builtin_names);
+    if !collisions.is_empty() {
+        panic!(
+            "custom plugin file stem must not shadow a built-in plugin name:\n  {}",
+            collisions.join("\n  ")
+        );
     }
 
     plugin_sources.sort_by(|a, b| a.0.cmp(&b.0));
@@ -331,6 +348,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Re-run build script when custom_plugins/ changes
     println!("cargo:rerun-if-changed=custom_plugins/");
+    println!("cargo:rerun-if-changed=src/plugins/mod.rs");
     println!("cargo:rerun-if-env-changed=FERRUM_CUSTOM_PLUGINS");
 
     Ok(())
