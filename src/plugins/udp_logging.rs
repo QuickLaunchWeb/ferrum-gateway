@@ -190,7 +190,7 @@ impl UdpLogging {
         Ok(Self {
             batch_config: build_batch_config(config, "udp_logging", batch_defaults)?,
             flush_config,
-            logger: DeferredBatchingLogger::new(),
+            logger: DeferredBatchingLogger::for_plugin("udp_logging"),
             endpoint_hostname: socket_host_warmup,
             schema,
             byte_budget: Arc::new(ByteBudget::new_observability(
@@ -718,6 +718,11 @@ pub(crate) fn local_record_drops_for_test() -> u64 {
 }
 
 fn record_local_record_drop(error: &UdpDeliveryError) {
+    crate::plugins::utils::sink_loss::record_dropped(
+        "udp_logging",
+        crate::plugins::utils::sink_loss::SinkLossReason::SinkError,
+        1,
+    );
     let total = LOCAL_RECORD_DROPS
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);

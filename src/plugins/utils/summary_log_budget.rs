@@ -12,6 +12,7 @@ use serde::Serialize;
 use super::batching_logger::{BatchingLoggerPermit, DeferredBatchingLogger};
 use super::byte_budget::{BoundedJsonWriter, ByteBudget, ByteLease, accounted_summary_bytes};
 use super::log_schema::{SchemaView, SummarySchema};
+use super::sink_loss::SinkLossReason;
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
 /// One admitted, pre-serialized summary record retained in a batching queue.
@@ -38,26 +39,32 @@ pub fn serialize_under_byte_budget<T: Serialize + ?Sized>(
     let mut writer = BoundedJsonWriter::new(max_entry_bytes);
     if let Err(error) = serde_json::to_writer(&mut writer, value) {
         if writer.limit_exceeded {
-            budget.record_drop("serialized entry exceeded max_entry_bytes");
+            budget.record_drop(
+                SinkLossReason::RecordTooLarge,
+                "serialized entry exceeded max_entry_bytes",
+            );
         } else {
             tracing::warn!(
                 plugin = "summary_log_budget",
                 "failed to serialize observability entry: {error}"
             );
-            budget.record_drop("serialization failed");
+            budget.record_drop(SinkLossReason::SinkError, "serialization failed");
         }
         return None;
     }
     let retained = writer.bytes.len();
     if retained > max_entry_bytes {
-        budget.record_drop("serialized entry exceeded max_entry_bytes");
+        budget.record_drop(
+            SinkLossReason::RecordTooLarge,
+            "serialized entry exceeded max_entry_bytes",
+        );
         return None;
     }
     lease.shrink_to(accounted_summary_bytes(retained));
     let json = match String::from_utf8(writer.bytes) {
         Ok(line) => Arc::<str>::from(line),
         Err(_) => {
-            budget.record_drop("serialized entry was not UTF-8");
+            budget.record_drop(SinkLossReason::SinkError, "serialized entry was not UTF-8");
             return None;
         }
     };
@@ -90,7 +97,8 @@ pub fn admit_http_summary(
     schema: Option<&SummarySchema>,
 ) {
     let Some(permit) = logger.try_reserve() else {
-        budget.record_drop("queue slot exhausted");
+        // `try_reserve` already published this loss on the sink family.
+        budget.record_drop_local("queue slot exhausted");
         return;
     };
     match schema.filter(|schema| schema.applies_to_http()) {
@@ -113,7 +121,8 @@ pub fn admit_stream_summary(
     schema: Option<&SummarySchema>,
 ) {
     let Some(permit) = logger.try_reserve() else {
-        budget.record_drop("queue slot exhausted");
+        // `try_reserve` already published this loss on the sink family.
+        budget.record_drop_local("queue slot exhausted");
         return;
     };
     match schema.filter(|schema| schema.applies_to_stream()) {

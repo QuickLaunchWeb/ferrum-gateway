@@ -89,6 +89,7 @@ use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metada
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
 };
+use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger,
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, LoggerHooks, PluginHttpClient, build_batch_config,
@@ -2185,7 +2186,7 @@ impl AiTranscriptAudit {
             batch_config,
             flush_config,
             custom_header_specs,
-            logger: DeferredBatchingLogger::new(),
+            logger: DeferredBatchingLogger::for_plugin("ai_transcript_audit"),
             endpoint_hostname,
             namespace,
             staging: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -2318,6 +2319,7 @@ impl AiTranscriptAudit {
                 }
             }
         }
+        let budget = self.retained_budget.as_ref();
         let (permit, staged_lease) = match staging {
             Some(staging) => {
                 // Record fields are already copied out of staging. Release the
@@ -2340,8 +2342,10 @@ impl AiTranscriptAudit {
             Some((lease, _)) => {
                 drop(lease);
                 drop(permit);
-                self.retained_budget
-                    .record_drop("record reservation was below the serialized-entry charge");
+                budget.record_drop(
+                    SinkLossReason::RecordTooLarge,
+                    "record reservation was below the serialized-entry charge",
+                );
                 return self.saturated_outcome();
             }
             // Fail-open admission takes the worst-case lease before
@@ -2357,33 +2361,43 @@ impl AiTranscriptAudit {
 
         let mut counter = BoundedJsonCounter::new(self.limits.max_entry_bytes);
         if serde_json::to_writer(&mut counter, &record).is_err() {
-            self.retained_budget.record_drop(if counter.limit_exceeded {
-                "serialized record exceeded limits.max_entry_bytes"
+            let (loss_reason, detail) = if counter.limit_exceeded {
+                (
+                    SinkLossReason::RecordTooLarge,
+                    "serialized record exceeded limits.max_entry_bytes",
+                )
             } else {
-                "record serialization failed"
-            });
+                (SinkLossReason::SinkError, "record serialization failed")
+            };
+            budget.record_drop(loss_reason, detail);
             drop(permit);
             return self.saturated_outcome();
         }
         let serialized_bytes = counter.bytes;
         if serialized_bytes > self.limits.max_entry_bytes {
-            self.retained_budget
-                .record_drop("serialized record exceeded limits.max_entry_bytes");
+            budget.record_drop(
+                SinkLossReason::RecordTooLarge,
+                "serialized record exceeded limits.max_entry_bytes",
+            );
             drop(permit);
             return self.saturated_outcome();
         }
         let exact_charge = accounted_record_bytes(serialized_bytes);
         if exact_charge > provisional {
-            self.retained_budget
-                .record_drop("serialized record exceeded its retained-byte reservation");
+            budget.record_drop(
+                SinkLossReason::RecordTooLarge,
+                "serialized record exceeded its retained-byte reservation",
+            );
             drop(permit);
             return self.saturated_outcome();
         }
         lease.shrink_to(exact_charge);
         let mut json = Vec::with_capacity(serialized_bytes);
         if serde_json::to_writer(&mut json, &record).is_err() || json.len() != serialized_bytes {
-            self.retained_budget
-                .record_drop("record serialization changed between bounded passes");
+            budget.record_drop(
+                SinkLossReason::SinkError,
+                "record serialization changed between bounded passes",
+            );
             drop(permit);
             return self.saturated_outcome();
         }

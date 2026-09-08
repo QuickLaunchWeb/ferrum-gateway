@@ -1454,6 +1454,22 @@ Telemetry uses fixed labels only — no attacker-controlled label values:
   delivered complete but degraded, such as `loki_logging` sending uncompressed
   because the gzip buffer could not be reserved. No record loss.
 
+Per-plugin record loss is published separately (issue #4801):
+
+- `ferrum_plugin_log_sink_records_dropped_total{plugin,reason}` — records
+  discarded by one sink, with `reason` drawn from the closed set
+  `batch_discard` / `byte_budget` / `queue_full` / `record_too_large` /
+  `shutdown` / `sink_error`
+- `ferrum_plugin_log_sink_records_accepted_total{plugin}` — records that sink
+  admitted to its bounded queue
+
+Both are process-cumulative and survive a plugin-cache reload, both label
+values come from fixed compile-time sets, and every plugin/reason series is
+emitted at zero rather than appearing only after a loss. The same totals and
+the non-zero reason breakdown appear on the authenticated `/status` payload
+under `log_sink_record_loss`. See
+[prometheus_metrics.md](prometheus_metrics.md#per-plugin-logging-sink-record-loss).
+
 Per-instance refusals stay on each sink's own drop accounting, so the counters
 together tell an operator whether to raise one sink's `buffer_max_bytes` or the
 process ceiling. If you see sustained

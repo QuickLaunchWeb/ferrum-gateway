@@ -266,6 +266,59 @@ on every status. Mapping: [error_classification.md](error_classification.md#http
 `ferrum_stream_disconnects_total{error_class}` uses the same 19
 `ErrorClass::as_str` values as stream logs and omits the label when unset.
 
+### Per-plugin logging-sink record loss
+
+`ferrum_plugin_log_sink_records_dropped_total{plugin,reason}` and
+`ferrum_plugin_log_sink_records_accepted_total{plugin}` publish the record
+accounting of the per-plugin observability sinks (`http_logging`,
+`tcp_logging`, `udp_logging`, `ws_logging`, `statsd_logging`, `loki_logging`,
+`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`). Before these
+families existed the sinks logged their discards but published nothing, so a
+truncated audit trail was invisible on `/metrics`.
+
+These are **not** the same as `ferrum_log_sink_*{sink}`, which covers only the
+process-global stdout/stderr writers, and not the same as
+`ferrum_observability_*`, which counts the shared retained-byte ceiling and
+batch-materialization layer for the process as a whole.
+
+Both label values come from fixed compile-time sets and never carry an
+endpoint, topic, namespace, policy id, or record content:
+
+| `plugin` | one of the nine sinks above, or `other` for a sink identity outside the closed set |
+| --- | --- |
+| `reason` | `batch_discard`, `byte_budget`, `queue_full`, `record_too_large`, `shutdown`, `sink_error` |
+
+- `byte_budget` — a per-instance `buffer_max_bytes` budget or the process-wide
+  `FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES` ceiling refused the admission.
+- `record_too_large` — the serialized record exceeded `max_entry_bytes` or its
+  own retained-byte reservation.
+- `queue_full` — the bounded in-memory queue was full and no overflow handoff
+  took ownership.
+- `batch_discard` — a whole batch was discarded after its retry budget was
+  exhausted with no durable fallback. Counts records, not batches.
+- `shutdown` — the flush worker was closed, or had not started yet.
+- `sink_error` — a per-record delivery or serialization failure that retrying
+  could not fix.
+
+Counters are process-cumulative and are **not** reset by a plugin-cache
+reload: a configuration change is not evidence that lost records came back.
+Every plugin/reason series is emitted on every scrape, including zero-valued
+ones, so `rate(ferrum_plugin_log_sink_records_dropped_total[5m]) > 0` is a
+usable alert expression without waiting for a series to appear. No alert rule
+is bundled — the acceptable loss rate is deployment-specific.
+
+`byte_budget`, `record_too_large`, `queue_full`, and `shutdown` are
+admission-time refusals, so `accepted` plus those four accounts for every
+record the sinks were offered — the property that makes the loss counter
+trustworthy. `batch_discard` is a post-admission loss of records that were
+already counted as accepted, and `sink_error` covers a per-record delivery or
+serialization failure that may occur on either side of admission; neither is
+part of that identity.
+
+Both totals, plus the non-zero per-plugin reason breakdown, are also projected
+onto the authenticated `/status` payload under `log_sink_record_loss`, so a
+loss is visible without a metrics backend.
+
 ## Complete family inventory
 
 Sorted by family name. Optional namespace labels are listed when the emitter supports them.
@@ -617,6 +670,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_overload_resource_current` | gauge | `resource`, `namespace` | `overload` | `documented_only` | `conditional` | Most recent overload-monitor sample of a tracked resource. |
 | `ferrum_overload_resource_limit` | gauge | `resource`, `namespace` | `overload` | `documented_only` | `conditional` | Ceiling the overload monitor compares each tracked resource against. |
 | `ferrum_overload_shedding_active` | gauge | `action`, `namespace` | `overload` | `alert_and_dashboard` | `conditional` | Whether a progressive load-shedding action is currently engaged (1) or not (0). |
+| `ferrum_plugin_log_sink_records_accepted_total` | counter | `plugin` | `logging_sinks` | `documented_only` | `always` | Observability records admitted to a per-plugin logging sink's bounded queue. Process-cumulative; not reset by a plugin-cache reload. |
+| `ferrum_plugin_log_sink_records_dropped_total` | counter | `plugin`, `reason` | `logging_sinks` | `documented_only` | `always` | Observability records discarded by a per-plugin logging sink, by bounded reason. Process-cumulative; not reset by a plugin-cache reload. |
 | `ferrum_proxy_passive_unhealthy_targets` | gauge | `proxy_id`, `proxy_namespace`, `namespace` | `upstream_health` | `documented_only` | `when_series_present` | Targets this proxy has ejected from traffic-based passive health checking. |
 | `ferrum_rate_limit_exceeded_total` | counter | `namespace` | `prometheus_metrics` | `dashboard` | `always` | Total rate limit rejections. |
 | `ferrum_request_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Request duration in milliseconds. |
