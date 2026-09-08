@@ -24153,7 +24153,10 @@ async fn encode_semantic_cache_replay(
     // Reuse the bounded producer window, deadline handling, and identity/406
     // fallback from the shared buffered pipeline. Only transport producers run;
     // semantic transforms and plaintext policy already ran in the finalizer.
-    transform_buffered_response_body_with_deadline(
+    // The pipeline's header-policy rejection path re-enters the reject-path
+    // chain that called us, so the future must be boxed; the 2xx status gate
+    // above guarantees a rejection cannot re-enter this encoder at runtime.
+    Box::pin(transform_buffered_response_body_with_deadline(
         &transport_plugins,
         ctx,
         crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated,
@@ -24162,7 +24165,7 @@ async fn encode_semantic_cache_replay(
         body,
         None,
         &[],
-    )
+    ))
     .await;
 }
 
