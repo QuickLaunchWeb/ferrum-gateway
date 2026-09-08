@@ -672,14 +672,14 @@ quiet `main` and, if the gate reports a pending run, let it complete.
 
 The repository cache is a 10 GB LRU quota, so lanes are few and owned.
 `setup-rust-ci` restores for every job but saves only from the designated
-lane producer (`save: "true"`) on a trusted push to `refs/heads/main`; the
+lane producer (`save: "true"`) on a trusted `refs/heads/main` run; the
 sccache local store is no longer persisted (the restored `target/` already
 skips dependency compilation). Lanes: `ci-debug` (produced by Unit Tests;
 shared by every debug-profile job through identical `CARGO_BUILD_JOBS` /
 `CARGO_PROFILE_DEV_DEBUG` job env), `ci-lint` (produced by Lint), the
-main-only `fuzz-smoke` lane, `ci-coverage`, and the FIPS contract lane. Every
-other rust-cache site is restore-only (`save-if: "false"`) so it cannot evict
-the PR-facing lanes.
+main-only `fuzz-smoke` lane, `ci-coverage`, and the separately governed FIPS
+contract lane. The direct eBPF-program cache also retains its main-push writer;
+binary and benchmark sites are restore-only (`save-if: "false"`).
 
 The planner runs `git diff --check` for PR/merge-group diff hygiene and disables
 rename detection when classifying paths, so both the source and destination of a
@@ -1000,21 +1000,21 @@ pushes to `main`. The commands below are grouped by job, not run as one
 sequential shell script:
 
 ```bash
-# test-unit: a four-shard matrix (core / plugins-a / plugins-b / gateway-core).
-# The former 642k-line `unit_tests` crate is four targets compiled in
-# parallel: `unit_tests` (config, admin, tls, identity, secrets, cli, ...),
-# `unit_plugins_a_tests` (plugin test files a–j), `unit_plugins_b_tests`
-# (k–z), and `unit_gateway_core_tests`. Each shard precompiles its targets in
-# one Cargo invocation (the core shard together with the inline lib harness)
-# before running anything, so a runner loss cannot land between two
-# compilations. The core shard also runs the inline lib tests and the kTLS
-# live-kernel proof; the plugins-b shard hosts the four-test plugin-hardening
+# test-unit: a five-shard matrix (lib / core / plugins-a / plugins-b /
+# gateway-core). The former 642k-line `unit_tests` crate is four targets
+# compiled in parallel: `unit_tests` (config, admin, tls, identity, secrets,
+# cli, ...), `unit_plugins_a_tests` (plugin test files a–j),
+# `unit_plugins_b_tests` (k–z), and `unit_gateway_core_tests`; the `lib`
+# shard compiles the inline `#[cfg(test)]` harness alone and runs it plus the
+# kTLS live-kernel proof. Each shard precompiles its target in one Cargo
+# invocation before running anything, so a runner loss cannot land between a
+# compile and a run. The plugins-b shard hosts the four-test plugin-hardening
 # exact gate. Per-shard passing floors live in run_unit_ci.py.
-cargo test $UNIT_PRECOMPILE_TARGETS --no-run      # "--lib --test unit_tests" on core
-cargo test --lib                                   # core shard
+cargo test $UNIT_PRECOMPILE_TARGETS --no-run      # "--lib" on lib, "--test <target>" elsewhere
+cargo test --lib                                   # lib shard
 FERRUM_KTLS_LIVE_REQUIRED=1 cargo test --lib -- --ignored --test-threads=1 \
-  proxy::ktls_live_kernel_tests                    # core shard
-cargo test --test "$UNIT_TARGET"                   # every shard
+  proxy::ktls_live_kernel_tests                    # lib shard
+cargo test --test "$UNIT_TARGET"                   # every other shard
 
 # test-acme (path-gated: src/tls/, tests/acme_dns01/, tests/unit/tls/, build
 # graph): the optional feature compiles the library a second time, so it has
@@ -1447,42 +1447,31 @@ rust-cache producer/consumer sites keep their existing fork-only `save-if`
 contract — that workflow's caching architecture is generation-pinned
 separately (PR #3889).
 
-**Rust-cache quota diet (#4643, part 2).** The editable direct rust-cache
-calls in `ci.yml` (`build-binaries`, `build-ebpf`) and the six on-demand
-benchmark workflows now save only on
-`github.event_name == 'push' && github.ref == 'refs/heads/main'`. Because the
-benchmark workflows only have `workflow_dispatch` triggers, they restore
-existing entries but publish no new ones, including on manual `main` runs.
-Their existing keys remain isolated; they do not gain a new cache producer.
-The binary producer retains separate `release` and `prbuild` keys, so its
-PR/merge-group builds cannot restore the release-profile cache and will
-compile cold once old `prbuild` entries expire.
+**Rust-cache quota diet (#4643, current state).** The initial direct-site
+change from `fix/issue-4643-cache-lane-diet` / #4665 is integrated. The shared
+`setup-rust-ci` action now archives Cargo downloads and target dependencies,
+without the duplicate sccache directory, and defaults to restore-only.
+The Unit core shard owns `ci-debug`, Lint owns `ci-lint`, and coverage's
+lib-unit shard owns `ci-coverage`. All three explicitly set
+`cache-on-failure: "false"`: a failed setup/fetch/compile must not reserve an
+incomplete immutable key that later exact-hit consumers cannot enrich.
+This also forgoes saving when tests fail after compilation; no compile-complete
+predicate is inferred. Existing incomplete entries are not deleted by the fix.
+The separate FIPS producer/handoff contract is unchanged.
 
-Lanes that cache useful Cargo targets stop also archiving the bounded 2 GiB
-`.cache/sccache` directory. Comparison, connection-saturation, and
-gateways-protocol benchmarks compile their host tools in nested workspaces
-and build the gateway in Docker; their default root `target/` archive never
-covered those host tools. They now set `cache-targets: "false"`, retaining
-only Cargo downloads and the compiler-cache restore path. No new shared
-sccache service or credential export is introduced.
+The main-only `fuzz-smoke` lane currently archives its target tree, without a
+sccache directory. The earlier target-only experiment showed that dropping
+compiler-store reuse can increase sanitizer time despite a target-cache hit.
+Restore-only benchmark and binary jobs do not create new cache producers.
+Ambient and NodeWaypoint image caches now use their separate GHCR contracts.
 
-| Lane / shared key | Expected archive after the diet (not yet measured) |
-|---|---|
-| `build-<target>-release` | Cargo downloads + target dependencies; previous archive minus its compressed sccache subset (up to 2 GiB before compression) |
-| `build-<target>-prbuild` | 0 new bytes; PR and merge-group saves disabled |
-| `ci-ebpf-programs` | Cargo downloads + `ebpf/target`; previous archive minus its compressed sccache subset, when the existing cache step runs |
-| `ci-perf-bench`, `ci-payload-bench`, `ci-scale-bench` | 0 new bytes on dispatch; restore paths are Cargo downloads + root target dependencies |
-| `ci-comparison-bench`, `ci-connection-saturation`, `ci-gateways-protocol-bench` | 0 new bytes on dispatch; restore paths are Cargo downloads + sccache, without root target |
-
-This is a partial quota reduction, not evidence that the repository fits
-under 10 GB. The frozen `setup-rust-ci` action still archives both target and
-sccache for Unit Tests (`ci-test`), Lint (`ci-lint`), Build Test Artifacts,
-coverage, and its other callers; it exposes neither `cache-targets` nor
-`cache-directories` nor `save-if` overrides. Changing that common policy
-requires a trusted direct-to-`main` generation. The frozen `fuzz-smoke` lane
-(reported at about 4.3 GB) still needs shrinking/splitting through a separate
-policy generation. FIPS, release publication, and `ci-perf` (#4090) keep
-their existing arrangements. Existing large entries are left to LRU expiry.
+The [September 8 hosted audit](ci_throughput_2026-09-08.md) records a complete
+seven-entry inventory of 5,785,469,165 bytes and primary-log exact restores in
+Unit, Lint and Build Test Artifacts. It also records a 29m40s sanitizer stage
+with zero compiler-cache hits despite an exact target-cache restore. These
+measurements supersede the initial archive-size estimates and the old claim
+that the shared composite still duplicates sccache. Durable retention and
+same-input compiler reuse remain acceptance requirements, not assumptions.
 
 To measure, capture this inventory before and after a subsequent `main`
 push, then again after a PR run based on that push (retain the output with
@@ -1497,7 +1486,7 @@ Compare the **same entry IDs** across snapshots: entries created before the
 later `main` push must still exist afterward and show `last_accessed_at` >
 `created_at` after the PR restore. Sum `size_in_bytes` across all pages and
 refs, including BuildKit caches, against the 10 GB repository quota; group
-by lane to replace the estimates above with measured compressed sizes. A
+by lane to track measured compressed sizes over time. A
 newly created replacement key is not survival evidence. Confirm `Restored
 from cache key …` in Unit Tests, Lint, and Build Test Artifacts logs, and
 record Unit Tests' precompile duration. Keep #4643 open until that evidence

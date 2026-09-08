@@ -505,12 +505,16 @@ jobs:
         include:
           # The unit suite is four test targets compiled in parallel instead of
           # one 642k-line rustc frontend (tests/unit_tests.rs documents the
-          # split). `core` also runs the inline `--lib` tests and the kTLS
-          # live-kernel proof, and is the producer of the shared `ci-debug`
-          # dependency lane on main; `plugins-b` hosts the plugin-hardening
-          # exact gate because both of its modules live in the k–z half.
+          # split). `lib` compiles the inline `#[cfg(test)]` harness and runs
+          # it plus the kTLS live-kernel proof; `core` is the producer of the
+          # shared `ci-debug` dependency lane on main; `plugins-b` hosts the
+          # plugin-hardening exact gate because both of its modules live in
+          # the k–z half.
+          - shard: lib
+            precompile: "--lib"
+            target: ""
           - shard: core
-            precompile: "--lib --test unit_tests"
+            precompile: "--test unit_tests"
             target: unit_tests
           - shard: plugins-a
             precompile: "--test unit_plugins_a_tests"
@@ -556,7 +560,8 @@ jobs:
           # Only the `core` shard publishes the shared dependency lane; the
           # other shards compile the same dependency graph and restore only.
           save: ${{ matrix.shard == 'core' && 'true' || 'false' }}
-          cache-on-failure: "true"
+          # A setup/compile failure must not reserve an incomplete immutable key.
+          cache-on-failure: "false"
 
       - name: Precompile inline and hardening test binaries
         # Compile this shard's targets in one Cargo invocation before running
@@ -578,7 +583,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Run inline lib tests
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'lib'
         # Covers `#[cfg(test)] mod tests` blocks inline in `src/` (used for
         # private fns/structs that the separate tests/ binaries can't see).
         run: |
@@ -632,7 +637,7 @@ jobs:
           echo "- test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
 
       - name: Run kTLS live-kernel handoff proof
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'lib'
         # Issue #3619 re-enabled a handoff that had been INERT, so classifier
         # unit tests are not sufficient evidence. These tests drive a real
         # rustls TLS 1.2 client against the real `try_ktls_accept`, install
@@ -677,6 +682,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Run unit tests
+        if: matrix.shard != 'lib'
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/unit-ci"
@@ -5968,7 +5974,8 @@ jobs:
         with:
           shared-key: "ci-lint"
           save: "true"
-          cache-on-failure: "true"
+          # Main concurrency protection does not prevent setup/compile failures.
+          cache-on-failure: "false"
           components: clippy
 
       - name: Run clippy

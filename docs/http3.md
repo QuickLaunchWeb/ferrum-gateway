@@ -12,6 +12,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Cross-protocol bridge](#cross-protocol-bridge)
   - [Mesh transport dispatch for the H3→gRPC bridge](#mesh-transport-dispatch-for-the-h3grpc-bridge)
 - [Buffering policy](#buffering-policy)
+- [Responses without content](#responses-without-content)
 - [Coalescing and frame cadence](#coalescing-and-frame-cadence)
 - [gRPC trailers over H3](#grpc-trailers-over-h3)
 - [Backend trailers and response header policy](#backend-trailers-and-response-header-policy)
@@ -462,6 +463,24 @@ The request pump and response relay run concurrently, so client-streaming and H3
 The relay consumes the request-scoped absolute gRPC deadline across pool acquisition, upload, response headers, response DATA/trailers, downstream H3 flow control, and FIN. Expiry before client-visible response DATA can complete with status-4 trailers; expiry after partial response DATA resets because a length-prefixed message may be incomplete. Without a client deadline, the operator read timeout remains the fallback. A zero-DATA terminal status gets one immediate write opportunity; if flow control would block, the gateway resets the response and drops/cancels the upstream body. Backend `Content-Length` is removed before committing a deadline-capable streaming response.
 
 **Response body — streamed with coalescing when policy permits.** See below. Retry/body-plugin cases retain their existing bounded buffered response behavior.
+
+## Responses without content
+
+Native H3 responses to HEAD and responses with body-forbidden statuses (including
+204, 205, and 304) cancel the backend stream's receive direction at the response
+headers using `H3_REQUEST_CANCELLED`. They finish downstream without DATA or
+backend trailers. Cancellation is stream-scoped: the pooled QUIC connection and
+other request streams remain usable. The gateway does not drain forbidden DATA,
+so a backend that keeps sending cannot prolong the request by refreshing an idle
+read deadline, even when the response byte ceiling or read timeout is disabled.
+
+This applies to streaming and buffered native H3 responses. The decision uses
+the dispatched request method and original backend status before response hooks;
+the buffered writer also enforces the final status after hooks. Header policy
+still runs, and HEAD retains a valid representation `Content-Length` even when
+that length exceeds the response body ceiling. Existing status-specific header
+sanitization remains in effect. Ordinary response bodies retain their size,
+read-timeout, inspection, and trailer-policy handling.
 
 ## Coalescing and frame cadence
 

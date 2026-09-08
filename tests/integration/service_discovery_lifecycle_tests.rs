@@ -309,6 +309,39 @@ async fn reconcile_replaces_only_the_upstream_whose_discovery_config_changed() {
 }
 
 #[tokio::test]
+async fn reconcile_replaces_kubernetes_task_when_address_family_changes() {
+    let _guard = isolated().await;
+    let sd: ServiceDiscoveryConfig = serde_json::from_value(serde_json::json!({
+        "provider": "kubernetes",
+        "kubernetes": {"service_name": "api", "address_type": "IPv4"}
+    }))
+    .unwrap();
+    let config = config_with(vec![upstream_with_sd("family", Vec::new(), Some(sd))]);
+    let manager = manager(&config);
+    manager.start(&config, None);
+    let first = health::generation_for_test(&task_key("family")).expect("task registered");
+    manager.reconcile(&config, None);
+    assert_eq!(
+        health::generation_for_test(&task_key("family")),
+        Some(first)
+    );
+
+    let mut changed = config.clone();
+    changed.upstreams[0]
+        .service_discovery
+        .as_mut()
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap()
+        .address_type = Some(ferrum_edge::config::types::KubernetesAddressType::Ipv6);
+    manager.reconcile(&changed, None);
+    let replacement = health::generation_for_test(&task_key("family")).expect("replacement task");
+    assert_ne!(replacement, first);
+    manager.stop();
+}
+
+#[tokio::test]
 async fn reconcile_replaces_a_task_whose_static_targets_changed() {
     let _guard = isolated().await;
 
