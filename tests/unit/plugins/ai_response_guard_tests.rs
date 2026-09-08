@@ -6255,10 +6255,55 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
             json!({"content": [{"type": "text", "text": format!("ssn {PII}")}]}),
         ),
         (
+            "content[].name (anthropic tool_use)",
+            json!({"content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": format!("lookup-{PII}"),
+                "input": {"ok": "yes"}
+            }]}),
+        ),
+        (
+            "content[].input (anthropic tool_use)",
+            json!({"content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {"note": format!("ssn {PII}")}
+            }]}),
+        ),
+        (
             "candidates[].content.parts[].text (gemini)",
             json!({"candidates": [{
                 "content": {"role": "model", "parts": [{"text": format!("ssn {PII}")}]}
             }]}),
+        ),
+        (
+            "candidates[].content.parts[].functionCall.name (gemini)",
+            json!({"candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": format!("mail-{PII}"), "args": {"ok": "yes"}}}
+            ]}}]}),
+        ),
+        (
+            "candidates[].content.parts[].functionCall.args (gemini)",
+            json!({"candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": "mail", "args": {"note": format!("ssn {PII}")}}}
+            ]}}]}),
+        ),
+        (
+            "results[].outputText (bedrock titan)",
+            json!({
+                "inputTextTokenCount": 12,
+                "results": [{
+                    "tokenCount": 20,
+                    "outputText": format!("ssn {PII}"),
+                    "completionReason": "FINISH"
+                }]
+            }),
+        ),
+        (
+            "response (ollama)",
+            json!({"model": "llama3", "response": format!("ssn {PII}"), "done": true}),
         ),
         (
             "text (cohere v1)",
@@ -6308,6 +6353,321 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
         assert!(
             redacted.contains("[REDACTED:pii:ssn]"),
             "`{label}` produced no redaction placeholder: {redacted}"
+        );
+    }
+}
+
+// ─── Buffered tool-call / provider-native completion shapes (#4792 sweep) ───
+
+#[tokio::test]
+async fn test_content_mode_scans_anthropic_tool_use_name_and_input() {
+    // A `tool_use` block is executable content: the client runs the named tool
+    // with the `input` document, so PII there reaches the tool caller exactly
+    // as PII in prose reaches the reader. Content mode read `type: text` blocks
+    // only, so the whole block passed unscanned even though
+    // `ai_semantic_firewall` reads both `$.content[*].name` and
+    // `$.content[*].input`.
+    for block in [
+        json!({"type": "tool_use", "id": "tu_1", "name": "lookup-123-45-6789"}),
+        json!({
+            "type": "tool_use",
+            "id": "tu_1",
+            "name": "lookup",
+            "input": {"note": "ssn 123-45-6789"}
+        }),
+        // A provider-executed variant: read untyped, so every `tool_use`
+        // spelling is covered rather than just the client one.
+        json!({
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "search",
+            "input": {"query": "ssn 123-45-6789"}
+        }),
+    ] {
+        let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let body = serde_json::to_vec(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [block]
+        }))
+        .unwrap();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "an Anthropic tool_use block must be scanned, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_gemini_buffered_function_call() {
+    // The streamed Gemini path has reassembled `functionCall` name and `args`
+    // since the SSE work; the BUFFERED `generateContent` arm still stopped at
+    // `parts[].text`, so the same tool call was governed while streaming and
+    // unscanned when buffered.
+    for part in [
+        json!({"functionCall": {"name": "report-123-45-6789", "args": {"ok": "yes"}}}),
+        json!({"functionCall": {"name": "mail", "args": {"ssn": "123-45-6789"}}}),
+    ] {
+        let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let body = serde_json::to_vec(&json!({
+            "candidates": [{"content": {"role": "model", "parts": [part]}}]
+        }))
+        .unwrap();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "a buffered Gemini functionCall must be scanned, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_bedrock_titan_and_ollama_completions() {
+    // Two provider-native completion shapes with no OpenAI-style container:
+    // Titan `InvokeModel` answers with `results[].outputText`, and Ollama
+    // `/api/generate` with a top-level `response`. Neither had an arm, so both
+    // completions were forwarded unscanned.
+    for body in [
+        json!({
+            "inputTextTokenCount": 12,
+            "results": [
+                {"tokenCount": 20, "outputText": "ssn 123-45-6789", "completionReason": "FINISH"}
+            ]
+        }),
+        json!({"model": "llama3", "response": "ssn 123-45-6789", "done": true}),
+    ] {
+        let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let encoded = serde_json::to_vec(&body).unwrap();
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &encoded)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "a provider-native completion must be scanned: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_tool_document_extraction_stays_one_level() {
+    // The tool-document arms read a block's OWN `input` / `args`; they do not
+    // walk back into a nested response envelope. A business body whose
+    // `content` array carries neither `name` nor `input`, and whose PII sits in
+    // an unrelated field, stays outside content mode.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = serde_json::to_vec(&json!({
+        "content": [{"id": 1, "internal_note": "ssn 123-45-6789"}],
+        "totalPages": 3
+    }))
+    .unwrap();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a paginated business body must stay outside content mode, got {result:?}"
+    );
+}
+
+// ─── Hugging Face TGI /generate_stream reassembly (#4792 sibling) ───────────
+
+/// A TGI `/generate_stream` body: one `data:` frame per token, then a terminal
+/// frame carrying the completed `generated_text`. `full` is what the terminal
+/// frame reports, which by protocol is the concatenation of `tokens`.
+fn tgi_sse_body(tokens: &[&str], full: &str) -> Vec<u8> {
+    let mut body = String::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let frame = json!({
+            "index": index + 1,
+            "token": {"id": 1000 + index, "text": token, "logprob": -0.5, "special": false},
+            "generated_text": serde_json::Value::Null,
+            "details": serde_json::Value::Null
+        });
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+    let closing = json!({
+        "index": tokens.len() + 1,
+        "token": {"id": 2, "text": "", "logprob": -0.1, "special": true},
+        "generated_text": full,
+        "details": {"finish_reason": "eos_token", "generated_tokens": tokens.len(), "seed": null}
+    });
+    body.push_str(&format!("data: {closing}\n\n"));
+    body.into_bytes()
+}
+
+#[tokio::test]
+async fn test_sse_tgi_split_completion_is_inspected() {
+    // The SSN is split across three `token.text` fragments, so only
+    // reassembly recovers it. The terminal `generated_text` repeats the same
+    // completion and must not make the guard scan it twice — the assertion
+    // here is simply that the split match is caught.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = tgi_sse_body(
+        &["Your SSN is 123-", "45-", "6789."],
+        "Your SSN is 123-45-6789.",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an SSN split across TGI token frames must be rejected, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_tgi_terminal_generated_text_is_inspected_when_it_diverges() {
+    // A terminal `generated_text` that does not merely repeat the deltas is
+    // client-visible text of its own — clients render it in preference to the
+    // fragments — so it must be scanned rather than skipped as a duplicate.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = tgi_sse_body(&["All ", "clear."], "Actually the ssn is 123-45-6789.");
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a divergent terminal generated_text must be inspected, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_tgi_clean_stream_passes() {
+    // The counterpart: a benign TGI stream now reassembles into real text and
+    // is delivered, rather than being failed closed as an unmapped provider
+    // stream.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = tgi_sse_body(&["The weather ", "is fine."], "The weather is fine.");
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a clean TGI stream must be delivered, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_tgi_is_redacted_not_rejected() {
+    // Redact mode must be able to rewrite everything the reassembler scans, or
+    // a match confined to one self-contained frame would hard-fail with 502
+    // instead of being redacted. Both the per-frame `token.text` and the
+    // terminal `generated_text` are rewritable here.
+    let plugin = make_plugin(json!({"pii_patterns": ["email"], "action": "redact"}));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = tgi_sse_body(
+        &["Mailing ", "ann@corp.io", " now."],
+        "Mailing ann@corp.io now.",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
+        .await;
+    assert!(
+        !matches!(result, PluginResult::Reject { .. }),
+        "a rewritable TGI match must not hard-fail: {result:?}"
+    );
+
+    let transformed = plugin
+        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
+        .await
+        .expect("expected redacted body");
+    let out = String::from_utf8(transformed).unwrap();
+    assert!(!out.contains("ann@corp.io"), "not redacted: {out}");
+    assert!(out.contains("[REDACTED:pii:email]"), "no placeholder");
+}
+
+#[tokio::test]
+async fn test_sse_tgi_malformed_and_unfoldable_frames_fail_closed() {
+    // A frame that claims the TGI shape while violating it, or that carries
+    // model text on a path the reassembler does not fold into the completion
+    // (`top_tokens` alternatives, `details.best_of_sequences`), may hide
+    // client-visible output. The reassembled prose is benign in every case, so
+    // the guard must fail closed rather than clear the stream.
+    for tail in [
+        r#"{"index":2,"token":"ssn 123-45-6789","generated_text":null}"#,
+        r#"{"index":2,"token":{"id":3,"text":7},"generated_text":null}"#,
+        r#"{"index":2,"token":{"id":3,"text":" "},"generated_text":{"a":"hidden"}}"#,
+        r#"{"index":2,"token":{"id":3,"text":" "},"top_tokens":[{"text":"ssn 123-45-6789"}]}"#,
+        r#"{"index":2,"token":{"id":3,"text":" "},"generated_text":"ok",
+"details":{"best_of_sequences":[{"generated_text":"ssn 123-45-6789"}]}}"#,
+    ] {
+        let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        let body = format!(
+            "data: {{\"index\":1,\"token\":{{\"id\":1,\"text\":\"all clear\"}},\
+\"generated_text\":null}}\n\ndata: {}\n\n",
+            tail.replace('\n', "")
+        );
+
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "a TGI frame outside the reassembled shape must fail closed: {tail}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sse_other_providers_are_unaffected_by_tgi_reassembly() {
+    // Behaviour-neutrality: none of the three already-reassembled protocols
+    // carries a bare `token` / `generated_text` member, so none reaches the TGI
+    // path, and a clean stream of each is still delivered.
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+
+    for body in [
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The wea\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ther is fine.\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"The weather is fine.\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ),
+        concat!(
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+            "\"parts\":[{\"text\":\"The weather is fine.\"}]}}]}\n\n",
+        ),
+    ] {
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "a clean non-TGI stream must still pass: {result:?}"
         );
     }
 }

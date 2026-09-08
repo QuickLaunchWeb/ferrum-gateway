@@ -43,6 +43,13 @@ enum Coverage {
     Extracts,
     /// The plugin does not read this shape. Closing the gap means flipping this
     /// cell — do not delete the row.
+    ///
+    /// Currently unconstructed: every cell of the table is [`Coverage::Extracts`]
+    /// since issue #4792's response-direction sweep closed the last five gaps.
+    /// The variant is deliberately kept — a new provider shape is added as a
+    /// row first, and recording an honest gap on it must not require
+    /// reintroducing the machinery that reports one.
+    #[allow(dead_code)]
     Gap(&'static str),
 }
 
@@ -101,10 +108,7 @@ fn response_shapes() -> Vec<ResponseShape> {
                 }]
             }),
             semantic_firewall: Coverage::Extracts,
-            response_guard: Coverage::Gap(
-                "the Anthropic arm of extract_completion_texts reads `type: text` blocks only, \
-                 so a tool_use block's name/input is outside content mode",
-            ),
+            response_guard: Coverage::Extracts,
         },
         ResponseShape {
             name: "gemini candidates[].content.parts[].text",
@@ -117,8 +121,8 @@ fn response_shapes() -> Vec<ResponseShape> {
             response_guard: Coverage::Extracts,
         },
         ResponseShape {
-            // Gemini's spelling of the same tool call. Neither plugin reads it:
-            // both stop at `parts[].text`.
+            // Gemini's spelling of the same tool call: the marker rides in the
+            // decoded `args` document rather than in any `text` part.
             name: "gemini candidates[].content.parts[].functionCall",
             body: json!({
                 "candidates": [{
@@ -131,9 +135,7 @@ fn response_shapes() -> Vec<ResponseShape> {
                 }]
             }),
             semantic_firewall: Coverage::Extracts,
-            response_guard: Coverage::Gap(
-                "the Gemini arm of extract_completion_texts reads parts[].text only",
-            ),
+            response_guard: Coverage::Extracts,
         },
         ResponseShape {
             name: "bedrock converse output.message.content[].text",
@@ -151,10 +153,7 @@ fn response_shapes() -> Vec<ResponseShape> {
                 "results": [{"tokenCount": 20, "outputText": MARKER, "completionReason": "FINISH"}]
             }),
             semantic_firewall: Coverage::Extracts,
-            response_guard: Coverage::Gap(
-                "extract_completion_texts has no `results` arm, so a Titan completion carries no \
-                 content-mode text",
-            ),
+            response_guard: Coverage::Extracts,
         },
         ResponseShape {
             name: "cohere v1 text",
@@ -171,19 +170,14 @@ fn response_shapes() -> Vec<ResponseShape> {
                 "generation_id": "gen-1",
                 "chat_history": [{"role": "CHATBOT", "message": MARKER}]
             }),
-            semantic_firewall: Coverage::Gap(
-                "$.chat_history[*].message is a REQUEST-direction path; \
-                 DEFAULT_RESPONSE_JSON_PATHS has no chat_history entry",
-            ),
+            semantic_firewall: Coverage::Extracts,
             response_guard: Coverage::Extracts,
         },
         ResponseShape {
             name: "ollama response",
             body: json!({"model": "llama3", "response": MARKER, "done": true}),
             semantic_firewall: Coverage::Extracts,
-            response_guard: Coverage::Gap(
-                "extract_completion_texts has no top-level `response` arm",
-            ),
+            response_guard: Coverage::Extracts,
         },
         ResponseShape {
             // The only shape in the table whose document root is an ARRAY.
@@ -295,31 +289,30 @@ async fn every_enforcing_response_plugin_matches_its_recorded_provider_shape_cov
     }
 }
 
-/// The three rows issue #4907 closed in `ai_response_guard` are asserted
-/// directly, not only per row, so a regression cannot be papered over by
-/// re-recording a cell as a gap: demoting one has to be a deliberate, reviewed
-/// edit.
+/// The table is asserted to be all-`Extracts` in BOTH columns, directly and not
+/// only per row, so a regression cannot be papered over by re-recording a cell
+/// as a gap: demoting one has to be a deliberate, reviewed edit.
 ///
-/// The remaining `Coverage::Gap` cells (Anthropic `tool_use`, Gemini
-/// `functionCall`, Bedrock Titan `results[].outputText`, Ollama `response`, and
-/// the firewall's Cohere `chat_history`) are recorded honestly per row above
-/// and are tracked for closure separately; #4907 scoped them out.
+/// Issue #4907 closed the three `ai_response_guard` Cohere / TGI rows; the
+/// response-direction sweep that followed closed the last five — the guard's
+/// Anthropic `tool_use` name/input, Gemini `functionCall` name/args, Bedrock
+/// Titan `results[].outputText`, and Ollama `response`, plus the firewall's
+/// response-direction Cohere `chat_history[].message`. Neither plugin has a
+/// recorded gap left, which is the property this asserts.
 #[test]
-fn the_response_guard_covers_the_shapes_issue_4907_closed() {
-    const CLOSED: &[&str] = &[
-        "cohere v1 text",
-        "cohere v1 chat_history[].message",
-        "huggingface tgi [*].generated_text",
-    ];
-    for name in CLOSED {
-        let shape = response_shapes()
-            .into_iter()
-            .find(|shape| shape.name == *name)
-            .unwrap_or_else(|| panic!("`{name}` must stay in the response parity table"));
+fn both_response_plugins_cover_every_shape_in_the_table() {
+    for shape in response_shapes() {
+        assert_eq!(
+            shape.semantic_firewall,
+            Coverage::Extracts,
+            "ai_semantic_firewall must extract `{}`",
+            shape.name
+        );
         assert_eq!(
             shape.response_guard,
             Coverage::Extracts,
-            "ai_response_guard must extract `{name}` (closed by issue #4907)"
+            "ai_response_guard must extract `{}`",
+            shape.name
         );
     }
 }
