@@ -330,8 +330,10 @@ async fn anthropic_finish_waits_for_stop_and_matches_buffered_mapping() {
             }));
             events.push(json!({"type": "message_delta", "delta": {"stop_reason": null}}));
             events.push(text_delta("tail"));
-            events.push(json!({"type": "message_delta", "delta": {"stop_reason": reason},
-                "usage": {"output_tokens": 4}}));
+            events.push(
+                json!({"type": "message_delta", "delta": {"stop_reason": reason},
+                "usage": {"output_tokens": 4}}),
+            );
             // Repeated terminal metadata must still produce only one finish.
             events.push(events.last().unwrap().clone());
             let before_stop = sse(&events);
@@ -397,11 +399,7 @@ async fn anthropic_missing_delta_retains_usage_and_errors_never_finish_successfu
         }
         let out = drive(
             &mut *inspector,
-            &sse(&[
-                first,
-                text_delta("hello"),
-                json!({"type": "message_stop"}),
-            ]),
+            &sse(&[first, text_delta("hello"), json!({"type": "message_stop"})]),
             1,
         )
         .await;
@@ -472,10 +470,7 @@ fn tool_events(provider_tools: bool, client_tools: bool, valid: bool) -> Vec<Val
         events.push(argument(4, "{\"q\":\"remote\"}"));
     }
     if client_tools {
-        events.push(argument(
-            7,
-            if valid { "1}" } else { "\"wrong-type\"}" },
-        ));
+        events.push(argument(7, if valid { "1}" } else { "\"wrong-type\"}" }));
     }
     if provider_tools {
         events.push(argument(9, "\"search\"}"));

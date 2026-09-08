@@ -4661,11 +4661,17 @@ impl AnthropicSseNormalizer {
                     Some("tool_use" | "server_tool_use" | "mcp_tool_use")
                 ) {
                     let Some(index) = event["index"].as_u64() else {
-                        self.fail_bound("upstream provider sent a tool block without an index", out);
+                        self.fail_bound(
+                            "upstream provider sent a tool block without an index",
+                            out,
+                        );
                         return true;
                     };
                     if self.tool_indices.contains_key(&index) {
-                        self.fail_bound("upstream provider repeated an active tool block index", out);
+                        self.fail_bound(
+                            "upstream provider repeated an active tool block index",
+                            out,
+                        );
                         return true;
                     }
                     if block_type != Some("tool_use") {
@@ -4785,7 +4791,10 @@ impl AnthropicSseNormalizer {
                             return true;
                         }
                     };
-                    if self.finish_reason.is_some_and(|previous| previous != finish) {
+                    if self
+                        .finish_reason
+                        .is_some_and(|previous| previous != finish)
+                    {
                         self.fail_bound("upstream provider changed Anthropic stop_reason", out);
                         return true;
                     }
