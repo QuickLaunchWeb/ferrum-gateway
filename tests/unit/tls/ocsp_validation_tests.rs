@@ -913,8 +913,7 @@ fn a_fresh_issuer_signed_response_for_the_configured_leaf_is_accepted() {
     let at = now();
     let der = ResponseBuilder::new(&pki, at).build();
 
-    let acceptance =
-        validate_stapled_response_at(&der, &chain(&pki), at).expect("accepted staple");
+    let acceptance = validate_stapled_response_at(&der, &chain(&pki), at).expect("accepted staple");
     assert_eq!(acceptance.der_len, der.len());
     assert_eq!(acceptance.this_update, at - 3_600);
     assert_eq!(acceptance.next_update, at + 3_600);
