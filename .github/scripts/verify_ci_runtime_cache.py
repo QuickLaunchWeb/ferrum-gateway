@@ -80,6 +80,15 @@ DIRECT_CACHE_DIET_JOBS = (
     ("gateways-protocol-benchmark.yml", "benchmark", True),
 )
 
+# These are the designated shared native-cache producers. The composite's
+# producer-only opt-in is insufficient: setup/fetch/compile can fail before a
+# complete dependency graph exists, even when main runs are never superseded.
+COMPLETED_CACHE_PRODUCER_JOBS = (
+    ("ci.yml", "test-unit"),
+    ("ci.yml", "lint"),
+    ("coverage.yml", "coverage-shard"),
+)
+
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
 RUST_CACHE = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
@@ -4714,6 +4723,28 @@ def check_completed_rust_cache_save(action: str, failures: list[str]) -> None:
         )
 
 
+def check_completed_cache_producer(job: str, source: str, failures: list[str]) -> None:
+    steps = [
+        step
+        for step in job_steps(job)
+        if step_uses(step) == "./.github/actions/setup-rust-ci"
+    ]
+    require(
+        len(steps) == 1,
+        f"{source} must keep one shared Rust setup step",
+        failures,
+    )
+    for step in steps:
+        values = re.findall(
+            r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", step_with(step)
+        )
+        require(
+            values == ['"false"'],
+            f"{source} must save shared Rust caches only after job success",
+            failures,
+        )
+
+
 def check_shared_actions(failures: list[str]) -> None:
     rust_ci = SETUP_RUST.read_text(encoding="utf-8")
     sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
@@ -5123,6 +5154,35 @@ def check_dockerfile(failures: list[str]) -> None:
 
 def self_test() -> int:
     failures: list[str] = []
+    for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
+        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        producer = extract_job(workflow, job_name)
+        producer_errors: list[str] = []
+        check_completed_cache_producer(producer, job_name, producer_errors)
+        require(
+            not producer_errors,
+            f"self-test: {job_name} completed-cache producer must pass",
+            failures,
+        )
+        for replacement in (
+            'cache-on-failure: "true"',
+            'cache-on-failure: ${{ always() }}',
+            '',
+            '# cache-on-failure: "false"',
+            'cache-on-failure: "false"\n          cache-on-failure: "true"',
+        ):
+            mutated = producer.replace('cache-on-failure: "false"', replacement)
+            producer_errors = []
+            require(mutated != producer, "self-test: producer mutation must apply", failures)
+            check_completed_cache_producer(mutated, job_name, producer_errors)
+            require(
+                bool(producer_errors),
+                f"self-test: {job_name} incomplete-cache publication must fail",
+                failures,
+            )
+        producer_errors = []
+        check_completed_cache_producer("", job_name, producer_errors)
+        require(bool(producer_errors), "self-test: absent producer must fail", failures)
     completed_cache = SETUP_RUST.read_text(encoding="utf-8")
     cache_errors: list[str] = []
     check_completed_rust_cache_save(completed_cache, cache_errors)
@@ -8766,6 +8826,11 @@ def main(argv: list[str] | None = None) -> int:
     check_production_smoke(node, failures)
     check_ambient_workflow_cache_budget(ambient, failures)
     check_shared_actions(failures)
+    for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
+        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        check_completed_cache_producer(
+            extract_job(workflow, job_name), f"{filename}/{job_name}", failures
+        )
     check_performance_cache_wrapper_key(ci, "performance-regression.yml", failures)
     for filename, job_name, compiler_only in DIRECT_CACHE_DIET_JOBS:
         workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
