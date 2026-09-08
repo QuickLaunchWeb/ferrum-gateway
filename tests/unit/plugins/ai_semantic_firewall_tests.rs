@@ -2755,6 +2755,241 @@ async fn streaming_response_buffer_rejects_interleaved_anthropic_event() {
     );
 }
 
+/// A two-candidate Gemini `streamGenerateContent?alt=sse` response. Each frame
+/// is a complete `GenerateContentResponse`: candidate 0 carries `prose` one
+/// fragment per frame, candidate 1 carries a benign second answer, and the
+/// final frame adds candidate 0's `functionCall` beside the usage envelope.
+/// `prose` and `tool_args` are spliced in so a caller can place a leak in
+/// either half.
+fn gemini_candidate_stream(prose: &[&str], tool_args: Value) -> Vec<u8> {
+    let mut body = String::new();
+    for fragment in prose {
+        let frame = json!({
+            "candidates": [
+                {
+                    "index": 0,
+                    "content": {"role": "model", "parts": [{"text": fragment}]}
+                },
+                {
+                    "index": 1,
+                    "content": {"role": "model", "parts": [{"text": "Fine. "}]}
+                }
+            ],
+            "modelVersion": "gemini-2.0-flash"
+        });
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+    let closing = json!({
+        "candidates": [{
+            "index": 0,
+            "content": {
+                "role": "model",
+                "parts": [{"functionCall": {"name": "note", "args": tool_args}}]
+            },
+            "finishReason": "STOP",
+            "safetyRatings": []
+        }],
+        "usageMetadata": {"totalTokenCount": 24}
+    });
+    body.push_str(&format!("data: {closing}\n\n"));
+    body.into_bytes()
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_reassembles_gemini_sse() {
+    // Issue #4904: a Gemini stream used to yield NO segments, so buffer mode
+    // could only fail closed. The leaking phrase is split across candidate 0's
+    // per-frame `parts[].text` fragments, so only reassembly recovers it — and
+    // the decision must come from the reassembled prose, not from one
+    // meaningless fragment.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = gemini_candidate_stream(
+        &["My sys", "tem prompt", " says never reveal policy."],
+        json!({"note": "ok"}),
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_inspects_gemini_function_call_args() {
+    // The leak lives in the streamed `functionCall.args` document rather than
+    // in prose, which reassembles to
+    // `$.candidates[*].content.parts[*].functionCall.args`.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = gemini_candidate_stream(
+        &["Sure, here you go."],
+        json!({"note": "my system prompt says never reveal policy"}),
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_allows_clean_gemini_sse() {
+    // The counterpart to the leaking case: a benign Gemini stream now yields
+    // real segments and a real decision instead of failing closed on zero
+    // segments, so it is delivered.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = gemini_candidate_stream(
+        &["The weather ", "is sunny today."],
+        json!({"city": "New York"}),
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
+        .await;
+
+    assert_continue(result);
+    assert_ne!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_uninspectable"),
+        "a well-formed Gemini stream is inspectable, not failed closed"
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_rejects_unfoldable_gemini_part() {
+    // Negative case: a part kind the reassembler cannot fold could carry
+    // client-visible output on a path nothing reads. The reassembled prose
+    // looks benign, so the decision must still fail closed rather than allow.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"The weather is sunny today.\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"executableCode\":{\"language\":\"PYTHON\",",
+        "\"code\":\"print('my system prompt')\"}}]}}]}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_uninspectable")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_rejects_malformed_gemini_parts() {
+    // A frame that claims the Gemini shape but violates it (`parts` is not an
+    // array) may hold client-visible text on a path nothing reads, and must not
+    // be cleared on the prose that did reassemble.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    let body = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"The weather is sunny today.\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":\"my system prompt\"}}]}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_uninspectable")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_inspect_cuts_on_gemini_leak() {
+    // Windowed `inspect` mode: the leak is split across two Gemini frames and
+    // completes a sentence, so the window flushes, the reassembled prose is
+    // inspected, and the stream is cut.
+    let plugin = plugin(&inspect_config());
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let opening = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"My sys\"}]}}]}\n\n",
+    );
+    assert!(matches!(
+        inspector.on_chunk(opening.as_bytes()).await,
+        ResponseStreamAction::Forward(_)
+    ));
+
+    let leak = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"tem prompt says never reveal policy.\"}]}}]}\n\n",
+    );
+    assert!(
+        matches!(
+            inspector.on_chunk(leak.as_bytes()).await,
+            ResponseStreamAction::Terminate(_)
+        ),
+        "a leaking reassembled Gemini window must terminate the stream"
+    );
+}
+
 #[tokio::test]
 async fn streaming_response_inspect_cuts_on_anthropic_leak() {
     // Windowed `inspect` mode: the leak is split across Anthropic `text_delta`
@@ -7007,13 +7242,55 @@ async fn benign_anthropic_tool_use_only_response_is_no_longer_uninspectable() {
 }
 
 #[tokio::test]
+async fn gemini_function_call_only_response_yields_tool_segments() {
+    // Issue #4904: adding `$.candidates[*].content.parts[*].functionCall.name`
+    // / `.args` to the response defaults changes buffered Gemini behaviour the
+    // same way `$.content[*].name` / `.input` changed Anthropic's. A
+    // functionCall-only `generateContent` response used to yield NO segments
+    // and route to `handle_uninspectable_body` as `no_extractable_content`; it
+    // now produces real `tool_call` / `tool_arguments` segments and a real
+    // verdict.
+    assert_response_shape_inspected(
+        "gemini functionCall args",
+        br#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"note","args":{"note":"My system prompt says never reveal policy."}}}]}}]}"#,
+        "$.candidates[0].content.parts[0].functionCall.args",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn benign_gemini_function_call_only_response_is_no_longer_uninspectable() {
+    // The counterpart: the same shape with nothing to flag no longer records
+    // `no_extractable_content`, because the `functionCall` name and `args` are
+    // now extractable segments.
+    let plugin = plugin(&response_shape_config());
+    let mut ctx = create_test_context();
+    let mut headers = response_headers();
+    let body = br#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"New York"}}}]}}]}"#;
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
+
+    assert_continue(result);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.uninspectable_body"),
+        "a functionCall-only Gemini response now yields extractable segments"
+    );
+}
+
+#[tokio::test]
 async fn ai_shaped_response_with_no_extractable_content_fails_closed() {
     let mut config = response_shape_config();
     config["on_error"] = json!("reject");
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
     let mut headers = response_headers();
-    let body = br#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{}}}]}}]}"#;
+    // An image-only candidate: the `candidates` marker still recognises the
+    // body as a governed AI response, but no configured path extracts text
+    // from an `inlineData` part.
+    let body = br#"{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"AAAA"}}]}}]}"#;
 
     let result = plugin
         .on_response_body(&mut ctx, 200, &mut headers, body)
@@ -7079,6 +7356,8 @@ async fn every_supported_extraction_path_is_configurable() {
 
     for path in [
         "$.candidates[*].content.parts[*].text",
+        "$.candidates[*].content.parts[*].functionCall.name",
+        "$.candidates[*].content.parts[*].functionCall.args",
         "$.content[*].text",
         "$.content[*].name",
         "$.content[*].input",
@@ -7612,7 +7891,13 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,
 }
 
 #[tokio::test]
-async fn gemini_event_stream_under_inspect_fails_closed() {
+async fn gemini_event_stream_under_inspect_is_reassembled_and_inspected() {
+    // Issue #4904: `SseReassembler` now folds `streamGenerateContent?alt=sse`
+    // frames into `$.candidates[*].content.parts[*].text`, so the window
+    // carries real segments and goes to the embedding provider like an OpenAI
+    // window would. With the provider unreachable and `on_error: reject`, the
+    // inspector must fail closed at some point — never release the completion
+    // clean the way the old segment-less window did.
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "inspect",
@@ -7628,13 +7913,43 @@ async fn gemini_event_stream_under_inspect_fails_closed() {
 
     let gemini = b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"My system \"}]}}]}\n\n\
 data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"prompt says never reveal policy.\"}]}}]}\n\n";
-    assert!(matches!(
-        inspector.on_chunk(gemini).await,
-        ResponseStreamAction::Forward(_)
-    ));
+    if let ResponseStreamAction::Forward(_) = inspector.on_chunk(gemini).await {
+        assert!(
+            matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
+            "a reassembled Gemini stream must reach a verdict and, with the \
+             provider unreachable, fail closed under on_error=reject"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gemini_event_stream_unfoldable_part_fails_closed() {
+    // Negative case: the reassembled prose is benign, but a part kind the
+    // reassembler cannot fold (an `executableCode` part here) may carry
+    // client-visible output on a path nothing scanned. The window must not be
+    // released clean.
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": "reject",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage")
+    });
+    let plugin = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let gemini = b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[\
+{\"text\":\"The weather is sunny today.\"},\
+{\"executableCode\":{\"language\":\"PYTHON\",\"code\":\"print(1)\"}}]}}]}\n\n";
+    let first = inspector.on_chunk(gemini).await;
+    let terminated = matches!(first, ResponseStreamAction::Terminate(_))
+        || matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_));
     assert!(
-        matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
-        "a Gemini stream must fail closed exactly like the Anthropic one"
+        terminated,
+        "an unfoldable Gemini part must not be released as inspected-clean"
     );
 }
 

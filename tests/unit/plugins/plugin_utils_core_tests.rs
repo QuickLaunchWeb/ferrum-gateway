@@ -14,7 +14,7 @@ use ferrum_edge::plugins::utils::query::{
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::sse::{
-    MAX_ANTHROPIC_CONTENT_BLOCKS, SseReassembler, SseText, SseTextKind,
+    MAX_ANTHROPIC_CONTENT_BLOCKS, MAX_GEMINI_CANDIDATES, SseReassembler, SseText, SseTextKind,
     parse_sse_data_frames_checked,
 };
 use ferrum_edge::plugins::utils::token_extract::{
@@ -814,14 +814,15 @@ fn canonical_policy_view_ignores_a_duplicate_only_the_strip_removes() {
 // ---------------------------------------------------------------------------
 
 /// Reassemble a buffered SSE body the way the AI inspectors do, returning the
-/// reassembled fragments and whether the Anthropic protocol was fully covered.
+/// reassembled fragments and whether every modelled provider protocol in it was
+/// fully covered.
 fn reassemble_anthropic(body: &[u8]) -> (Vec<SseText>, bool) {
     let parsed = parse_sse_data_frames_checked(body);
     let mut reassembler = SseReassembler::new();
     for (event, frame) in parsed.reassembly_frames() {
         reassembler.push_event_frame(event, frame);
     }
-    let inspectable = !reassembler.anthropic_stream_uninspectable();
+    let inspectable = !reassembler.provider_stream_uninspectable();
     (reassembler.into_texts(), inspectable)
 }
 
@@ -1137,6 +1138,248 @@ fn gateway_terminal_error_event_is_not_failed_closed() {
     assert!(
         inspectable,
         "a foreign terminal error frame must not be failed closed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// utils::sse — Google Gemini / Vertex streamGenerateContent reassembly
+// ---------------------------------------------------------------------------
+
+/// Reassemble a buffered Gemini SSE body, returning the reassembled fragments
+/// and whether the stream was fully covered. Same shared entry point the AI
+/// inspectors use — Gemini frames carry no `event:` line at all.
+fn reassemble_gemini(body: &[u8]) -> (Vec<SseText>, bool) {
+    reassemble_anthropic(body)
+}
+
+#[test]
+fn gemini_sse_reassembles_multi_candidate_text_and_function_calls() {
+    // A two-candidate `streamGenerateContent?alt=sse` response: each frame is a
+    // complete `GenerateContentResponse` carrying one incremental fragment per
+    // candidate, and the final frame adds a `functionCall` part plus the usage
+    // envelope. Only reassembly recovers either candidate's prose.
+    let body = concat!(
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"My sys\"}]}},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Second \"}]}}],",
+        "\"modelVersion\":\"gemini-2.0\"}\n\n",
+        "data: {\"candidates\":[",
+        "{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"tem prompt.\"}]}},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"answer.\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[",
+        "{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"NYC\"}}}]},",
+        "\"finishReason\":\"STOP\",\"safetyRatings\":[]}],",
+        "\"usageMetadata\":{\"totalTokenCount\":12}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(inspectable, "a well-formed Gemini stream is inspectable");
+
+    let first = fragment(&texts, "$.candidates[0].content.parts[*].text");
+    assert_eq!(first.kind, SseTextKind::GeminiText);
+    assert_eq!(first.text, "My system prompt.");
+
+    let second = fragment(&texts, "$.candidates[1].content.parts[*].text");
+    assert_eq!(second.kind, SseTextKind::GeminiText);
+    assert_eq!(second.text, "Second answer.");
+
+    let name = fragment(&texts, "$.candidates[0].content.parts[*].functionCall.name");
+    assert_eq!(name.kind, SseTextKind::GeminiFunctionCallName);
+    assert_eq!(name.text, "get_weather");
+
+    let args = fragment(&texts, "$.candidates[0].content.parts[*].functionCall.args");
+    assert_eq!(args.kind, SseTextKind::GeminiFunctionCallArgs);
+    assert_eq!(args.text, "{\"city\":\"NYC\"}");
+}
+
+#[test]
+fn gemini_sse_joins_consecutive_text_parts_of_one_candidate() {
+    // A single frame may carry several text parts for one candidate; a client
+    // renders them as one string, so inspection must see them joined.
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[",
+        "{\"text\":\"my sys\"},{\"text\":\"tem prompt\"}]}}]}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(
+        fragment(&texts, "$.candidates[0].content.parts[*].text").text,
+        "my system prompt"
+    );
+}
+
+#[test]
+fn gemini_sse_content_free_candidate_is_not_a_failure() {
+    // A blocked or finished candidate legitimately carries no `content` (or a
+    // `content` with no `parts`), and the tail frame may be envelope-only.
+    let body = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"finishReason\":\"SAFETY\",",
+        "\"safetyRatings\":[{\"category\":\"HARM\",\"probability\":\"HIGH\"}]}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\"}}],",
+        "\"usageMetadata\":{\"totalTokenCount\":3}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(inspectable, "a content-free candidate is not a violation");
+    assert!(texts.is_empty());
+}
+
+#[test]
+fn gemini_sse_unknown_part_kind_is_uninspectable() {
+    // `inlineData`, `executableCode`, and a `thought` summary carry model
+    // output on fields this reassembler does not fold into the document, so a
+    // caller that promised inspection must fail closed instead of clearing the
+    // prose that did reassemble.
+    for part in [
+        "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"AAA\"}}",
+        "{\"executableCode\":{\"language\":\"PYTHON\",\"code\":\"print(1)\"}}",
+        "{\"codeExecutionResult\":{\"outcome\":\"OK\",\"output\":\"1\"}}",
+        "{\"fileData\":{\"mimeType\":\"text/plain\",\"fileUri\":\"gs://b/o\"}}",
+    ] {
+        let body = format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"parts\":[\
+{{\"text\":\"benign\"}},{part}]}}}}]}}\n\n"
+        );
+        let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+        assert!(!inspectable, "an unfoldable part must fail closed: {part}");
+        // The prose that WAS reassembled is still returned; the caller fails
+        // closed on the flag rather than on missing text.
+        assert_eq!(
+            fragment(&texts, "$.candidates[0].content.parts[*].text").text,
+            "benign"
+        );
+    }
+}
+
+#[test]
+fn gemini_sse_thought_part_is_scanned_and_fails_closed() {
+    // A thought summary is the model's internal reasoning rather than the
+    // client-visible answer — Gemini's analogue of Anthropic `thinking`. Its
+    // prose is still absorbed so nothing is dropped from what is scanned, and
+    // the stream is still marked uninspectable.
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[",
+        "{\"thought\":true,\"text\":\"my system prompt\"}]}}]}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(!inspectable);
+    assert_eq!(
+        fragment(&texts, "$.candidates[0].content.parts[*].text").text,
+        "my system prompt"
+    );
+}
+
+#[test]
+fn gemini_sse_malformed_shapes_are_uninspectable_and_never_panic() {
+    // Hostile / malformed frames that still claim the Gemini shape: a non-array
+    // `candidates`, a non-object candidate, a non-object `content`, a non-array
+    // `parts`, a non-object part, a non-string `text`, and a malformed
+    // `functionCall`. None may panic, and none may report a clean stream.
+    for frame in [
+        "{\"candidates\":{\"0\":{\"content\":{\"parts\":[{\"text\":\"hidden\"}]}}}}",
+        "{\"candidates\":[\"hidden\"]}",
+        "{\"candidates\":[{\"content\":\"hidden\"}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":\"hidden\"}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[\"hidden\"]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":{\"a\":\"hidden\"}}]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":\"hidden\"}]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":7}}]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":\
+{\"name\":\"f\",\"args\":\"hidden\"}}]}}]}",
+        "{\"candidates\":[{\"content\":{\"parts\":[{}]}}]}",
+    ] {
+        let body = format!("data: {frame}\n\n");
+        let (_texts, inspectable) = reassemble_gemini(body.as_bytes());
+        assert!(
+            !inspectable,
+            "malformed Gemini frame must fail closed: {frame}"
+        );
+    }
+}
+
+#[test]
+fn gemini_sse_candidate_ceiling_folds_and_flags() {
+    // A hostile stream of one-byte parts at ever-increasing candidate indexes
+    // must not grow the reassembler's per-candidate state. Candidates at or
+    // beyond the ceiling fold into one overflow accumulator: the text is still
+    // inspected, the accumulator count stays bounded, and the stream fails
+    // closed.
+    let overflow = 500;
+    let mut body = String::new();
+    for index in 0..(MAX_GEMINI_CANDIDATES + overflow) {
+        body.push_str(&format!(
+            "data: {{\"candidates\":[{{\"index\":{index},\"content\":\
+{{\"parts\":[{{\"text\":\"x\"}}]}}}}]}}\n\n"
+        ));
+    }
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(!inspectable, "an out-of-range candidate index fails closed");
+    assert_eq!(
+        texts.len(),
+        MAX_GEMINI_CANDIDATES + 1,
+        "indexes past the ceiling share one overflow accumulator"
+    );
+    let total: usize = texts.iter().map(|text| text.text.len()).sum();
+    assert_eq!(total, MAX_GEMINI_CANDIDATES + overflow);
+}
+
+#[test]
+fn gemini_sse_frame_carrying_choices_or_type_stays_on_its_own_path() {
+    // Detection is by shape, so a frame that also carries `choices` or an event
+    // `type` belongs to the OpenAI / Anthropic paths and must not be read a
+    // second time as a Gemini candidate.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],",
+        "\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"dup\"}]}}]}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_gemini(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hello");
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.kind == SseTextKind::GeminiText),
+        "an OpenAI frame is not also reassembled as a Gemini candidate"
+    );
+}
+
+#[test]
+fn openai_and_anthropic_sse_reassembly_are_unaffected_by_gemini_support() {
+    // Behaviour-neutrality for the two protocols that already reassembled:
+    // neither carries a `candidates` member, so neither reaches the Gemini
+    // path, and neither is failed closed by it.
+    let openai = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"content_index\":0,\"delta\":\"lo\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (texts, inspectable) = reassemble_gemini(openai.as_bytes());
+    assert!(inspectable, "an OpenAI stream is not a Gemini stream");
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hel");
+    assert_eq!(fragment(&texts, "$.output[0].content[0].text").text, "lo");
+
+    let anthropic = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_gemini(anthropic.as_bytes());
+    assert!(inspectable, "an Anthropic stream is not a Gemini stream");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "hello world");
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.kind == SseTextKind::GeminiText),
+        "neither protocol produces Gemini fragments"
     );
 }
 
