@@ -1686,6 +1686,209 @@ async fn test_sse_gemini_streaming_format() {
 }
 
 #[tokio::test]
+async fn test_sse_gemini_multi_candidate_split_is_inspected() {
+    // Issue #4904: a `streamGenerateContent?alt=sse` response repeats every
+    // candidate on every frame. The SSN is split across two frames of candidate
+    // 1 while candidate 0 stays benign, so only per-candidate reassembly
+    // recovers it.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let mut body = String::new();
+    for (first, second) in [("The weather ", "Your SSN is 123-"), ("is fine.", "45-6789")] {
+        let frame = json!({
+            "candidates": [
+                {"index": 0, "content": {"role": "model", "parts": [{"text": first}]}},
+                {"index": 1, "content": {"role": "model", "parts": [{"text": second}]}}
+            ]
+        });
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an SSN split across Gemini frames of one candidate must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_gemini_function_call_is_inspected() {
+    // Issue #4904: `functionCall` parts are the Gemini equivalent of an
+    // Anthropic `tool_use` name plus input, and the ad-hoc accumulation this
+    // replaced read neither. Both the invoked name and the `args` document are
+    // client-visible tool text and must be scanned.
+    for part in [
+        json!({"functionCall": {"name": "report-123-45-6789", "args": {"ok": "yes"}}}),
+        json!({"functionCall": {"name": "mail", "args": {"ssn": "123-45-6789"}}}),
+    ] {
+        let plugin = make_plugin(json!({
+            "pii_patterns": ["ssn"],
+            "action": "reject"
+        }));
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        let frame = json!({
+            "candidates": [{
+                "index": 0,
+                "content": {"role": "model", "parts": [part]},
+                "finishReason": "STOP"
+            }]
+        });
+        let body = format!("data: {frame}\n\n");
+
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "a Gemini functionCall must be inspected: {frame}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sse_gemini_function_call_is_redacted_not_rejected() {
+    // Redact mode must be able to rewrite everything the reassembler scans, or
+    // a match confined to the newly scanned `functionCall` name / `args` would
+    // hard-fail with 502 instead of being redacted. Both are self-contained in
+    // one frame here, so both are rewritable. `args` arrives as a JSON object
+    // rather than a serialized string, so it gets value-safe redaction of the
+    // decoded document — the same rule as OpenAI tool-call `arguments`.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let frame = json!({
+        "candidates": [{
+            "index": 0,
+            "content": {"role": "model", "parts": [
+                {"text": "Sending to ann@corp.io now."},
+                {"functionCall": {
+                    "name": "mail_bob@corp.io",
+                    "args": {"to": "carol@corp.io"}
+                }}
+            ]}
+        }]
+    });
+    let body_str = format!("data: {frame}\n\ndata: [DONE]\n\n");
+    let body = body_str.as_bytes();
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
+        .await;
+    assert!(
+        !matches!(result, PluginResult::Reject { .. }),
+        "a rewritable Gemini match must not hard-fail: {result:?}"
+    );
+
+    let transformed = plugin
+        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
+        .await
+        .expect("expected redacted body");
+    let out = String::from_utf8(transformed).unwrap();
+    assert!(!out.contains("ann@corp.io"), "part text must be redacted");
+    assert!(!out.contains("bob@corp.io"), "call name must be redacted");
+    assert!(!out.contains("carol@corp.io"), "call args must be redacted");
+    assert!(out.contains("[REDACTED:pii:email]"));
+}
+
+#[tokio::test]
+async fn test_sse_gemini_unfoldable_part_fails_closed() {
+    // Negative case: the reassembled prose is benign, but a part kind the
+    // reassembler cannot fold could carry client-visible output on a path
+    // nothing scanned. The guard must fail closed instead of clearing it.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let body = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"all clear\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"inlineData\":{\"mimeType\":\"text/plain\",",
+        "\"data\":\"c3NuIDEyMy00NS02Nzg5\"}}]}}]}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an unfoldable Gemini part must not be cleared as inspected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_gemini_malformed_parts_fails_closed() {
+    // A frame that claims the Gemini shape but violates it (`parts` is not an
+    // array) may hold client-visible text on a path nothing reads.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+
+    let body = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"all clear\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":\"ssn 123-45-6789\"}}]}\n\n",
+    );
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a malformed Gemini candidates frame must not be cleared as inspected"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_openai_and_anthropic_are_unaffected_by_gemini_reassembly() {
+    // Behaviour-neutrality: neither protocol carries a `candidates` member, so
+    // neither reaches the Gemini path, and a clean stream of either is still
+    // delivered rather than being failed closed by it.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "action": "reject"
+    }));
+
+    for body in [
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The wea\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ther is fine.\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"The weather is fine.\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ),
+    ] {
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "a clean non-Gemini stream must still pass: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_sse_scan_all_mode() {
     let plugin = make_plugin(json!({
         "pii_patterns": ["ip_address"],
