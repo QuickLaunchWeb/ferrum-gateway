@@ -4069,6 +4069,14 @@ pub mod _test_support {
         crate::proxy::ws_idle_timeout_policy_close_frame()
     }
 
+    /// Defined relay-failure policy Close mapping `ErrorClass` to 1002/1011/1001.
+    pub fn ws_relay_failure_close_frame_for_test(
+        error_class: crate::retry::ErrorClass,
+        draining: bool,
+    ) -> CloseFrame {
+        crate::proxy::ws_relay_failure_close_frame(error_class, draining)
+    }
+
     /// Class for a WebSocket capacity overflow used when the relay maps
     /// `Capacity` errors onto `ErrorClass`.
     pub fn ws_capacity_error_class_for_test(

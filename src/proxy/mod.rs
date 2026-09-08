@@ -18220,6 +18220,42 @@ pub(crate) fn ws_idle_timeout_policy_close_frame() -> CloseFrame {
     }
 }
 
+/// Defined RFC 6455 Close for a transport- or protocol-level relay failure.
+///
+/// Maps the already-computed `ErrorClass` to a wire code (issue #4770): 1002
+/// for a protocol violation, 1011 for a transport failure, or 1001 while the
+/// gateway is draining. The reason is a fixed literal so no peer-controlled or
+/// secret material is ever echoed and the frame stays within the 123-byte
+/// control-frame budget.
+pub(crate) fn ws_relay_failure_close_frame(
+    error_class: retry::ErrorClass,
+    draining: bool,
+) -> CloseFrame {
+    let (code, reason) = if draining {
+        (CloseCode::Away, "gateway draining")
+    } else if error_class == retry::ErrorClass::ProtocolError {
+        (CloseCode::Protocol, "protocol error")
+    } else {
+        (CloseCode::Error, "relay error")
+    };
+    CloseFrame {
+        code,
+        reason: reason.into(),
+    }
+}
+
+/// Whether the gateway is draining (graceful shutdown or overload drain).
+///
+/// Mirrors the drain test in `wait_for_websocket_session_stop` so a transport
+/// failure that races a shutdown publishes the same 1001 "going away" Close a
+/// policy stop would, instead of a 1011 backend failure.
+fn ws_websocket_is_draining(
+    overload: &crate::overload::OverloadState,
+    shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    overload.draining.load(Ordering::Acquire) || shutdown.is_some_and(|receiver| *receiver.borrow())
+}
+
 fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
     use tokio_tungstenite::tungstenite::Error;
 
@@ -19040,6 +19076,10 @@ where
     let ws_idle_tracker_btc = ws_idle_tracker;
     let size_limits_ctb = Arc::clone(&effective_size_limits);
     let size_limits_btc = effective_size_limits;
+    let overload_ctb = Arc::clone(&overload);
+    let overload_btc = Arc::clone(&overload);
+    let shutdown_rx_ctb = shutdown_rx.clone();
+    let shutdown_rx_btc = shutdown_rx.clone();
 
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
@@ -19372,7 +19412,24 @@ where
                                 retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from client: {}", e);
-                                retry::classify_boxed_error(&e)
+                                let class = retry::classify_boxed_error(&e);
+                                // A client protocol violation or transport failure
+                                // must still publish a defined policy Close so the
+                                // surviving peer learns why the session ended
+                                // instead of observing 1005/1006 (issue #4770).
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(ws_relay_failure_close_frame(
+                                        class,
+                                        ws_websocket_is_draining(
+                                            &overload_ctb,
+                                            shutdown_rx_ctb.as_ref(),
+                                        ),
+                                    )),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                class
                             };
                             // Read-side failure on the c2b path means the client
                             // dropped / reset the socket.
@@ -19679,7 +19736,26 @@ where
                                 retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from backend: {}", e);
-                                retry::classify_boxed_error(&e)
+                                let class = retry::classify_boxed_error(&e);
+                                // A backend protocol violation, reset, or other
+                                // transport failure must still publish a defined
+                                // policy Close and write it to the surviving peer
+                                // (the client) instead of a bare EOF/1006 and an
+                                // empty Close into the dead backend sink
+                                // (issue #4770).
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(ws_relay_failure_close_frame(
+                                        class,
+                                        ws_websocket_is_draining(
+                                            &overload_btc,
+                                            shutdown_rx_btc.as_ref(),
+                                        ),
+                                    )),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                class
                             };
                             // Read-side failure on the b2c path means the
                             // backend closed / reset the socket.
