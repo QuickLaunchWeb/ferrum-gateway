@@ -1009,7 +1009,9 @@ impl SseReassembler {
                     }
                     Some("input_json_delta") => {
                         if let Some(fragment) = delta.get("partial_json").and_then(Value::as_str) {
-                            self.anthropic_block_mut(index).input_json.push_str(fragment);
+                            self.anthropic_block_mut(index)
+                                .input_json
+                                .push_str(fragment);
                         } else {
                             self.anthropic_uninspectable = true;
                         }
