@@ -71,6 +71,7 @@ adding, removing, or materially changing a workflow.
 | `gateways-protocol-benchmark.yml` | Gateways Protocol Benchmark | Manual | Gateway/protocol benchmark harness. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
+| `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
 | `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Supplies the single required human-root approval for one exact independently reviewed PR head after hosted checks and review-thread resolution; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
 
 ### CI Pipeline Flow
@@ -3395,3 +3396,286 @@ reviewed policy adoption. No generation admission or ruleset change is retained.
 Known incomplete archives need separate evidence-based retirement so a subsequent
 successful main producer can populate their keys. Do not purge unrelated caches.
 Capacity stays at 10 GB and spending budgets stay at $0.
+
+
+### CI latency report (#4672)
+
+`.github/scripts/ci_latency_report.py` is the read-only latency report issue
+[#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672) asks for before
+any cancellation, batching, or cadence policy is changed. It reads the Actions
+API and separates:
+
+- **queued time** — job creation to job start, per job and in aggregate;
+- **execution** — job start to job completion, with a slowest-job table;
+- **serial dependency** — run creation to the last job completion, plus a
+  dispatch-wave count. A wave is a group of jobs created within 30s of each
+  other; the wave count approximates dependency depth because the Actions API
+  does not expose `needs:` edges. It is labelled as an approximation in the
+  rendered report, not presented as a graph read;
+- **attempt number** — the run-attempt histogram and the number of distinct
+  heads validated more than once;
+- **cancellations** — run conclusions per event, and the job-execution minutes
+  that landed inside runs that were eventually cancelled. That second figure
+  includes jobs that completed *before* the cancellation, so it is not a claim
+  that every minute was wasted, and a `cancelled` conclusion is not by itself
+  evidence of pending coalescing rather than a lost hosted runner;
+- **whole-required-set completion** — per exact `(head_sha, event)` pair, how
+  many heads had every required context succeed and how long that took. The
+  required-context inventory is read from
+  `.github/required-publication-checks.json`, so the report cannot drift from
+  the publication gate's own list. `push` heads exclude the
+  pull-request-head-only context (`Trusted Cross Build Policy`), which
+  structurally cannot run for a push; counting its absence as latency would be
+  wrong. Incomplete heads stay in the denominator, and the percentiles cover
+  only complete sets, so they carry survivorship bias.
+
+Collect across **all** workflows (the default), not just `ci.yml`: a
+collection narrowed to one workflow can never complete a required set, and the
+rendered report says how many of the required workflows the collection
+actually contained so a narrow window cannot be misread as a finding.
+
+Run it from the `CI Latency Report` workflow (`workflow_dispatch`, or the
+Monday 07:00 UTC schedule). The workflow uploads `ci-latency-report`
+containing the rendered Markdown, the JSON summary, and the raw run/job
+records it was computed from, so a later reader can re-derive the numbers
+without re-querying the API:
+
+```bash
+python3 -I .github/scripts/ci_latency_report.py --self-test
+python3 -I .github/scripts/ci_latency_report.py --check-inventory
+python3 -I .github/scripts/ci_latency_report.py \
+  --repository ferrum-edge/ferrum-edge --workflow all --runs 400 \
+  --output-dir ci-latency-report
+python3 -I .github/scripts/ci_latency_report.py \
+  --input-dir ci-latency-report/raw --output-dir rerender
+```
+
+The lane holds `contents: read` and `actions: read`, never dispatches,
+re-runs, or cancels anything, and is not a branch-protection-required check.
+Pull requests run only the offline self-test and the inventory parse; the API
+collection is paid on an explicit dispatch or the weekly schedule. The Actions
+listing API caps a query at 1,000 results, so the tool caps `--runs` at 1,000
+and a wider window has to be collected in slices, exactly as the week-long
+baseline audit on #4672 was.
+
+#### What this does *not* settle
+
+The acceptance criterion on #4672 is a representative week compared against
+the week-long baseline recorded on that issue (2026-08-30 → 2026-09-05:
+p50/p95 exact-SHA required-set readiness of 94.1/220.9 min for PR heads and
+64.7/115.3 min for merge groups, 91.7% main-push cancellation, and 1,635.2
+CI-only runner-minutes per merged PR). This tool makes that comparison
+repeatable; it does not perform it. Collect a complete post-change week with
+the same definitions before treating the issue as satisfied.
+
+#### Merge-queue batching and coordinated cadence (evaluation, not a decision)
+
+Latest-wins cancellation on superseded pull-request heads stays exactly as it
+is. It is the cheapest correct policy for a head that no longer exists, and
+#4672 explicitly asks to keep it.
+
+The open question is `main`. The main workflow intentionally cancels
+superseded main runs, and publication requires a complete exact-SHA set, so a
+push burst can prevent any main validation run from finishing and discards
+unsaved warm caches. Three options, with what each would actually cost:
+
+1. **Enable a merge-queue rule.** The active ruleset (`Main merge queue and
+   root review gate`) is named for a queue but currently contains only
+   deletion protection, non-fast-forward protection, and the required status
+   checks — there is **no `merge_queue` rule**. Historical merge-group runs are
+   evidence that a queue was once configured, not that one is required today.
+   Enabling one batches landings, so `main` receives fewer, larger pushes and
+   each validation run has a better chance of completing. The measured cost is
+   real: the baseline week spent 85,207 CI runner-minutes on merge-group runs,
+   22,721 of them in runs that were eventually cancelled, because every
+   synthesized SHA is validated in addition to the pull-request head. Any
+   change here is a separately reviewed repository-settings proposal, not a
+   workflow edit.
+2. **Coordinated update cadence with no settings change.** Land already
+   reviewed, green, independent pull requests in deliberate batches and follow
+   the resulting combined main validation while it is progressing, rather than
+   merging continuously. This is the current operational practice. It needs no
+   ruleset change and no extra synthesized-SHA validation, but it depends on
+   an operator, and the waiting time of a ready-to-land change is a cost that
+   must be measured separately rather than assumed to be zero.
+3. **Relax main-push cancellation.** Rejected as written: letting every
+   superseded main run finish converts the 91.7% cancellation rate into
+   runner-minutes rather than removing it, and a stale run must never be
+   allowed to overwrite newer artifacts.
+
+The decision belongs to maintainers. What this repository can supply first is
+the post-change week from the report above, measured with the same joins as
+the baseline. Nothing here changes concurrency, required gates, test
+eligibility, artifact producer/head matching, merge-base policy, or any
+repository setting.
+
+
+### Sanitizer smoke on the main critical path (#4694)
+
+**Status: not changeable by a pull request.** The `fuzz-smoke` job in `ci.yml`
+is byte-frozen by the trusted policy (`CI_FUZZ_SMOKE_JOB_GENERATIONS` in
+`.github/scripts/verify_cross_build_policy.py`), and so is its wiring into the
+required `test` aggregate (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`). Every
+command, toolchain pin, target name, and libFuzzer bound in that job is part of
+the contract. Adding a `--profile` argument to `cargo fuzz run`, adding a step,
+or moving the job out of the `test` aggregate all change bytes no pull request
+may change, and `verify_cross_build_policy.py` is itself unmodifiable by a pull
+request. Both options in
+[#4694](https://github.com/ferrum-edge/ferrum-edge/issues/4694) are therefore
+direct-to-`main` changes, applied as a new admitted generation pair.
+
+Half of the "off the critical path" option is already done. Issues #3902 and
+#4238 narrowed the sanitizer step to `push: main` and `workflow_dispatch`
+only, so pull requests and merge groups pay the deterministic property smoke
+alone. What remains on the critical path is `main`'s own `Tests` aggregate.
+
+#### Expected saving from the recorded timing evidence
+
+The measurements collected on #4694 and in
+[ci_throughput_2026-09-08.md](ci_throughput_2026-09-08.md) do not support the
+bounded-profile experiment, and they do support the cache path instead:
+
+| Variant | Cold first-target sanitizer compile | Whole sanitizer step | Executed iterations |
+|---|---:|---:|---|
+| Shipping optimized (cold, run 34018271780) | 37m22s | 41m35s | 512 per target |
+| Shipping optimized (cold control, run 34028933678) | — | 36m05s | 512 per target |
+| `dev` opt-level 0 (run 34026677585) | — | 19m46s | **45** on `config_decode`, 512 on the other six |
+| `dev` opt-level 1 (run 34028543883) | — | 40m21s | 512 per target |
+| Exact fuzz-cache hit (run 34087106670) | **1m09s** | **5m19s** | 512 per target |
+| Exact fuzz-cache hit (run 34165057380) | — | 29m40s | 512 per target |
+
+Read honestly: the only reduced-optimization variant that saved meaningful
+compile time was opt-level 0, at roughly **22 minutes (≈52%) off the cold
+sanitizer step** — and it is inadmissible, because it lost 467 of the 512
+required `config_decode` iterations inside the unchanged time bound, which is
+exactly the coverage #4694 forbids trading away. Opt-level 1 kept the
+iterations and showed **no repeatable benefit**: its apparent 3% gain against
+an earlier cold run did not survive comparison with a concurrent control on
+which it was slower. Different hosted runners and commits make these
+descriptive observations, not causal estimates.
+
+An exact fuzz-cache hit, by contrast, removed roughly **38 minutes** from the
+first-target compile (1m09s versus 38m56s on the immediately preceding cold
+producer) with no profile, target-inventory, or bound change at all. The
+29m40s reading on run 34165057380 is a warm restore of a lane that no longer
+archives the compiler store, with 0 compiler hits and 16 misses — which is why
+the next experiment worth running is a same-input compiler-store comparison
+under [#4643](https://github.com/ferrum-edge/ferrum-edge/issues/4643), not
+another optimization-profile guess.
+
+#### If the bounded profile is attempted anyway
+
+It is a direct-to-`main` change with these parts, applied atomically:
+
+1. a `[profile.fuzz-smoke]` section in `fuzz/Cargo.toml` inheriting `release`,
+   with reduced `opt-level` and `debug`, AddressSanitizer untouched;
+2. `--profile fuzz-smoke` added to the six-target loop **and** to the
+   `datagram_client_address` invocation in `ci.yml`'s `fuzz-smoke` job, leaving
+   `-runs`, `-max_total_time`, `-max_len`, `-timeout` and `-rss_limit_mb`
+   byte-identical, and leaving `fuzz.yml`'s scheduled discovery lane optimized;
+3. a new `CI_FUZZ_SMOKE_JOB_GENERATIONS` entry in
+   `verify_cross_build_policy.py` whose adopted text is the edited job, with
+   `CI_FUZZ_SMOKE_BOUNDED_BUDGET` and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` still
+   appearing verbatim exactly once so the budget cannot move with the profile;
+4. a `main` run that reports the **actual** per-target iteration counts, not
+   just a pass, because opt-level 0 already passed while silently losing 91%
+   of one target's executions.
+
+Nothing here has been adopted. AddressSanitizer, the seven-target inventory,
+every input-size limit, and every execution bound remain as they are.
+
+
+### Release build tail: timings, budgets, and the profile experiment (#4674)
+
+**Status: not changeable by a pull request.** `release.yml`'s
+`build-release-arm64-cross` is digest-frozen in `WORKFLOW_CONTRACTS`, and
+`build-release-binaries` is read as Cross-sensitive and held to `main`'s own
+text by the whole-job surface comparison (its former #4301/#4355 generation
+pairs are retired precisely because issue #4423 moved it again directly on
+`main`). Adding `--timings`, a timings-artifact upload, or a `timeout-minutes`
+to either producer is therefore a direct-to-`main` change. See
+[Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions-temporary)
+and [Published x86_64 GNU producer contract (standing)](#published-x86_64-gnu-producer-contract-standing).
+
+#### Observed tail, and the budget it justifies
+
+| Producer / target | Observation | Source |
+|---|---:|---|
+| `build-release-binaries` — macOS aarch64 (job) | 2h16m18s | main CI run 34008463614 |
+| `build-release-binaries` — macOS x86_64 (job) | 2h00m21s | main CI run 34008463614 |
+| `build-release-binaries` — Windows x86_64 (compile step) | 84m36s | main CI run 34008463614 |
+| `build-release-binaries` — Linux x86_64 (compile step) | 38m21s | main CI run 34008463614 |
+| `build-release-arm64-cross` — ARM64 (compile step) | 45m39s | main CI run 34008463614 |
+| Cold shipping-profile study, macOS aarch64 / x86_64 / Windows | 55m35s / 54m20s / 54m10s | run 34071933579 |
+| Same-source host comparison, `macos-15` vs `macos-15-intel` | 4,184.63s / 4,668.32s | run 34084116391 |
+
+Every one of those jobs currently runs with no `timeout-minutes`, i.e. the
+360-minute Actions default. That default is an accident, not a budget: a hung
+release build burns six hours of a serialized publication path before anyone
+sees a failure.
+
+Derived budgets, using the worst observed job duration plus headroom for a
+cold cache and a slow runner:
+
+- `build-release-binaries`: **`timeout-minutes: 180` at the job level with
+  `timeout-minutes: 165` on the build step** — 1.32× the 136.3-minute worst
+  observed job. This is not a new number: the non-publishing
+  `release-platform-study.yml` already runs the same three cold shipping-profile
+  compiles under exactly that 180/165 pair, so the publishing producer would
+  simply stop being the only place without one.
+- `build-release-arm64-cross`: **`timeout-minutes: 120`** — 2.6× its 45m39s
+  observed compile step, leaving room for image pull and sysroot preparation.
+
+Both are far below 360 and above anything ever observed to succeed. Raise a
+number when a *successful* run exceeds it; do not raise one to absorb a hang.
+
+#### Timings capture that preserves logs on timeout
+
+A job cancelled by a job-level `timeout-minutes` skips its remaining steps, so
+the capture has to be arranged to survive it:
+
+1. append `--timings` to the native `Build release binary` step (the macOS and
+   Windows cells; the x86_64 GNU cell builds through the pinned sysroot script
+   and would need the same flag threaded there);
+2. give **that step** its own `timeout-minutes` (165) below the job budget
+   (180), so the job is still alive when the build step is killed —
+   `release-platform-study.yml` already demonstrates this exact pairing;
+3. upload `target/cargo-timings/` with `if: always()`, under a name distinct
+   from the canonical `release-binaries-<target>` artifact — a second uploader
+   of the canonical name is refused outright by
+   `linux_gnu_producer_contract_errors`, and the timings artifact must never
+   be able to collide with the bytes the ABI gate scanned.
+
+Cargo writes one HTML report plus a JSON sidecar per invocation, single-digit
+megabytes. Bound it with `retention-days: 14` and `if-no-files-found: warn`,
+since a cell that failed before codegen legitimately has no report.
+
+#### Shipping-profile experiment plan (not adopted)
+
+The shipping profile — `opt-level = 3`, fat LTO, one codegen unit — is
+**unchanged** and must stay unchanged until a runtime-regression budget is
+agreed in advance. The measurements that exist already argue against a naive
+swap:
+
+- Same-host paired study (run 34064983492, one AMD EPYC 7763, four vCPUs,
+  fresh separate targets, compiler caching disabled): fat/thin compile
+  1,804.24s / 1,085.28s — thin was 39.8% faster — but the executable grew
+  21.8% (93,403,200 → 113,730,080 bytes) and gateway throughput fell across
+  every protocol (HTTP/1.1 −5.45%, HTTP/1.1+TLS −6.07%, HTTP/2 −4.97%,
+  HTTP/3 −3.65%), with HTTP/2 p99 up a median 15.04% and one TCP+TLS p99 pair
+  up 42.92%. Compilation order was fixed fat-then-thin, so OS/source cache
+  effects remain a confounder, and these are short-run descriptive numbers,
+  not confidence bounds.
+- A native Intel macOS host was 11.56% *slower* than its ARM counterpart on
+  the same source, so "bigger runner" is not an established win either.
+
+The remaining work is therefore ordered as: (1) land the timings capture and
+the finite budgets above, direct to `main`; (2) agree an explicit tolerated
+throughput/p99 regression budget *before* any profile comparison is scored;
+(3) re-run the non-publishing studies in `release-platform-study.yml` /
+`release-profile-study.yml` against that budget, including protected ARM64
+Cross phase measurements and oldest-baseline ABI/install/image results on
+every platform whose compiler or linker settings change. No CI verification
+profile is ever published as a release, and exact-SHA publication gates,
+protected Cross isolation, FIPS boundaries and reproducible toolchain inputs
+are untouched by any of this.
