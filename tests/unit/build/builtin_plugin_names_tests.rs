@@ -13,10 +13,9 @@ mod builtin_plugin_names {
 fn parsed_builtin_names_match_runtime_registry() {
     use ferrum_edge::plugins::BUILTIN_PLUGIN_REGISTRATIONS;
 
-    let parsed = builtin_plugin_names::builtin_plugin_names_from_mod_rs(
-        Path::new("src/plugins/mod.rs"),
-    )
-    .expect("parse built-in plugin names from src/plugins/mod.rs");
+    let parsed =
+        builtin_plugin_names::builtin_plugin_names_from_mod_rs(Path::new("src/plugins/mod.rs"))
+            .expect("parse built-in plugin names from src/plugins/mod.rs");
 
     let registry: BTreeSet<_> = BUILTIN_PLUGIN_REGISTRATIONS
         .iter()
@@ -25,8 +24,7 @@ fn parsed_builtin_names_match_runtime_registry() {
     let parsed_set: BTreeSet<_> = parsed.iter().map(String::as_str).collect();
 
     assert_eq!(
-        parsed_set,
-        registry,
+        parsed_set, registry,
         "build.rs built-in inventory must stay set-equal with BUILTIN_PLUGIN_REGISTRATIONS"
     );
 }
@@ -39,10 +37,8 @@ fn collision_errors_name_file_and_builtin() {
         Path::new("custom_plugins/cors.rs").to_path_buf(),
     )];
 
-    let errors = builtin_plugin_names::format_builtin_name_collision_errors(
-        &plugin_sources,
-        &builtin_names,
-    );
+    let errors =
+        builtin_plugin_names::format_builtin_name_collision_errors(&plugin_sources, &builtin_names);
 
     assert_eq!(errors.len(), 1);
     assert!(errors[0].contains("custom_plugins/cors.rs"));

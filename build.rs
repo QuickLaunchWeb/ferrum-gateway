@@ -150,10 +150,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let builtin_names = builtin_plugin_names::builtin_plugin_name_set_from_mod_rs(
-        Path::new("src/plugins/mod.rs"),
-    )
-    .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
+    let builtin_names =
+        builtin_plugin_names::builtin_plugin_name_set_from_mod_rs(Path::new("src/plugins/mod.rs"))
+            .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
     let collisions =
         builtin_plugin_names::format_builtin_name_collision_errors(&plugin_sources, &builtin_names);
     if !collisions.is_empty() {
