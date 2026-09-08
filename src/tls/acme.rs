@@ -44,6 +44,7 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::config::types::validate_resource_id;
+use crate::tls::ocsp_recheck::StapleRetiringResolver;
 use crate::tls::shared_store::{
     SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, TlsStoreAdmissionReason,
     TlsStoreIoDirection, VersionedStoreFile, record_store_admission_rejected, record_store_pruned,
@@ -2186,7 +2187,12 @@ enum AcmeResolverFallback {
     /// path, replacing the `Arc` clone this arm did before; nothing on the
     /// per-request hot path observes it.
     Single(arc_swap::ArcSwap<rustls::sign::CertifiedKey>),
-    Resolver(Arc<dyn rustls::server::ResolvesServerCert>),
+    /// An inner resolver that selects among several credentials. Typed as
+    /// [`StapleRetiringResolver`] rather than a bare `ResolvesServerCert` so
+    /// this arm can give up a staple too: a fallback that could not would be a
+    /// certificate source exempt from `crate::tls::ocsp_recheck`, which is the
+    /// gap issue #4773 reported for the Gateway multi-certificate frontend.
+    Resolver(Arc<dyn StapleRetiringResolver>),
 }
 
 impl AcmeResolverFallback {
@@ -2233,8 +2239,14 @@ impl AcmeTlsAlpnResolver {
     /// so no handshake pays for the retirement and none can observe a torn
     /// credential.
     pub fn drop_stapled_ocsp_response(&self) -> bool {
-        let AcmeResolverFallback::Single(slot) = &self.fallback else {
-            return false;
+        let slot = match &self.fallback {
+            AcmeResolverFallback::Single(slot) => slot,
+            // The Gateway multi-certificate index publishes its own stapleless
+            // generation; the retirement is the inner resolver's to make
+            // because it owns every credential it selects among.
+            AcmeResolverFallback::Resolver(resolver) => {
+                return resolver.drop_stapled_ocsp_response();
+            }
         };
         let current = slot.load_full();
         if current.ocsp.is_none() {
@@ -2248,7 +2260,7 @@ impl AcmeTlsAlpnResolver {
 
     /// Wrap an inner resolver (Gateway multi-certificate SNI selection) so
     /// ACME TLS-ALPN-01 validation still takes precedence over it.
-    pub fn with_resolver(fallback: Arc<dyn rustls::server::ResolvesServerCert>) -> Self {
+    pub fn with_resolver(fallback: Arc<dyn StapleRetiringResolver>) -> Self {
         Self {
             fallback: AcmeResolverFallback::Resolver(fallback),
             cache: Mutex::new(BTreeMap::new()),
