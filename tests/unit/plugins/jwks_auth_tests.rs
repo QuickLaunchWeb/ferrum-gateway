@@ -4625,6 +4625,131 @@ fn equivalent_providers_that_disagree_on_require_dpop_are_rejected() {
     }
 }
 
+/// Equivalent providers with matching authorization fields still converge on
+/// one replay lane; disagreement on those fields is refused separately.
+#[test]
+fn equivalent_providers_with_matching_authorization_fields_converge_on_one_replay_lane() {
+    let (_, jwks) = build_dpop_fixture("dpop-auth-fields-converge");
+    let provider = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "require_dpop": true,
+        "dpop_replay_scope": "process",
+        "require_mtls_binding": true,
+        "required_scopes": ["read:data"],
+        "required_roles": ["admin"],
+    });
+
+    let plugin = dpop_plugin_with_providers(
+        json!([provider.clone(), provider]),
+        "dpop-auth-fields-converge",
+    );
+    let markers = plugin.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(
+        markers[0], markers[1],
+        "equivalent providers with matching authorization fields must share one replay lane"
+    );
+}
+
+/// A token that verifies against both siblings is matched to the first success.
+/// If one sibling requires certificate binding and the other does not, matching
+/// order is an authentication bypass of the RFC 8705 gate.
+#[test]
+fn equivalent_providers_that_disagree_on_require_mtls_binding_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("mtls-binding-mix-reject");
+    let with_binding = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "require_mtls_binding": true,
+    });
+    let without_binding = json!({ "jwks": jwks, "issuer": DPOP_TEST_ISSUER });
+
+    for providers in [
+        json!([with_binding.clone(), without_binding.clone()]),
+        json!([without_binding.clone(), with_binding.clone()]),
+    ] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("mtls-binding-mix-reject"),
+        )
+        .map(|_| ())
+        .expect_err("equivalent providers must agree on require_mtls_binding");
+        assert!(
+            error.contains("require_mtls_binding") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing certificate-binding requirement: {error}"
+        );
+    }
+}
+
+/// Matching order would otherwise let a permissive sibling satisfy a token that
+/// lacks scopes the stricter sibling demands.
+#[test]
+fn equivalent_providers_that_disagree_on_required_scopes_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("required-scopes-mix-reject");
+    let strict = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "required_scopes": ["read:data", "write:data"],
+    });
+    let permissive = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "required_scopes": ["read:data"],
+    });
+
+    for providers in [
+        json!([strict.clone(), permissive.clone()]),
+        json!([permissive.clone(), strict.clone()]),
+    ] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("required-scopes-mix-reject"),
+        )
+        .map(|_| ())
+        .expect_err("equivalent providers must agree on required_scopes");
+        assert!(
+            error.contains("required_scopes") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing scope requirement: {error}"
+        );
+    }
+}
+
+/// Matching order would otherwise let a permissive sibling satisfy a token that
+/// lacks roles the stricter sibling demands.
+#[test]
+fn equivalent_providers_that_disagree_on_required_roles_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("required-roles-mix-reject");
+    let strict = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "required_roles": ["admin", "operator"],
+    });
+    let permissive = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "required_roles": ["admin"],
+    });
+
+    for providers in [
+        json!([strict.clone(), permissive.clone()]),
+        json!([permissive.clone(), strict.clone()]),
+    ] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("required-roles-mix-reject"),
+        )
+        .map(|_| ())
+        .expect_err("equivalent providers must agree on required_roles");
+        assert!(
+            error.contains("required_roles") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing role requirement: {error}"
+        );
+    }
+}
+
 /// Distinct issuers are different replay realms. One may require DPoP and the
 /// other may not; a token matching only one of them is not an ambiguous DPoP
 /// bypass. A non-DPoP sibling without an issuer is also not the same realm.
