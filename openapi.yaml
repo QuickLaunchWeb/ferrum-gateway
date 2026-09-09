@@ -20425,20 +20425,30 @@ components:
         the complete candidate set and each imminent dial under the active backend
         egress policy, and retains the configured hostname for TLS/SNI verification.
         Non-loopback plaintext `ldap://` is rejected unless the development-only
-        `allow_plaintext` override is explicitly enabled. Search-then-bind requires
-        a canonical identity attribute, rejects ambiguous searches, and exports the
-        selected entry's canonical value rather than the presented username.
+        `allow_plaintext` override is explicitly enabled. Exactly one authentication
+        mode may be configured; combining `bind_dn_template` with `search_base_dn`/
+        `search_filter` is rejected. Both modes require a canonical identity
+        attribute, reject ambiguous or duplicate values, and export the authenticated
+        entry's canonical value rather than the presented username: direct bind reads
+        it with a base-scope search on the bound DN, and search-then-bind takes it
+        from the uniquely selected search entry.
       required:
         - ldap_url
       allOf:
         - anyOf:
-            - required: [bind_dn_template]
+            - required: [bind_dn_template, canonical_identity_attribute]
+              not:
+                anyOf:
+                  - required: [search_base_dn]
+                  - required: [search_filter]
             - required:
                 - search_base_dn
                 - search_filter
                 - canonical_identity_attribute
                 - service_account_dn
                 - service_account_password
+              not:
+                required: [bind_dn_template]
         - if:
             required: [search_base_dn, search_filter]
           then:
@@ -20506,7 +20516,7 @@ components:
         canonical_identity_attribute:
           type: string
           minLength: 1
-          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
+          description: "Required in both bind modes. Exactly one value from the authenticated entry (the uniquely selected search entry, or a base-scope read of the directly bound DN) becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
           minLength: 1
@@ -20524,7 +20534,7 @@ components:
         group_filter:
           type: string
           minLength: 1
-          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity: the presented username for direct bind, or canonical_identity_attribute for search-then-bind. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
+          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity read from canonical_identity_attribute in both bind modes, never the presented login. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:

@@ -2813,7 +2813,7 @@ credentials:
 
 ### ldap_auth
 
-Authenticates requests by extracting HTTP Basic credentials and validating them against an LDAP directory. Supports direct bind (faster, no service account) or search-then-bind (more flexible), with optional Active Directory / LDAP group filtering.
+Authenticates requests by extracting HTTP Basic credentials and validating them against an LDAP directory. Supports direct bind (faster, no service account) or search-then-bind (more flexible) — exactly one of the two — with optional Active Directory / LDAP group filtering. Either way the Ferrum identity comes from the authenticated directory entry, never from the presented login.
 
 **Priority:** 1250
 
@@ -2823,11 +2823,11 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `bind_dn_template` | string | (none) | Direct bind DN template with `{username}` placeholder (e.g., `uid={username},ou=users,dc=example,dc=com`) |
 | `search_base_dn` | string | (none) | Base DN for search-then-bind user search |
 | `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`) |
-| `canonical_identity_attribute` | string | (none) | Required for search-then-bind. The uniquely selected entry must return exactly one value for this attribute; that value becomes the Ferrum identity, Consumer mapping key, custom group-filter `{username}`, and default `memberUid` value |
+| `canonical_identity_attribute` | string | (required) | Required in both bind modes. The authenticated entry must return exactly one value for this attribute; that value becomes the Ferrum identity, Consumer mapping key, custom group-filter `{username}`, and default `memberUid` value. Direct bind reads it with a base-scope search on the bound DN; search-then-bind reads it from the uniquely selected search entry |
 | `service_account_dn` | string | (none) | DN for the service account used in search-then-bind |
 | `service_account_password` | string | (none) | Password for the service account |
 | `group_base_dn` | string | (none) | Base DN for group membership search (required when `required_groups` is set) |
-| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` is the authenticated canonical identity (the presented username for direct bind, or `canonical_identity_attribute` for search-then-bind). Default checks `member`, `uniqueMember`, and canonical-identity `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
+| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` is the authenticated canonical identity read from `canonical_identity_attribute` in both bind modes, never the presented login. Default checks `member`, `uniqueMember`, and canonical-identity `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
 | `required_groups` | string[] | `[]` | List of LDAP/AD group names the user must belong to (OR logic — at least one must match) |
 | `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
@@ -2841,8 +2841,12 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 
 **Authentication modes** (must configure one):
 
-1. **Direct bind** — set `bind_dn_template` with `{username}` placeholder. Fastest option, no service account needed.
-2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user. The configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping and username-based group authorization.
+1. **Direct bind** — set `bind_dn_template` with `{username}` placeholder and `canonical_identity_attribute`. Fastest option, no service account needed. After the user's bind succeeds, the plugin issues a base-scope search on the bound DN over that same authenticated connection and takes the canonical attribute's single value as the identity.
+2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user.
+
+In **both** modes the configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping and username-based group authorization. Directories match login attributes case- and whitespace-insensitively, so `alice`, `ALICE`, and `alice ` all bind to the same account; deriving the identity from the directory entry keeps them one Ferrum principal instead of three, so per-consumer rate limits and `access_control` `disallowed_consumers` revocation cannot be evaded by varying the presented login.
+
+The two modes are mutually exclusive: a configuration that sets `bind_dn_template` together with `search_base_dn` or `search_filter` is **rejected** at load, rather than silently taking the direct-bind branch and leaving the search keys inert.
 
 **Example — Direct bind:**
 ```yaml
@@ -2851,6 +2855,7 @@ plugins:
     config:
       ldap_url: "ldaps://ldap.example.com:636"
       bind_dn_template: "uid={username},ou=users,dc=example,dc=com"
+      canonical_identity_attribute: "uid"
 ```
 
 **Example — AD search-then-bind with group filtering:**
@@ -2872,7 +2877,7 @@ plugins:
       cache_ttl_seconds: 300
 ```
 
-For direct bind, the plugin sets `ctx.authenticated_identity` to the presented LDAP username. For search-then-bind, it uses the validated `canonical_identity_attribute` value from the unique search result. When `consumer_mapping` is enabled (default), the same authenticated identity is used to find a matching gateway Consumer for ACL and rate-limiting integration.
+In both modes the plugin sets `ctx.authenticated_identity` to the validated `canonical_identity_attribute` value taken from the authenticated directory entry — read with a base-scope search on the bound DN for direct bind, or from the unique search result for search-then-bind. The presented login is never exported, and an entry that cannot yield exactly one canonical value fails closed with a `500` rather than falling back to it. When `consumer_mapping` is enabled (default), the same authenticated identity is used to find a matching gateway Consumer for ACL and rate-limiting integration.
 
 **Status codes:** The plugin distinguishes failure classes so clients and operators get an accurate signal:
 

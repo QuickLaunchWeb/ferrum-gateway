@@ -112,7 +112,8 @@ fn test_invalid_config_types_rejected() {
         json!(""),
         json!({
             "ldap_url": 123,
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
@@ -121,21 +122,25 @@ fn test_invalid_config_types_rejected() {
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "starttls": "yes"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_groups": "admins"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "connect_timeout_seconds": 0
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "max_cache_entries": 0
         }),
     ];
@@ -153,7 +158,8 @@ fn test_invalid_ldap_url_scheme_rejected() {
     let result = LdapAuth::new(
         &json!({
             "ldap_url": "http://ldap.example.com",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     );
@@ -166,7 +172,8 @@ fn test_malformed_ldap_url_rejected() {
     let result = LdapAuth::new(
         &json!({
             "ldap_url": "ldap://[not-ipv6",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     );
@@ -179,7 +186,8 @@ fn test_ldap_url_empty_authority_rejected() {
     let result = LdapAuth::new(
         &json!({
             "ldap_url": "ldap:///dc=example,dc=com",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     );
@@ -204,7 +212,8 @@ fn test_direct_bind_valid() {
     let result = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     );
@@ -216,7 +225,8 @@ fn test_ldaps_url_valid() {
     let result = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     );
@@ -228,7 +238,8 @@ fn test_bind_dn_template_missing_placeholder_rejected() {
     let result = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid=admin,ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid=admin,ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     );
@@ -289,6 +300,7 @@ fn test_starttls_with_ldaps_rejected() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "starttls": true
         }),
         http_client(),
@@ -303,6 +315,7 @@ fn test_starttls_with_ldap_valid() {
         &json!({
             "ldap_url": "ldap://ldap.example.com:389",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "starttls": true
         }),
         http_client(),
@@ -316,6 +329,7 @@ fn test_required_groups_without_group_base_dn_rejected() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_groups": ["admins"]
         }),
         http_client(),
@@ -330,6 +344,7 @@ fn test_required_groups_with_group_base_dn_valid() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_groups": ["admins", "developers"],
             "group_base_dn": "ou=groups,dc=example,dc=com"
         }),
@@ -349,6 +364,7 @@ fn test_required_groups_direct_bind_without_service_account_accepted() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_groups": ["admins"],
             "group_base_dn": "ou=groups,dc=example,dc=com"
         }),
@@ -369,6 +385,7 @@ fn test_required_groups_with_service_account_accepted() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_groups": ["admins"],
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "service_account_dn": "cn=admin,dc=example,dc=com",
@@ -385,6 +402,7 @@ fn test_custom_group_attribute() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_groups": ["admins"],
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "group_attribute": "sAMAccountName"
@@ -400,6 +418,7 @@ fn test_cache_ttl_config() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "cache_ttl_seconds": 300
         }),
         http_client(),
@@ -413,6 +432,7 @@ fn test_consumer_mapping_disabled() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "consumer_mapping": false
         }),
         http_client(),
@@ -426,6 +446,7 @@ fn test_unknown_config_key_rejected() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_group": ["admins"]
         }),
         http_client(),
@@ -445,6 +466,7 @@ fn test_static_custom_group_filter_rejected() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "group_filter": "(cn=admins)",
             "required_groups": ["admins"]
@@ -470,6 +492,7 @@ fn test_user_specific_custom_group_filters_accepted() {
             &json!({
                 "ldap_url": "ldaps://ldap.example.com:636",
                 "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+                "canonical_identity_attribute": "uid",
                 "group_base_dn": "ou=groups,dc=example,dc=com",
                 "group_filter": group_filter,
                 "required_groups": ["admins"]
@@ -508,6 +531,7 @@ fn test_cache_ttl_maximum_boundary() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "cache_ttl_seconds": LDAP_AUTH_MAX_CACHE_TTL_SECONDS
         }),
         http_client(),
@@ -522,6 +546,7 @@ fn test_cache_ttl_maximum_boundary() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "cache_ttl_seconds": LDAP_AUTH_MAX_CACHE_TTL_SECONDS + 1
         }),
         http_client(),
@@ -534,6 +559,7 @@ fn test_cache_ttl_maximum_boundary() {
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "cache_ttl_seconds": u64::MAX
         }),
         http_client(),
@@ -554,7 +580,8 @@ fn test_ldap_resource_boundaries_rejected() {
     ] {
         let mut config = json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         });
         config[field] = value;
         let error = LdapAuth::new(&config, http_client())
@@ -568,7 +595,8 @@ fn test_ldap_resource_boundaries_rejected() {
 fn test_remote_plaintext_ldap_requires_explicit_opt_in() {
     let config = json!({
         "ldap_url": "ldap://directory.example.test:389",
-        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test",
+        "canonical_identity_attribute": "uid"
     });
     let error = LdapAuth::new(&config, http_client())
         .err()
@@ -593,7 +621,8 @@ fn test_loopback_plaintext_ldap_remains_available_for_local_testing() {
         let result = LdapAuth::new(
             &json!({
                 "ldap_url": ldap_url,
-                "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+                "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+                "canonical_identity_attribute": "uid"
             }),
             http_client(),
         );
@@ -609,7 +638,8 @@ fn test_embedded_ldap_url_credentials_rejected() {
     let error = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://admin:secret@ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -634,6 +664,7 @@ fn test_malformed_service_account_password_errors_are_redacted() {
             &json!({
                 "ldap_url": "ldaps://ldap.example.com:636",
                 "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+                "canonical_identity_attribute": "uid",
                 "service_account_password": malformed
             }),
             http_client(),
@@ -660,7 +691,8 @@ fn test_plugin_name() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -673,7 +705,8 @@ fn test_is_auth_plugin() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -686,7 +719,8 @@ fn test_priority() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -700,7 +734,8 @@ fn test_ldap_auth_plugin_contract() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -724,6 +759,7 @@ fn test_warmup_hostnames_ldap() {
         &json!({
             "ldap_url": "ldap://ldap.example.com:389",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "allow_plaintext": true
         }),
         http_client(),
@@ -737,7 +773,8 @@ fn test_warmup_hostnames_ldaps() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://secure-ldap.corp.internal:636",
-            "bind_dn_template": "uid={username},ou=users,dc=corp,dc=internal"
+            "bind_dn_template": "uid={username},ou=users,dc=corp,dc=internal",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -750,7 +787,8 @@ fn test_warmup_hostnames_unbrackets_ipv6_ldap_url() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://[2001:db8::50]:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -768,7 +806,8 @@ async fn test_missing_authorization_header() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -789,7 +828,8 @@ async fn test_non_basic_auth_scheme_rejected() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -809,7 +849,8 @@ async fn test_invalid_base64_rejected() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -831,7 +872,8 @@ async fn test_missing_colon_in_credentials_rejected() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -854,7 +896,8 @@ async fn test_empty_username_rejected() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -884,7 +927,8 @@ async fn test_empty_password_rejected_without_contacting_ldap() {
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldap://127.0.0.1:1",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         http_client(),
     )
@@ -903,6 +947,34 @@ async fn test_empty_password_rejected_without_contacting_ldap() {
         start.elapsed() < std::time::Duration::from_millis(500),
         "Empty-password rejection must short-circuit before contacting LDAP"
     );
+}
+
+/// Canonical identity the direct-bind mock servers report for the bound entry.
+/// Direct bind never exports the presented login, so successful mock flows land
+/// on this value regardless of how the client spelled its username.
+const DIRECT_BIND_CANONICAL_IDENTITY: &str = "canonical-alice";
+
+/// Answer the base-scope search that direct bind issues on the bound DN to read
+/// `canonical_identity_attribute`. ldap3 numbers it message ID 2 on a
+/// connection whose bind was message ID 1.
+async fn answer_canonical_identity_search<S>(stream: &mut S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    if try_read_ldap_message_bytes(stream).await.is_err() {
+        return;
+    }
+    let _ = stream
+        .write_all(&search_result_entry(
+            2,
+            "uid=canonical-alice,ou=users,dc=example,dc=com",
+            &[("uid", &[DIRECT_BIND_CANONICAL_IDENTITY])],
+        ))
+        .await;
+    let _ = stream.write_all(&search_result_done(2, 0)).await;
+    let _ = stream.flush().await;
 }
 
 /// Minimal mock LDAP server: accepts one TCP connection, reads the client's
@@ -947,6 +1019,9 @@ async fn spawn_bind_response_ldap_server(result_code: u8) -> (u16, tokio::task::
             ];
             let _ = stream.write_all(&response).await;
             let _ = stream.flush().await;
+            if result_code == 0 {
+                answer_canonical_identity_search(&mut stream).await;
+            }
             // Hold the connection briefly so the client reads the response
             // before the socket is torn down.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1055,6 +1130,9 @@ async fn spawn_bind_response_ldap_server_at(
             let mut buffer = [0u8; 1_024];
             let _ = stream.read(&mut buffer).await;
             let _ = stream.write_all(&bind_response(1, result_code)).await;
+            if result_code == 0 {
+                answer_canonical_identity_search(&mut stream).await;
+            }
         }
     });
     (port, task)
@@ -1089,6 +1167,7 @@ async fn test_direct_bind_dials_fresh_screened_ipv4_answer() {
         &json!({
             "ldap_url": format!("ldap://directory.test:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "allow_plaintext": true,
             "consumer_mapping": false
         }),
@@ -1119,6 +1198,7 @@ async fn test_direct_bind_dials_fresh_screened_ipv6_answer() {
         &json!({
             "ldap_url": format!("ldap://directory.test:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "allow_plaintext": true,
             "consumer_mapping": false
         }),
@@ -1158,6 +1238,7 @@ async fn test_mixed_ipv4_ipv6_answer_fails_before_any_starttls_dial() {
         &json!({
             "ldap_url": format!("ldap://directory.test:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "starttls": true,
             "connect_timeout_seconds": 1
         }),
@@ -1261,6 +1342,7 @@ async fn test_literal_denial_is_enforced_at_dial_time() {
         &json!({
             "ldap_url": "ldap://169.254.169.254:389",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "allow_plaintext": true,
             "connect_timeout_seconds": 1
         }),
@@ -1295,6 +1377,7 @@ async fn test_plaintext_localhost_exception_rejects_non_loopback_override() {
         &json!({
             "ldap_url": format!("ldap://localhost:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "connect_timeout_seconds": 1
         }),
         http_client_with_dns_config(
@@ -1333,6 +1416,7 @@ async fn test_dial_resolution_timeout_is_bounded() {
         &json!({
             "ldap_url": "ldap://directory.test:389",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "allow_plaintext": true,
             "connect_timeout_seconds": 1
         }),
@@ -1364,6 +1448,7 @@ async fn test_dial_resolver_empty_response_fails_closed() {
         &json!({
             "ldap_url": "ldap://missing.directory.test:389",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "allow_plaintext": true,
             "connect_timeout_seconds": 1
         }),
@@ -1445,12 +1530,14 @@ async fn test_ldaps_keeps_configured_hostname_for_certificate_verification() {
             .write_all(&bind_response(1, 0))
             .await
             .expect("write LDAPS bind response");
+        answer_canonical_identity_search(&mut stream).await;
     });
     let dns = TestDnsServer::spawn(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": format!("ldaps://directory.test:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "consumer_mapping": false,
             "connect_timeout_seconds": 2
         }),
@@ -1658,6 +1745,167 @@ async fn test_search_bind_uses_canonical_entry_identity() {
         ctx.authenticated_identity_header.as_deref(),
         Some("canonical-alice")
     );
+    task.abort();
+}
+
+/// Mock direct-bind directory that serves `connections` sequential
+/// authentications. Every bind succeeds and every canonical-identity search
+/// answers with the same entry, mirroring a real directory that matches the
+/// login attribute case- and whitespace-insensitively.
+async fn spawn_direct_bind_server(connections: usize) -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind direct-bind LDAP server");
+    let port = listener
+        .local_addr()
+        .expect("direct-bind LDAP local addr")
+        .port();
+    let task = tokio::spawn(async move {
+        for _ in 0..connections {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            if try_read_ldap_message_bytes(&mut stream).await.is_err() {
+                return;
+            }
+            if stream.write_all(&bind_response(1, 0)).await.is_err() {
+                return;
+            }
+            answer_canonical_identity_search(&mut stream).await;
+        }
+    });
+    (port, task)
+}
+
+/// Directories fold case and insignificant whitespace when matching a login
+/// attribute, so `alice`, `ALICE`, and `alice ` all bind to one account. Direct
+/// bind must therefore export the directory entry's canonical value, or one
+/// account would mint an unbounded set of Ferrum principals — each with its own
+/// per-consumer rate-limit budget and each missing an `access_control`
+/// `disallowed_consumers` entry that names the real identity.
+#[tokio::test]
+async fn test_direct_bind_login_variants_share_one_canonical_identity() {
+    use ferrum_edge::plugins::rate_limiting::RateLimiting;
+
+    let logins = ["alice", "ALICE", "alice "];
+    let (port, task) = spawn_direct_bind_server(logins.len()).await;
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://127.0.0.1:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "consumer_mapping": false
+        }),
+        http_client(),
+    )
+    .expect("valid direct-bind config");
+
+    // One request per window: a second admitted request proves the variants
+    // were keyed as separate consumers.
+    let limiter = RateLimiting::new(
+        &json!({
+            "limit_by": "consumer",
+            "limits": [{ "scope": "default", "window_seconds": 60, "max_requests": 1 }]
+        }),
+        http_client(),
+    )
+    .expect("valid consumer rate limit");
+
+    let mut admitted = 0usize;
+    for login in logins {
+        let mut ctx = make_ctx();
+        ctx.headers.insert(
+            "authorization".to_string(),
+            basic_header(login, "user-secret"),
+        );
+
+        let result = plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await;
+        assert_continue(result);
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some(DIRECT_BIND_CANONICAL_IDENTITY),
+            "login '{login}' must not become the Ferrum identity"
+        );
+        assert_eq!(
+            ctx.effective_identity(),
+            Some(DIRECT_BIND_CANONICAL_IDENTITY),
+            "login '{login}' must resolve to the directory entry's identity"
+        );
+
+        if matches!(limiter.authorize(&mut ctx).await, PluginResult::Continue) {
+            admitted += 1;
+        }
+    }
+
+    assert_eq!(
+        admitted, 1,
+        "case and whitespace variants of one login must share a single rate-limiting key"
+    );
+    task.await.expect("direct-bind LDAP server");
+}
+
+/// A bind that succeeds but whose entry cannot yield exactly one canonical
+/// value fails closed as a backend error rather than falling back to the
+/// client-presented login.
+#[tokio::test]
+async fn test_direct_bind_without_a_canonical_value_fails_closed() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind canonical-less LDAP server");
+    let port = listener
+        .local_addr()
+        .expect("canonical-less LDAP local addr")
+        .port();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept direct bind");
+        read_ldap_message(&mut stream).await;
+        stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write bind success");
+        read_ldap_message(&mut stream).await;
+        stream
+            .write_all(&search_result_entry(
+                2,
+                "uid=alice,ou=users,dc=example,dc=com",
+                &[],
+            ))
+            .await
+            .expect("write attribute-less entry");
+        stream
+            .write_all(&search_result_done(2, 0))
+            .await
+            .expect("write canonical search done");
+    });
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://127.0.0.1:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "consumer_mapping": false
+        }),
+        http_client(),
+    )
+    .expect("valid direct-bind config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject(result, Some(500));
+    assert!(ctx.authenticated_identity.is_none());
     task.abort();
 }
 
@@ -1959,6 +2207,7 @@ async fn assert_group_search_result(
         &json!({
             "ldap_url": format!("ldap://127.0.0.1:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "group_filter": group_filter,
             "group_attribute": "sAMAccountName",
@@ -2033,6 +2282,7 @@ async fn test_complete_flow_wall_clock_timeout() {
         &json!({
             "ldap_url": format!("ldap://127.0.0.1:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "connect_timeout_seconds": 5,
             "request_timeout_seconds": 1
         }),
@@ -2128,6 +2378,7 @@ async fn test_concurrency_limit_rejects_excess_without_new_connection() {
             &json!({
                 "ldap_url": format!("ldap://127.0.0.1:{port}"),
                 "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+                "canonical_identity_attribute": "uid",
                 "connect_timeout_seconds": 5,
                 "request_timeout_seconds": 5,
                 "max_concurrent_requests": 1
@@ -2183,6 +2434,7 @@ async fn test_ldap_invalid_credentials_returns_401() {
         &json!({
             "ldap_url": format!("ldap://127.0.0.1:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "connect_timeout_seconds": 5
         }),
         http_client(),
@@ -2213,6 +2465,7 @@ async fn test_ldap_busy_bind_result_returns_500() {
         &json!({
             "ldap_url": format!("ldap://127.0.0.1:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "connect_timeout_seconds": 5
         }),
         http_client(),
@@ -2243,6 +2496,7 @@ async fn test_ldap_connection_failure_returns_500() {
         &json!({
             "ldap_url": "ldap://127.0.0.1:19",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "connect_timeout_seconds": 1
         }),
         http_client(),
@@ -2317,21 +2571,46 @@ fn test_full_ad_config() {
 }
 
 #[test]
-fn test_both_bind_modes_accepted() {
-    // Config is valid when both bind_dn_template and search config are provided.
-    // At runtime, direct bind takes precedence (see authenticate_user logic).
-    let result = LdapAuth::new(
-        &json!({
+fn test_both_bind_modes_rejected() {
+    // Direct bind and search-then-bind are alternatives, not layers. Accepting
+    // both and silently taking the direct-bind branch would leave the search
+    // keys inert while an operator believes they are in force.
+    for extra_key in ["search_base_dn", "search_filter"] {
+        let mut config = json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
-            "search_base_dn": "ou=users,dc=example,dc=com",
-            "search_filter": "(&(objectClass=person)(uid={username}))",
+            "canonical_identity_attribute": "uid",
             "service_account_dn": "cn=admin,dc=example,dc=com",
             "service_account_password": "admin_password"
+        });
+        let value = if extra_key == "search_base_dn" {
+            "ou=users,dc=example,dc=com"
+        } else {
+            "(&(objectClass=person)(uid={username}))"
+        };
+        config[extra_key] = json!(value);
+
+        let error = LdapAuth::new(&config, http_client())
+            .err()
+            .unwrap_or_else(|| panic!("'{extra_key}' beside 'bind_dn_template' must be refused"));
+        assert!(error.contains("bind_dn_template"), "{error}");
+        assert!(error.contains(extra_key), "{error}");
+    }
+}
+
+#[test]
+fn test_direct_bind_requires_canonical_identity_attribute() {
+    let error = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
         }),
         http_client(),
-    );
-    assert!(result.is_ok());
+    )
+    .err()
+    .expect("direct bind without a canonical identity must fail closed");
+
+    assert!(error.contains("canonical_identity_attribute"), "{error}");
 }
 
 // ─── Cache bounding config tests ─────────────────────────────────────────
@@ -2341,7 +2620,8 @@ fn test_ldap_auth_max_cache_entries_default() {
     // Create a valid config without max_cache_entries — default is 10000
     let config = json!({
         "ldap_url": "ldaps://ldap.example.com:636",
-        "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+        "canonical_identity_attribute": "uid"
     });
     let plugin = LdapAuth::new(&config, http_client()).unwrap();
     assert_eq!(plugin.name(), "ldap_auth");
@@ -2352,6 +2632,7 @@ fn test_ldap_auth_max_cache_entries_custom() {
     let config = json!({
         "ldap_url": "ldaps://ldap.example.com:636",
         "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+        "canonical_identity_attribute": "uid",
         "max_cache_entries": 500
     });
     let plugin = LdapAuth::new(&config, http_client()).unwrap();
@@ -2471,7 +2752,11 @@ fn test_filter_escape_preserves_utf8() {
 #[tokio::test]
 async fn test_ldap_auth_non_ascii_authorization_returns_invalid_not_missing() {
     let plugin = LdapAuth::new(
-        &json!({"ldap_url": "ldap://127.0.0.1:389", "bind_dn_template": "uid={username},dc=example,dc=com"}),
+        &json!({
+            "ldap_url": "ldap://127.0.0.1:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
+        }),
         http_client(),
     )
     .unwrap();
