@@ -535,9 +535,9 @@ impl AdminState {
         }
         match db.latest_change_sequence(namespace).await {
             Ok(sequence) if db.config_topology_epoch() == topology_epoch => {
-                Ok(PreparedLiveApply::from_covering_cursor(
-                    LiveApplyCursor::new(topology_epoch, sequence),
-                ))
+                let cursor = LiveApplyCursor::new(topology_epoch, sequence);
+                apply.record_issued_cursor(cursor);
+                Ok(PreparedLiveApply::from_covering_cursor(cursor))
             }
             Ok(_) => {
                 warn_persistence_failure_redacted("admin_write_live_apply_topology");
@@ -11040,7 +11040,9 @@ async fn handle_config_apply_status(
         ));
     };
     let cursor = params.cursor;
-    let cursor_state = if db.config_topology_epoch() != cursor.topology_epoch {
+    let cursor_state = if db.config_topology_epoch() != cursor.topology_epoch
+        || !apply.cursor_was_issued(cursor)
+    {
         // Replaced topology (failover/reconnect) — or a cursor this process
         // never minted. Either way liveness cannot be proven here.
         LiveApplyCursorState::Unverifiable
