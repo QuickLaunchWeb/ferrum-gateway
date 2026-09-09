@@ -169,6 +169,13 @@ const PROBE_ADMISSION_SITES: &[&str] = &[
 /// The one RAII type every admitting path must construct.
 const SHARED_PROBE_GUARD: &str = "HalfOpenProbeGuard::new(";
 
+/// UDP bypasses the shared admission helper, so check each direct-cache
+/// admission body independently (issue #4979).
+const UDP_PROBE_ADMISSION_SITES: &[&str] = &[
+    "async fn handle_dtls_client_inner(",
+    "async fn create_session(",
+];
+
 /// Files that must own a guard rather than re-deriving the release: the
 /// admission sites plus every module they hand the guard to.
 const PROBE_GUARD_HOLDERS: &[&str] = &[
@@ -178,6 +185,7 @@ const PROBE_GUARD_HOLDERS: &[&str] = &[
     "src/http3/websocket.rs",
     "src/proxy/hbone_proxy.rs",
     "src/proxy/mod.rs",
+    "src/proxy/udp_proxy.rs",
 ];
 
 /// Every settle path on the shared guard: `(label, signature, terminator)`.
@@ -224,6 +232,24 @@ fn every_circuit_breaker_admission_site_carries_a_probe_guard() {
             SHARED_PROBE_GUARD
         );
     }
+
+    let udp = source("src/proxy/udp_proxy.rs");
+    assert_eq!(
+        udp.matches("circuit_breaker_cache.can_execute(").count(),
+        UDP_PROBE_ADMISSION_SITES.len(),
+        "every UDP direct-cache admission must be listed and own a probe guard"
+    );
+    for &signature in UDP_PROBE_ADMISSION_SITES {
+        let body = item_body(&udp, signature, "\n}");
+        assert!(
+            body.contains("circuit_breaker_cache.can_execute("),
+            "{signature} must retain its direct-cache admission check"
+        );
+        assert!(
+            body.contains("HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe)"),
+            "{signature} must own the slot on the breaker returned by cache admission"
+        );
+    }
 }
 
 #[test]
@@ -238,6 +264,8 @@ fn no_dispatch_path_carries_a_bare_probe_flag_beside_the_guard() {
             "{file} must carry the shared `HalfOpenProbeGuard` as `cb_probe`"
         );
         for banned in [
+            "let mut cb_is_half_open_probe",
+            "let release_half_open_probe =",
             "ws_cb_probe_slot_available",
             "grpc_cb_probe_slot",
             "cb_retry_probe_slot_available",

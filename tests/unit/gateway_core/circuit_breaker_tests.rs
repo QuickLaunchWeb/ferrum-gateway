@@ -2660,6 +2660,48 @@ fn dropping_the_probe_guard_releases_the_slot_without_moving_breaker_health() {
 }
 
 #[test]
+fn dropping_the_udp_cache_probe_guard_releases_the_admitted_breaker_slot() {
+    let cache = CircuitBreakerCache::new();
+    let config = probe_slot_breaker_config();
+    let target = target_key("udp-backend.internal", 5353);
+
+    // Both UDP frontend paths admit through the cache, using a proxy-wide
+    // breaker for a direct backend and a target-scoped breaker for an upstream.
+    for target in [None, Some(target.as_str())] {
+        let cb = cache.get_or_create("default", "udp-proxy", target, &config);
+        cb.record_failure(502, true, false);
+        assert_eq!(cb.state_name(), "open");
+        let (admitted_cb, is_half_open_probe) = cache
+            .can_execute("default", "udp-proxy", target, &config)
+            .expect("timeout 0 admits the UDP setup probe");
+        assert!(Arc::ptr_eq(&cb, &admitted_cb));
+        assert!(is_half_open_probe);
+        let cb_probe = HalfOpenProbeGuard::for_admitted_probe(&admitted_cb, is_half_open_probe);
+        assert_eq!(cb.half_open_in_flight(), 1);
+        assert!(
+            cache
+                .can_execute("default", "udp-proxy", target, &config)
+                .is_err()
+        );
+
+        // DNS/connect cancellation or an early setup error records no outcome.
+        drop(cb_probe);
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(cb.state_name(), "half_open");
+
+        let (next_cb, is_half_open_probe) = cache
+            .can_execute("default", "udp-proxy", target, &config)
+            .expect("dropping UDP setup must allow the next probe");
+        assert!(Arc::ptr_eq(&cb, &next_cb));
+        assert!(is_half_open_probe);
+        let next_probe = HalfOpenProbeGuard::for_admitted_probe(&next_cb, is_half_open_probe);
+        next_cb.record_success(next_probe.take_slot());
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(cb.state_name(), "closed");
+    }
+}
+
+#[test]
 fn taking_the_probe_slot_disarms_the_guard_so_drop_cannot_release_it_twice() {
     let (cb, guard) = breaker_with_admitted_probe();
 
