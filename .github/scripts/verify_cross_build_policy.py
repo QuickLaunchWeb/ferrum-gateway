@@ -56,7 +56,6 @@ EXPECTED_PASSTHROUGH = (
     "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar",
 )
 EXPECTED_CARGO_BUILD = {
-    "rustc-wrapper": "sccache",
     "incremental": False,
 }
 EXPECTED_CARGO_TARGETS = {
@@ -67,12 +66,6 @@ EXPECTED_CARGO_TARGETS = {
     "aarch64-unknown-linux-gnu": {
         "linker": "clang",
         "rustflags": ["-C", "link-arg=-fuse-ld=mold"],
-    },
-    "aarch64-apple-darwin": {
-        "rustflags": ["-C", "link-arg=-fuse-ld=lld"],
-    },
-    "x86_64-apple-darwin": {
-        "rustflags": ["-C", "link-arg=-fuse-ld=lld"],
     },
 }
 
@@ -5146,8 +5139,7 @@ def validate_cargo_tool_configuration(parsed: Any) -> list[str]:
     errors.extend(exact_keys(build, set(EXPECTED_CARGO_BUILD), ".cargo config build"))
     if not errors and build != EXPECTED_CARGO_BUILD:
         errors.append(
-            ".cargo config build must retain the approved rustc-wrapper and "
-            "incremental values"
+            ".cargo config build must retain the approved incremental value"
         )
 
     targets = parsed["target"]
