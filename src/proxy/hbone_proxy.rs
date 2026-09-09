@@ -816,6 +816,17 @@ pub(super) async fn handle_hbone_request(
                 return build_response_from_normalized_reject(reject);
             }
         };
+    // GHSA-4cq4-3f3f-mq76: own the admitted HALF_OPEN probe slot with an RAII
+    // guard. Between here and the connect outcome below the relay awaits the
+    // client's upgrade handle and the backend dial, and a peer that vanishes in
+    // that window drops this future without running either settle site. Dropping
+    // the guard releases the slot NEUTRALLY instead of wedging the breaker.
+    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
+        state,
+        proxy,
+        cb_target_key.as_deref(),
+        cb_is_half_open_probe,
+    );
 
     let hbone_on_upgrade = match client_request_body {
         ClientRequestBody::Streaming(request) => {
@@ -941,7 +952,7 @@ pub(super) async fn handle_hbone_request(
                 settle_hbone_backend_connect_circuit_breaker_outcome(
                     &cb,
                     err.status,
-                    cb_is_half_open_probe,
+                    cb_probe.take_slot(),
                 );
             }
             ctx.metadata
@@ -977,7 +988,7 @@ pub(super) async fn handle_hbone_request(
             cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(cb_is_half_open_probe);
+        cb.record_success(cb_probe.take_slot());
     }
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
         && let Some(upstream) = LoadBalancerCache::get_upstream_from(

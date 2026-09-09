@@ -2139,7 +2139,7 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         .split("async fn finalize_upload_deadline_rejection(")
         .nth(1)
         .expect("shared upload-deadline rejection finalizer")
-        .split("fn release_circuit_breaker_probe_on_admission_reject")
+        .split("fn normalized_authorization_expired(")
         .next()
         .expect("bounded upload-deadline finalizer");
     assert!(helper.contains("build_finalized_upload_deadline_response("));
@@ -2198,8 +2198,7 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         .collect();
     assert_eq!(grpc_collect_deadline_branches.len(), 2);
     for branch in grpc_collect_deadline_branches {
-        assert!(branch.contains("grpc_probe_guard.disarm()"));
-        assert!(branch.contains("release_circuit_breaker_probe_on_admission_reject("));
+        assert!(branch.contains("cb_probe.release_neutral()"));
         assert!(branch.contains("preacquired_backend_admission.take_if_acquired()"));
     }
 }

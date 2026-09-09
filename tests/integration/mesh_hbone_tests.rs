@@ -2306,7 +2306,7 @@ fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
     let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         collapsed.contains(
-            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, err.status, cb_is_half_open_probe, );"
+            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, err.status, cb_probe.take_slot(), );"
         ),
         "connect_backend error arm must settle the same selected-target breaker"
     );

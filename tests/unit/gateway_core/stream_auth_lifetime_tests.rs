@@ -2785,8 +2785,7 @@ fn both_buffered_grpc_authorization_exits_release_their_admission_state() {
         .collect();
     assert_eq!(branches.len(), 2, "split and mixed buffered gRPC arms");
     for branch in branches {
-        assert!(branch.contains("grpc_probe_guard.disarm()"));
-        assert!(branch.contains("release_circuit_breaker_probe_on_admission_reject("));
+        assert!(branch.contains("cb_probe.release_neutral()"));
         assert!(branch.contains("preacquired_backend_admission.take_if_acquired()"));
         assert!(branch.contains("finalize_authorization_expired_rejection("));
         assert!(branch.contains("authorization_expired_buffered_grpc_upload"));

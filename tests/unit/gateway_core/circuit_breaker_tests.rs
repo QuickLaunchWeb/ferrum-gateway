@@ -5,7 +5,7 @@ use ferrum_edge::config::db_loader::IncrementalResult;
 use ferrum_edge::config::types::{
     CircuitBreakerConfig, GatewayConfig, LoadBalancerAlgorithm, UpstreamTarget,
 };
-use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::proxy::{ConfigApplyOutcome, HalfOpenProbeGuard, ProxyState};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2585,4 +2585,193 @@ fn ceiling_refusals_are_counted_and_a_scoped_prune_restores_admission() {
         "open",
         "a cached breaker accumulates failures and opens"
     );
+}
+
+// ===========================================================================
+// HALF_OPEN probe-slot ownership (GHSA-4cq4-3f3f-mq76)
+//
+// A request admitted as the breaker's single HALF_OPEN probe used to signal
+// ownership of that slot with a bare `bool` threaded through every explicit
+// `record_*` call site. None of those sites run when the client disconnects
+// mid-probe — the transport drops the whole service future — so the packed
+// state stayed `(HALF_OPEN, count = 1)`. There is no timer out of HALF_OPEN, so
+// from that moment the gateway shed every later request to the backend.
+//
+// `HalfOpenProbeGuard` owns the slot instead, and these pin its four settle
+// paths: an explicit outcome, a gateway-side NEUTRAL refusal, a rotated retry
+// target, and `Drop`.
+// ===========================================================================
+
+fn probe_slot_breaker_config() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        // Zero recovery delay: `can_execute` admits the HALF_OPEN probe on the
+        // very next call, with no sleep and no wall-clock dependency.
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    }
+}
+
+/// An OPEN breaker with exactly one HALF_OPEN probe admitted, plus the guard
+/// that owns that probe's slot.
+fn breaker_with_admitted_probe() -> (Arc<CircuitBreaker>, HalfOpenProbeGuard) {
+    let cb = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    let is_half_open_probe = cb.can_execute().expect("timeout 0 admits a probe");
+    assert!(is_half_open_probe, "the admission must claim the probe slot");
+    assert_eq!(cb.half_open_in_flight(), 1);
+    assert!(
+        cb.can_execute().is_err(),
+        "the single probe slot must be occupied"
+    );
+    let guard = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+    (cb, guard)
+}
+
+#[test]
+fn dropping_the_probe_guard_releases_the_slot_without_moving_breaker_health() {
+    let (cb, guard) = breaker_with_admitted_probe();
+
+    // The reported defect: the client disconnects mid-probe and the dispatch
+    // future is dropped without any `record_*` running.
+    drop(guard);
+
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "a dropped probe must return its slot"
+    );
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "a client disconnect is neither a backend success nor a backend failure"
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "the next probe must be admitted instead of the breaker wedging OPEN forever"
+    );
+}
+
+#[test]
+fn taking_the_probe_slot_disarms_the_guard_so_drop_cannot_release_it_twice() {
+    let (cb, guard) = breaker_with_admitted_probe();
+
+    assert!(guard.holds_slot());
+    assert!(guard.take_slot(), "the first take owns the slot");
+    assert!(!guard.holds_slot());
+    assert!(
+        !guard.take_slot(),
+        "a second take must not claim the same slot"
+    );
+
+    // The explicit outcome the taker recorded.
+    cb.record_success(true);
+    assert_eq!(cb.half_open_in_flight(), 0);
+    assert_eq!(cb.state_name(), "closed", "success_threshold 1 closes");
+
+    // Re-open and admit a fresh probe on a DIFFERENT logical request. Dropping
+    // the already-taken guard must not decrement this unrelated probe's slot.
+    cb.record_failure(500, false, false);
+    assert!(cb.can_execute().expect("second cycle admits a probe"));
+    assert_eq!(cb.half_open_in_flight(), 1);
+    drop(guard);
+    assert_eq!(
+        cb.half_open_in_flight(),
+        1,
+        "a disarmed guard must never release another probe's slot"
+    );
+}
+
+#[test]
+fn releasing_neutrally_returns_the_slot_exactly_once() {
+    let (cb, guard) = breaker_with_admitted_probe();
+
+    guard.release_neutral();
+    assert_eq!(cb.half_open_in_flight(), 0);
+    assert_eq!(cb.state_name(), "half_open");
+
+    // A second admission for a different request, then a redundant release and
+    // the drop: neither may touch the new probe's slot.
+    assert!(cb.can_execute().expect("next probe admitted"));
+    assert_eq!(cb.half_open_in_flight(), 1);
+    guard.release_neutral();
+    drop(guard);
+    assert_eq!(
+        cb.half_open_in_flight(),
+        1,
+        "release_neutral and Drop must both be no-ops once the slot is settled"
+    );
+}
+
+#[test]
+fn a_guard_for_a_closed_state_request_owns_nothing() {
+    let cb = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
+    let is_half_open_probe = cb.can_execute().expect("closed admits");
+    assert!(!is_half_open_probe);
+
+    let guard = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
+    assert!(!guard.holds_slot());
+    assert!(!guard.take_slot());
+    guard.release_neutral();
+    drop(guard);
+
+    // Trip and admit a real probe; the CLOSED-state guard above must not have
+    // left anything behind that could free it.
+    cb.record_failure(500, false, false);
+    assert!(cb.can_execute().expect("probe admitted"));
+    assert_eq!(cb.half_open_in_flight(), 1);
+}
+
+#[test]
+fn rearming_adopts_the_rotated_targets_slot_and_settles_the_previous_one() {
+    let (first, mut guard) = breaker_with_admitted_probe();
+    let (second, second_guard) = breaker_with_admitted_probe();
+    // The rotated target's slot is owned by the retry's own re-admission; this
+    // fixture guard for it must not also hold it.
+    second_guard.take_slot();
+
+    // A retry rotates onto `second` while `first`'s slot is still held. Rearm
+    // settles the abandoned slot NEUTRALLY rather than leaking it.
+    guard.rearm(&second, true);
+    assert_eq!(
+        first.half_open_in_flight(),
+        0,
+        "rotating away must return the previous target's slot"
+    );
+    assert_eq!(
+        first.state_name(),
+        "half_open",
+        "the rotation itself is health-neutral for the previous target"
+    );
+    assert!(guard.holds_slot());
+
+    drop(guard);
+    assert_eq!(
+        second.half_open_in_flight(),
+        0,
+        "the rearmed guard must release the rotated target's slot"
+    );
+    assert_eq!(second.state_name(), "half_open");
+}
+
+#[test]
+fn rearming_onto_a_closed_state_retry_leaves_the_guard_empty() {
+    let (first, mut guard) = breaker_with_admitted_probe();
+    let healthy = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
+
+    guard.rearm(&healthy, false);
+    assert_eq!(first.half_open_in_flight(), 0);
+    assert!(!guard.holds_slot());
+
+    drop(guard);
+    assert_eq!(
+        healthy.half_open_in_flight(),
+        0,
+        "a CLOSED-state re-admission owns no probe slot to release"
+    );
+    assert_eq!(healthy.state_name(), "closed");
 }

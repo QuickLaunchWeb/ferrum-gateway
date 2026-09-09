@@ -165,7 +165,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     );
     assert_eq!(
         mesh_collection
-            .matches("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+            .matches("cb_probe.release_neutral(")
             .count(),
         3,
         "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch"
@@ -179,7 +179,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .next()
         .expect("bounded mesh collection Ok(None) branch");
     let oversize_release = oversize
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("Ok(None) must release HALF_OPEN probe");
     let oversize_write = oversize
         .find("write_plain_gateway_error(")
@@ -206,7 +206,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         "the mesh force-buffer must bind the captured winner rather than a unit variant"
     );
     let deadline_release = deadline_compact
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("DeadlineExceeded must release HALF_OPEN probe");
     let auth_record = deadline_compact
         .find("record_authorization_termination_once(")
@@ -246,7 +246,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .next()
         .expect("bounded mesh collection TimedOut/Read branch");
     let timeout_release = timeout
-        .find("release_cross_protocol_circuit_breaker_probe_on_admission_reject(")
+        .find("cb_probe.release_neutral()")
         .expect("TimedOut/Read must release HALF_OPEN probe");
     let timeout_write = timeout
         .find("write_plain_gateway_error(")

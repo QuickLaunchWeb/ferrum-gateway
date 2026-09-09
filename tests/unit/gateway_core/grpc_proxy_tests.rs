@@ -3598,16 +3598,13 @@ fn standard_grpc_frontend_materializes_the_transport_before_dispatch() {
     );
 
     // The fail-closed arm answers UNAVAILABLE and releases the half-open probe
-    // slot instead of letting the armed guard double-release it.
+    // slot. `release_neutral` takes the slot from the RAII guard, so the guard's
+    // `Drop` cannot double-release it.
     let tail = &proxy_src[resolve_at..first_dispatch_at];
     assert!(
-        tail.contains("grpc_probe_guard.disarm();"),
-        "the transport refusal must disarm the RAII probe guard before its \
-         explicit release, mirroring the sibling egress-policy reject"
-    );
-    assert!(
-        tail.contains("release_circuit_breaker_probe_on_admission_reject("),
-        "the transport refusal must release a HALF_OPEN probe slot it consumed"
+        tail.contains("cb_probe.release_neutral();"),
+        "the transport refusal must release a HALF_OPEN probe slot it consumed, \
+         through the shared RAII guard so the release happens exactly once"
     );
 }
 

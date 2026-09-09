@@ -103,66 +103,62 @@ fn item_body<'a>(text: &'a str, signature: &str, terminator: &str) -> &'a str {
 // ---------------------------------------------------------------------------
 // (a) Circuit-breaker HALF_OPEN probe-slot release
 //
-// GHSA-4cq4-3f3f-mq76: a request admitted as a HALF_OPEN probe that is then
-// refused by the gateway must still release its probe slot, or the breaker
-// wedges. Every protocol path that can admit a probe carries the invariant.
+// GHSA-4cq4-3f3f-mq76: a request admitted as a HALF_OPEN probe must release its
+// probe slot on EVERY exit — a gateway-side refusal, a recorded backend outcome,
+// and (the reported defect) a dropped future when the client disconnects. The
+// slot is otherwise held forever: the state machine has no timer out of
+// HALF_OPEN, so one abandoned probe sheds every later request to that backend
+// for the rest of the process lifetime.
+//
+// The invariant is now carried by ONE RAII type, `HalfOpenProbeGuard`, rather
+// than a bare `bool` threaded through each path's `record_*` call sites. Every
+// protocol path that admits a probe owns a guard.
 // ---------------------------------------------------------------------------
 
 /// Files that call the shared circuit-breaker admission. Adding a protocol path
-/// here without a probe-release mechanism is exactly the #4792 shape.
+/// here without a probe guard is exactly the #4792 shape.
 const PROBE_ADMISSION_SITES: &[&str] = &[
     "src/http3/server.rs",
     "src/proxy/hbone_proxy.rs",
     "src/proxy/mod.rs",
 ];
 
-/// The delegating entry point every non-owning protocol path must call.
-const SHARED_PROBE_RELEASE: &str =
-    "crate::proxy::release_circuit_breaker_probe_on_admission_reject(";
+/// The one RAII type every admitting path must construct.
+const SHARED_PROBE_GUARD: &str = "HalfOpenProbeGuard::new(";
 
-/// Every named release mechanism: `(label, file, signature, terminator, marker)`.
-/// The marker is either the NEUTRAL release itself, for the paths that own an
-/// implementation, or the delegation to it.
-const PROBE_RELEASE_MECHANISMS: &[(&str, &str, &str, &str, &str)] = &[
+/// Files that must own a guard rather than re-deriving the release: the
+/// admission sites plus every module they hand the guard to.
+const PROBE_GUARD_HOLDERS: &[&str] = &[
+    "src/http3/connect_udp.rs",
+    "src/http3/cross_protocol.rs",
+    "src/http3/server.rs",
+    "src/http3/websocket.rs",
+    "src/proxy/hbone_proxy.rs",
+    "src/proxy/mod.rs",
+];
+
+/// Every settle path on the shared guard: `(label, signature, terminator)`.
+/// Each must reach the NEUTRAL release or explicitly hand the slot over.
+const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str)] = &[
     (
-        "H1/H2/WebSocket/gRPC handler (shared implementation)",
-        "src/proxy/mod.rs",
-        "pub(crate) fn release_circuit_breaker_probe_on_admission_reject(",
-        "\n}\n",
-        "record_neutral(",
+        "explicit gateway-side refusal",
+        "    pub(crate) fn release_neutral(&self) {",
+        "\n    }\n",
     ),
     (
-        "gRPC dispatch RAII guard",
-        "src/proxy/mod.rs",
-        "impl Drop for GrpcProbeReleaseGuard {",
+        "dropped future (client disconnect)",
+        "impl Drop for HalfOpenProbeGuard {",
         "\n}\n",
-        "record_neutral(",
     ),
     (
-        "HTTP/3 request path",
-        "src/http3/server.rs",
-        "fn release_h3_circuit_breaker_probe_on_admission_reject(",
+        "gRPC streaming recorder handoff",
+        "impl Drop for GrpcStreamingProbeRecorder {",
         "\n}\n",
-        SHARED_PROBE_RELEASE,
-    ),
-    (
-        "HTTP/3 WebSocket path",
-        "src/http3/websocket.rs",
-        "pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(",
-        "\n}\n",
-        SHARED_PROBE_RELEASE,
-    ),
-    (
-        "HBONE CONNECT relay",
-        "src/proxy/hbone_proxy.rs",
-        "pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(",
-        "\n}\n",
-        "record_neutral(",
     ),
 ];
 
 #[test]
-fn every_circuit_breaker_admission_site_carries_a_probe_release_mechanism() {
+fn every_circuit_breaker_admission_site_carries_a_probe_guard() {
     let admitting: BTreeSet<String> = production_sources()
         .into_iter()
         .filter(|(_, text)| text.contains("backend_dispatch::check_circuit_breaker("))
@@ -174,62 +170,80 @@ fn every_circuit_breaker_admission_site_carries_a_probe_release_mechanism() {
         .collect();
     assert_eq!(
         admitting, expected,
-        "a new protocol path admits HALF_OPEN circuit-breaker probes; give it a probe-release \
-         mechanism and add it to PROBE_RELEASE_MECHANISMS before listing it here"
+        "a new protocol path admits HALF_OPEN circuit-breaker probes; give it a \
+         `HalfOpenProbeGuard` and add it to PROBE_GUARD_HOLDERS before listing it here"
     );
 
-    let defining: BTreeSet<&str> = PROBE_RELEASE_MECHANISMS
-        .iter()
-        .map(|(_, file, _, _, _)| *file)
-        .collect();
     for &site in PROBE_ADMISSION_SITES {
         assert!(
-            defining.contains(site),
-            "{site} admits HALF_OPEN probes but defines no probe-release mechanism"
+            source(site).contains(SHARED_PROBE_GUARD),
+            "{site} admits HALF_OPEN probes but constructs no `{}`",
+            SHARED_PROBE_GUARD
         );
     }
 }
 
 #[test]
-fn every_probe_release_mechanism_settles_through_the_shared_neutral_release() {
-    for &(label, file, signature, terminator, marker) in PROBE_RELEASE_MECHANISMS {
+fn no_dispatch_path_carries_a_bare_probe_flag_beside_the_guard() {
+    // #4792 root cause 1: the same rule re-implemented per protocol path. The
+    // bare `bool` plumbing is what let a dropped future skip every release, so
+    // no holder may reintroduce a local copy of it.
+    for &file in PROBE_GUARD_HOLDERS {
         let text = source(file);
+        assert!(
+            text.contains("cb_probe"),
+            "{file} must carry the shared `HalfOpenProbeGuard` as `cb_probe`"
+        );
+        for banned in [
+            "ws_cb_probe_slot_available",
+            "grpc_cb_probe_slot",
+            "cb_retry_probe_slot_available",
+        ] {
+            assert!(
+                !text.contains(banned),
+                "{file} reintroduced the bare probe flag `{banned}`; thread the shared \
+                 `HalfOpenProbeGuard` instead so a dropped future still releases the slot"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_probe_guard_settle_path_releases_neutrally() {
+    let text = source("src/proxy/mod.rs");
+    for &(label, signature, terminator) in PROBE_GUARD_SETTLE_PATHS {
         let body = item_body(&text, signature, terminator);
         assert!(
-            body.contains(marker),
-            "{label} ({file}) must settle the probe slot through the shared NEUTRAL release \
-             (`{marker}`): a gateway-side refusal is neither a backend success nor a backend \
+            body.contains("record_neutral("),
+            "the {label} settle path must return the probe slot through the NEUTRAL \
+             release: a client disconnect is neither a backend success nor a backend \
              failure, and leaving the slot held wedges the breaker"
         );
     }
 }
 
 #[test]
-fn the_two_http3_probe_releases_delegate_to_the_shared_implementation() {
-    // #4792 root cause 1: the same rule implemented independently per protocol
-    // path. These two were byte-identical copies of the H1/H2 helper; they now
-    // delegate, so a change to the release semantics cannot reach one path only.
-    for (file, signature) in [
-        (
-            "src/http3/server.rs",
-            "fn release_h3_circuit_breaker_probe_on_admission_reject(",
-        ),
-        (
-            "src/http3/websocket.rs",
-            "pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(",
-        ),
-    ] {
-        let text = source(file);
-        let body = item_body(&text, signature, "\n}\n");
-        assert!(
-            body.contains(SHARED_PROBE_RELEASE),
-            "{file} must delegate to the shared probe release rather than re-implement it"
-        );
-        assert!(
-            !body.contains("circuit_breaker_cache.get_or_create("),
-            "{file} must not carry its own copy of the breaker lookup"
-        );
-    }
+fn taking_the_probe_slot_is_what_disarms_the_guard() {
+    // The exactly-once property the whole design rests on: every explicit
+    // `record_*` argument comes from `take_slot`, which atomically clears the
+    // armed flag, so no path can release the same slot twice (a double release
+    // decrements a DIFFERENT probe's slot and over-admits).
+    let text = source("src/proxy/mod.rs");
+    let take = item_body(
+        &text,
+        "    pub(crate) fn take_slot(&self) -> bool {",
+        "\n    }\n",
+    );
+    assert!(
+        take.contains("self.armed.swap(false"),
+        "`take_slot` must atomically clear the armed flag as it hands the slot over"
+    );
+    let drop_body = item_body(&text, "impl Drop for HalfOpenProbeGuard {", "\n}\n");
+    assert!(
+        drop_body.contains("self.armed.swap(false"),
+        "the guard's `Drop` must claim the slot with the same atomic swap so it \
+         cannot race an explicit release"
+    );
 }
 
 fn probe_breaker_config() -> CircuitBreakerConfig {

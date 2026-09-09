@@ -5654,6 +5654,19 @@ async fn handle_h3_request(
                 return Ok(());
             }
         };
+    // GHSA-4cq4-3f3f-mq76: own the admitted HALF_OPEN probe slot with an RAII
+    // guard instead of threading a bare `bool` through every explicit `record_*`
+    // site. H3's per-stream task is detached, so a client reset does not cancel
+    // it the way a dropped hyper service future cancels H1/H2 — but an early
+    // `?` return from a failed client write reaches none of those sites either,
+    // and the leaked slot wedges the breaker just the same. Dropping `cb_probe`
+    // releases the slot NEUTRALLY on every such path.
+    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
+        &state,
+        &proxy,
+        cb_target_key.as_deref(),
+        cb_is_half_open_probe,
+    );
 
     // Preserve fail-fast breaker behavior for ordinary request-body plugins:
     // only drain/transform their H3 body after the selected target's breaker
@@ -5705,8 +5718,7 @@ async fn handle_h3_request(
                 &state,
                 start_time,
                 plugin_execution_ns,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
+                &cb_probe,
             )
             .await?
             {
@@ -5731,12 +5743,7 @@ async fn handle_h3_request(
             {
                 Ok(Some(body_data)) => body_data,
                 Ok(None) => {
-                    release_h3_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
-                    );
+                    cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
                     let metric_status = h3_reject_log_status_and_metadata(
                         &mut ctx,
@@ -5761,24 +5768,14 @@ async fn handle_h3_request(
                 }
                 Err(H3RequestBodyReadError::Read(error)) => {
                     halt_cancelled_h3_upload(&mut stream);
-                    release_h3_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
-                    );
+                    cb_probe.release_neutral();
                     return Err(error.into());
                 }
                 // The winner was captured where BOTH instants were known, so a
                 // late wake cannot reattribute a strictly earlier client RPC
                 // deadline to the gateway's security decision.
                 Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
-                    release_h3_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
-                    );
+                    cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
                     finalize_h3_upload_deadline_rejection(
                         &mut stream,
@@ -5797,12 +5794,7 @@ async fn handle_h3_request(
                 }
                 Err(timeout) => {
                     let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
-                    release_h3_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
-                    );
+                    cb_probe.release_neutral();
                     // Admission capacity is no longer protecting backend work;
                     // release it before an awaited client write can stall.
                     drop(preacquired_backend_admission.take_if_acquired());
@@ -5869,12 +5861,7 @@ async fn handle_h3_request(
                 request_body_prepared = true;
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                release_h3_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                     run_h3_reject_response_committed_hooks(
                         &plugins,
@@ -6047,12 +6034,7 @@ async fn handle_h3_request(
     ) {
         Ok(url) => url,
         Err(_) => {
-            crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             record_request(
                 &state,
                 if matches!(http_flavor, HttpFlavor::Grpc) {
@@ -6114,12 +6096,7 @@ async fn handle_h3_request(
         );
         // Release any HALF_OPEN probe slot the circuit-breaker check above
         // admitted so the breaker doesn't wedge (mirrors the WS-origin reject).
-        crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         // `send_h3_error_flavor_aware` emits a gRPC error as HTTP 200 + trailers
         // (gRPC errors ride 200), so the recorded request status must match the
         // wire — 200 for gRPC, 502 otherwise — to agree with the H1/H2 gRPC
@@ -6210,7 +6187,7 @@ async fn handle_h3_request(
             502,
             false,
             Some(crate::retry::ErrorClass::DispatchPolicyRejected),
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -6323,8 +6300,7 @@ async fn handle_h3_request(
                 start_time,
                 request_path: original_request_path.clone(),
                 proxy_headers,
-                cb_target_key,
-                cb_is_half_open_probe,
+                cb_probe,
                 route_overrides_applied,
             },
         )
@@ -6365,12 +6341,7 @@ async fn handle_h3_request(
                 record_request(&state, 403);
                 // Gateway-side reject after the CB check above — release a
                 // claimed HALF_OPEN probe slot so the breaker doesn't wedge.
-                crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 crate::http3::websocket::send_h3_error_body(
                     &mut stream,
                     StatusCode::FORBIDDEN,
@@ -6417,7 +6388,7 @@ async fn handle_h3_request(
             sticky_cookie_needed,
             start_time,
             cb_target_key,
-            cb_is_half_open_probe,
+            cb_probe,
             backend_url,
             effective_query_string.to_string(),
             proxy_headers,
@@ -6452,7 +6423,7 @@ async fn handle_h3_request(
             upstream_target.as_deref(),
             upstream_balancer.as_ref(),
             cb_target_key.as_deref(),
-            cb_is_half_open_probe,
+            &cb_probe,
             &grpc_client_ip,
             socket_ip,
             backend_resolved_ip.as_deref(),
@@ -6494,7 +6465,7 @@ async fn handle_h3_request(
                 upstream_target.as_deref(),
                 upstream_balancer.as_ref(),
                 cb_target_key.as_deref(),
-                cb_is_half_open_probe,
+                &cb_probe,
                 &client_ip_owned,
                 socket_ip,
                 backend_start,
@@ -6541,7 +6512,7 @@ async fn handle_h3_request(
                                 413,
                                 false,
                                 Some(crate::retry::ErrorClass::ClientDisconnect),
-                                cb_is_half_open_probe,
+                                cb_probe.take_slot(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -6572,7 +6543,7 @@ async fn handle_h3_request(
                                 0,
                                 false,
                                 Some(crate::retry::ErrorClass::ClientDisconnect),
-                                cb_is_half_open_probe,
+                                cb_probe.take_slot(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -6592,7 +6563,7 @@ async fn handle_h3_request(
                                 StatusCode::REQUEST_TIMEOUT.as_u16(),
                                 false,
                                 Some(crate::retry::ErrorClass::ClientDisconnect),
-                                cb_is_half_open_probe,
+                                cb_probe.take_slot(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -6624,7 +6595,7 @@ async fn handle_h3_request(
                                 StatusCode::REQUEST_TIMEOUT.as_u16(),
                                 false,
                                 Some(crate::retry::ErrorClass::ClientDisconnect),
-                                cb_is_half_open_probe,
+                                cb_probe.take_slot(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -6688,7 +6659,7 @@ async fn handle_h3_request(
                 upstream_target: upstream_target.as_deref(),
                 upstream_balancer: upstream_balancer.as_ref(),
                 cb_target_key: cb_target_key.as_deref(),
-                cb_is_half_open_probe,
+                cb_probe: &cb_probe,
                 flavor: backend_http_flavor,
                 prebuffered_body: prebuffered,
                 request_body_prepared,
@@ -6834,8 +6805,7 @@ async fn handle_h3_request(
             &state,
             start_time,
             plugin_execution_ns,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
+            &cb_probe,
         )
         .await?
         {
@@ -6973,7 +6943,7 @@ async fn handle_h3_request(
                         413,
                         false,
                         Some(crate::retry::ErrorClass::ClientDisconnect),
-                        cb_is_half_open_probe,
+                        cb_probe.take_slot(),
                         false,
                         backend_start.elapsed(),
                     );
@@ -7046,7 +7016,7 @@ async fn handle_h3_request(
                     reject_status_code,
                     outcome_connection_error,
                     outcome_error_class,
-                    cb_is_half_open_probe,
+                    cb_probe.take_slot(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -7169,7 +7139,7 @@ async fn handle_h3_request(
                 response_status,
                 false,
                 None,
-                cb_is_half_open_probe,
+                cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
@@ -7260,7 +7230,7 @@ async fn handle_h3_request(
                 response_status,
                 false,
                 None,
-                cb_is_half_open_probe,
+                cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
@@ -7983,7 +7953,7 @@ async fn handle_h3_request(
             response_status,
             body_outcome_connection_error,
             body_outcome_error_class,
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -8098,12 +8068,7 @@ async fn handle_h3_request(
         {
             Ok(Some(body_data)) => body_data,
             Ok(None) => {
-                release_h3_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 let metric_status = h3_reject_log_status_and_metadata(
                     &mut ctx,
                     http_flavor,
@@ -8127,24 +8092,14 @@ async fn handle_h3_request(
             }
             Err(H3RequestBodyReadError::Read(error)) => {
                 halt_cancelled_h3_upload(&mut stream);
-                release_h3_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 return Err(error.into());
             }
             // The winner was captured where BOTH instants were known, so a late
             // wake cannot reattribute a strictly earlier client RPC deadline to
             // the gateway's security decision.
             Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
-                release_h3_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 finalize_h3_upload_deadline_rejection(
                     &mut stream,
                     &state,
@@ -8162,12 +8117,7 @@ async fn handle_h3_request(
             }
             Err(timeout) => {
                 let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
-                release_h3_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
+                cb_probe.release_neutral();
                 record_request(
                     &state,
                     if matches!(http_flavor, HttpFlavor::Grpc) {
@@ -8268,12 +8218,7 @@ async fn handle_h3_request(
             // reset), matching run_h3_backend_admission_or_send_reject. Placed
             // before the destructure so it also covers the 500 conversion-failure
             // fallback below.
-            release_h3_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                 tracing::error!("Plugin result could not be converted to rejection parts");
                 record_request(&state, 500);
@@ -8374,8 +8319,7 @@ async fn handle_h3_request(
                 &state,
                 start_time,
                 plugin_execution_ns,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
+                &cb_probe,
             )
             .await?
             {
@@ -8602,7 +8546,7 @@ async fn handle_h3_request(
             backend_status,
             connection_error,
             backend_outcome_error_class,
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -8710,7 +8654,6 @@ async fn handle_h3_request(
         // correctly reports `false` (no commitment) — that mismatch
         // would suppress `retry_on_connect_failure` and mis-account a
         // pre-wire failure as a 502 status fault on CB / passive health.
-        let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
         // Set when the retry loop breaks on the egress screen for a ROTATED
         // candidate that was never dialed. `final_target` still points at that
         // candidate for outcome/logging attribution, but nothing served this
@@ -8898,16 +8841,19 @@ async fn handle_h3_request(
                     // rather than opening it on a healthy destination. Mirrors
                     // `apply_circuit_breaker_outcome` and the raw-TCP over-cap
                     // path.
+                    // Take the probe slot for this intermediate record: the
+                    // post-loop record must not decrement it again, and an early
+                    // return during the backoff must not release a second slot.
+                    let retry_probe_slot = cb_probe.take_slot();
                     if client_side_no_backend_signal(result.error_class) {
-                        cb.record_neutral(cb_retry_probe_slot_available);
+                        cb.record_neutral(retry_probe_slot);
                     } else {
                         cb.record_failure(
                             result.status,
                             h3_connection_error(result.request_on_wire, result.error_class),
-                            cb_retry_probe_slot_available,
+                            retry_probe_slot,
                         );
                     }
-                    cb_retry_probe_slot_available = false;
                 }
 
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -9018,8 +8964,7 @@ async fn handle_h3_request(
                     &state,
                     start_time,
                     plugin_execution_ns,
-                    current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
+                    &cb_probe,
                 )
                 .await?
                 {
@@ -9180,7 +9125,7 @@ async fn handle_h3_request(
             response_status,
             !h3_request_on_wire,
             h3_error_class,
-            cb_retry_probe_slot_available,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -9995,8 +9940,7 @@ async fn run_h3_backend_admission_or_send_reject(
     state: &ProxyState,
     start_time: std::time::Instant,
     plugin_execution_ns: u64,
-    cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
 ) -> Result<Result<Option<BackendAdmissionPermitSet>, ()>, anyhow::Error> {
     match crate::proxy::backend_dispatch::run_backend_admission_plugins(
         state,
@@ -10014,12 +9958,7 @@ async fn run_h3_backend_admission_or_send_reject(
             // the H3 client resets mid-write this returns early. The caller frees
             // the probe only on the `Ok(Err(()))` arm, so releasing here guarantees
             // the slot is freed even when the reject write fails.
-            release_h3_circuit_breaker_probe_on_admission_reject(
-                state,
-                proxy,
-                cb_target_key,
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             let mut headers = rejection.headers;
             crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
                 plugins,
@@ -10099,25 +10038,6 @@ async fn run_h3_backend_admission_or_send_reject(
             Ok(Err(()))
         }
     }
-}
-
-/// H3 entry point for the shared HALF_OPEN probe release (issue #4792).
-///
-/// Delegates to [`crate::proxy::release_circuit_breaker_probe_on_admission_reject`]
-/// so the H1/H2/WebSocket/gRPC handler, this path, and the H3 WebSocket path
-/// cannot drift into three separately-maintained copies of one invariant.
-fn release_h3_circuit_breaker_probe_on_admission_reject(
-    state: &ProxyState,
-    proxy: &Proxy,
-    target_key: Option<&str>,
-    is_half_open_probe: bool,
-) {
-    crate::proxy::release_circuit_breaker_probe_on_admission_reject(
-        state,
-        proxy,
-        target_key,
-        is_half_open_probe,
-    );
 }
 
 fn record_h3_backend_admission_outcome(
@@ -12409,7 +12329,7 @@ struct H3GrpcDispatchEnv<'a> {
     upstream_target: Option<&'a UpstreamTarget>,
     upstream_balancer: Option<&'a Arc<crate::load_balancer::LoadBalancer>>,
     cb_target_key: Option<&'a str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
     plugins: &'a [Arc<dyn Plugin>],
     initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
     method: &'a str,
@@ -12680,7 +12600,7 @@ async fn record_failed_h3_grpc_dispatch(
         upstream_target,
         upstream_balancer,
         cb_target_key,
-        cb_is_half_open_probe,
+        cb_probe,
         plugins,
         method,
         original_request_path,
@@ -12710,7 +12630,7 @@ async fn record_failed_h3_grpc_dispatch(
         health_status,
         outcome_connection_error,
         outcome_error_class,
-        cb_is_half_open_probe,
+        cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
@@ -12858,7 +12778,7 @@ async fn dispatch_grpc_native_h3(
     upstream_target: Option<&UpstreamTarget>,
     upstream_balancer: Option<&Arc<crate::load_balancer::LoadBalancer>>,
     cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     client_ip: &str,
     xff_append_ip: &str,
     backend_resolved_ip: Option<&str>,
@@ -12907,8 +12827,7 @@ async fn dispatch_grpc_native_h3(
         state,
         start_time,
         *plugin_execution_ns,
-        cb_target_key,
-        cb_is_half_open_probe,
+        &cb_probe,
     )
     .await?
     {
@@ -13040,7 +12959,7 @@ async fn dispatch_grpc_native_h3(
         upstream_target,
         upstream_balancer,
         cb_target_key,
-        cb_is_half_open_probe,
+        &cb_probe,
         plugins,
         initial_response_header_policy_plugins,
         method,
@@ -13425,7 +13344,7 @@ async fn dispatch_grpc_native_h3(
                 response_status,
                 false,
                 None,
-                cb_is_half_open_probe,
+                cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
@@ -13521,7 +13440,7 @@ async fn dispatch_grpc_native_h3(
             response_status,
             false,
             Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -13633,7 +13552,7 @@ async fn dispatch_grpc_native_h3(
             response_status,
             false,
             None,
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -13875,7 +13794,7 @@ async fn dispatch_grpc_native_h3(
             response_status,
             false,
             health_error_class,
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -14990,7 +14909,7 @@ async fn dispatch_grpc_native_h3(
         response_status,
         body_outcome_connection_error,
         body_outcome_error_class,
-        cb_is_half_open_probe,
+        cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
