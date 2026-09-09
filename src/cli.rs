@@ -1405,8 +1405,11 @@ fn health_request_tls(
             .set_certificate_verifier(Arc::new(NoVerifier));
     }
 
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| format!("Invalid server name '{}': {}", host, e))?;
+    let server_name = match host.parse::<std::net::IpAddr>() {
+        Ok(address) => rustls::pki_types::ServerName::IpAddress(address.into()),
+        Err(_) => rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| format!("Invalid server name '{}': {}", host, e))?,
+    };
 
     let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name).map_err(|e| {
         format!(
