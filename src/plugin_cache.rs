@@ -1960,6 +1960,9 @@ impl Plugin for PluginInstanceWrapper {
     fn is_auth_plugin(&self) -> bool {
         self.inner.is_auth_plugin()
     }
+    fn has_execution_trigger(&self) -> bool {
+        self.trigger.is_some() || self.inner.has_execution_trigger()
+    }
     fn authentication_applies(&self, ctx: &RequestContext) -> bool {
         self.runs_cached(ctx) && self.inner.authentication_applies(ctx)
     }
@@ -5091,7 +5094,22 @@ fn build_protocol_snapshot(
     for (proxy_id, plugins) in proxy_map {
         let mut inner = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
         for &proto in &ALL_PROXY_PROTOCOLS {
-            inner.insert(proto, build_protocol_entry(plugins, proto));
+            let entry = build_protocol_entry(plugins, proto);
+            if !entry.phase.auth_plugins.is_empty()
+                && entry
+                    .phase
+                    .auth_plugins
+                    .iter()
+                    .all(|plugin| plugin.has_execution_trigger())
+            {
+                warn!(
+                    proxy_id = %proxy_id,
+                    protocol = ?proto,
+                    "Every authentication instance is trigger-gated; requests matching no \
+                     authentication trigger are unauthenticated"
+                );
+            }
+            inner.insert(proto, entry);
         }
         proxy.insert(proxy_id.clone(), inner);
         grpc_web_proxy.insert(proxy_id.clone(), build_grpc_web_protocol_entry(plugins));

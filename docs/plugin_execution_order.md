@@ -1260,6 +1260,18 @@ Available `match` predicates:
 (list, OR), or `regex` (implicitly anchored `^(?:…)$`), plus optional
 `case_insensitive`.
 
+Path `exact` and `prefix` values must start with `/` and already be canonical:
+percent escapes, backslashes, and literal `.` or `..` segments are rejected at
+admission. Dots within a segment remain valid. Path regexes also reject percent
+escapes, but retain regex syntax such as `^/v1\.0/.*`. Host matchers containing
+uppercase ASCII require `case_insensitive: true`, including regex patterns;
+configuration is rejected rather than silently lowercased.
+
+At startup and cache rebuild, a warning identifies each proxy/protocol whose
+effective authentication instances are all trigger-gated. Requests matching none
+of those triggers remain unauthenticated; include an unconditional authentication
+instance when every request must authenticate.
+
 ### Deterministic semantics
 
 * **Absent input never matches a positive predicate.** A header that is not

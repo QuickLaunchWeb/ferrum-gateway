@@ -10456,12 +10456,15 @@ components:
         path:
           description: >-
             Canonical policy path (the same value every security decision uses),
-            never the raw request target.
+            never the raw request target. Exact/prefix values must start with
+            / and be canonical: no percent escapes, backslashes, or literal dot
+            segments. Regex patterns reject percent escapes but retain regex syntax.
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         host:
           description: >-
             Request authority host, ASCII-lowercased with the trailing DNS dot
-            and any port removed.
+            and any port removed. Uppercase ASCII in exact/prefix values or regex
+            patterns requires case_insensitive: true; otherwise admission rejects it.
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         sni:
           description: >-

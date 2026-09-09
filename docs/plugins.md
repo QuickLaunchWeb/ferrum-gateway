@@ -180,6 +180,13 @@ Every `PluginConfig` also accepts an optional `trigger` block that decides
 whether that one instance executes for a given request or stream connection.
 An absent `trigger` preserves today's behavior exactly.
 
+Path `exact`/`prefix` trigger values must start with `/` and already be canonical
+(no percent escapes, backslashes, or dot segments). Path regexes reject percent
+escapes while preserving regex syntax. Uppercase ASCII in any host matcher
+requires `case_insensitive: true`. Invalid spellings are refused at admission.
+Startup and cache rebuild warn when all effective authentication instances for
+a proxy/protocol are trigger-gated: requests matching none remain unauthenticated.
+
 ```yaml
 plugin_configs:
   - id: mark-external-only
