@@ -19,6 +19,7 @@ pub(crate) use ocsp_validation_tests::signed_ocsp_response_fixture;
 mod pem_bundle_redaction_tests;
 #[cfg(feature = "pkcs11")]
 mod pkcs11_key_encoding_tests;
+mod pkcs11_module_policy_tests;
 #[cfg(feature = "pkcs11")]
 mod pkcs11_softhsm_tests;
 mod renewal_lease_tests;

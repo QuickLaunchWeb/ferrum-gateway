@@ -707,9 +707,8 @@ Query: `epoch`, `sequence` (both required u64s), optional `wait_ms`
   also returns `pending`; retry harmlessly with the same cursor.
 - `rejected` — a completed poll attempted a covering sequence and the runtime
   rejected the candidate. Fail-closed: durable but not live.
-- `unverifiable` — the cursor's topology was replaced
-  (failover/reconnect/restart) or was never issued by this process; observe
-  config directly instead.
+- `unverifiable` — the cursor was not issued by this process or its topology
+  was replaced (failover/reconnect/restart); observe config directly instead.
 
 With `wait_ms`, the probe registers as a live-apply waiter and inherits the
 immediate poll nudge. The bulk recipe: POST every chunk with `apply=async`,
@@ -1343,6 +1342,11 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/cluster
 ### CP Mode Response
 
 Returns all currently connected Data Plane nodes and Mesh nodes. Each registry is independent: a node that subscribes to both `ConfigSync.Subscribe` (DP) and `MeshConfigSync.MeshSubscribe` (mesh) appears in both arrays with separate `connected_at` timestamps.
+
+Both subscription services require the request's trimmed `node_id` to equal the
+authenticated bearer JWT's `sub`. A mismatched identity is rejected before
+registration and cannot replace another node's `GET /cluster` entry. Built-in
+DP token minting uses the node ID as `sub`; external issuers must do the same.
 
 ```json
 {
