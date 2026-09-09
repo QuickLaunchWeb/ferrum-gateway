@@ -331,7 +331,12 @@ fn the_expiry_boundary_refuses_renewal_and_commit_before_takeover() {
 
     clock.advance(Duration::from_millis(399));
     assert!(instance_a.is_owner(&name, lease.fence()).expect("live"));
-    assert!(instance_b.try_acquire(&name, ttl).expect("B denied").is_none());
+    assert!(
+        instance_b
+            .try_acquire(&name, ttl)
+            .expect("B denied")
+            .is_none()
+    );
 
     clock.advance(Duration::from_millis(1));
     assert_eq!(clock.now(), before.expires_at);
@@ -342,8 +347,14 @@ fn the_expiry_boundary_refuses_renewal_and_commit_before_takeover() {
         .commit_fenced(&name, lease.fence(), || published = true)
         .expect("expired commit is answered");
     assert_eq!(outcome, FencedCommit::NotOwner);
-    assert!(!published, "an expired claim must not publish before takeover");
-    assert_eq!(instance_a.peek(&name).expect("read").expect("present"), before);
+    assert!(
+        !published,
+        "an expired claim must not publish before takeover"
+    );
+    assert_eq!(
+        instance_a.peek(&name).expect("read").expect("present"),
+        before
+    );
 
     let successor = instance_b
         .try_acquire(&name, ttl)
