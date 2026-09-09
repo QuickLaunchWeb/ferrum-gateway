@@ -196,7 +196,8 @@ impl TcpConnectionThrottle {
     }
 
     fn throttle_key(&self, ctx: &StreamConnectionContext) -> String {
-        let mut proxy_key = String::with_capacity(ctx.proxy_namespace.len() + 1 + ctx.proxy_id.len());
+        let mut proxy_key =
+            String::with_capacity(ctx.proxy_namespace.len() + 1 + ctx.proxy_id.len());
         crate::config::db_backend::write_namespaced_runtime_key(
             &mut proxy_key,
             ctx.proxy_namespace.as_str(),
@@ -216,8 +217,9 @@ impl TcpConnectionThrottle {
             None => {
                 let canonical_ip =
                     crate::util::client_identity::canonical_client_ip_text(&ctx.client_ip);
-                let mut key =
-                    String::with_capacity("proxy::ip:".len() + proxy_key.len() + canonical_ip.len());
+                let mut key = String::with_capacity(
+                    "proxy::ip:".len() + proxy_key.len() + canonical_ip.len(),
+                );
                 key.push_str("proxy:");
                 key.push_str(&proxy_key);
                 key.push_str(":ip:");
@@ -331,9 +333,9 @@ impl Plugin for TcpConnectionThrottle {
 #[cfg(test)]
 mod tests {
     use super::{TcpConnectionThrottle, TcpConnectionThrottleState};
+    use crate::ConsumerIndex;
     use crate::config::types::BackendScheme;
     use crate::plugins::StreamConnectionContext;
-    use crate::ConsumerIndex;
     use dashmap::Map;
     use serde_json::json;
     use std::sync::Arc;
