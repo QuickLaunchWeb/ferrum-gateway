@@ -559,6 +559,15 @@ upstreams:
 
 ### Passive Health Checks
 
+Full configuration reloads and incremental updates preserve passive ejections
+and accumulated failure history for endpoints still in the live, merged
+static-plus-discovery target set. Passive health and circuit-breaker cleanup
+resolve that set from the same load-balancer snapshot, rather than treating the
+authored static seed as the discovery result. Discovery retirement removes the
+withdrawn endpoints' state; an installed empty target set is authoritative and
+is also pruned. This does not re-admit endpoints that remain ejected or change
+the configured recovery policy.
+
 Passive health checks monitor the HTTP response status codes from actual proxied requests. No additional probe traffic is generated.
 
 ```yaml

@@ -122,6 +122,12 @@ Request-only policy fields stay out of the key and are applied at dispatch time 
 
 **Client-baked settings (reqwest `rcfg` key segment).** Divergent per-proxy values of `pool_idle_timeout_seconds`, TCP keepalive, and the H2 client knobs listed above produce distinct pool entries. Identical endpoint + identical effective `rcfg` values continue to share one client. Adaptive window (`aw=1`) overrides fixed initial windows in reqwest/hyper, so `sw`/`cw` are omitted from the key whenever adaptive is enabled (divergent fixed windows with adaptive on do not fragment). `pool_max_idle_per_host` remains global-only by deliberate tradeoff — per-proxy values would over-fragment without a per-request escape hatch. Secrets never appear in pool keys.
 
+The reqwest suffix is encoded from the same resolved `PoolConfig::for_proxy`
+used to construct its client. A fixed window with no explicit adaptive setting
+therefore records `aw0` and the effective `sw`/`cw` values, including clamps.
+An implicit adaptive-off setting and an explicit `false` with identical windows
+share one entry; distinct effective fixed windows use separate entries.
+
 **Direct-H2 and native-gRPC keys** encode the effective `PoolConfig::for_proxy(...).http2_max_concurrent_streams` after `upstream_subset` (decimal, or `none` when the effective cap is unlimited). The raw per-proxy `Option` is not keyed: inheriting the process-wide global and setting that same number explicitly share one key, and a present override is clamped with `.max(1)` so `Some(0)` and `Some(1)` also share. Reqwest does not consume this builder knob, so it stays out of `rcfg`.
 
 Both request timeouts can therefore be set independently per proxy without forcing distinct `dns_override` values to fragment the pool. Earlier versions of ferrum-edge documented a `dns_override` work-around for `backend_connect_timeout_ms` — that work-around is no longer needed.
