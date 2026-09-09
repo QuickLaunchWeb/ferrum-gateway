@@ -100,8 +100,13 @@ paths:
   keyed state. The RFC shared-cache authorization admission checks both pristine
   inbound and live backend-visible `Authorization`, so request transforms cannot
   erase it.
+- Exception: `api_chargeback_sink` admits at most one effective instance per
+  proxy after merge: independent event IDs cannot deduplicate duplicate billing
+  rows. Its Prometheus counters and top-level status totals are process-lifetime;
+  instance diagnostics are generation-local. Pending per-event ownership spans
+  retired workers, but a process crash cannot flush or account for lost memory.
 - Exception: `load_testing` admits at most one effective instance per proxy
-  after merge. Both it and `api_chargeback` are enforced by
+  after merge. It and both chargeback plugins are enforced by
   `exclusive_effective_instance_errors` in `src/plugin_cache.rs`, applied to the
   merged per-proxy chain in both the full-build and incremental-rebuild paths.
 - Stateful protections are owned by a **stable policy identity**
