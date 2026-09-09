@@ -1387,7 +1387,8 @@ fn test_jwks_auth_skips_below_floor_rsa_key() {
         }),
         default_client(),
     )
-    .expect_err("a JWKS with only below-floor RSA keys must not load");
+    .err()
+    .expect("a JWKS with only below-floor RSA keys must not load");
     assert!(
         error.contains("no usable signing keys"),
         "unexpected error: {error}"
