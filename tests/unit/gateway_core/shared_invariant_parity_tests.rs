@@ -134,7 +134,11 @@ fn mesh_apply_paths_carry_permission_from_preparation_to_commit() {
             "{signature} must carry an apply-begin capability"
         );
     }
-    let commit = item_body(&runtime, "    pub fn record_applied_slice_with_token(", "\n    }");
+    let commit = item_body(
+        &runtime,
+        "    pub fn record_applied_slice_with_token(",
+        "\n    }",
+    );
     assert!(!commit.contains("begin_revision_apply("));
     assert!(!runtime.contains("pub fn record_applied_slice("));
 }

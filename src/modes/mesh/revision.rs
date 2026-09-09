@@ -688,8 +688,7 @@ impl MeshRevisionGate {
         // received candidate is pending or has failed runtime validation.
         let accepted =
             state.accepted.as_ref() == candidate && state.accepted_content == Some(content);
-        let applied =
-            state.applied.as_ref() == candidate && state.applied_content == Some(content);
+        let applied = state.applied.as_ref() == candidate && state.applied_content == Some(content);
         if !accepted && !applied {
             return None;
         }

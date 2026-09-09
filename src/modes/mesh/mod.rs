@@ -4167,7 +4167,14 @@ async fn wait_for_initial_mesh_config(
     runtime: &MeshRuntimeConfig,
     activation: FederationActivation,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<(GatewayConfig, Arc<MeshSlice>, revision::MeshRevisionApplyToken), anyhow::Error> {
+) -> Result<
+    (
+        GatewayConfig,
+        Arc<MeshSlice>,
+        revision::MeshRevisionApplyToken,
+    ),
+    anyhow::Error,
+> {
     let mut updates = mesh_state.subscribe();
     loop {
         let snapshot = mesh_state.snapshot();
@@ -33392,7 +33399,13 @@ mod tests {
 
         assert!(mesh_state.install_slice(rejected.clone()).installed());
         let token = mesh_state.begin_revision_apply(&rejected);
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true, token);
+        record_mesh_slice_apply_result(
+            &mesh_state,
+            &mut last_applied_slice,
+            &rejected,
+            true,
+            token,
+        );
         assert!(mesh_state.applied_snapshot().as_ref().is_some());
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),

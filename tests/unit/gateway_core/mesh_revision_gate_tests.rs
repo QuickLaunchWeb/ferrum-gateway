@@ -116,7 +116,11 @@ fn a_missing_commit_token_is_loud_and_preserves_the_serving_baseline() {
     let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
     assert!(log.contains("ERROR"));
     assert!(log.contains("Mesh revision commit has no apply token"));
-    for field in ["candidate_revision", "accepted_revision", "applied_revision"] {
+    for field in [
+        "candidate_revision",
+        "accepted_revision",
+        "applied_revision",
+    ] {
         assert!(log.contains(field), "missing revision identity: {log}");
     }
     assert!(missing_token_rejections() > before);
@@ -131,7 +135,10 @@ fn a_missing_commit_token_is_loud_and_preserves_the_serving_baseline() {
     assert!(state.record_rejected_slice(&state.snapshot()));
     assert_eq!(state.accepted_revision(), serving.revision);
     assert_eq!(
-        MeshConfigRevision::compare(state.accepted_revision().as_ref(), slice(9).revision.as_ref()),
+        MeshConfigRevision::compare(
+            state.accepted_revision().as_ref(),
+            slice(9).revision.as_ref()
+        ),
         MeshRevisionOrder::Older
     );
 
