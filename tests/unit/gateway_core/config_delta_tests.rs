@@ -853,7 +853,7 @@ fn test_plugin_rebuild_unrelated_proxy_not_affected() {
 // --- Timestamp-neutral content comparisons ---
 
 #[test]
-fn test_same_timestamp_proxy_content_change_is_modification() {
+fn test_same_timestamp_is_not_modification() {
     let t = Utc::now();
     let old = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t)],
@@ -864,8 +864,11 @@ fn test_same_timestamp_proxy_content_change_is_modification() {
         ..Default::default()
     };
     let delta = ConfigDelta::compute(&old, &new);
-    assert_eq!(delta.modified_proxies.len(), 1);
-    assert_eq!(delta.modified_proxies[0].id, "p1");
+    // Same updated_at = no Proxy resource modification detected (by design).
+    // Timestamp-neutral route content is owned by
+    // `ProxyState::projected_route_proxy_content_changed`, so DestinationRule
+    // projections can never be re-attributed to the proxy row.
+    assert!(delta.modified_proxies.is_empty());
 }
 
 #[test]
@@ -874,7 +877,7 @@ fn test_same_timestamp_consumer_credential_rotation_is_modification() {
     let mut consumer = make_consumer("c1", "alice", t);
     consumer.credentials.insert(
         "keyauth".to_string(),
-        serde_json::json!({"key": "old-test-key"}),
+        serde_json::json!([{"key": "old-test-key"}]),
     );
     let old = GatewayConfig {
         consumers: vec![consumer],
@@ -883,7 +886,7 @@ fn test_same_timestamp_consumer_credential_rotation_is_modification() {
     let mut new = old.clone();
     new.consumers[0].credentials.insert(
         "keyauth".to_string(),
-        serde_json::json!({"key": "new-test-key"}),
+        serde_json::json!([{"key": "new-test-key"}]),
     );
 
     let delta = ConfigDelta::compute(&old, &new);
@@ -924,81 +927,6 @@ fn test_same_timestamp_plugin_body_or_enabled_change_is_modification() {
 }
 
 #[test]
-fn test_same_timestamp_stream_backend_change_is_modification() {
-    for scheme in [
-        BackendScheme::Tcp,
-        BackendScheme::Tcps,
-        BackendScheme::Udp,
-        BackendScheme::Dtls,
-    ] {
-        let mut proxy = make_proxy("p1", "/unused", Utc::now());
-        proxy.listen_path = None;
-        proxy.listen_port = Some(9000);
-        proxy.backend_scheme = Some(scheme);
-        proxy.dispatch_kind = DispatchKind::from(scheme);
-        let old = GatewayConfig {
-            proxies: vec![proxy],
-            ..Default::default()
-        };
-        let mut new = old.clone();
-        new.proxies[0].backend_port = 8081;
-
-        let delta = ConfigDelta::compute(&old, &new);
-
-        assert_eq!(old.proxies[0].updated_at, new.proxies[0].updated_at);
-        assert_eq!(delta.modified_proxies.len(), 1, "scheme: {scheme:?}");
-        assert_eq!(delta.modified_proxies[0].backend_port, 8081);
-    }
-}
-
-#[test]
-fn test_same_timestamp_upstream_content_change_is_modification() {
-    let old = GatewayConfig {
-        upstreams: vec![make_upstream(
-            "u1",
-            vec![make_target("localhost", 8080)],
-            Utc::now(),
-        )],
-        ..Default::default()
-    };
-    let mut new = old.clone();
-    new.upstreams[0].targets[0].port = 8081;
-
-    let delta = ConfigDelta::compute(&old, &new);
-
-    assert_eq!(delta.modified_upstreams.len(), 1);
-    assert_eq!(delta.modified_upstreams[0].targets[0].port, 8081);
-}
-
-#[test]
-fn test_same_timestamp_proxy_dispatch_projection_change_is_modification() {
-    let old = GatewayConfig {
-        proxies: vec![make_proxy("p1", "/api", Utc::now())],
-        ..Default::default()
-    };
-    let policy = ResolvedPortOverride {
-        max_connections: Some(10),
-        ..Default::default()
-    };
-    let mut per_port_changed = old.clone();
-    per_port_changed.proxies[0].dispatch_port_overrides =
-        Some(HashMap::from([(8080, policy.clone())]));
-    let mut fallback_changed = old.clone();
-    fallback_changed.proxies[0].dispatch_port_override_fallback = Some(policy);
-
-    for new in [per_port_changed, fallback_changed] {
-        // The content change is entirely absent from the serialized config.
-        assert_eq!(
-            serde_json::to_value(&old.proxies[0]).unwrap(),
-            serde_json::to_value(&new.proxies[0]).unwrap()
-        );
-        let delta = ConfigDelta::compute(&old, &new);
-        assert_eq!(delta.modified_proxies.len(), 1);
-        assert!(ConfigDelta::compute(&new, &new.clone()).is_empty());
-    }
-}
-
-#[test]
 fn test_identical_content_and_updated_at_remain_unchanged_for_all_resources() {
     let t = Utc::now();
     let old = GatewayConfig {
@@ -1026,31 +954,60 @@ fn test_identical_content_and_updated_at_remain_unchanged_for_all_resources() {
     assert!(ConfigDelta::compute(&old, &new).is_empty());
 }
 
-#[tokio::test]
-async fn test_unchanged_reload_keeps_compatibility_config_on_accepted_epoch() {
-    use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+/// The persisted-content fingerprint covers a resource's own row only.
+///
+/// DestinationRule projections, service-discovery-resolved upstream targets,
+/// and junction-table plugin associations each have their own detection path
+/// (`ProxyState::projected_route_proxy_content_changed`,
+/// `ProxyState::projected_dr_dispatch_changed_upstreams`, and
+/// `plugin_association_changed_proxy_ids`). Re-attributing any of them to the
+/// owning row would make the incremental appliers rebuild a byte-identical
+/// proxy or upstream from the authored snapshot.
+#[test]
+fn test_projected_and_association_changes_are_not_resource_modifications() {
+    let t = Utc::now();
+    let mut proxy = make_proxy("p1", "/api", t);
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "pc1".to_string(),
+    }];
+    let old = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![make_upstream("u1", vec![make_target("localhost", 8080)], t)],
+        ..Default::default()
+    };
 
-    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
-    let (state, _) = ProxyState::new(
-        GatewayConfig::default(),
-        dns_cache,
-        ferrum_edge::config::EnvConfig::default(),
-        None,
-        None,
-    )
-    .expect("test proxy state should build");
-    let accepted = state.config.load_full();
-    let mut candidate = accepted.as_ref().clone();
-    candidate.loaded_at += chrono::Duration::seconds(10);
-
-    assert_eq!(
-        state.update_config(candidate),
-        ConfigApplyOutcome::Unchanged
+    let mut new = old.clone();
+    // DestinationRule projections onto the proxy and onto the upstream.
+    let projected_port_policy = ResolvedPortOverride {
+        max_connections: Some(10),
+        ..Default::default()
+    };
+    new.proxies[0].dispatch_port_overrides = Some(HashMap::from([(8080, projected_port_policy)]));
+    new.upstreams[0].port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            connect_timeout_ms: Some(1_000),
+            ..Default::default()
+        },
     );
-    assert!(std::sync::Arc::ptr_eq(&accepted, &state.config.load_full()));
+    // A service-discovery-resolved target set.
+    new.upstreams[0].targets[0].port = 8081;
+    // Junction-table association membership.
+    new.proxies[0].plugins.clear();
+
+    let delta = ConfigDelta::compute(&old, &new);
+
+    assert!(
+        delta.modified_proxies.is_empty(),
+        "projections and association membership must not be re-attributed to the proxy row"
+    );
+    assert!(
+        delta.modified_upstreams.is_empty(),
+        "projections and discovered targets must not be re-attributed to the upstream row"
+    );
     assert_eq!(
-        state.request_epoch.load().config().loaded_at,
-        accepted.loaded_at
+        delta.plugin_association_changed_proxy_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "p1")]
     );
 }
 
@@ -1061,9 +1018,10 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
     for change_route in [false, true] {
         let t = Utc::now();
         let mut consumer = make_consumer("c1", "alice", t);
+        // `ConsumerIndex` reads keyauth credentials as an array of entries.
         consumer.credentials.insert(
             "keyauth".to_string(),
-            serde_json::json!({"key": "old-test-key"}),
+            serde_json::json!([{"key": "old-test-key"}]),
         );
         let mut plugin = make_plugin_config("pc1", "key_auth", PluginScope::Global, None, t);
         plugin.enabled = false;
@@ -1097,7 +1055,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         let mut candidate = state.config.load_full().as_ref().clone();
         candidate.consumers[0].credentials.insert(
             "keyauth".to_string(),
-            serde_json::json!({"key": "new-test-key"}),
+            serde_json::json!([{"key": "new-test-key"}]),
         );
         candidate.plugin_configs[0].enabled = true;
         if change_route {
@@ -1126,7 +1084,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         );
         let epoch = state.request_epoch.load();
         assert_eq!(
-            epoch.config().consumers[0].credentials["keyauth"]["key"],
+            epoch.config().consumers[0].credentials["keyauth"][0]["key"],
             "new-test-key"
         );
         assert!(epoch.config().plugin_configs[0].enabled);

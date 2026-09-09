@@ -8,10 +8,13 @@
 //! Changes are detected by comparing the namespace-qualified `(namespace, id)`
 //! identity plus `updated_at` timestamps. Resources present in the new config
 //! but not the old are additions; resources in the old but not the new are
-//! removals; resources in both with a different `updated_at` or different
-//! timestamp-neutral content are modifications. Timestamp comparison uses `!=`
-//! to catch both forward progress and backward clock skew; content comparison
-//! runs only when timestamps match.
+//! removals; resources in both with a different `updated_at` are modifications
+//! (uses `!=` to catch both forward progress and backward clock skew).
+//! Consumers and plugin configurations additionally compare their own
+//! persisted content when `updated_at` is reused, so a rotated credential or a
+//! flipped policy cannot be classified as unchanged (GHSA-2wrj-vq9m-75jg).
+//! That fingerprint deliberately covers a resource's own persisted fields only
+//! — see `HasNamespacedIdAndTimestamp::persisted_content_changed`.
 //! Proxy/plugin association membership is compared directly because
 //! junction-table changes can arrive without advancing the owning proxy's
 //! timestamp.
@@ -80,7 +83,8 @@ impl ConfigDelta {
     /// Compute the delta between an old and new config snapshot.
     ///
     /// Uses `(namespace, id)` for identity and `updated_at` for change detection,
-    /// falling back to timestamp-neutral content when timestamps match.
+    /// plus a persisted-content fingerprint for the resource kinds that carry
+    /// no projection-derived state.
     /// Returns a delta describing exactly which resources were added,
     /// removed, or modified.
     pub fn compute(old: &GatewayConfig, new: &GatewayConfig) -> Self {
@@ -310,30 +314,58 @@ impl ConfigDelta {
 
 type ResourceKey<'a> = (&'a str, &'a str);
 
-trait HasNamespacedIdAndTimestamp: Clone + serde::Serialize {
+trait HasNamespacedIdAndTimestamp {
     fn namespace(&self) -> &str;
     fn id(&self) -> &str;
     fn updated_at(&self) -> DateTime<Utc>;
-    fn normalize_timestamps(&mut self);
 
-    /// Runtime projections skipped by serde must also agree before reuse.
-    fn projected_content_eq(&self, _other: &Self) -> bool {
-        true
+    /// Whether this resource's own persisted content differs from `other`,
+    /// consulted only when both carry the same `updated_at`.
+    ///
+    /// # Scope of the fingerprint
+    ///
+    /// It covers the resource's own persisted row and nothing else. Projected
+    /// and derived state is deliberately excluded: DestinationRule projections
+    /// (`Upstream.port_overrides`, `dispatch_port_override_fallback`,
+    /// `resolved_subset_tls`, the proxy-side `dispatch_port_overrides` /
+    /// `resolved_tls` / `dispatch_kind`), service-discovery-resolved
+    /// `Upstream.targets`, and junction-table `Proxy.plugins` membership all
+    /// change without the owning row changing. Attributing them here would
+    /// report a byte-identical proxy or upstream as a modified resource, and
+    /// the incremental appliers would then rebuild from the authored snapshot
+    /// — rolling live discovered targets back to static ones and undoing the
+    /// targeted rebuild guarantees of #3243. Those dimensions keep their own
+    /// detection paths: `ProxyState::projected_route_proxy_content_changed`,
+    /// `ProxyState::projected_dr_dispatch_changed_upstreams`, and
+    /// `diff_plugin_association_changes`.
+    ///
+    /// The default is "no content comparison", so a resource kind opts in only
+    /// once its serialized form is entirely operator-owned.
+    fn persisted_content_changed(&self, _other: &Self) -> bool {
+        false
     }
+}
 
-    fn content_eq(&self, other: &Self) -> bool {
-        if !self.projected_content_eq(other) {
-            return false;
-        }
-        let mut left = self.clone();
-        let mut right = other.clone();
-        left.normalize_timestamps();
-        right.normalize_timestamps();
-        match (serde_json::to_value(&left), serde_json::to_value(&right)) {
-            (Ok(left), Ok(right)) => left == right,
-            // A failed comparison must never silently retain stale policy.
-            _ => false,
-        }
+/// Compare two resources by serialized content with creation and modification
+/// metadata neutralized, so timestamps alone never invalidate a cache.
+///
+/// A serialization failure counts as changed: a reload must never silently
+/// retain revoked credentials or superseded policy because the comparison
+/// itself could not be made.
+fn timestamp_neutral_content_changed<T, F>(old: &T, new: &T, neutralize_timestamps: F) -> bool
+where
+    T: Clone + serde::Serialize,
+    F: Fn(&mut T),
+{
+    let mut old_normalized = old.clone();
+    let mut new_normalized = new.clone();
+    neutralize_timestamps(&mut old_normalized);
+    neutralize_timestamps(&mut new_normalized);
+    let old_serialized = serde_json::to_value(&old_normalized);
+    let new_serialized = serde_json::to_value(&new_normalized);
+    match (old_serialized, new_serialized) {
+        (Ok(old_value), Ok(new_value)) => old_value != new_value,
+        _ => true,
     }
 }
 
@@ -355,16 +387,10 @@ impl HasNamespacedIdAndTimestamp for Proxy {
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
-    fn normalize_timestamps(&mut self) {
-        self.created_at = DateTime::<Utc>::UNIX_EPOCH;
-        self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
-    }
-    fn projected_content_eq(&self, other: &Self) -> bool {
-        self.dispatch_kind == other.dispatch_kind
-            && self.resolved_tls == other.resolved_tls
-            && self.dispatch_port_overrides == other.dispatch_port_overrides
-            && self.dispatch_port_override_fallback == other.dispatch_port_override_fallback
-    }
+    // No persisted-content fingerprint: a proxy's timestamp-neutral route
+    // content, its DestinationRule projections, and its plugin association
+    // membership each have a dedicated detection path, and none of them may be
+    // reported as a modified Proxy resource.
 }
 
 impl HasNamespacedIdAndTimestamp for Consumer {
@@ -377,9 +403,13 @@ impl HasNamespacedIdAndTimestamp for Consumer {
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
-    fn normalize_timestamps(&mut self) {
-        self.created_at = DateTime::<Utc>::UNIX_EPOCH;
-        self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+    /// Every `Consumer` field is operator-owned persisted state, so a reused
+    /// `updated_at` must not hide a rotated or revoked credential.
+    fn persisted_content_changed(&self, other: &Self) -> bool {
+        timestamp_neutral_content_changed(other, self, |consumer| {
+            consumer.created_at = DateTime::<Utc>::UNIX_EPOCH;
+            consumer.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+        })
     }
 }
 
@@ -393,9 +423,14 @@ impl HasNamespacedIdAndTimestamp for PluginConfig {
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
-    fn normalize_timestamps(&mut self) {
-        self.created_at = DateTime::<Utc>::UNIX_EPOCH;
-        self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+    /// Every `PluginConfig` field is operator-owned persisted state, so a
+    /// reused `updated_at` must not hide a changed policy body or an
+    /// `enabled` flip.
+    fn persisted_content_changed(&self, other: &Self) -> bool {
+        timestamp_neutral_content_changed(other, self, |plugin_config| {
+            plugin_config.created_at = DateTime::<Utc>::UNIX_EPOCH;
+            plugin_config.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+        })
     }
 }
 
@@ -409,16 +444,11 @@ impl HasNamespacedIdAndTimestamp for Upstream {
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
-    fn normalize_timestamps(&mut self) {
-        self.created_at = DateTime::<Utc>::UNIX_EPOCH;
-        self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
-    }
-    fn projected_content_eq(&self, other: &Self) -> bool {
-        self.resolved_subset_tls == other.resolved_subset_tls
-            && self.dispatch_port_override_fallback == other.dispatch_port_override_fallback
-            // Targets also carry a serde-skipped service-port policy key.
-            && self.targets == other.targets
-    }
+    // No persisted-content fingerprint: `targets` is resolved by service
+    // discovery and `port_overrides` / `locality_lb_setting` /
+    // `dispatch_port_override_fallback` / `resolved_subset_tls` are
+    // DestinationRule projections. `projected_dr_dispatch_changed_upstreams`
+    // rebuilds exactly the affected balancers instead.
 }
 
 /// Resources in `new` but not in `old`.
@@ -442,7 +472,8 @@ fn diff_removed_ids<T: HasNamespacedIdAndTimestamp>(
         .collect()
 }
 
-/// Resources present in both whose timestamp or timestamp-neutral content changed.
+/// Resources present in both whose `updated_at`, or whose own persisted
+/// content under a reused `updated_at`, changed.
 ///
 /// Uses `!=` instead of `>` for snapshot-to-snapshot comparison so a full
 /// snapshot can detect backward timestamp drift once both versions are present
@@ -452,10 +483,12 @@ fn diff_removed_ids<T: HasNamespacedIdAndTimestamp>(
 fn diff_modified<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
     let old_map: HashMap<ResourceKey<'_>, &T> = old.iter().map(|r| (resource_key(r), r)).collect();
     new.iter()
-        .filter(|r| {
-            old_map
-                .get(&resource_key(*r))
-                .is_some_and(|&old| r.updated_at() != old.updated_at() || !r.content_eq(old))
+        .filter(|new_resource| {
+            let Some(old_resource) = old_map.get(&resource_key(*new_resource)) else {
+                return false;
+            };
+            new_resource.updated_at() != old_resource.updated_at()
+                || new_resource.persisted_content_changed(old_resource)
         })
         .cloned()
         .collect()
@@ -511,7 +544,7 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::json;
 
-    #[derive(Clone, serde::Serialize)]
+    #[derive(Clone)]
     struct TestResource {
         namespace: String,
         id: String,
@@ -529,10 +562,6 @@ mod tests {
 
         fn updated_at(&self) -> DateTime<Utc> {
             self.updated_at
-        }
-
-        fn normalize_timestamps(&mut self) {
-            self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
         }
     }
 

@@ -402,11 +402,13 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 
 ### File Mode
 
-Reload change detection compares resource content when `updated_at` is unchanged, so edits to
-proxies, consumers, plugin configurations, and upstreams do not require a timestamp bump.
-The content comparison ignores `created_at` and `updated_at`; an identical resource with the
-same `updated_at` remains unchanged. A no-op reload retains the accepted runtime configuration
-and its `loaded_at` value for compatibility readers as well as the request epoch.
+Reload change detection compares consumer and plugin-configuration content when `updated_at`
+is unchanged, so a rotated credential or a changed policy body does not require a timestamp
+bump. The comparison ignores `created_at` and `updated_at`; an identical resource with the
+same `updated_at` remains unchanged. It covers each resource's own persisted fields only:
+DestinationRule projections, service-discovery-resolved upstream targets, and proxy/plugin
+association membership are never reported as a changed proxy or upstream — they keep their
+existing targeted route-table, load-balancer, and plugin-cache rebuild paths.
 
 File loading, `ferrum-edge validate --mode file --spec <path>`, and SIGHUP reload run the shared rejecting runtime-config admission gate used by SQL and MongoDB full loads, in addition to file mode's stricter field, identity, and local-file checks. A `tcp_connection_throttle` attached to an HTTP proxy (or globally with one or more attached proxies, all using unsupported protocols) is rejected before runtime construction. Duplicate effective `correlation_id` header writers are also rejected at admission. Diagnostics identify the rejected rule; a rejected reload keeps the last known-good generation. A successful validation checks configuration admission, but does not promise that runtime resources such as listener ports will be available at startup.
 

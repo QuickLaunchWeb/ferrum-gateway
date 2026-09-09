@@ -11662,13 +11662,13 @@ impl ProxyState {
     /// Whether a route-indexed proxy's effective route-table content changed
     /// without a serialized proxy delta.
     ///
-    /// Supplements `ConfigDelta`'s resource content comparison with gateway-level
-    /// listener and mesh stream-relay inputs. DR-derived projections such as
-    /// `dispatch_port_overrides` and
+    /// `ConfigDelta` detects proxy changes by `updated_at`, but DR-derived
+    /// projections such as `dispatch_port_overrides` and
     /// `dispatch_port_override_fallback` are `#[serde(skip)]` fields populated by
     /// `GatewayConfig::resolve_dispatch_port_overrides()`. A DestinationRule-only
-    /// edit can change gateway-level listener or mesh stream-relay inputs
-    /// without a resource delta, while the route table needs to carry new dispatch
+    /// edit can therefore leave `delta.modified_proxies` empty (or leave the
+    /// entire `ConfigDelta` empty when upstream timestamps are also unchanged)
+    /// while the route table's stored `Arc<Proxy>` needs to carry new dispatch
     /// policy. Callers must consult this helper from both the non-empty delta
     /// path and the empty-delta publish path (#3243).
     fn projected_route_proxy_content_changed(
@@ -11709,8 +11709,9 @@ impl ProxyState {
     /// Timestamp-neutral upstream content changes that require rebuilding
     /// individual upstream load balancers.
     ///
-    /// Mesh projections can change serde-skipped fields without advancing
-    /// timestamps. Supplement `ConfigDelta`'s content comparison to keep the LB's
+    /// `ConfigDelta` keys upstream modifications on `updated_at`. Mesh
+    /// projections can change serde-skipped fields without advancing that
+    /// timestamp, and defensive same-timestamp handling must also keep the LB's
     /// upstream index current. Compare normalized serialized content plus every
     /// skipped field consumed by dispatch, then rebuild only those upstreams so
     /// unrelated RR/WRR/latency state survives a DR-only reload.
@@ -12682,7 +12683,7 @@ impl ProxyState {
                     // (`dispatch_port_overrides`, `dispatch_port_override_fallback`,
                     // `resolved_tls`, stream-relay dispatch maps) and the
                     // Gateway-level `http_tls_listen_ports` classification are
-                    // also checked beyond ConfigDelta's resource comparison. A
+                    // invisible to ConfigDelta's `updated_at` comparison. A
                     // DR-only edit or listener-class flip that left every
                     // resource timestamp unchanged must still republish the
                     // route table (and LB, which also consumes DR-derived
@@ -12708,10 +12709,11 @@ impl ProxyState {
                     // `config.mesh`, not materialized `Upstream.targets`. A
                     // mesh-only change therefore also needs an epoch publish.
                     //
-                    // Without this, the `Ok(None)` no-delta path below leaves
-                    // `request_epoch.config` stale — so a remote scale-up /
-                    // trust-bundle overlay never reaches the live proxy until
-                    // an unrelated proxy/upstream
+                    // Without this, the `Ok(None)` no-delta path below updates
+                    // only `ProxyState.config` (the ArcSwap the request path
+                    // does NOT read for mesh), leaving `request_epoch.config`
+                    // stale — so a remote scale-up / trust-bundle overlay never
+                    // reaches the live proxy until an unrelated proxy/upstream
                     // delta forces a republish (codex F7.2 round-5, finding 3).
                     // When the mesh block changed, the route table snapshot
                     // must also refresh because it materializes mesh-derived maps
@@ -12783,7 +12785,8 @@ impl ProxyState {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
                 debug!("Config poll: candidate valid but unchanged, skipping update");
-                // Keep compatibility readers on the generation the request epoch accepted.
+                // Still update loaded_at timestamp
+                self.config.store(Arc::new(new_config));
                 return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
