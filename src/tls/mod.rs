@@ -39,6 +39,7 @@ pub mod ocsp_recheck;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 pub(crate) mod private_file;
+pub(crate) mod store_dir;
 pub mod shared_store;
 #[cfg(test)]
 mod shared_store_tests;

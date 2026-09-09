@@ -188,7 +188,7 @@ impl TlsLeaseStore {
                 "store directory must not be empty".to_string(),
             ));
         }
-        std::fs::create_dir_all(&dir).map_err(|error| {
+        crate::tls::store_dir::create_private_store_dir(&dir).map_err(|error| {
             TlsLeaseError::InvalidPath(format!(
                 "failed to create TLS lease store directory '{}': {error}",
                 dir.display()
