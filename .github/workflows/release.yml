@@ -278,15 +278,6 @@ jobs:
       # `release-binaries-<target>` artifact and the `docker-digest-*` manifest
       # wildcards can never match. The x86_64 GNU cell compiles inside the
       # pinned sysroot script and records no report, hence `warn`.
-      - name: Upload build timings
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: release-build-timings-${{ matrix.target }}
-          path: target/cargo-timings/
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Create release assets directory
         shell: bash
         run: mkdir -p release-assets
@@ -346,6 +337,17 @@ jobs:
         with:
           name: release-binaries-${{ matrix.target }}
           path: release-assets/
+
+      # Trusted policy: every artifact upload in this job must follow the
+      # staged published-asset ABI gate (issue #4674 added this capture).
+      - name: Upload build timings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-build-timings-${{ matrix.target }}
+          path: target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 14
 
   build-release-arm64-cross:
     name: Build (ferrum-edge-linux-aarch64)
