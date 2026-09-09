@@ -1180,7 +1180,11 @@ fn test_json_body_redacts_exact_sensitive_field_names_and_data_source_parameters
         "{}",
         sample.rendered
     );
-    assert!(sample.rendered.contains("***REDACTED***"), "{}", sample.rendered);
+    assert!(
+        sample.rendered.contains("***REDACTED***"),
+        "{}",
+        sample.rendered
+    );
 }
 
 #[test]

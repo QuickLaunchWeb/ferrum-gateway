@@ -6516,7 +6516,8 @@ fn redact_json_value_strings_at_depth(
             for (key, mut value) in entries {
                 if sensitive_json_field(&key) {
                     value = Value::String(REDACTED_PLACEHOLDER.to_string());
-                } else if ctx == JsonRedactionContext::DataSourceItem && is_azure_parameters_key(&key)
+                } else if ctx == JsonRedactionContext::DataSourceItem
+                    && is_azure_parameters_key(&key)
                 {
                     wholesale_redact_data_source_parameters(&mut value);
                 } else if ctx == JsonRedactionContext::Normal && is_azure_data_sources_key(&key) {

@@ -759,12 +759,7 @@ impl TransactionDebugger {
             || lowered.contains("eyj")
     }
 
-    fn redact_json_value(
-        &self,
-        value: &mut Value,
-        depth: usize,
-        ctx: JsonBodyRedactionContext,
-    ) {
+    fn redact_json_value(&self, value: &mut Value, depth: usize, ctx: JsonBodyRedactionContext) {
         if depth > MAX_JSON_REDACTION_DEPTH {
             *value = Value::String(BODY_DEPTH_MARKER.to_string());
             return;
