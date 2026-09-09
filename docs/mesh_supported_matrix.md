@@ -167,7 +167,7 @@ An Istio `ServiceEntry` with a wildcard host (`hosts: ["*.example.com"]`,
 |---|---|
 | `resolution: DNS` or `NONE`, HTTP family | **Supported.** The wildcard route and configured target materialize; request dispatch replaces the target with the matching concrete authority before DNS, SNI, and pool selection. |
 | `resolution: STATIC` + non-empty `endpoints[]`, HTTP or stream family | **Supported.** The declared endpoint addresses are the dial targets and the wildcard is only the route selector. |
-| `resolution: DNS` or `NONE` (or `STATIC` with no endpoints), stream family | **Refused.** Raw streams have no HTTP authority from which to derive a concrete dial target. |
+| `resolution: DNS` or `NONE` (or `STATIC` with no endpoints), stream family | **Refused.** Raw streams have no HTTP authority from which to derive a concrete dial target. The host is skipped with a `hosts[]`-named `warn!`, and the Istio CRD status carries a `spec.hosts[]` entry in `deferred_fields` (`FerrumAccepted` stays `True`). |
 | `protocol: UDP` / `DTLS`, **any** resolution | **Refused.** Datagram egress matches the CONNECT `:authority` exactly, so a wildcard authority could never be named by a client. |
 
 For HTTP-family traffic the literal wildcard is only configured selection

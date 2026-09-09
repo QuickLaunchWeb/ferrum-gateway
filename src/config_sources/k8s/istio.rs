@@ -16,7 +16,8 @@ use crate::modes::mesh::config::{
     PortPatternAdmission, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
     ServiceEntryLocation, ServicePort, SourceNegationMatch, TagOverrideOperation,
     TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
-    admit_request_match_port_pattern, validate_mesh_condition, validate_mesh_export_to,
+    admit_request_match_port_pattern, egress_host_is_unresolvable_wildcard,
+    validate_mesh_condition, validate_mesh_export_to,
 };
 use crate::modes::mesh::metric_tag_cel::{
     parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
@@ -6688,13 +6689,77 @@ pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool
     matches!(app_protocol(protocol), AppProtocol::Udp | AppProtocol::Dtls)
 }
 
-/// Parse an Istio `ServiceEntry` `spec.resolution` string, defaulting to `NONE`.
+/// Parse an Istio `ServiceEntry` `spec.resolution` string, defaulting to `NONE`
+/// exactly as Istio does. Shared by the ServiceEntry translator and by
+/// [`service_entry_spec_has_unresolvable_stream_wildcard_host`] so the raw-spec
+/// predicate can never classify a resolution differently from the translation
+/// that feeds materialization.
 fn service_entry_resolution(spec: &Value) -> Resolution {
     match string_field(spec, "resolution").unwrap_or("NONE") {
         "DNS" => Resolution::Dns,
         "STATIC" => Resolution::Static,
         _ => Resolution::None,
     }
+}
+
+/// Whether an Istio `ServiceEntry` `spec.ports[].protocol` string names a
+/// stream-family egress port (`tcp`, `mongo`, `redis`, `mysql`, `postgres`).
+///
+/// Routes the raw token through the SAME [`app_protocol`] classifier the
+/// translator uses and mirrors the EgressGateway materializer's stream/HTTP
+/// split (`egress_is_stream_protocol` in `src/modes/mesh/mod.rs`) minus the
+/// UDP lane, which [`service_entry_port_protocol_is_udp`] reports separately.
+/// `tls` is HTTP-family there, so it is HTTP-family here.
+pub(crate) fn service_entry_port_protocol_is_stream_family(protocol: Option<&str>) -> bool {
+    matches!(
+        app_protocol(protocol),
+        AppProtocol::Tcp
+            | AppProtocol::Mongo
+            | AppProtocol::Redis
+            | AppProtocol::Mysql
+            | AppProtocol::Postgres
+    )
+}
+
+/// Whether a raw Istio `ServiceEntry` spec carries a wildcard `spec.hosts[]`
+/// element that its stream-family egress ports cannot materialize.
+///
+/// HTTP-family egress concretizes a wildcard target from the request authority
+/// at dispatch, so a wildcard host is inert only on stream-family ports: the
+/// stream materializer applies the SHARED [`egress_host_is_unresolvable_wildcard`]
+/// predicate and skips the host. This wrapper reads `resolution` through
+/// [`service_entry_resolution`] (defaulting to `NONE`) and the endpoint count
+/// from `spec.endpoints`, and reports `true` only when at least one port is
+/// stream-family, so `istio_status::service_entry_status` can never claim a
+/// stream host is materialized that the materializer skips — the same
+/// lock-step contract [`service_entry_port_protocol_is_udp`] provides for the
+/// UDP lane.
+pub(crate) fn service_entry_spec_has_unresolvable_stream_wildcard_host(spec: &Value) -> bool {
+    let has_stream_port = spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|port| {
+            service_entry_port_protocol_is_stream_family(
+                port.get("protocol").and_then(Value::as_str),
+            )
+        });
+    if !has_stream_port {
+        return false;
+    }
+    let resolution = service_entry_resolution(spec);
+    let endpoint_count = spec
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    spec.get("hosts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|host| egress_host_is_unresolvable_wildcard(host.trim(), resolution, endpoint_count))
 }
 
 /// Map a Sidecar `ingress[].port.protocol` string to the `AppProtocol` carried on

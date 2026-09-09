@@ -1538,6 +1538,55 @@ fn service_entry_dns_http_wildcard_host_is_not_deferred() {
     );
 }
 
+/// Issue #4535, stream family: the stream materializer still skips a wildcard
+/// `spec.hosts[]` element without declared endpoints (a raw stream has no
+/// request authority to concretize), so the status writer must surface it as a
+/// deferred field rather than reporting a fully accepted resource that serves
+/// nothing on that port. `FerrumAccepted` stays `True` — the resource IS
+/// translated, just inert for that host.
+#[test]
+fn service_entry_stream_wildcard_host_is_reported_as_deferred() {
+    let obj = object(
+        "networking.istio.io/v1",
+        "ServiceEntry",
+        "wildcard-dns-tcp",
+        json!({
+            "hosts": ["*.db.example.com"],
+            "location": "MESH_EXTERNAL",
+            "resolution": "DNS",
+            "ports": [{"number": 5432, "name": "postgres", "protocol": "TCP"}]
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], options());
+    let condition = find_condition(
+        updates[0].status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    assert_eq!(
+        condition["status"].as_str(),
+        Some("True"),
+        "the resource is still accepted/translated, just inert for that host"
+    );
+    let detail = updates[0].ferrum_detail.as_ref().unwrap();
+    let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        deferred.iter().any(|f| f.starts_with("spec.hosts[]:")),
+        "an unresolvable stream wildcard host must be reported as deferred: {deferred:?}"
+    );
+    assert!(
+        condition["message"]
+            .as_str()
+            .unwrap()
+            .contains("deferred fields"),
+        "the condition message must name the deferral: {condition:?}"
+    );
+}
+
 /// The converse: a wildcard host under `resolution: STATIC` with declared
 /// `endpoints[]` IS materialized (the endpoints are the dial set), so it must
 /// NOT be reported as deferred.
