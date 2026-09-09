@@ -168,6 +168,11 @@ impl V001SqlBuilder {
         sqlx::query(self.create_proxy_route_locks_sql())
             .execute(&mut *connection)
             .await?;
+        sqlx::query(self.create_mtls_dns_admission_locks_sql())
+            .execute(&mut *connection)
+            .await?;
+        self.ensure_mtls_dns_restore_owner_column(connection)
+            .await?;
         sqlx::query(self.create_config_change_locks_sql())
             .execute(&mut *connection)
             .await?;
@@ -191,6 +196,68 @@ impl V001SqlBuilder {
         self.create_config_change_indexes(connection).await?;
         self.ensure_namespaces_registry(connection).await?;
         Ok(())
+    }
+
+    async fn ensure_mtls_dns_restore_owner_column(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        if self
+            .table_column_exists(connection, "mtls_dns_admission_locks", "restore_owner")
+            .await?
+        {
+            return Ok(());
+        }
+
+        let definition = if self.is_mysql() {
+            "VARCHAR(36) COLLATE utf8mb4_0900_bin NULL"
+        } else {
+            "TEXT NULL"
+        };
+        let sql =
+            format!("ALTER TABLE mtls_dns_admission_locks ADD COLUMN restore_owner {definition}");
+        if let Err(error) = sqlx::query(&sql).execute(&mut *connection).await {
+            // Concurrent gateway startups can both observe the old schema.
+            // Accept a racing ALTER only after confirming the column now exists.
+            if !self
+                .table_column_exists(connection, "mtls_dns_admission_locks", "restore_owner")
+                .await?
+            {
+                return Err(error.into());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn table_column_exists(
+        &self,
+        connection: &mut AnyConnection,
+        table: &str,
+        column: &str,
+    ) -> Result<bool, anyhow::Error> {
+        if self.is_sqlite() {
+            let sql = format!("PRAGMA table_info({table})");
+            let rows = sqlx::query(&sql).fetch_all(&mut *connection).await?;
+            return Ok(rows.iter().any(|row| {
+                row.try_get::<String, _>("name")
+                    .is_ok_and(|name| name == column)
+            }));
+        }
+
+        let sql = if self.is_mysql() {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?"
+        } else {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2"
+        };
+        Ok(sqlx::query(sql)
+            .bind(table)
+            .bind(column)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some())
     }
 
     async fn ensure_audit_event_context_columns(
@@ -1626,9 +1693,9 @@ impl V001SqlBuilder {
     /// one is enabled. `restore_owner` is a logical fence that persists across
     /// every transaction in a compensating restore replay.
     ///
-    /// Build-out policy intentionally keeps this table in the current baseline
-    /// only. It must not be added to `ensure_compatibility_tables` as an
-    /// old-schema upgrade shim.
+    /// The compatibility pass also creates this table and adds `restore_owner`
+    /// when reconciling databases that recorded V001 before either was folded
+    /// into the baseline.
     fn create_mtls_dns_admission_locks_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"

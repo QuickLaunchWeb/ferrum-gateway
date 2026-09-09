@@ -144,6 +144,49 @@ async fn test_run_pending_restores_route_lock_table_on_existing_v001_db() {
     .expect("restored proxy_route_locks must be writable");
 }
 
+/// Existing V001 databases can predate both the mTLS DNS admission lock table
+/// and its restore-owner fence. The compatibility pass must support either
+/// shape because guarded admin writes read the column unconditionally.
+#[tokio::test]
+async fn test_run_pending_reconciles_mtls_dns_admission_lock_schema() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    sqlx::query("DROP TABLE mtls_dns_admission_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE mtls_dns_admission_locks (\
+         namespace TEXT PRIMARY KEY, updated_at TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(applied.is_empty(), "V001 must remain already applied");
+
+    sqlx::query(
+        "INSERT INTO mtls_dns_admission_locks (namespace, updated_at, restore_owner) \
+         VALUES ('ferrum', '2026-01-01T00:00:00Z', 'restore-1')",
+    )
+    .execute(&pool)
+    .await
+    .expect("compatibility pass must add restore_owner");
+
+    sqlx::query("DROP TABLE mtls_dns_admission_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    runner.run_pending().await.unwrap();
+    assert!(
+        table_exists(&pool, "mtls_dns_admission_locks").await,
+        "compatibility pass must recreate a missing admission lock table"
+    );
+}
+
 /// Regression test for the audit_events compatibility pass.
 ///
 /// `audit_events` was folded into the V001 baseline after databases could
