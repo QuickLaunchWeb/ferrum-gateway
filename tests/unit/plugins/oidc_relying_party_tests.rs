@@ -3021,7 +3021,13 @@ async fn generated_session_cookies_enforce_prefix_attributes_and_allow_explicit_
     // `Domain` and `Path=/`. A prefix a browser would reject is worse than none.
     for (secure, domain, path, explicit_name, expected_prefix) in [
         (true, None, "/", None, "__Host-ferrum_session_"),
-        (true, Some("example.com"), "/", None, "__Secure-ferrum_session_"),
+        (
+            true,
+            Some("example.com"),
+            "/",
+            None,
+            "__Secure-ferrum_session_",
+        ),
         (true, None, "/app", None, "__Secure-ferrum_session_"),
         (false, None, "/", None, "ferrum_session_"),
         (false, Some("example.com"), "/", None, "ferrum_session_"),
