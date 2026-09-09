@@ -18,11 +18,11 @@ use std::os::fd::AsFd;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::maps::SockHash;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId;
+use aya::programs::cgroup_sock_addr::CgroupSockAddrLink;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::sock_ops::SockOpsLinkId;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::tc::{SchedClassifierLink, SchedClassifierLinkId};
+use aya::programs::tc::SchedClassifierLink;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 // `Link` is the trait that owns `SchedClassifierLink::detach`; the
 // ingress-redirect teardown owns its links rather than tracking link ids, so it
@@ -71,8 +71,8 @@ const INGRESS_REDIRECT_PROGRAM: &str = super::BPF_PROGRAM_TC_INGRESS_REDIRECT;
 /// Tracks per-pod attachment state for cleanup.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 struct PodLinks {
-    cgroup_link_ids: Vec<CgroupSockAddrLinkId>,
-    tc_link_ids: Vec<SchedClassifierLinkId>,
+    cgroup_links: Vec<CgroupSockAddrLink>,
+    tc_links: Vec<SchedClassifierLink>,
 }
 
 /// One node-level tc ingress-redirect classifier attachment.
@@ -320,15 +320,20 @@ impl EbpfBackend for AyaEbpfBackend {
         let link_id = prog
             .attach(cgroup_fd.as_fd(), CgroupAttachMode::Single)
             .map_err(|e| format!("Failed to attach '{program}' to '{cgroup_path}': {e}"))?;
+        let link = prog.take_link(link_id).map_err(|e| {
+            format!(
+                "Attached '{program}' to '{cgroup_path}' but could not take ownership of its link: {e}"
+            )
+        })?;
 
         let links = self
             .pod_links
             .entry(pod_uid.to_string())
             .or_insert_with(|| PodLinks {
-                cgroup_link_ids: Vec::new(),
-                tc_link_ids: Vec::new(),
+                cgroup_links: Vec::new(),
+                tc_links: Vec::new(),
             });
-        links.cgroup_link_ids.push(link_id);
+        links.cgroup_links.push(link);
 
         debug!(program, cgroup_path, "BPF cgroup program attached");
         Ok(())
@@ -358,15 +363,21 @@ impl EbpfBackend for AyaEbpfBackend {
                 direction.as_str()
             )
         })?;
+        let link = prog.take_link(link_id).map_err(|e| {
+            format!(
+                "Attached '{program}' to '{iface}' {} but could not take ownership of its link: {e}",
+                direction.as_str()
+            )
+        })?;
 
         let links = self
             .pod_links
             .entry(pod_uid.to_string())
             .or_insert_with(|| PodLinks {
-                cgroup_link_ids: Vec::new(),
-                tc_link_ids: Vec::new(),
+                cgroup_links: Vec::new(),
+                tc_links: Vec::new(),
             });
-        links.tc_link_ids.push(link_id);
+        links.tc_links.push(link);
 
         debug!(
             program,
@@ -378,7 +389,28 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn detach_pod(&mut self, pod_uid: &str) -> Result<(), String> {
-        self.pod_links.remove(pod_uid);
+        let Some(links) = self.pod_links.remove(pod_uid) else {
+            return Ok(());
+        };
+
+        let mut errors = Vec::new();
+        for link in links.cgroup_links {
+            if let Err(e) = link.detach() {
+                errors.push(format!("cgroup link: {e}"));
+            }
+        }
+        for link in links.tc_links {
+            if let Err(e) = link.detach() {
+                errors.push(format!("tc link: {e}"));
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(format!(
+                "Failed to detach BPF programs for pod '{pod_uid}': {}",
+                errors.join(", ")
+            ));
+        }
         debug!(pod_uid, "BPF programs detached for pod");
         Ok(())
     }
