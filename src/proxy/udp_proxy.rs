@@ -2946,6 +2946,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             node_waypoint_udp_source_scoping,
             node_waypoint_udp_owner,
             datagram_client_address,
+            mesh_outbound_enforcement,
         )
         .await;
     }
@@ -4961,6 +4962,8 @@ async fn start_dtls_frontend_listener(
     >,
     node_waypoint_udp_owner: bool,
     datagram_client_address: Option<Arc<DatagramClientAddressGate>>,
+    mesh_outbound_enforcement:
+        crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let admission_overload = overload.clone();
@@ -5145,6 +5148,8 @@ async fn start_dtls_frontend_listener(
                 let handler_ca_bundle = tls_ca_bundle_path.clone();
                 let handler_dtls_cache = backend_dtls_config_cache.clone();
                 let handler_overload = overload.clone();
+                let handler_mesh_outbound_enforcement =
+                    Arc::clone(&mesh_outbound_enforcement);
                 // NodeWaypoint per-datagram source attribution for this DTLS
                 // session (issue #3286); `None` for every other listener.
                 let handler_node_waypoint_source = node_waypoint_udp_source_scoping.clone();
@@ -5410,6 +5415,7 @@ async fn start_dtls_frontend_listener(
                         handler_node_waypoint_session_source,
                         handler_auth_deadline,
                         &client_trust,
+                        &handler_mesh_outbound_enforcement,
                     )
                     .await;
                     let (err_msg, error_class, disconnect_cause, disconnect_direction) =
@@ -5580,6 +5586,8 @@ async fn handle_dtls_client(
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     client_trust: &DtlsClientTrustFence,
+    mesh_outbound_enforcement:
+        &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -5619,6 +5627,7 @@ async fn handle_dtls_client(
         node_waypoint_source,
         auth_deadline,
         client_trust,
+        mesh_outbound_enforcement,
     )
     .await;
     DtlsHandlerResult {
@@ -6709,6 +6718,8 @@ async fn handle_dtls_client_inner(
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     client_trust: &DtlsClientTrustFence,
+    mesh_outbound_enforcement:
+        &crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
 ) -> Result<(), anyhow::Error> {
     // Frontend client-trust fence, before any post-admission work (issue
     // #3857). A withdrawal can land between the driver's accept handoff and
@@ -6765,6 +6776,42 @@ async fn handle_dtls_client_inner(
     )?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
+
+    // A terminating DTLS frontend bypasses the plain-UDP session path, so it
+    // must apply the mesh egress decision here, after selecting the concrete
+    // backend but before circuit-breaker admission, DNS, or socket creation.
+    let mesh_enforcement_snapshot = mesh_outbound_enforcement.load_full();
+    if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
+        use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
+        let protocol_label = if matches!(proxy.effective_scheme(), BackendScheme::Dtls) {
+            PROTOCOL_UDP_DTLS
+        } else {
+            PROTOCOL_UDP
+        };
+        match enforcement.check_destination(listen_port, &backend_host, backend_port) {
+            Decision::Admit => {
+                enforcement.record_stream_decision(protocol_label, Decision::Admit);
+            }
+            Decision::Deny => {
+                enforcement.record_stream_decision(protocol_label, Decision::Deny);
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %udp_client_log_addr(identity.resolved()),
+                    listen_port,
+                    backend_host = %backend_host,
+                    backend_port,
+                    protocol = protocol_label,
+                    "Mesh REGISTRY_ONLY: rejecting DTLS frontend session to unadmitted destination"
+                );
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::RejectedByPlugin,
+                    "(mesh REGISTRY_ONLY)",
+                )
+                .into());
+            }
+            Decision::Skip => {}
+        }
+    }
 
     // Least-connection accounting for the DTLS session's lifetime (issue
     // #4514). Unlike plain UDP, a DTLS session has no `UdpSession` record: this
