@@ -385,7 +385,8 @@ fn test_build_backend_url_grpc_uses_http_scheme() {
         "/grpc/my.Service/MyMethod",
         "",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(
         url,
         "http://grpc-backend.example.com:50051/my.Service/MyMethod"
@@ -402,7 +403,8 @@ fn test_build_backend_url_grpcs_uses_https_scheme() {
         "/grpc/my.Service/MyMethod",
         "",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(
         url,
         "https://grpc-backend.example.com:50051/my.Service/MyMethod"
@@ -418,7 +420,8 @@ fn test_build_backend_url_grpc_with_backend_path() {
         "/grpc/my.Service/MyMethod",
         "",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(
         url,
         "http://grpc-backend.example.com:50051/prefix/my.Service/MyMethod"
@@ -434,7 +437,8 @@ fn test_build_backend_url_grpc_no_strip() {
         "/grpc/my.Service/MyMethod",
         "",
         proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-    );
+    )
+    .unwrap();
     assert_eq!(
         url,
         "http://grpc-backend.example.com:50051/grpc/my.Service/MyMethod"

@@ -210,6 +210,7 @@ fn start_gateway_with_extra_env(
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -1697,4 +1698,82 @@ plugin_configs: []
     drop(held);
     shutdown_gateway(&mut gateway);
     backend.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_userspace_tls_write_timeout_preserves_request_then_push_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                if stream.read_u8().await.ok() != Some(b'S') {
+                    return;
+                }
+                for byte in 0..30u8 {
+                    if stream.write_all(&[byte]).await.is_err() {
+                        return;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                if stream.read_u8().await.ok() == Some(b'Q') {
+                    let _ = stream.write_all(b"!").await;
+                }
+            });
+        }
+    });
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let key_path = std::fs::canonicalize("tests/certs/server.key")
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry_extra_env(
+        |proxy_port| {
+            format!(
+                r#"
+version: "1"
+proxies:
+  - id: "userspace-request-then-push"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    frontend_tls: true
+    backend_write_timeout_ms: 500
+    backend_read_timeout_ms: 0
+    tcp_idle_timeout_seconds: 30
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        Some(&cert_path),
+        Some(&key_path),
+        &[("FERRUM_KTLS_ENABLED", "false")],
+    )
+    .await;
+    let socket = connect_tcp_proxy(proxy_port).await;
+    let mut stream = insecure_tls_connector()
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            socket,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        stream.write_all(b"S").await.unwrap();
+        for expected in 0..30u8 {
+            assert_eq!(stream.read_u8().await.unwrap(), expected);
+        }
+        stream.write_all(b"Q").await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), b'!');
+    })
+    .await
+    .expect("userspace TLS relay must not time out a drained client write queue");
+    shutdown_gateway(&mut gateway);
+    backend_task.abort();
 }
