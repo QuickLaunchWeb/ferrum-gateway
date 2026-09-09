@@ -8,8 +8,10 @@
 //! Changes are detected by comparing the namespace-qualified `(namespace, id)`
 //! identity plus `updated_at` timestamps. Resources present in the new config
 //! but not the old are additions; resources in the old but not the new are
-//! removals; resources in both with a different `updated_at` are modifications
-//! (uses `!=` to catch both forward progress and backward clock skew).
+//! removals; resources in both with a different `updated_at` or different
+//! timestamp-neutral content are modifications. Timestamp comparison uses `!=`
+//! to catch both forward progress and backward clock skew; content comparison
+//! runs only when timestamps match.
 //! Proxy/plugin association membership is compared directly because
 //! junction-table changes can arrive without advancing the owning proxy's
 //! timestamp.
@@ -77,7 +79,8 @@ pub struct ConfigDelta {
 impl ConfigDelta {
     /// Compute the delta between an old and new config snapshot.
     ///
-    /// Uses `(namespace, id)` for identity and `updated_at` for change detection.
+    /// Uses `(namespace, id)` for identity and `updated_at` for change detection,
+    /// falling back to timestamp-neutral content when timestamps match.
     /// Returns a delta describing exactly which resources were added,
     /// removed, or modified.
     pub fn compute(old: &GatewayConfig, new: &GatewayConfig) -> Self {
@@ -307,10 +310,31 @@ impl ConfigDelta {
 
 type ResourceKey<'a> = (&'a str, &'a str);
 
-trait HasNamespacedIdAndTimestamp {
+trait HasNamespacedIdAndTimestamp: Clone + serde::Serialize {
     fn namespace(&self) -> &str;
     fn id(&self) -> &str;
     fn updated_at(&self) -> DateTime<Utc>;
+    fn normalize_timestamps(&mut self);
+
+    /// Runtime projections skipped by serde must also agree before reuse.
+    fn projected_content_eq(&self, _other: &Self) -> bool {
+        true
+    }
+
+    fn content_eq(&self, other: &Self) -> bool {
+        if !self.projected_content_eq(other) {
+            return false;
+        }
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.normalize_timestamps();
+        right.normalize_timestamps();
+        match (serde_json::to_value(&left), serde_json::to_value(&right)) {
+            (Ok(left), Ok(right)) => left == right,
+            // A failed comparison must never silently retain stale policy.
+            _ => false,
+        }
+    }
 }
 
 fn resource_key<T: HasNamespacedIdAndTimestamp>(resource: &T) -> ResourceKey<'_> {
@@ -331,6 +355,16 @@ impl HasNamespacedIdAndTimestamp for Proxy {
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
+    fn normalize_timestamps(&mut self) {
+        self.created_at = DateTime::<Utc>::UNIX_EPOCH;
+        self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+    }
+    fn projected_content_eq(&self, other: &Self) -> bool {
+        self.dispatch_kind == other.dispatch_kind
+            && self.resolved_tls == other.resolved_tls
+            && self.dispatch_port_overrides == other.dispatch_port_overrides
+            && self.dispatch_port_override_fallback == other.dispatch_port_override_fallback
+    }
 }
 
 impl HasNamespacedIdAndTimestamp for Consumer {
@@ -342,6 +376,10 @@ impl HasNamespacedIdAndTimestamp for Consumer {
     }
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
+    }
+    fn normalize_timestamps(&mut self) {
+        self.created_at = DateTime::<Utc>::UNIX_EPOCH;
+        self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
     }
 }
 
@@ -355,6 +393,10 @@ impl HasNamespacedIdAndTimestamp for PluginConfig {
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
+    fn normalize_timestamps(&mut self) {
+        self.created_at = DateTime::<Utc>::UNIX_EPOCH;
+        self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+    }
 }
 
 impl HasNamespacedIdAndTimestamp for Upstream {
@@ -366,6 +408,16 @@ impl HasNamespacedIdAndTimestamp for Upstream {
     }
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
+    }
+    fn normalize_timestamps(&mut self) {
+        self.created_at = DateTime::<Utc>::UNIX_EPOCH;
+        self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+    }
+    fn projected_content_eq(&self, other: &Self) -> bool {
+        self.resolved_subset_tls == other.resolved_subset_tls
+            && self.dispatch_port_override_fallback == other.dispatch_port_override_fallback
+            // Targets also carry a serde-skipped service-port policy key.
+            && self.targets == other.targets
     }
 }
 
@@ -390,7 +442,7 @@ fn diff_removed_ids<T: HasNamespacedIdAndTimestamp>(
         .collect()
 }
 
-/// Resources present in both whose `updated_at` changed.
+/// Resources present in both whose timestamp or timestamp-neutral content changed.
 ///
 /// Uses `!=` instead of `>` for snapshot-to-snapshot comparison so a full
 /// snapshot can detect backward timestamp drift once both versions are present
@@ -398,15 +450,12 @@ fn diff_removed_ids<T: HasNamespacedIdAndTimestamp>(
 /// predicate to fetch candidates in the first place, so this is a defensive
 /// diff guard rather than a substitute for monotonic database timestamps.
 fn diff_modified<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
-    let old_map: HashMap<ResourceKey<'_>, DateTime<Utc>> = old
-        .iter()
-        .map(|r| (resource_key(r), r.updated_at()))
-        .collect();
+    let old_map: HashMap<ResourceKey<'_>, &T> = old.iter().map(|r| (resource_key(r), r)).collect();
     new.iter()
         .filter(|r| {
-            old_map
-                .get(&resource_key(*r))
-                .is_some_and(|&old_ts| r.updated_at() != old_ts)
+            old_map.get(&resource_key(*r)).is_some_and(|&old| {
+                r.updated_at() != old.updated_at() || !r.content_eq(old)
+            })
         })
         .cloned()
         .collect()
@@ -462,7 +511,7 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::json;
 
-    #[derive(Clone)]
+    #[derive(Clone, serde::Serialize)]
     struct TestResource {
         namespace: String,
         id: String,
@@ -480,6 +529,10 @@ mod tests {
 
         fn updated_at(&self) -> DateTime<Utc> {
             self.updated_at
+        }
+
+        fn normalize_timestamps(&mut self) {
+            self.updated_at = DateTime::<Utc>::UNIX_EPOCH;
         }
     }
 
