@@ -96,9 +96,11 @@ mod enabled {
         let errors = snapshot
             .validate_all_fields(30)
             .expect_err("DP admission must apply local policy to distributed keys");
-        assert!(errors.iter().any(|error| {
-            error.contains("frontend_tls_key_path") && error.contains(ALLOWED)
-        }));
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("frontend_tls_key_path") && error.contains(ALLOWED)
+            })
+        );
         assert!(errors.iter().any(|error| {
             error.contains("backend_tls_client_key_path") && error.contains(ALLOWED)
         }));
