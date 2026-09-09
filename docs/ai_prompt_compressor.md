@@ -286,5 +286,5 @@ JSON safety/passthrough, and the direct-dispatch metadata rewrite.
 Run them with:
 
 ```bash
-cargo test --test unit_tests ai_prompt_compressor
+cargo test --test unit_plugins_a_tests ai_prompt_compressor
 ```

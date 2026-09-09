@@ -487,6 +487,10 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   one, never changes an image or tag. The PR carries no gates of its own — normal
   required CI (multi-arch build, FIPS, eBPF, GNU ABI scan, chart smoke) is what
   proves a new base before merge.
+  The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
+  so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
+  `BASE_IMAGE` is supplied by the preceding local image build; the refresh changes
+  only the digest-pinned external tooling input.
 
 Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
 fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the
@@ -560,6 +564,16 @@ When reviewing an actions Dependabot PR:
    to.
 3. Do not accept a PR that reintroduces a mutable tag ref.
 
+The setup-python v7 update is limited to eligible jobs: all uses in
+`native-cache-envelope.yml`, the `contracts`, `publish`, and `anonymous-reader`
+jobs in `native-compiler-store.yml`, and `contracts` in
+`release-platform-study.yml`. The compiler-store `produce` and platform-study
+`study` jobs retain their trusted v6 pins because their Cross-sensitive job
+bodies are frozen. The v7 action still runs on Node 24 and accepts the existing
+`python-version: '3.13'` input; its removed `pip-install` input is not used here.
+Keep future Dependabot updates scoped to eligible jobs instead of changing the
+trusted policy to admit an action bump.
+
 The ARM64 Cross build and publication contracts are deliberately frozen by the
 trusted `pull_request_target` verifier. Existing checkout uses on the guarded
 workflow surfaces still carry the historical `# v6` annotation, although their
@@ -568,6 +582,15 @@ annotation change as a change to that executable surface, so an ordinary pull
 request cannot normalize those comments. Correct them only as part of an
 authorized, coordinated rotation of the trusted policy; do not copy the legacy
 annotation onto new uses.
+
+The install-action v2.87.5 update applies to `ci.yml` and
+`dependency-audit.yml`. The ARM64 release producer and the coverage workflow
+retain the trusted v2.87.2 SHA, including their existing `# v2` comments.
+Dependabot updates must preserve those frozen surfaces; even a patch release
+with unchanged action inputs cannot rotate them through an ordinary PR. The
+v2.87.5 action retains the composite runtime, checksum verification default,
+and existing `tool`/`fallback` inputs. No policy digest is refreshed for this
+dependency update.
 
 #### Scope of the repository-script (automation) freeze
 

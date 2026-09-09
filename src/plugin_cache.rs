@@ -2163,6 +2163,10 @@ impl Plugin for PluginInstanceWrapper {
 const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
     ("api_chargeback", "shared /charges registry is exactly-once"),
     (
+        "api_chargeback_sink",
+        "independent event_id dedup keys would duplicate durable billing rows",
+    ),
+    (
         "load_testing",
         "one detached run cohort is admitted per policy",
     ),
@@ -4187,6 +4191,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "ai_transcript_audit",
     "compression",
     "correlation_id",
+    "cors",
     "grpc_deadline",
     "grpc_web",
     "hmac_auth",
@@ -4217,6 +4222,84 @@ fn is_security_composition_candidate_plugin(
         || custom_plugin_names.contains(&plugin_name)
 }
 
+/// A topology-only view for built-ins whose capabilities are not otherwise
+/// needed by security admission. This keeps every intervening plugin in the
+/// effective chain without opening node-local files or starting runtime clients.
+/// The existing built-in parity tests pin priority/protocol metadata to the
+/// concrete implementations; config-dependent security capabilities below
+/// continue to use their established constructors or dedicated pure views.
+struct CompositionShapePlugin {
+    name: &'static str,
+    priority: u16,
+    protocols: &'static [ProxyProtocol],
+}
+
+#[async_trait]
+impl Plugin for CompositionShapePlugin {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.protocols
+    }
+}
+
+fn composition_shape_plugin(config: &PluginConfig) -> Option<Arc<dyn Plugin>> {
+    let metadata = crate::plugins::builtin_plugin_parity_meta(&config.plugin_name)?;
+    if metadata.classification == crate::plugins::BuiltinPluginClassification::ConfigOnly {
+        return None;
+    }
+    Some(Arc::new(CompositionShapePlugin {
+        name: metadata.name,
+        priority: config.priority_override.unwrap_or(metadata.priority),
+        protocols: metadata.matrix_protocols,
+    }))
+}
+
+/// One assembly gate for admission, full construction and incremental rebuilds.
+/// Call only with the complete effective chain, including topology-only entries
+/// during admission, so an omitted plugin cannot conceal an interleaving.
+fn prepare_plugin_chain(
+    plugins: &mut Vec<Arc<dyn Plugin>>,
+    proxy: Option<&Proxy>,
+    real_ip_header: Option<&str>,
+) -> Vec<String> {
+    let context = proxy.map_or_else(
+        || "global plugins".to_string(),
+        |proxy| format!("proxy_id={}", proxy.id),
+    );
+    let mut errors = Vec::new();
+    plugins.sort_by_key(|plugin| plugin.priority());
+    for result in [
+        install_cors_finalizer(plugins),
+        install_mesh_route_dispatch_finalizer(plugins),
+        validate_plugin_security_composition(plugins),
+        validate_correlation_id_composition(plugins, real_ip_header),
+    ] {
+        if let Err(error) = result {
+            errors.push(format!("{context}: {error}"));
+        }
+    }
+    if let Some(proxy) = proxy {
+        warn_if_cors_ws_origin_policy_gap(proxy, plugins);
+        errors.extend(exclusive_effective_instance_errors(plugins, &proxy.id));
+        if let Err(error) =
+            crate::plugins::mesh::workload_metrics::validate_effective_metric_tag_override_plan_budget(
+                plugins,
+                &proxy.id,
+            )
+        {
+            errors.push(error);
+        }
+    }
+    errors
+}
+
 /// Validate security-sensitive and cross-plugin composition invariants against a
 /// candidate config before an admin Proxy or PluginConfig write is persisted.
 /// Runtime cache construction repeats the same checks as a fail-closed backstop.
@@ -4224,12 +4307,11 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
-    validate_api_chargeback_ownership(config)?;
-    validate_replay_provenance_composition(config)?;
-    validate_soap_ws_security_composition(config)?;
+    validate_gateway_plugin_composition(config)?;
     let mut errors = Vec::new();
     let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
+    let mut proxy_scoped_configs: ProxyScopedConfigIndex = HashMap::new();
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
@@ -4239,13 +4321,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
 
     for plugin_config in &config.plugin_configs {
         let has_trigger = plugin_config.trigger.is_some();
-        if !plugin_config.enabled
-            || (!has_trigger
-                && !is_security_composition_candidate_plugin(
-                    plugin_config.plugin_name.as_str(),
-                    &custom_plugin_names,
-                ))
-        {
+        if !plugin_config.enabled {
             continue;
         }
         // A trigger's composition safety depends on the concrete plugin's
@@ -4268,8 +4344,15 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                             &plugin_config.config,
                         )
                     })
-                    .map(|()| None)
+                    .map(|()| composition_shape_plugin(plugin_config))
             })
+        } else if !has_trigger
+            && !is_security_composition_candidate_plugin(
+                plugin_config.plugin_name.as_str(),
+                &custom_plugin_names,
+            )
+        {
+            Ok(composition_shape_plugin(plugin_config))
         } else if has_trigger {
             try_create_plugin(
                 plugin_config,
@@ -4320,6 +4403,14 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                 global_plugins.push(plugin);
             }
             Ok(Some(plugin)) => {
+                if plugin_config.scope == PluginScope::Proxy
+                    && let Some(proxy_id) = plugin_config.proxy_id.as_deref()
+                {
+                    proxy_scoped_configs
+                        .entry((plugin_config.namespace.as_str(), proxy_id))
+                        .or_default()
+                        .push(plugin_config);
+                }
                 scoped_plugins.insert(
                     (plugin_config.namespace.as_str(), plugin_config.id.as_str()),
                     (plugin_config, plugin),
@@ -4336,49 +4427,50 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             .iter()
             .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
             .collect();
-        for association in &proxy.plugins {
-            let Some((plugin_config, plugin)) = scoped_plugins.get(&(
+        // Match runtime's stable tie ordering: config-order proxy instances,
+        // then association-order proxy-group instances, after all globals.
+        let attached_ids: HashSet<&str> = proxy
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let local_configs = proxy_scoped_configs
+            .get(&(proxy.namespace.as_str(), proxy.id.as_str()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|pc| attached_ids.contains(pc.id.as_str()));
+        let group_configs = proxy.plugins.iter().filter_map(|association| {
+            let (pc, _) = scoped_plugins.get(&(
                 proxy.namespace.as_str(),
                 association.plugin_config_id.as_str(),
-            )) else {
+            ))?;
+            (pc.scope == PluginScope::ProxyGroup && pc.proxy_id.is_none()).then_some(*pc)
+        });
+        for plugin_config in local_configs.chain(group_configs) {
+            let Some((_, plugin)) =
+                scoped_plugins.get(&(plugin_config.namespace.as_str(), plugin_config.id.as_str()))
+            else {
                 continue;
             };
-            let applies = match plugin_config.scope {
-                PluginScope::Proxy => plugin_config.proxy_id.as_deref() == Some(proxy.id.as_str()),
-                PluginScope::ProxyGroup => plugin_config.proxy_id.is_none(),
-                PluginScope::Global => false,
-            };
-            if !applies {
-                continue;
-            }
             if !is_istio_route_transform_consumer(plugin_config, &proxy.id) {
                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
             }
             merged.push(Arc::clone(plugin));
         }
-        if let Err(error) = validate_plugin_security_composition(&merged) {
-            errors.push(format!("proxy={}/{}: {error}", proxy.namespace, proxy.id));
-        }
-        if let Err(error) =
-            validate_correlation_id_composition(&merged, http_client.real_ip_header())
-        {
-            errors.push(format!("proxy={}/{}: {error}", proxy.namespace, proxy.id));
-        }
-        warn_if_cors_ws_origin_policy_gap(proxy, &merged);
+        errors.extend(prepare_plugin_chain(
+            &mut merged,
+            Some(proxy),
+            http_client.real_ip_header(),
+        ));
     }
 
-    // Keep the gateway-wide global chain behind the same slice-shaped
-    // validation boundary used by the former per-namespace map. Besides
-    // preserving one admission path, this makes it explicit that globals from
-    // every namespace are validated together because runtime installs them
-    // together.
-    let plugins = &global_plugins;
-    if let Err(error) = validate_plugin_security_composition(plugins) {
-        errors.push(format!("global plugins: {error}"));
-    }
-    if let Err(error) = validate_correlation_id_composition(plugins, http_client.real_ip_header()) {
-        errors.push(format!("global plugins: {error}"));
-    }
+    // Globals share one process-wide fallback chain across namespaces.
+    errors.extend(prepare_plugin_chain(
+        &mut global_plugins,
+        None,
+        http_client.real_ip_header(),
+    ));
 
     if errors.is_empty() {
         Ok(())
@@ -6166,6 +6258,14 @@ pub(crate) enum CountryMmdbLoadMode {
     PreloadedOnly,
 }
 
+fn validate_gateway_plugin_composition(config: &GatewayConfig) -> Result<(), String> {
+    validate_prometheus_metrics_ownership(config)?;
+    validate_mesh_bpf_metrics_ownership(config)?;
+    validate_api_chargeback_ownership(config)?;
+    validate_replay_provenance_composition(config)?;
+    validate_soap_ws_security_composition(config)
+}
+
 fn validate_prometheus_metrics_ownership(config: &GatewayConfig) -> Result<(), String> {
     let mut enabled = config
         .plugin_configs
@@ -6307,11 +6407,7 @@ impl PluginCache {
         previous_lifecycle_generations: &HashMap<String, u64>,
         previous_lifecycle_generation_high_water: u64,
     ) -> Result<Arc<PluginCacheInner>, String> {
-        validate_prometheus_metrics_ownership(config)?;
-        validate_mesh_bpf_metrics_ownership(config)?;
-        validate_api_chargeback_ownership(config)?;
-        validate_replay_provenance_composition(config)?;
-        validate_soap_ws_security_composition(config)?;
+        validate_gateway_plugin_composition(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -6744,11 +6840,7 @@ impl PluginCache {
         rebuild_globals: bool,
         country_mmdb_load_mode: CountryMmdbLoadMode,
     ) -> Result<Arc<PluginCacheInner>, String> {
-        validate_prometheus_metrics_ownership(config)?;
-        validate_mesh_bpf_metrics_ownership(config)?;
-        validate_api_chargeback_ownership(config)?;
-        validate_replay_provenance_composition(config)?;
-        validate_soap_ws_security_composition(config)?;
+        validate_gateway_plugin_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -6787,11 +6879,7 @@ impl PluginCache {
         config: &GatewayConfig,
         force_node_local_refresh: bool,
     ) -> Result<Option<Arc<PluginCacheInner>>, String> {
-        validate_prometheus_metrics_ownership(config)?;
-        validate_mesh_bpf_metrics_ownership(config)?;
-        validate_api_chargeback_ownership(config)?;
-        validate_replay_provenance_composition(config)?;
-        validate_soap_ws_security_composition(config)?;
+        validate_gateway_plugin_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);
@@ -7009,22 +7097,11 @@ impl PluginCache {
                     }
                 }
             }
-            global_plugins.sort_by_key(|p| p.priority());
-            if let Err(e) = install_cors_finalizer(&mut global_plugins) {
-                plugin_errors.push(format!("global plugins: {e}"));
-            }
-            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
-                plugin_errors.push(format!("global plugins: {e}"));
-            }
-            if let Err(e) = validate_plugin_security_composition(&global_plugins) {
-                plugin_errors.push(format!("global plugins: {e}"));
-            }
-            if let Err(e) = validate_correlation_id_composition(
-                &global_plugins,
+            plugin_errors.extend(prepare_plugin_chain(
+                &mut global_plugins,
+                None,
                 self.http_client.real_ip_header(),
-            ) {
-                plugin_errors.push(format!("global plugins: {e}"));
-            }
+            ));
             Arc::new(global_plugins)
         } else if rebuild_adaptive_globals {
             // Route compatibility can require a fresh global adaptive view
@@ -7063,13 +7140,11 @@ impl PluginCache {
                     }
                 }
             }
-            global_plugins.sort_by_key(|plugin| plugin.priority());
-            if let Err(e) = install_cors_finalizer(&mut global_plugins) {
-                plugin_errors.push(format!("global plugins: {e}"));
-            }
-            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
-                plugin_errors.push(format!("global plugins: {e}"));
-            }
+            plugin_errors.extend(prepare_plugin_chain(
+                &mut global_plugins,
+                None,
+                self.http_client.real_ip_header(),
+            ));
             Arc::new(global_plugins)
         } else {
             Arc::clone(&current.global_plugins)
@@ -7307,31 +7382,11 @@ impl PluginCache {
                 }
             }
 
-            merged.sort_by_key(|p| p.priority());
-            if let Err(e) = install_cors_finalizer(&mut merged) {
-                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
-            }
-            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
-                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
-            }
-            if let Err(e) = validate_plugin_security_composition(&merged) {
-                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
-            }
-            if let Err(e) =
-                validate_correlation_id_composition(&merged, self.http_client.real_ip_header())
-            {
-                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
-            }
-            warn_if_cors_ws_origin_policy_gap(proxy, &merged);
-            plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
-            if let Err(e) =
-                crate::plugins::mesh::workload_metrics::validate_effective_metric_tag_override_plan_budget(
-                    &merged,
-                    &proxy.id,
-                )
-            {
-                plugin_errors.push(e);
-            }
+            plugin_errors.extend(prepare_plugin_chain(
+                &mut merged,
+                Some(proxy),
+                self.http_client.real_ip_header(),
+            ));
             new_map.insert(proxy_runtime_key(proxy), Arc::new(merged));
         }
 
@@ -8108,32 +8163,11 @@ impl PluginCache {
                 }
             }
 
-            // Sort by priority so execution order is deterministic
-            merged.sort_by_key(|p| p.priority());
-            if let Err(e) = install_cors_finalizer(&mut merged) {
-                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
-            }
-            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
-                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
-            }
-            if let Err(e) = validate_plugin_security_composition(&merged) {
-                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
-            }
-            if let Err(e) =
-                validate_correlation_id_composition(&merged, http_client.real_ip_header())
-            {
-                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
-            }
-            warn_if_cors_ws_origin_policy_gap(proxy, &merged);
-            plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
-            if let Err(e) =
-                crate::plugins::mesh::workload_metrics::validate_effective_metric_tag_override_plan_budget(
-                    &merged,
-                    &proxy.id,
-                )
-            {
-                plugin_errors.push(e);
-            }
+            plugin_errors.extend(prepare_plugin_chain(
+                &mut merged,
+                Some(proxy),
+                http_client.real_ip_header(),
+            ));
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());
@@ -8158,21 +8192,11 @@ impl PluginCache {
 
         // Sort and validate the global fallback list before committing the
         // staged registry so ordering errors reject the whole cache build.
-        global_plugins.sort_by_key(|p| p.priority());
-        if let Err(e) = install_cors_finalizer(&mut global_plugins) {
-            plugin_errors.push(format!("global plugins: {e}"));
-        }
-        if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
-            plugin_errors.push(format!("global plugins: {e}"));
-        }
-        if let Err(e) = validate_plugin_security_composition(&global_plugins) {
-            plugin_errors.push(format!("global plugins: {e}"));
-        }
-        if let Err(e) =
-            validate_correlation_id_composition(&global_plugins, http_client.real_ip_header())
-        {
-            plugin_errors.push(format!("global plugins: {e}"));
-        }
+        plugin_errors.extend(prepare_plugin_chain(
+            &mut global_plugins,
+            None,
+            http_client.real_ip_header(),
+        ));
 
         // If any enabled plugin failed validation or could not be resolved,
         // refuse to build the cache.
