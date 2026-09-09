@@ -6641,8 +6641,7 @@ impl PluginCache {
         &self,
         config: &GatewayConfig,
         proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
-        rebuild_globals: bool,
-    ) -> (HashSet<NamespacedResourceId>, bool) {
+    ) -> HashSet<NamespacedResourceId> {
         let current = self.inner.load();
         let mut expanded_proxy_ids = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -6652,10 +6651,7 @@ impl PluginCache {
             &mut expanded_proxy_ids,
             &mut rebuild_adaptive_globals,
         );
-        (
-            expanded_proxy_ids,
-            rebuild_globals || rebuild_adaptive_globals,
-        )
+        expanded_proxy_ids
     }
 
     /// Whether the exact delta-build scope, including adaptive-concurrency
@@ -6666,11 +6662,8 @@ impl PluginCache {
         proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
         rebuild_globals: bool,
     ) -> bool {
-        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
-            config,
-            proxy_ids_to_rebuild,
-            rebuild_globals,
-        );
+        let expanded_proxy_ids =
+            self.expanded_file_dependency_rebuild_scope(config, proxy_ids_to_rebuild);
         country_mmdb_preload_required_for_scope(config, &expanded_proxy_ids, rebuild_globals)
     }
 
@@ -6683,11 +6676,8 @@ impl PluginCache {
         proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
         rebuild_globals: bool,
     ) -> bool {
-        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
-            config,
-            proxy_ids_to_rebuild,
-            rebuild_globals,
-        );
+        let expanded_proxy_ids =
+            self.expanded_file_dependency_rebuild_scope(config, proxy_ids_to_rebuild);
         body_validator_descriptor_preload_required_for_scope(
             config,
             &expanded_proxy_ids,
@@ -6704,11 +6694,8 @@ impl PluginCache {
         proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
         rebuild_globals: bool,
     ) -> bool {
-        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
-            config,
-            proxy_ids_to_rebuild,
-            rebuild_globals,
-        );
+        let expanded_proxy_ids =
+            self.expanded_file_dependency_rebuild_scope(config, proxy_ids_to_rebuild);
         ai_response_guard_descriptor_preload_required_for_scope(
             config,
             &expanded_proxy_ids,
@@ -6725,11 +6712,8 @@ impl PluginCache {
         proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
         rebuild_globals: bool,
     ) -> bool {
-        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
-            config,
-            proxy_ids_to_rebuild,
-            rebuild_globals,
-        );
+        let expanded_proxy_ids =
+            self.expanded_file_dependency_rebuild_scope(config, proxy_ids_to_rebuild);
         ai_transcript_audit_descriptor_preload_required_for_scope(
             config,
             &expanded_proxy_ids,
