@@ -1054,6 +1054,7 @@ fn test_prometheus_render_with_data() {
     assert!(output.contains("ferrum_api_chargeable_calls_total{") && output.contains("} 2\n"));
     // Currency label on per-call charges
     assert!(output.contains("currency=\"USD\""));
+    assert_counter_samples_omit_proxy_name(&output);
 }
 
 #[test]
@@ -1073,6 +1074,7 @@ fn test_prometheus_render_emits_stream_metrics() {
     );
 
     let output = registry.render_prometheus_uncached().unwrap();
+    assert_counter_samples_omit_proxy_name(&output);
     assert!(output.contains("ferrum_api_stream_connections_total{consumer=\"bob\""));
     assert!(output.contains("protocol_family=\"stream\""));
     // Stream entry must NOT emit ferrum_api_chargeable_calls_total rows (those are HTTP-only).
@@ -1678,7 +1680,7 @@ fn test_live_proxy_names_are_namespace_qualified() {
     let team_a = prometheus
         .lines()
         .find(|line| {
-            line.starts_with("ferrum_api_chargeable_calls_total{")
+            line.starts_with("ferrum_api_proxy_info{")
                 && line.contains("proxy_id=\"shared\"")
                 && line.contains("namespace=\"team-a\"")
         })
@@ -1686,7 +1688,7 @@ fn test_live_proxy_names_are_namespace_qualified() {
     let team_b = prometheus
         .lines()
         .find(|line| {
-            line.starts_with("ferrum_api_chargeable_calls_total{")
+            line.starts_with("ferrum_api_proxy_info{")
                 && line.contains("proxy_id=\"shared\"")
                 && line.contains("namespace=\"team-b\"")
         })
@@ -2047,7 +2049,19 @@ fn test_websocket_then_bandwidth_only_stream_keeps_families_distinct() {
 
 // --- Issue #2572: proxy_name is live metadata; aggregation is deterministic ---
 
-/// Extract the `proxy_name="..."` label from a Prometheus sample line.
+fn assert_counter_samples_omit_proxy_name(prometheus: &str) {
+    for line in prometheus
+        .lines()
+        .filter(|line| line.starts_with("ferrum_api_") && line.contains("_total{"))
+    {
+        assert!(
+            !line.contains("proxy_name="),
+            "mutable display metadata must not split a counter series: {line}"
+        );
+    }
+}
+
+/// Extract the `proxy_name="..."` label from a Prometheus metadata sample.
 fn prometheus_proxy_name(line: &str) -> Option<&str> {
     let key = "proxy_name=\"";
     let start = line.find(key)? + key.len();
@@ -2066,8 +2080,8 @@ fn record_payment(
     );
 }
 
-/// Assert JSON and Prometheus expose the same authoritative `proxy_name` for a
-/// consumer/proxy HTTP status row, and that repeated renders stay stable.
+/// Assert JSON and the separate Prometheus info metric expose the same live
+/// `proxy_name`, while counter identities remain free of mutable metadata.
 fn assert_json_and_prometheus_proxy_name_agree(
     registry: &ChargebackRegistry,
     consumer: &str,
@@ -2089,28 +2103,22 @@ fn assert_json_and_prometheus_proxy_name_agree(
             .unwrap_or_else(|| {
                 panic!("{order_label} pass {pass}: missing chargeable_calls row\n{prom}")
             });
-        let prom_name = prometheus_proxy_name(call_line).unwrap_or_else(|| {
-            panic!("{order_label} pass {pass}: missing proxy_name label\n{call_line}")
-        });
-        assert_eq!(
-            prom_name, expected_name,
-            "{order_label} pass {pass}: prometheus name mismatch\n{call_line}"
+        assert!(
+            !call_line.contains("proxy_name="),
+            "{order_label} pass {pass}: mutable name must not split counter series\n{call_line}"
         );
 
-        let charge_line = prom
+        let info_line = prom
             .lines()
             .find(|l| {
-                l.starts_with("ferrum_api_charges_total{")
-                    && l.contains(&format!("consumer=\"{consumer}\""))
+                l.starts_with("ferrum_api_proxy_info{")
                     && l.contains(&format!("proxy_id=\"{proxy_id}\""))
-                    && l.contains(&format!("status_code=\"{status_code}\""))
             })
-            .unwrap_or_else(|| panic!("{order_label} pass {pass}: missing charges row\n{prom}"));
-        assert_eq!(
-            prometheus_proxy_name(charge_line),
-            Some(expected_name),
-            "{order_label} pass {pass}: charges label must match calls\n{charge_line}"
-        );
+            .unwrap_or_else(|| panic!("{order_label} pass {pass}: missing proxy info row\n{prom}"));
+        let prom_name = prometheus_proxy_name(info_line).unwrap_or_else(|| {
+            panic!("{order_label} pass {pass}: missing proxy_name label\n{info_line}")
+        });
+        assert_eq!(prom_name, expected_name, "{order_label} pass {pass}");
 
         let json: serde_json::Value =
             serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
@@ -2119,14 +2127,8 @@ fn assert_json_and_prometheus_proxy_name_agree(
             .unwrap_or_else(|| {
                 panic!("{order_label} pass {pass}: missing json proxy_name: {json}")
             });
-        assert_eq!(
-            json_name, expected_name,
-            "{order_label} pass {pass}: json/prometheus name disagreement"
-        );
-        assert_eq!(
-            json_name, prom_name,
-            "{order_label} pass {pass}: json and prometheus must agree"
-        );
+        assert_eq!(json_name, expected_name, "{order_label} pass {pass}");
+        assert_eq!(json_name, prom_name, "{order_label} pass {pass}");
     }
 }
 
@@ -2211,7 +2213,7 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
     assert!(
         prom.lines().any(|l| {
             l.starts_with("ferrum_api_chargeable_calls_total{")
-                && l.contains("proxy_name=\"Payments v2\"")
+                && !l.contains("proxy_name=")
                 && l.ends_with(" 15")
         }),
         "expected continuous counter under the live name\n{prom}"
@@ -2260,10 +2262,9 @@ fn assert_rename_plus_price_overlap(
         "{order_label}: aggregated call count mismatch\n{}",
         call_rows[0]
     );
-    assert_eq!(
-        prometheus_proxy_name(call_rows[0]),
-        Some(expected_name),
-        "{order_label}: unexpected prometheus name\n{}",
+    assert!(
+        !call_rows[0].contains("proxy_name="),
+        "{order_label}: counters must omit mutable proxy metadata\n{}",
         call_rows[0]
     );
 
@@ -2415,29 +2416,17 @@ fn test_deleted_proxy_uses_lexicographic_admission_name_fallback() {
         serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     for i in 0..16 {
         let proxy_id = format!("deleted-proxy-{i}");
-        let call_line = prom
+        let info_line = prom
             .lines()
             .find(|l| {
-                l.starts_with("ferrum_api_chargeable_calls_total{")
+                l.starts_with("ferrum_api_proxy_info{")
                     && l.contains(&format!("proxy_id=\"{proxy_id}\""))
             })
-            .unwrap_or_else(|| panic!("missing http calls for {proxy_id}\n{prom}"));
+            .unwrap_or_else(|| panic!("missing proxy metadata for {proxy_id}\n{prom}"));
         assert_eq!(
-            prometheus_proxy_name(call_line),
+            prometheus_proxy_name(info_line),
             Some("Zulu"),
-            "deleted proxy http export must pick lex-max admission name\n{call_line}"
-        );
-        let stream_line = prom
-            .lines()
-            .find(|l| {
-                l.starts_with("ferrum_api_stream_connections_total{")
-                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
-            })
-            .unwrap_or_else(|| panic!("missing stream connections for {proxy_id}\n{prom}"));
-        assert_eq!(
-            prometheus_proxy_name(stream_line),
-            Some("Zulu"),
-            "deleted proxy stream export must pick lex-max admission name\n{stream_line}"
+            "deleted proxy metadata must pick lex-max admission name\n{info_line}"
         );
         assert_eq!(
             json["consumers"]["alice"]["proxies"][&proxy_id]["proxy_name"], "Zulu",

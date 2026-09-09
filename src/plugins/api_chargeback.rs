@@ -1734,7 +1734,6 @@ impl ChargebackRegistry {
 
         // --- Per-call metrics (HTTP entries only — streams have no status code) ---
         struct ChargeAggregate {
-            proxy_name: String,
             currency: Arc<str>,
             namespace_label: Arc<str>,
             count: u64,
@@ -1750,6 +1749,7 @@ impl ChargebackRegistry {
         let mut http_aggregates: HashMap<HttpChargeAggregateKey, ChargeAggregate> = HashMap::new();
         let mut stream_aggregates: HashMap<StreamChargeAggregateKey, ChargeAggregate> =
             HashMap::new();
+        let mut proxy_metadata: HashMap<(String, Arc<str>), String> = HashMap::new();
 
         for entry in self.entries.iter() {
             let v = entry.value();
@@ -1758,6 +1758,10 @@ impl ChargebackRegistry {
                 .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
                 .map(String::as_str)
                 .unwrap_or(v.proxy_name.as_ref());
+            let metadata_name = proxy_metadata
+                .entry((v.proxy_id.to_string(), Arc::clone(&v.namespace_label)))
+                .or_insert_with(|| proxy_name.to_string());
+            apply_export_proxy_name(metadata_name, proxy_name);
             match v.protocol_family {
                 ProtocolFamily::Http => {
                     let agg = http_aggregates
@@ -1769,13 +1773,11 @@ impl ChargebackRegistry {
                             Arc::clone(&v.namespace_label),
                         ))
                         .or_insert_with(|| ChargeAggregate {
-                            proxy_name: proxy_name.to_string(),
                             currency: Arc::clone(&v.currency),
                             namespace_label: Arc::clone(&v.namespace_label),
                             count: 0,
                             charges: 0.0,
                         });
-                    apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
                     agg.count += v.call_count.load(Ordering::Relaxed);
                     agg.charges = checked_add_charge(agg.charges, v.call_charge()?)?;
                 }
@@ -1788,17 +1790,28 @@ impl ChargebackRegistry {
                             Arc::clone(&v.namespace_label),
                         ))
                         .or_insert_with(|| ChargeAggregate {
-                            proxy_name: proxy_name.to_string(),
                             currency: Arc::clone(&v.currency),
                             namespace_label: Arc::clone(&v.namespace_label),
                             count: 0,
                             charges: 0.0,
                         });
-                    apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
                     agg.count += v.call_count.load(Ordering::Relaxed);
                     agg.charges = checked_add_charge(agg.charges, v.call_charge()?)?;
                 }
             }
+        }
+
+        output.push_str(
+            "# HELP ferrum_api_proxy_info Live display metadata for a stable chargeback proxy identity.\n",
+        );
+        output.push_str("# TYPE ferrum_api_proxy_info gauge\n");
+        for ((proxy_id, namespace_label), proxy_name) in &proxy_metadata {
+            output.push_str(&format!(
+                "ferrum_api_proxy_info{{proxy_id=\"{}\",proxy_name=\"{}\"{}}} 1\n",
+                escape_label_value(proxy_id),
+                escape_label_value(proxy_name),
+                namespace_label,
+            ));
         }
 
         output.push_str(
@@ -1807,10 +1820,9 @@ impl ChargebackRegistry {
         output.push_str("# TYPE ferrum_api_chargeable_calls_total counter\n");
         for ((consumer, proxy_id, status_code, _, _), agg) in &http_aggregates {
             output.push_str(&format!(
-                "ferrum_api_chargeable_calls_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\",currency=\"{}\"{}}} {}\n",
+                "ferrum_api_chargeable_calls_total{{consumer=\"{}\",proxy_id=\"{}\",status_code=\"{}\",currency=\"{}\"{}}} {}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
-                escape_label_value(&agg.proxy_name),
                 status_code,
                 escape_label_value(&agg.currency),
                 agg.namespace_label,
@@ -1825,10 +1837,9 @@ impl ChargebackRegistry {
         for ((consumer, proxy_id, status_code, _, _), agg) in &http_aggregates {
             let charges = require_finite_charge(agg.charges, "ferrum_api_charges_total")?;
             output.push_str(&format!(
-                "ferrum_api_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\",currency=\"{}\"{}}} {:.10}\n",
+                "ferrum_api_charges_total{{consumer=\"{}\",proxy_id=\"{}\",status_code=\"{}\",currency=\"{}\"{}}} {:.10}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
-                escape_label_value(&agg.proxy_name),
                 status_code,
                 escape_label_value(&agg.currency),
                 agg.namespace_label,
@@ -1844,10 +1855,9 @@ impl ChargebackRegistry {
         output.push_str("# TYPE ferrum_api_stream_connections_total counter\n");
         for ((consumer, proxy_id, _, _), agg) in &stream_aggregates {
             output.push_str(&format!(
-                "ferrum_api_stream_connections_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",currency=\"{}\"{}}} {}\n",
+                "ferrum_api_stream_connections_total{{consumer=\"{}\",proxy_id=\"{}\",currency=\"{}\"{}}} {}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
-                escape_label_value(&agg.proxy_name),
                 escape_label_value(&agg.currency),
                 agg.namespace_label,
                 agg.count
@@ -1862,10 +1872,9 @@ impl ChargebackRegistry {
             let charges =
                 require_finite_charge(agg.charges, "ferrum_api_stream_connection_charges_total")?;
             output.push_str(&format!(
-                "ferrum_api_stream_connection_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",currency=\"{}\"{}}} {:.10}\n",
+                "ferrum_api_stream_connection_charges_total{{consumer=\"{}\",proxy_id=\"{}\",currency=\"{}\"{}}} {:.10}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
-                escape_label_value(&agg.proxy_name),
                 escape_label_value(&agg.currency),
                 agg.namespace_label,
                 charges
@@ -1878,7 +1887,6 @@ impl ChargebackRegistry {
         //     HTTP/stream and distinct billing scopes under the same proxy_id
         //     stay on separate, deterministically labeled rows.
         struct BandwidthAggregate {
-            proxy_name: String,
             currency: Arc<str>,
             namespace_label: Arc<str>,
             bytes_sent: u64,
@@ -1890,11 +1898,6 @@ impl ChargebackRegistry {
         let mut bw_aggregates: HashMap<BandwidthAggregateKey, BandwidthAggregate> = HashMap::new();
         for entry in self.entries.iter() {
             let v = entry.value();
-            let proxy_name = active_proxy_names
-                .get(v.proxy_namespace.as_ref())
-                .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
-                .map(String::as_str)
-                .unwrap_or(v.proxy_name.as_ref());
             let agg = bw_aggregates
                 .entry((
                     v.consumer.to_string(),
@@ -1904,7 +1907,6 @@ impl ChargebackRegistry {
                     Arc::clone(&v.namespace_label),
                 ))
                 .or_insert_with(|| BandwidthAggregate {
-                    proxy_name: proxy_name.to_string(),
                     currency: Arc::clone(&v.currency),
                     namespace_label: Arc::clone(&v.namespace_label),
                     bytes_sent: 0,
@@ -1912,7 +1914,6 @@ impl ChargebackRegistry {
                     charge_sent: 0.0,
                     charge_received: 0.0,
                 });
-            apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
             agg.bytes_sent += v.bytes_sent_total.load(Ordering::Relaxed);
             agg.bytes_received += v.bytes_received_total.load(Ordering::Relaxed);
             agg.charge_sent = checked_add_charge(agg.charge_sent, v.bandwidth_charge_sent()?)?;
@@ -1926,10 +1927,9 @@ impl ChargebackRegistry {
         output.push_str("# TYPE ferrum_api_bytes_sent_total counter\n");
         for ((consumer, proxy_id, family, _, _), agg) in &bw_aggregates {
             output.push_str(&format!(
-                "ferrum_api_bytes_sent_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",currency=\"{}\",protocol_family=\"{}\"{}}} {}\n",
+                "ferrum_api_bytes_sent_total{{consumer=\"{}\",proxy_id=\"{}\",currency=\"{}\",protocol_family=\"{}\"{}}} {}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
-                escape_label_value(&agg.proxy_name),
                 escape_label_value(&agg.currency),
                 family.label(),
                 agg.namespace_label,
@@ -1943,10 +1943,9 @@ impl ChargebackRegistry {
         output.push_str("# TYPE ferrum_api_bytes_received_total counter\n");
         for ((consumer, proxy_id, family, _, _), agg) in &bw_aggregates {
             output.push_str(&format!(
-                "ferrum_api_bytes_received_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",currency=\"{}\",protocol_family=\"{}\"{}}} {}\n",
+                "ferrum_api_bytes_received_total{{consumer=\"{}\",proxy_id=\"{}\",currency=\"{}\",protocol_family=\"{}\"{}}} {}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
-                escape_label_value(&agg.proxy_name),
                 escape_label_value(&agg.currency),
                 family.label(),
                 agg.namespace_label,
@@ -1964,20 +1963,18 @@ impl ChargebackRegistry {
             let charge_received =
                 require_finite_charge(agg.charge_received, "ferrum_api_bandwidth_charges_total")?;
             output.push_str(&format!(
-                "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",direction=\"sent\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
+                "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",direction=\"sent\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
-                escape_label_value(&agg.proxy_name),
                 escape_label_value(&agg.currency),
                 family.label(),
                 agg.namespace_label,
                 charge_sent
             ));
             output.push_str(&format!(
-                "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",direction=\"received\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
+                "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",direction=\"received\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
-                escape_label_value(&agg.proxy_name),
                 escape_label_value(&agg.currency),
                 family.label(),
                 agg.namespace_label,

@@ -2008,21 +2008,24 @@ paths:
               schema:
                 type: string
               example: |
+                # HELP ferrum_api_proxy_info Live display metadata for a stable chargeback proxy identity.
+                # TYPE ferrum_api_proxy_info gauge
+                ferrum_api_proxy_info{proxy_id="proxy-1",proxy_name="Payments API",namespace="ferrum"} 1
                 # HELP ferrum_api_chargeable_calls_total Total chargeable HTTP-family API calls per consumer.
                 # TYPE ferrum_api_chargeable_calls_total counter
-                ferrum_api_chargeable_calls_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",currency="USD",namespace="ferrum"} 150000
+                ferrum_api_chargeable_calls_total{consumer="alice",proxy_id="proxy-1",status_code="200",currency="USD",namespace="ferrum"} 150000
                 # HELP ferrum_api_charges_total Total per-call charges accumulated per consumer.
                 # TYPE ferrum_api_charges_total counter
-                ferrum_api_charges_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",currency="USD",namespace="ferrum"} 1.5000000000
+                ferrum_api_charges_total{consumer="alice",proxy_id="proxy-1",status_code="200",currency="USD",namespace="ferrum"} 1.5000000000
                 # HELP ferrum_api_bytes_sent_total Total bytes the gateway sent client->backend on this consumer's behalf.
                 # TYPE ferrum_api_bytes_sent_total counter
-                ferrum_api_bytes_sent_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",currency="USD",protocol_family="http",namespace="ferrum"} 4500000
+                ferrum_api_bytes_sent_total{consumer="alice",proxy_id="proxy-1",currency="USD",protocol_family="http",namespace="ferrum"} 4500000
                 # HELP ferrum_api_bandwidth_charges_total Total bandwidth charges per consumer, split by direction.
                 # TYPE ferrum_api_bandwidth_charges_total counter
-                ferrum_api_bandwidth_charges_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",direction="received",currency="USD",protocol_family="http",namespace="ferrum"} 0.0900000000
+                ferrum_api_bandwidth_charges_total{consumer="alice",proxy_id="proxy-1",direction="received",currency="USD",protocol_family="http",namespace="ferrum"} 0.0900000000
                 # HELP ferrum_api_stream_connections_total Total stream sessions (TCP/UDP/DTLS) per consumer.
                 # TYPE ferrum_api_stream_connections_total counter
-                ferrum_api_stream_connections_total{consumer="alice",proxy_id="tcp-edge",proxy_name="TCP Edge",currency="USD",namespace="ferrum"} 42
+                ferrum_api_stream_connections_total{consumer="alice",proxy_id="tcp-edge",currency="USD",namespace="ferrum"} 42
             application/json:
               schema:
                 $ref: "#/components/schemas/ChargebackResponse"
