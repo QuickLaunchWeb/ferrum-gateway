@@ -4710,3 +4710,33 @@ fn chargeback_plugin_config(id: &str, config: serde_json::Value) -> PluginConfig
     }))
     .expect("test plugin config")
 }
+
+#[tokio::test]
+async fn explicit_zero_tier_records_a_call_in_the_shared_registry() {
+    use ferrum_edge::plugins::chargeback::pricing::PricingConfig;
+
+    let config = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0}]});
+    let pricing = PricingConfig::from_config(&config, "api_chargeback").unwrap();
+    assert!(pricing.has_any_pricing());
+    assert!(pricing.compute_http(404, 0, 0).is_none());
+    let free = pricing.compute_http(200, 0, 0).unwrap();
+    assert_eq!(free.call_count, 1);
+    assert_eq!(free.charge_total, 0.0);
+
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
+    let summary = make_summary(
+        "zero-price-presence",
+        "Free API",
+        Some("zero-tier-user"),
+        200,
+    );
+    plugin.log(&summary).await;
+    let registry = global_registry();
+    let rows: Vec<_> = registry
+        .entries
+        .iter()
+        .filter(|entry| entry.proxy_id.as_ref() == "zero-price-presence")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].call_count.load(Ordering::Relaxed), 1);
+}

@@ -638,9 +638,9 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
 /// being written, instead of materialising a larger `Vec` that is only rejected
 /// afterwards (GHSA-pwcm-6rh8-f2gh). The request side keeps `usize::MAX`; its
 /// bounds live on the request-body ceilings.
-/// Returns [`crate::plugins::BoundedResponseBodyConstruction::CapacityRefused`]
-/// when a rule set claimed a rewrite but the rewritten document could not be
-/// serialized within the ceiling — distinct from an ordinary semantic no-op
+/// Returns [`crate::plugins::BoundedResponseBodyConstruction::SizeLimitExceeded`]
+/// when a claimed rewrite exceeds the ceiling, or `CapacityRefused` for other
+/// construction failures — distinct from an ordinary semantic no-op
 /// ([`crate::plugins::BoundedResponseBodyConstruction::Unchanged`]).
 pub(crate) fn apply_body_rules_bounded(
     body: &[u8],
@@ -707,7 +707,13 @@ pub(crate) fn apply_body_rules_bounded(
     }
 
     if modified {
-        match crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling) {
+        let mut sink =
+            crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(ceiling);
+        let serialized = serde_json::to_writer(&mut sink, &json).is_ok();
+        if let Some(produced_bytes) = sink.size_refused_at() {
+            return BoundedResponseBodyConstruction::SizeLimitExceeded(produced_bytes);
+        }
+        match serialized.then(|| sink.finish()).flatten() {
             Some(bytes) => BoundedResponseBodyConstruction::Replaced(bytes),
             None => {
                 // A claimed rewrite that cannot fit the retained ceiling (or

@@ -5958,10 +5958,15 @@ pub(crate) fn finalized_request_rejection_phase(rejected_by_egress: bool) -> &'s
 pub(crate) fn rebase_route_override_path(
     ctx: &mut RequestContext,
     original_path: String,
+    strip_len: &mut usize,
 ) -> String {
     let Some(rewritten) = ctx.route_override_path.clone() else {
         return original_path;
     };
+    // A replacement has its own coordinates, even when its bytes happen to
+    // equal the original path. Backend base-path composition is independent.
+    *strip_len = 0;
+    ctx.matched_path_strip_len = 0;
     ctx.path.clone_from(&rewritten);
     rewritten
 }
@@ -9558,24 +9563,34 @@ impl ProxyState {
                             "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
                         );
                         // io_uring splice spawns 2 `spawn_blocking` tasks per relayed
-                        // TCP connection (one per direction), but concurrent io_uring
-                        // relays are semaphore-capped at IO_URING_SPLICE_MAX_CONCURRENT
-                        // (128) in tcp_proxy.rs — beyond the cap, additional relays
+                        // TCP connection (one per direction), and concurrent io_uring
+                        // relays are semaphore-capped at a quarter of the blocking
+                        // pool in `tcp_proxy::derive_io_uring_splice_max_concurrent`
+                        // (issue #4786) — beyond the cap, additional relays
                         // transparently fall back to the async splice path instead of
                         // queueing on the blocking pool. Worst-case io_uring usage is
-                        // therefore 256 blocking threads. Warn only when the configured
-                        // pool is smaller than the default 512: 256 io_uring threads
-                        // would then crowd out other `spawn_blocking` users.
-                        let effective_blocking_threads =
-                            env_config_arc.blocking_threads.unwrap_or(512);
-                        if effective_blocking_threads < 512 {
+                        // therefore half the pool. Warn only when the configured pool
+                        // is smaller than the default 512: the remaining half is what
+                        // every other `spawn_blocking` user has to share.
+                        let effective_blocking_threads = env_config_arc
+                            .blocking_threads
+                            .unwrap_or(tcp_proxy::DEFAULT_BLOCKING_THREADS);
+                        if effective_blocking_threads < tcp_proxy::DEFAULT_BLOCKING_THREADS {
+                            let max_relays = tcp_proxy::derive_io_uring_splice_max_concurrent(
+                                env_config_arc.blocking_threads,
+                            );
                             tracing::warn!(
                                 blocking_threads = effective_blocking_threads,
+                                max_concurrent_relays = max_relays,
                                 "FERRUM_IO_URING_SPLICE_ENABLED=true with FERRUM_BLOCKING_THREADS={} below the 512 default; \
-                             io_uring splice can occupy up to 256 blocking threads (128 concurrent relays x 2 directions; \
-                             further relays fall back to async splice). \
-                             Recommended: FERRUM_BLOCKING_THREADS >= 512 so other spawn_blocking work keeps headroom.",
-                                effective_blocking_threads
+                             io_uring splice can occupy up to {} blocking threads ({} concurrent relays x 2 directions; \
+                             further relays fall back to async splice). Everything else that uses the blocking pool shares \
+                             what is left — including the overload monitor's open-FD count, whose result feeds the \
+                             load-shedding flags, and config reload. \
+                             Recommended: FERRUM_BLOCKING_THREADS >= 512 so that work keeps headroom.",
+                                effective_blocking_threads,
+                                max_relays * 2,
+                                max_relays
                             );
                         }
                     } else {
@@ -9632,6 +9647,7 @@ impl ProxyState {
                 trusted_proxies.clone(),
             ),
         );
+        stream_listener_manager.start_supervisor();
         // Raw TCP / TCP+TLS stream listeners own a dedicated backend socket per
         // relay session, so they must admit on the SAME per-destination lane as
         // WebSocket, the pooled multiplexed transports, and reqwest. Attached
@@ -11845,18 +11861,17 @@ impl ProxyState {
         }
     }
 
-    /// Keys HTTP dispatch currently mints for live circuit breakers.
+    /// Prune target health against one live load-balancer snapshot.
     ///
     /// Direct-backend proxies contribute `namespace|id::backend_host:backend_port`.
     /// Upstream-backed proxies contribute one key per target in the live
     /// load-balancer set (static plus service-discovery), falling back to the
     /// authored config only when the upstream is not yet in the LB cache.
-    /// Callers pass this set to [`CircuitBreakerCache::prune_stale_targets`] so
-    /// a config delta cannot reclaim still-routable breakers.
-    fn collect_active_circuit_breaker_target_keys(
-        &self,
-        config: &GatewayConfig,
-    ) -> HashSet<String> {
+    /// Passive ejections and failure counters use that same target set: the
+    /// authored static seed must not erase health state for discovered targets.
+    /// An installed empty set is authoritative (including discovery withdrawal);
+    /// do not substitute old targets or retain their stale health indefinitely.
+    fn prune_stale_target_health(&self, config: &GatewayConfig) {
         let mut active_keys = HashSet::new();
         let lb_snapshot = self.load_balancer_cache.load();
         for proxy in &config.proxies {
@@ -11866,6 +11881,11 @@ impl ProxyState {
                     &proxy.namespace,
                     upstream_id,
                 ) {
+                    self.health_checker.remove_stale_passive_targets_for_proxy(
+                        &proxy.namespace,
+                        &proxy.id,
+                        &live_upstream.targets,
+                    );
                     for target in &live_upstream.targets {
                         active_keys.insert(scoped_cache_key(
                             &proxy.namespace,
@@ -11877,6 +11897,15 @@ impl ProxyState {
                 } else if let Some(upstream) = config.upstreams.iter().find(|upstream| {
                     upstream.id == *upstream_id && upstream.namespace == proxy.namespace
                 }) {
+                    // Without a live snapshot, a discovery-backed static seed
+                    // cannot establish that a previously discovered target left.
+                    if upstream.service_discovery.is_none() {
+                        self.health_checker.remove_stale_passive_targets_for_proxy(
+                            &proxy.namespace,
+                            &proxy.id,
+                            &upstream.targets,
+                        );
+                    }
                     for target in &upstream.targets {
                         active_keys.insert(scoped_cache_key(
                             &proxy.namespace,
@@ -11895,7 +11924,7 @@ impl ProxyState {
                 ));
             }
         }
-        active_keys
+        self.circuit_breaker_cache.prune_stale_targets(&active_keys);
     }
 
     /// Timestamp-neutral proxy content comparison for route-table reuse.
@@ -12827,29 +12856,12 @@ impl ProxyState {
         // Keep keys dispatch currently mints (direct-backend host:port, live
         // upstream/SD targets) so a config delta cannot reclaim still-routable
         // breakers, while still dropping retired pod IPs and removed hosts.
-        {
-            let active_keys = self.collect_active_circuit_breaker_target_keys(&new_config);
-            self.circuit_breaker_cache.prune_stale_targets(&active_keys);
-        }
+        self.prune_stale_target_health(&new_config);
 
         // --- HealthChecker: prune passive health state for removed proxies ---
         if !delta.removed_proxy_ids.is_empty() {
             self.health_checker
                 .prune_removed_proxies(&delta.removed_proxy_ids);
-        }
-        for proxy in &new_config.proxies {
-            if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = new_config
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
-            {
-                self.health_checker.remove_stale_passive_targets_for_proxy(
-                    &proxy.namespace,
-                    &proxy.id,
-                    &upstream.targets,
-                );
-            }
         }
 
         // --- DNS warmup for new/modified hostnames ---
@@ -13459,29 +13471,12 @@ impl ProxyState {
         // Keep keys dispatch currently mints (direct-backend host:port, live
         // upstream/SD targets) so a config delta cannot reclaim still-routable
         // breakers, while still dropping retired pod IPs and removed hosts.
-        {
-            let active_keys = self.collect_active_circuit_breaker_target_keys(&new_config);
-            self.circuit_breaker_cache.prune_stale_targets(&active_keys);
-        }
+        self.prune_stale_target_health(&new_config);
 
         // --- HealthChecker: prune passive health state for removed proxies ---
         if !delta.removed_proxy_ids.is_empty() {
             self.health_checker
                 .prune_removed_proxies(&delta.removed_proxy_ids);
-        }
-        for proxy in &new_config.proxies {
-            if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = new_config
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
-            {
-                self.health_checker.remove_stale_passive_targets_for_proxy(
-                    &proxy.namespace,
-                    &proxy.id,
-                    &upstream.targets,
-                );
-            }
         }
 
         // --- DNS warmup for new/modified hostnames ---
@@ -14298,7 +14293,7 @@ async fn handle_websocket_request_authenticated(
     } else {
         (proxy.backend_host.as_str(), proxy.backend_port)
     };
-    let backend_url = build_websocket_backend_url_with_target(
+    let backend_url = match build_websocket_backend_url_with_target(
         &proxy,
         &ctx.path,
         &query_string,
@@ -14306,7 +14301,22 @@ async fn handle_websocket_request_authenticated(
         effective_port,
         strip_len,
         upstream_target.as_ref().and_then(|t| t.path.as_deref()),
-    );
+    ) {
+        Ok(url) => url,
+        Err(_) => {
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                current_cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            return Ok(build_websocket_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"Invalid backend path coordinates"}"#,
+                &initial_response_header_policy_plugins,
+            ));
+        }
+    };
 
     // Get the upgrade parts from the request
     let (mut parts, _body) = req.into_parts();
@@ -14980,7 +14990,7 @@ async fn handle_websocket_request_authenticated(
                                 "Aborting WebSocket retry because the candidate exceeds its DestinationRule maxRetries cap"
                             );
                         } else {
-                            retry_backend_url = build_websocket_backend_url_with_target(
+                            retry_backend_url = match build_websocket_backend_url_with_target(
                                 &proxy,
                                 &ctx.path,
                                 &query_string,
@@ -14988,7 +14998,13 @@ async fn handle_websocket_request_authenticated(
                                 next.port,
                                 strip_len,
                                 next.path.as_deref(),
-                            );
+                            ) {
+                                Ok(url) => url,
+                                Err(_) => {
+                                    retry_path_mismatch = true;
+                                    current_backend_url.clone()
+                                }
+                            };
                             retry_cb_target_key =
                                 Some(crate::circuit_breaker::target_key(&next.host, next.port));
                             retry_target = Some(next);
@@ -16023,13 +16039,19 @@ fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str)
     url.push_str(remaining_path);
 }
 
+/// The router offset does not identify a UTF-8 boundary in this path.
+/// Refuse construction rather than clamp it or substitute another path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid backend path coordinates")]
+pub struct InvalidBackendPath;
+
 fn with_backend_path_parts<R>(
     proxy: &Proxy,
     incoming_path: &str,
     strip_len: usize,
     target_path: Option<&str>,
     use_parts: impl FnOnce(&str, &str) -> R,
-) -> R {
+) -> Result<R, InvalidBackendPath> {
     // `strip_len` is measured by the router after encoded-slash
     // normalization, so stripping must use the same coordinate system.
     let normalized_path = if proxy.strip_listen_path {
@@ -16040,11 +16062,11 @@ fn with_backend_path_parts<R>(
         None
     };
     let remaining_path = match &normalized_path {
-        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        Some(normalized) => normalized.get(strip_len..).ok_or(InvalidBackendPath)?,
         None => incoming_path,
     };
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
-    use_parts(backend_path, remaining_path)
+    Ok(use_parts(backend_path, remaining_path))
 }
 
 /// Assemble the exact path that URL construction will forward to the selected
@@ -16056,7 +16078,7 @@ pub fn build_backend_effective_path(
     incoming_path: &str,
     strip_len: usize,
     target_path: Option<&str>,
-) -> String {
+) -> Result<String, InvalidBackendPath> {
     with_backend_path_parts(
         proxy,
         incoming_path,
@@ -16091,9 +16113,16 @@ pub fn retry_target_preserves_backend_path(
     }
     let previous_path = previous.path.as_deref().or(proxy.backend_path.as_deref());
     let next_path = next.path.as_deref().or(proxy.backend_path.as_deref());
-    previous_path == next_path
-        || build_backend_effective_path(proxy, incoming_path, strip_len, previous.path.as_deref())
-            == build_backend_effective_path(proxy, incoming_path, strip_len, next.path.as_deref())
+    if previous_path == next_path {
+        return with_backend_path_parts(proxy, incoming_path, strip_len, None, |_, _| ()).is_ok();
+    }
+    match (
+        build_backend_effective_path(proxy, incoming_path, strip_len, previous.path.as_deref()),
+        build_backend_effective_path(proxy, incoming_path, strip_len, next.path.as_deref()),
+    ) {
+        (Ok(previous), Ok(next)) => previous == next,
+        _ => false,
+    }
 }
 
 fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
@@ -16378,7 +16407,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
     port: u16,
     strip_len: usize,
     target_path: Option<&str>,
-) -> String {
+) -> Result<String, InvalidBackendPath> {
     use std::fmt::Write;
 
     // WebSocket URL scheme: TLS intent comes from `backend_scheme`; the
@@ -16389,55 +16418,34 @@ pub(crate) fn build_websocket_backend_url_with_target(
         _ => "wss",
     };
 
-    // Host-only proxies (listen_path == None) have no prefix to strip.
-    // Exact listen_paths carry a leading '=' marker for routing; strip only
-    // the literal path part so WebSocket forwarding matches HTTP forwarding.
-    //
-    // `strip_len` is computed by the router against the encoded-slash
-    // NORMALIZED path, so slice the normalized path (not the raw one) to keep
-    // routing and forwarding in the same coordinate system; slicing the raw
-    // path mis-aligns by 2 bytes per %2f and can panic mid-UTF-8 codepoint.
-    // See `build_backend_url_with_target` for the full rationale. For paths
-    // without encoded slashes this is an allocation-free borrowed no-op.
-    let normalized_path = if proxy.strip_listen_path {
-        Some(crate::router_cache::normalize_encoded_slashes(
-            incoming_path,
-        ))
-    } else {
-        None
-    };
-    let remaining_path = match &normalized_path {
-        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
-        None => incoming_path,
-    };
-
-    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
-
-    let path_layout = backend_path_layout(backend_path, remaining_path);
-    let rendered_host = url_render_host(host);
-
-    // Pre-calculate capacity and build in a single buffer.
-    let capacity = scheme.len()
-        + 3 // "://"
-        + rendered_host.len()
-        + 6 // ":PORT" (max 5 digits + colon)
-        + path_layout.len
-        + if query_string.is_empty() {
-            0
-        } else {
-            1 + query_string.len()
-        };
-
-    let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
-    push_backend_path(&mut url, backend_path, remaining_path);
-
-    if !query_string.is_empty() {
-        url.push('?');
-        url.push_str(query_string);
-    }
-
-    url
+    with_backend_path_parts(
+        proxy,
+        incoming_path,
+        strip_len,
+        target_path,
+        |backend_path, remaining_path| {
+            let path_layout = backend_path_layout(backend_path, remaining_path);
+            let rendered_host = url_render_host(host);
+            let capacity = scheme.len()
+                + 3
+                + rendered_host.len()
+                + 6
+                + path_layout.len
+                + if query_string.is_empty() {
+                    0
+                } else {
+                    1 + query_string.len()
+                };
+            let mut url = String::with_capacity(capacity);
+            let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
+            push_backend_path(&mut url, backend_path, remaining_path);
+            if !query_string.is_empty() {
+                url.push('?');
+                url.push_str(query_string);
+            }
+            url
+        },
+    )
 }
 
 /// Whether `proxy`'s resolved backend TLS carries an SNI override the WebSocket
@@ -18212,6 +18220,42 @@ pub(crate) fn ws_idle_timeout_policy_close_frame() -> CloseFrame {
     }
 }
 
+/// Defined RFC 6455 Close for a transport- or protocol-level relay failure.
+///
+/// Maps the already-computed `ErrorClass` to a wire code (issue #4770): 1002
+/// for a protocol violation, 1011 for a transport failure, or 1001 while the
+/// gateway is draining. The reason is a fixed literal so no peer-controlled or
+/// secret material is ever echoed and the frame stays within the 123-byte
+/// control-frame budget.
+pub(crate) fn ws_relay_failure_close_frame(
+    error_class: retry::ErrorClass,
+    draining: bool,
+) -> CloseFrame {
+    let (code, reason) = if draining {
+        (CloseCode::Away, "gateway draining")
+    } else if error_class == retry::ErrorClass::ProtocolError {
+        (CloseCode::Protocol, "protocol error")
+    } else {
+        (CloseCode::Error, "relay error")
+    };
+    CloseFrame {
+        code,
+        reason: reason.into(),
+    }
+}
+
+/// Whether the gateway is draining (graceful shutdown or overload drain).
+///
+/// Mirrors the drain test in `wait_for_websocket_session_stop` so a transport
+/// failure that races a shutdown publishes the same 1001 "going away" Close a
+/// policy stop would, instead of a 1011 backend failure.
+fn ws_websocket_is_draining(
+    overload: &crate::overload::OverloadState,
+    shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> bool {
+    overload.draining.load(Ordering::Acquire) || shutdown.is_some_and(|receiver| *receiver.borrow())
+}
+
 fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
     use tokio_tungstenite::tungstenite::Error;
 
@@ -19032,6 +19076,10 @@ where
     let ws_idle_tracker_btc = ws_idle_tracker;
     let size_limits_ctb = Arc::clone(&effective_size_limits);
     let size_limits_btc = effective_size_limits;
+    let overload_ctb = Arc::clone(&overload);
+    let overload_btc = Arc::clone(&overload);
+    let shutdown_rx_ctb = shutdown_rx.clone();
+    let shutdown_rx_btc = shutdown_rx.clone();
 
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
@@ -19364,7 +19412,24 @@ where
                                 retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from client: {}", e);
-                                retry::classify_boxed_error(&e)
+                                let class = retry::classify_boxed_error(&e);
+                                // A client protocol violation or transport failure
+                                // must still publish a defined policy Close so the
+                                // surviving peer learns why the session ended
+                                // instead of observing 1005/1006 (issue #4770).
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(ws_relay_failure_close_frame(
+                                        class,
+                                        ws_websocket_is_draining(
+                                            &overload_ctb,
+                                            shutdown_rx_ctb.as_ref(),
+                                        ),
+                                    )),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                class
                             };
                             // Read-side failure on the c2b path means the client
                             // dropped / reset the socket.
@@ -19671,7 +19736,26 @@ where
                                 retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from backend: {}", e);
-                                retry::classify_boxed_error(&e)
+                                let class = retry::classify_boxed_error(&e);
+                                // A backend protocol violation, reset, or other
+                                // transport failure must still publish a defined
+                                // policy Close and write it to the surviving peer
+                                // (the client) instead of a bare EOF/1006 and an
+                                // empty Close into the dead backend sink
+                                // (issue #4770).
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(ws_relay_failure_close_frame(
+                                        class,
+                                        ws_websocket_is_draining(
+                                            &overload_btc,
+                                            shutdown_rx_btc.as_ref(),
+                                        ),
+                                    )),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                class
                             };
                             // Read-side failure on the b2c path means the
                             // backend closed / reset the socket.
@@ -22094,6 +22178,23 @@ pub(crate) async fn log_rejected_request_with_path(
     .await;
 }
 
+fn rejected_request_backend_url(proxy: &Proxy, ctx: &RequestContext) -> Option<String> {
+    let (path, strip_len) = match ctx.route_override_path.as_deref() {
+        Some(path) => (path, 0),
+        None => (ctx.path.as_str(), ctx.matched_path_strip_len),
+    };
+    build_backend_url_with_target(
+        proxy,
+        path,
+        "",
+        &proxy.backend_host,
+        proxy.backend_port,
+        strip_len,
+        ctx.route_override_path_is_absolute.then_some(""),
+    )
+    .ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn log_rejected_request_with_path_and_backend_state(
     plugins: &[Arc<dyn Plugin>],
@@ -22154,14 +22255,11 @@ async fn log_rejected_request_with_path_and_backend_state(
         proxy_id: proxy.map(|p| p.id.clone()),
         proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target: if include_backend_target {
-            proxy.map(|p| {
-                // Host-only proxies (listen_path None) have no prefix to strip.
-                // `ctx.path` is intentionally used here (not the override) because
-                // `backend_target` should reflect the rewritten path that would
-                // have been sent to the backend.
-                let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
-                let url = build_backend_url(p, &ctx.path, "", strip_len);
-                strip_query_params(&url).to_string()
+            proxy.and_then(|p| {
+                // Recover the dispatch coordinate even when a finalized hook
+                // temporarily exposes the original client path in `ctx.path`.
+                let url = rejected_request_backend_url(p, ctx)?;
+                Some(strip_query_params(&url).to_string())
             })
         } else {
             None
@@ -22471,6 +22569,11 @@ async fn run_after_proxy_hooks_on_rejection(
     }
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.applies_after_proxy_on_reject() {
+            continue;
+        }
+        // Decoded semantic-cache hits defer the one transport-planning hook
+        // until final header rules and body policy have accepted the replay.
+        if ctx.semantic_cache_response_replay && plugin.applies_response_transport_encoding() {
             continue;
         }
         let terminal_gateway_deadline = ctx.gateway_deadline_response_selected()
@@ -23574,6 +23677,11 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 .iter()
                 .filter(|plugin| response_transform_stage(plugin.as_ref()) == stage)
             {
+                if ctx.semantic_cache_response_replay
+                    && stage == ResponseTransformStage::TransportEncoding
+                {
+                    continue;
+                }
                 let mandatory_replay_transform = ctx.finalized_response_replay
                     && plugin.requires_replay_response_body_transform(ctx);
                 if ctx.finalized_response_replay && !mandatory_replay_transform {
@@ -23824,6 +23932,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
 /// The reject-path `after_proxy` hooks are header-only and do not depend on the
 /// body-hook output (`compression::after_proxy` deliberately no-ops on the
 /// rejection path), so deferring them past the body hooks is safe.
+/// Decoded semantic-cache hits defer transport planning and encoding further,
+/// until this header chain and its plaintext body-policy recheck have finished.
 ///
 /// Because that chain is last, it is also the last thing that can change the
 /// client-visible header map — and the representation fields in that map are
@@ -23933,6 +24043,14 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             final_body_policy_terminal_replacement,
         )
         .await;
+    }
+
+    // A semantic-cache entry holds decoded JSON. Its compression decision must
+    // see the final header rules (including no-transform and strong ETag), and
+    // the encode must follow every plaintext body-policy decision. Other
+    // synthetic responses retain their existing transport behavior.
+    if ctx.semantic_cache_response_replay && (200..300).contains(status) {
+        encode_semantic_cache_replay(plugins, ctx, status, headers, body).await;
     }
 
     // Authoritative final client-visible HEADER policy, AFTER the deliberately
@@ -24084,6 +24202,58 @@ pub(crate) struct AfterProxyReject {
     pub status_code: u16,
     pub body: Bytes,
     pub headers: HashMap<String, String>,
+}
+
+/// Plan and encode a decoded cache replay after the synthetic header chain.
+/// Transport hooks were deferred in both earlier passes, so each runs once.
+async fn encode_semantic_cache_replay(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: &mut u16,
+    headers: &mut HashMap<String, String>,
+    body: &mut Bytes,
+) {
+    let transport_plugins: Vec<_> = plugins
+        .iter()
+        .filter(|plugin| plugin.applies_response_transport_encoding())
+        .cloned()
+        .collect();
+    if transport_plugins.is_empty() {
+        return;
+    }
+    // The whole replay is buffered; use its final size for the live minimum
+    // length policy even though storage stripped the origin's wire length.
+    headers.insert("content-length".to_string(), body.len().to_string());
+    for plugin in &transport_plugins {
+        let result = crate::plugins::await_precommit_response_phase(
+            ctx.precommit_response_phase_bound(),
+            plugin.after_proxy(ctx, *status, headers),
+        )
+        .await
+        .into_plugin_result(ctx);
+        if let Some(reject) = plugin_result_into_reject_parts(result) {
+            install_final_header_policy_rejection(ctx, status, headers, body, reject, true, false);
+            return;
+        }
+        ctx.record_deadline_response_header_plugin(plugin.as_ref(), headers);
+    }
+    // Reuse the bounded producer window, deadline handling, and identity/406
+    // fallback from the shared buffered pipeline. Only transport producers run;
+    // semantic transforms and plaintext policy already ran in the finalizer.
+    // The pipeline's header-policy rejection path re-enters the reject-path
+    // chain that called us, so the future must be boxed; the 2xx status gate
+    // above guarantees a rejection cannot re-enter this encoder at runtime.
+    Box::pin(transform_buffered_response_body_with_deadline(
+        &transport_plugins,
+        ctx,
+        crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated,
+        status,
+        headers,
+        body,
+        None,
+        &[],
+    ))
+    .await;
 }
 
 pub(crate) async fn run_after_proxy_hooks(
@@ -24422,6 +24592,19 @@ pub(crate) fn x_gateway_error_for_backend_failure(
     status: u16,
 ) -> Option<&'static str> {
     crate::retry::http_observability_error_class(connection_error, status)
+}
+
+/// A gateway output-ceiling decision overrides the original backend outcome.
+pub(crate) fn x_gateway_error_for_response(
+    ctx: &RequestContext,
+    connection_error: bool,
+    status: u16,
+) -> Option<&'static str> {
+    if ctx.response_transform_size_refusal_selected() && status >= 500 {
+        Some("overload")
+    } else {
+        x_gateway_error_for_backend_failure(connection_error, status)
+    }
 }
 
 /// Insert or replace the gateway-owned `X-Gateway-Error` value after generic
@@ -25690,6 +25873,13 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
 ) {
     use crate::proxy::response_buffer_budget as budget;
 
+    let policy_refusal = ctx.response_transform_size_refusal_selected();
+    let message = if policy_refusal {
+        "Response body too large"
+    } else {
+        budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE
+    };
+
     let owned_grpc_web_response_content_type =
         crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
     let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
@@ -25708,7 +25898,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         let mut response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            message,
         );
         response.headers.extend(response_headers.drain());
         finalize_grpc_web_error_response_headers_with_policy_source(
@@ -25723,7 +25913,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         insert_grpc_error_metadata(
             &mut ctx.metadata,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            message,
         );
     } else if native_grpc_request {
         ctx.retain_deadline_response_gateway_headers(response_headers);
@@ -25734,7 +25924,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         grpc_proxy::finalize_grpc_error_response_headers(
             response_headers,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            message,
             &[],
         );
         *response_body = Bytes::new();
@@ -25743,7 +25933,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
         insert_grpc_error_metadata(
             &mut ctx.metadata,
             budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
-            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            message,
         );
     } else {
         // Plain HTTP keeps the narrower discipline: drop exactly the fields that
@@ -25764,8 +25954,18 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
                 .iter()
                 .any(|stale| name.eq_ignore_ascii_case(stale))
         });
-        *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
-        *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+        if policy_refusal {
+            *response_status = StatusCode::BAD_GATEWAY.as_u16();
+            *response_body = Bytes::from(crate::plugins::utils::size_limit::rejection_body(
+                "Response body too large",
+                ctx.retained_response_body_ceiling() as u128,
+            ));
+            crate::plugins::invalidate_content_bound_response_headers(response_headers);
+            restore_authoritative_gateway_error_header(response_headers, "overload");
+        } else {
+            *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
+            *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+        }
         response_headers.insert("content-type".to_string(), "application/json".to_string());
         response_headers.insert(
             "content-length".to_string(),
@@ -25782,9 +25982,8 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
     ctx.record_deadline_response_header_mutations(response_headers);
 }
 
-/// If a response-body inspector marked a one-shot retained-response capacity
-/// refusal pending, install the shared health-neutral terminal and return
-/// `true` so the enclosing `on_response_body` loop stops later hooks.
+/// Consume a one-shot construction refusal, distinguishing deterministic JSON
+/// output policy from aggregate capacity, and stop subsequent body hooks.
 pub(crate) fn install_pending_buffered_response_capacity_refusal(
     ctx: &mut RequestContext,
     response_status: &mut u16,
@@ -25792,8 +25991,19 @@ pub(crate) fn install_pending_buffered_response_capacity_refusal(
     response_body: &mut Bytes,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
 ) -> bool {
+    let produced_bytes = ctx.take_response_transform_size_refusal_pending();
     if !ctx.take_buffered_response_capacity_refusal_pending() {
         return false;
+    }
+    if let Some(produced_bytes) = produced_bytes {
+        ctx.mark_response_transform_size_refusal_selected();
+        warn!(
+            proxy_id = ctx.matched_proxy.as_ref().map(|proxy| proxy.id.as_str()),
+            plugin = "response_transformer",
+            produced_bytes_at_least = produced_bytes,
+            ceiling = ctx.retained_response_body_ceiling(),
+            "Response body transform refused: output exceeds response size policy"
+        );
     }
     replace_buffered_response_with_capacity_refusal_with_policy_source(
         ctx,
@@ -27804,7 +28014,11 @@ async fn run_backend_path_plugins_or_build_reject(
                 };
                 let status = StatusCode::from_u16(plugin_reject.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                // Keep the rejection pipeline out of the generic request's
+                // unoptimized poll frame, including requests with no path
+                // policy. These factories allocate only on rejection; see
+                // `boxed_finalize_reject_response` for the stack invariant.
+                let reject = boxed_finalize_reject_response(
                     plugins,
                     ctx,
                     status,
@@ -27815,14 +28029,14 @@ async fn run_backend_path_plugins_or_build_reject(
                 )
                 .await;
                 apply_grpc_reject_metadata(ctx, &reject);
-                let grpc_web_response = build_grpc_web_reject_response(
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
                     plugins,
                     ctx,
                     grpc_web_response_content_type,
                     &reject,
                 )
                 .await;
-                log_rejected_request_with_path(
+                boxed_log_rejected_request_with_path(
                     plugins,
                     ctx,
                     reject.http_status.as_u16(),
@@ -28098,7 +28312,22 @@ async fn finalize_upload_deadline_rejection(
     response
 }
 
-fn release_circuit_breaker_probe_on_admission_reject(
+/// Release a HALF_OPEN probe slot `check_circuit_breaker` admitted, for a
+/// request the gateway rejects before it ever reaches the backend.
+///
+/// A gateway-side refusal is neither a backend success nor a backend failure,
+/// so the slot is released NEUTRAL: the breaker's health is unchanged and the
+/// next probe can be admitted instead of the breaker wedging OPEN forever.
+///
+/// Siblings that share this invariant and MUST route through this one
+/// implementation (issue #4792): the H1/H2/WebSocket/gRPC handler in this
+/// module, [`crate::http3::server::release_h3_circuit_breaker_probe_on_admission_reject`],
+/// and [`crate::http3::websocket::release_h3_ws_circuit_breaker_probe_on_admission_reject`].
+/// The gRPC dispatch block additionally carries `GrpcProbeReleaseGuard`, an RAII
+/// wrapper over the same NEUTRAL release for its many early returns. When one of
+/// these changes, change them together —
+/// `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts they agree.
+pub(crate) fn release_circuit_breaker_probe_on_admission_reject(
     state: &ProxyState,
     proxy: &Proxy,
     target_key: Option<&str>,
@@ -28565,7 +28794,27 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
             }
         }
     }
+    // All transports and deferred passes converge here before rebasing or
+    // evaluating the backend path. Provider overrides share the same path
+    // contract as mesh rewrites; retain the client path for policy/logging.
+    if let Some(path) = ctx.route_override_path.as_mut() {
+        match crate::policy_path::canonicalize_policy_path(path) {
+            Ok(std::borrow::Cow::Borrowed(_)) => {}
+            Ok(std::borrow::Cow::Owned(canonical)) => *path = canonical,
+            Err(rejection) => return reject_route_override_path(rejection),
+        }
+    }
     PluginResult::Continue
+}
+
+pub(crate) fn reject_route_override_path(
+    rejection: crate::policy_path::PolicyPathRejection,
+) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: rejection.client_error_body().to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
 }
 
 const MAX_SET_COOKIE_NAME_VALUE_BYTES: usize = 4096;
@@ -29471,7 +29720,7 @@ async fn handle_proxy_request_on_frontend_port(
     // outlives this function scope.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
-    let response = handle_proxy_request_inner(
+    let response = boxed_handle_proxy_request_inner(
         req,
         state,
         remote_addr,
@@ -29490,6 +29739,39 @@ async fn handle_proxy_request_on_frontend_port(
         *resp.body_mut() = body.with_request_guard(request_guard);
         resp
     })
+}
+
+/// Keep the full routing/dispatch future out of the admission wrapper and
+/// Hyper's per-stream service future. In particular, H2 constructs and moves
+/// that service future before spawning it; boxing a task at spawn time does
+/// not bound those earlier stack temporaries. Rejection-only boxes also leave
+/// the successful direct-H2 dispatch pipeline embedded in every service call.
+///
+/// Construct out of line so the large temporary is gone before polling the
+/// pipeline. The caller retains the request guard and attaches it to the body
+/// exactly as before; dropping this future still cancels the same request.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_handle_proxy_request_inner(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    remote_addr: SocketAddr,
+    is_tls: bool,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
+    connection_metadata: RequestConnectionMetadata,
+) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
+    Box::pin(handle_proxy_request_inner(
+        req,
+        state,
+        remote_addr,
+        is_tls,
+        tls_client_cert_der,
+        tls_client_cert_chain_der,
+        mtls_auth_connection_cache,
+        connection_metadata,
+    ))
 }
 
 /// Inner implementation of [`handle_proxy_request`] — separated so the outer
@@ -30270,7 +30552,7 @@ async fn handle_proxy_request_inner(
         route_match
     };
 
-    let (proxy, strip_len) = match route_match {
+    let (proxy, mut strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,
             // and all subsequent code (plugins, backend dispatch) needs the HashMap.
@@ -30436,6 +30718,7 @@ async fn handle_proxy_request_inner(
         }
     };
 
+    ctx.matched_path_strip_len = strip_len;
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
@@ -31826,12 +32109,12 @@ async fn handle_proxy_request_inner(
     // used for backend URL building (reqwest / direct-H2 / gRPC paths read the
     // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
     // override onto `ctx.path` too). The original path was already used for
-    // route selection; VS-derived proxies never set `strip_listen_path`, so
-    // the rewritten value is the literal forwarded path. Preserve the private
+    // route selection; replacing it invalidates that route's strip offset.
+    // Ordinary rewrites retain backend base-path composition. Preserve the private
     // override so finalized-egress plugins can recover the selected backend
     // path while their public `ctx.path` view is temporarily restored to the
     // client path. No allocation when no rewrite is set.
-    let mut path = rebase_route_override_path(&mut ctx, path);
+    let mut path = rebase_route_override_path(&mut ctx, path, &mut strip_len);
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
@@ -31862,14 +32145,25 @@ async fn handle_proxy_request_inner(
     // external work. This also ensures an exhausted method rate limit rejects
     // before a pre-proxy serverless function is invoked.
     if backend_path_is_policy_bound {
-        let backend_path = build_backend_effective_path(
+        let backend_path = match build_backend_effective_path(
             &proxy,
             &path,
             strip_len,
             upstream_target
                 .as_ref()
                 .and_then(|target| target.path.as_deref()),
-        );
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(build_pre_plugin_reject_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"Invalid backend path coordinates",
+                    &HashMap::new(),
+                    request_uses_grpc_content_type,
+                    grpc_web_response_content_type,
+                ));
+            }
+        };
         if let Some(response) = run_backend_path_plugins_or_build_reject(
             backend_path_plugins,
             &plugins,
@@ -32077,9 +32371,9 @@ async fn handle_proxy_request_inner(
         let path_rebase_pending = ctx
             .route_override_path
             .as_deref()
-            .is_some_and(|rewrite| rewrite != path || rewrite != ctx.path);
+            .is_some_and(|rewrite| strip_len != 0 || rewrite != path || rewrite != ctx.path);
         if path_rebase_pending {
-            path = rebase_route_override_path(&mut ctx, path);
+            path = rebase_route_override_path(&mut ctx, path, &mut strip_len);
         }
         if destination_rebound {
             // Replace the whole selection rather than only the target:
@@ -33368,7 +33662,7 @@ async fn handle_proxy_request_inner(
         };
 
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
-        let mut grpc_backend_url = build_backend_url_with_target(
+        let mut grpc_backend_url = match build_backend_url_with_target(
             grpc_dispatch_proxy,
             &path,
             effective_query_string.as_ref(),
@@ -33376,7 +33670,18 @@ async fn handle_proxy_request_inner(
             grpc_effective_port,
             strip_len,
             upstream_target.as_ref().and_then(|t| t.path.as_deref()),
-        );
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(build_pre_plugin_reject_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"Invalid backend path coordinates",
+                    &HashMap::new(),
+                    request_uses_grpc_content_type,
+                    grpc_web_response_content_type,
+                ));
+            }
+        };
         let backend_start = Instant::now();
         // Adaptive-concurrency admission latency must be measured from the
         // backend dispatch point, not from here: `backend_start` precedes
@@ -34212,6 +34517,14 @@ async fn handle_proxy_request_inner(
             let mut grpc_current_cb_key = cb_target_key.clone();
 
             loop {
+                let dispatch_error = grpc_result
+                    .as_ref()
+                    .err()
+                    .map(retry::classify_grpc_proxy_error);
+                ctx.record_backend_dispatch_outcome(
+                    dispatch_error,
+                    dispatch_error.is_none_or(retry::request_reached_wire),
+                );
                 // Classify the error and determine if retryable. Narrow to
                 // the connect-class kinds via `is_connect_class()` so
                 // `retry_on_connect_failure` cannot replay non-idempotent
@@ -34293,7 +34606,21 @@ async fn handle_proxy_request_inner(
                         );
                         break;
                     }
-                    Some(next)
+                    // Refuse invalid coordinates before settling the current
+                    // attempt; the post-loop path still owns its outcome.
+                    let next_url = match build_backend_url_with_target(
+                        &proxy,
+                        &path,
+                        effective_query_string.as_ref(),
+                        &next.host,
+                        next.port,
+                        strip_len,
+                        next.path.as_deref(),
+                    ) {
+                        Ok(url) => url,
+                        Err(_) => break,
+                    };
+                    Some((next, next_url))
                 } else {
                     None
                 };
@@ -34383,16 +34710,8 @@ async fn handle_proxy_request_inner(
                 let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
-                if let Some(next) = next_retry_target {
-                    grpc_backend_url = build_backend_url_with_target(
-                        &proxy,
-                        &path,
-                        effective_query_string.as_ref(),
-                        &next.host,
-                        next.port,
-                        strip_len,
-                        next.path.as_deref(),
-                    );
+                if let Some((next, next_url)) = next_retry_target {
+                    grpc_backend_url = next_url;
                     grpc_current_cb_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
@@ -34807,6 +35126,14 @@ async fn handle_proxy_request_inner(
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
+        let dispatch_error = grpc_result
+            .as_ref()
+            .err()
+            .map(retry::classify_grpc_proxy_error);
+        ctx.record_backend_dispatch_outcome(
+            dispatch_error,
+            dispatch_error.is_none_or(retry::request_reached_wire),
+        );
         match grpc_result {
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
                 let grpc_backend_admission_elapsed = grpc_backend_admission_started_at.elapsed();
@@ -36492,10 +36819,9 @@ async fn handle_proxy_request_inner(
                             request_path: original_request_path.clone(),
                             proxy_id: proxy_ref.map(|p| p.id.clone()),
                             proxy_name: proxy_ref.and_then(|p| p.name.clone()),
-                            backend_target: proxy_ref.map(|p| {
-                                let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
-                                let url = build_backend_url(p, &ctx.path, "", strip_len);
-                                strip_query_params(&url).to_string()
+                            backend_target: proxy_ref.and_then(|p| {
+                                let url = rejected_request_backend_url(p, &ctx)?;
+                                Some(strip_query_params(&url).to_string())
                             }),
                             response_status_code: 200, // gRPC errors use HTTP 200
                             latency_total_ms: total_ms,
@@ -36589,7 +36915,7 @@ async fn handle_proxy_request_inner(
         (proxy.backend_host.as_str(), proxy.backend_port)
     };
 
-    let backend_url = build_backend_url_with_target(
+    let backend_url = match build_backend_url_with_target(
         &proxy,
         &path,
         effective_query_string.as_ref(),
@@ -36597,7 +36923,24 @@ async fn handle_proxy_request_inner(
         effective_port,
         strip_len,
         upstream_target.as_ref().and_then(|t| t.path.as_deref()),
-    );
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            return Ok(build_pre_plugin_reject_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                b"Invalid backend path coordinates",
+                &HashMap::new(),
+                request_uses_grpc_content_type,
+                grpc_web_response_content_type,
+            ));
+        }
+    };
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing. The guard calls
@@ -36989,6 +37332,7 @@ async fn handle_proxy_request_inner(
         };
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            ctx.record_backend_dispatch_outcome(result.error_class, !result.connection_error);
             // Re-check the CURRENT target's DestinationRule maxRetries before
             // authorizing another retry. Use the original route ceiling (not a
             // permanently lowered initial-port projection) so a looser rotated
@@ -37081,7 +37425,21 @@ async fn handle_proxy_request_inner(
                     );
                     break;
                 }
-                Some(next)
+                // Validate before intermediate-attempt accounting so a
+                // builder refusal leaves exactly one terminal outcome.
+                let next_url = match build_backend_url_with_target(
+                    &proxy,
+                    &path,
+                    effective_query_string.as_ref(),
+                    &next.host,
+                    next.port,
+                    strip_len,
+                    next.path.as_deref(),
+                ) {
+                    Ok(url) => url,
+                    Err(_) => break,
+                };
+                Some((next, next_url))
             } else {
                 None
             };
@@ -37156,19 +37514,11 @@ async fn handle_proxy_request_inner(
             // result correctly if we break before dispatching to the new
             // target (e.g. its circuit breaker is open).
             let pre_rotation_cb_key = current_cb_target_key.clone();
-            if let Some(next) = next_retry_target {
+            if let Some((next, next_url)) = next_retry_target {
                 let target_changed = current_target.as_ref().is_some_and(|prev_target| {
                     next.host != prev_target.host || next.port != prev_target.port
                 });
-                current_url = build_backend_url_with_target(
-                    &proxy,
-                    &path,
-                    effective_query_string.as_ref(),
-                    &next.host,
-                    next.port,
-                    strip_len,
-                    next.path.as_deref(),
-                );
+                current_url = next_url;
                 current_cb_target_key =
                     Some(crate::circuit_breaker::target_key(&next.host, next.port));
                 current_target = Some(next);
@@ -37710,6 +38060,7 @@ async fn handle_proxy_request_inner(
         sticky_served_target,
     )
     .is_some();
+    ctx.record_backend_dispatch_outcome(backend_resp.error_class, !backend_resp.connection_error);
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
@@ -38732,7 +39083,7 @@ async fn handle_proxy_request_inner(
                 latency_gateway_overhead_ms: gateway_overhead_ms,
                 request_user_agent: ctx.headers.get("user-agent").cloned(),
                 response_streamed: is_streaming_response,
-                error_class: backend_error_class,
+                error_class: ctx.response_policy_error_class(backend_error_class),
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
                 grpc_request_messages,
@@ -38927,7 +39278,7 @@ async fn handle_proxy_request_inner(
     // so a late phase cannot spoof or duplicate the token beside the builder
     // write. Classification is the original dispatch signal; status is final.
     let gateway_error_token =
-        x_gateway_error_for_backend_failure(backend_resp.connection_error, response_status);
+        x_gateway_error_for_response(&ctx, backend_resp.connection_error, response_status);
     response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
     resp_builder =
         headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
@@ -39703,7 +40054,7 @@ pub fn build_backend_url(
     incoming_path: &str,
     query_string: &str,
     strip_len: usize,
-) -> String {
+) -> Result<String, InvalidBackendPath> {
     build_backend_url_with_target(
         proxy,
         incoming_path,
@@ -39750,7 +40101,7 @@ pub fn build_backend_url_with_target(
     port: u16,
     strip_len: usize,
     target_path: Option<&str>,
-) -> String {
+) -> Result<String, InvalidBackendPath> {
     use std::fmt::Write;
 
     let scheme = backend_url_scheme_for_dispatch(proxy);
@@ -45916,7 +46267,7 @@ fn is_valid_ip_literal_contents(content: &str) -> bool {
 /// dispatch where the same string would be re-parsed and fail with a
 /// less-specific error.
 fn is_valid_port(port: &str) -> bool {
-    !port.is_empty() && port.parse::<u16>().is_ok()
+    crate::util::http_headers::parse_authority_port(port).is_some()
 }
 
 fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
@@ -54664,7 +55015,11 @@ mod tests {
         );
         ctx.route_override_path = Some("/internal/ping".to_string());
 
-        let backend_path = super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string());
+        let mut strip_len = "/shadow".len();
+        let backend_path =
+            super::rebase_route_override_path(&mut ctx, "/shadow/ping".to_string(), &mut strip_len);
+        assert_eq!(strip_len, 0);
+        assert_eq!(ctx.matched_path_strip_len, 0);
 
         assert_eq!(backend_path, "/internal/ping");
         assert_eq!(ctx.path, "/internal/ping");
@@ -59220,7 +59575,8 @@ mod tests {
             8080,
             "/ws".len(),
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(url, "ws://backend.local:8080/?token=1");
     }
@@ -59241,7 +59597,8 @@ mod tests {
             8080,
             incoming_path.len(),
             Some("/internal"),
-        );
+        )
+        .unwrap();
 
         assert_eq!(url, "ws://backend.local:8080/internal?token=1");
     }
@@ -59262,7 +59619,8 @@ mod tests {
             8080,
             "/ws".len(),
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(url, "ws://backend.local:8080/internal/chat");
     }
@@ -59282,7 +59640,8 @@ mod tests {
             8080,
             "/ws/".len(),
             Some("internal"),
-        );
+        )
+        .unwrap();
 
         assert_eq!(url, "ws://backend.local:8080/internal/chat");
     }
@@ -59314,7 +59673,8 @@ mod tests {
             8080,
             strip_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "http://backend.local:8080/");
     }
 
@@ -59342,7 +59702,8 @@ mod tests {
             8080,
             strip_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "http://backend.local:8080/");
     }
 
@@ -59372,7 +59733,8 @@ mod tests {
             8080,
             strip_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "http://backend.local:8080/c");
     }
 
@@ -59410,7 +59772,8 @@ mod tests {
             8080,
             rm.matched_prefix_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "http://backend.local:8080/files/a/b");
     }
 
@@ -59438,7 +59801,8 @@ mod tests {
             8080,
             strip_len,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(url, "ws://backend.local:8080/a/b");
     }
 
@@ -59449,7 +59813,7 @@ mod tests {
         proxy.backend_path = None;
         proxy.strip_listen_path = false;
 
-        let url = build_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None);
+        let url = build_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None).unwrap();
         assert_eq!(url, "http://[::1]:8080/mcp");
     }
 
@@ -59459,7 +59823,8 @@ mod tests {
         proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.strip_listen_path = false;
 
-        let url = build_websocket_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None);
+        let url = build_websocket_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None)
+            .unwrap();
         assert_eq!(url, "ws://[::1]:8080/mcp");
     }
 
