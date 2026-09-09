@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::plugin_utils::create_test_context;
+use super::plugin_utils::{create_test_consumer, create_test_context};
 
 fn transparent_config(upstream_url: &str) -> Value {
     json!({
@@ -11225,4 +11225,164 @@ async fn an_oversized_reflected_id_is_refused_without_echoing_it() {
     let (status, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
     assert_eq!(raw_response_id(&body), format!("\"{bounded}\""));
+}
+
+/// `initialize` request body used by the session-ownership tests below.
+fn initialize_request_body() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    })
+}
+
+fn tools_list_body(request_id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/list",
+        "params": {}
+    })
+}
+
+/// One MCP caller: its request context plus that request's header map.
+type McpCaller = (ferrum_edge::plugins::RequestContext, HashMap<String, String>);
+
+/// Caller authenticated as a gateway Consumer with the given id and username.
+fn caller_as_consumer(body: Value, id: &str, username: &str) -> McpCaller {
+    let (mut ctx, headers) = mcp_ctx(body);
+    let mut consumer = create_test_consumer();
+    consumer.id = id.to_string();
+    consumer.username = username.to_string();
+    ctx.identified_consumer = Some(Arc::new(consumer));
+    ctx.authenticated_identity = None;
+    (ctx, headers)
+}
+
+/// Caller carrying an externally authenticated identity with no gateway
+/// Consumer mapping (the `jwks_auth` shape).
+fn caller_as_identity(body: Value, identity: &str) -> McpCaller {
+    let (mut ctx, headers) = mcp_ctx(body);
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some(identity.to_string());
+    (ctx, headers)
+}
+
+/// Caller on a proxy with no authentication plugin: no principal at all.
+fn caller_unauthenticated(body: Value) -> McpCaller {
+    let (mut ctx, headers) = mcp_ctx(body);
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    (ctx, headers)
+}
+
+/// Drive a synthetic `initialize` for one caller and return the minted session.
+async fn initialize_as(
+    plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>,
+    caller: McpCaller,
+) -> String {
+    let (mut ctx, mut headers) = caller;
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["serverInfo"]["name"], "ferrum-mcp-gateway");
+    response_headers
+        .get("mcp-session-id")
+        .expect("synthetic initialize must return an MCP session")
+        .clone()
+}
+
+/// Replay a request on an existing downstream session as one caller.
+async fn reuse_session_as(
+    plugin: &std::sync::Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    caller: McpCaller,
+) -> PluginResult {
+    let (mut ctx, mut headers) = caller;
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await
+}
+
+fn assert_session_refused(result: PluginResult) {
+    let (status, body, _) = reject_raw(result);
+    assert_eq!(status, 404);
+    assert!(body.is_empty(), "refusal must reuse the session error shape");
+}
+
+fn assert_tools_listed(result: PluginResult) {
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert!(body["result"]["tools"].as_array().is_some());
+}
+
+#[tokio::test]
+async fn aggregate_session_is_bound_to_the_consumer_that_created_it() {
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let owner = caller_as_consumer(initialize_request_body(), "consumer-a", "alice");
+    let session_id = initialize_as(&plugin, owner).await;
+
+    // Another authenticated Consumer holding the same session id is refused
+    // with the ordinary session-not-found shape rather than served the session.
+    let other = caller_as_consumer(tools_list_body(2), "consumer-b", "mallory");
+    assert_session_refused(reuse_session_as(&plugin, &session_id, other).await);
+
+    // The creating Consumer still gets the session.
+    let owner = caller_as_consumer(tools_list_body(3), "consumer-a", "alice");
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+
+    // An unknown session id keeps producing the same error for that Consumer.
+    let owner = caller_as_consumer(tools_list_body(4), "consumer-a", "alice");
+    assert_session_refused(reuse_session_as(&plugin, "no-such-session", owner).await);
+}
+
+#[tokio::test]
+async fn aggregate_session_is_bound_to_an_external_identity_without_a_consumer() {
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let owner = caller_as_identity(initialize_request_body(), "alice@example.test");
+    let session_id = initialize_as(&plugin, owner).await;
+
+    let other = caller_as_identity(tools_list_body(2), "mallory@example.test");
+    assert_session_refused(reuse_session_as(&plugin, &session_id, other).await);
+
+    // A Consumer-mapped caller is a different principal even when the mapped
+    // username happens to equal the external identity string.
+    let mapped = caller_as_consumer(tools_list_body(3), "consumer-a", "alice@example.test");
+    assert_session_refused(reuse_session_as(&plugin, &session_id, mapped).await);
+
+    let owner = caller_as_identity(tools_list_body(4), "alice@example.test");
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+}
+
+#[tokio::test]
+async fn aggregate_sessions_are_unchanged_without_an_authentication_plugin() {
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let owner = caller_unauthenticated(initialize_request_body());
+    let session_id = initialize_as(&plugin, owner).await;
+
+    // No principal was available to bind, so reuse is unaffected.
+    let owner = caller_unauthenticated(tools_list_body(2));
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+
+    // An unknown session id still fails the same way.
+    let owner = caller_unauthenticated(tools_list_body(3));
+    assert_session_refused(reuse_session_as(&plugin, "no-such-session", owner).await);
+
+    // The binding is compared in both directions: a session minted with no
+    // principal is not reusable by an authenticated one.
+    let authenticated = caller_as_consumer(tools_list_body(4), "consumer-a", "alice");
+    assert_session_refused(reuse_session_as(&plugin, &session_id, authenticated).await);
 }
