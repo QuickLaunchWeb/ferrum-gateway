@@ -78,6 +78,7 @@ use super::utils::auth_flow::constant_time_eq;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::byte_budget::{ByteBudget, ByteLease};
 use super::utils::cache_headers::sanitize_cached_headers;
+use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::redis_rate_limiter::{
     BoundedRedisValue, REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
@@ -1291,6 +1292,9 @@ impl AiSemanticCache {
     }
 
     fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
+        if status == "HIT" {
+            ctx.semantic_cache_response_replay = true;
+        }
         ctx.metadata
             .insert(self.meta_status.clone(), status.to_string());
     }
@@ -2688,9 +2692,10 @@ fn append_identity_key_parts(
     // outbound map and the query is `request_transformer`'s published outbound
     // query, so this is genuinely what the provider will see rather than the
     // pre-transform request. Credential values are digested inside the
-    // partition; no secret enters the assembled `String`.
+    // partition; no secret enters the assembled `String`. Body length and
+    // content coding are excluded because the normalized JSON is keyed below.
     let mut request = PartitionHasher::new(AI_SEMANTIC_CACHE_REQUEST_DOMAIN);
-    replay_partition::append_request_context_partition(&mut request, ctx, request_headers);
+    replay_partition::append_semantic_request_context_partition(&mut request, ctx, request_headers);
     start_key_part(key_input, has_part);
     key_input.push_str("req:");
     key_input.push_str(&request.hex());
@@ -5088,6 +5093,35 @@ impl Plugin for AiSemanticCache {
             );
             return PluginResult::Continue;
         }
+        // Final observers see the transport-encoded representation on both
+        // buffered HTTP and native H3. Retain plaintext so synthetic replay can
+        // pass through the live compression policy exactly once.
+        let mut encodings = response_headers.iter().filter_map(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding")
+                .then_some(value.as_str())
+        });
+        let encoding = encodings.next();
+        if encodings.next().is_some() {
+            debug!("ai_semantic_cache: skipping ambiguous response content encoding");
+            return PluginResult::Continue;
+        }
+        let decoded = match decode_content_encoding(
+            encoding,
+            body,
+            DecodeLimits {
+                max_decoded_bytes: self.max_entry_size_bytes,
+                max_cumulative_bytes: self.max_entry_size_bytes.saturating_mul(2),
+                max_codings: 2,
+                max_amplification_ratio: 100,
+            },
+        ) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                debug!("ai_semantic_cache: response content decoding failed or exceeded limits");
+                return PluginResult::Continue;
+            }
+        };
+        let body = decoded.as_ref();
         if serde_json::from_slice::<Value>(body).is_err() {
             debug!("ai_semantic_cache: skipping syntactically invalid JSON response");
             return PluginResult::Continue;
@@ -5098,7 +5132,26 @@ impl Plugin for AiSemanticCache {
         // original response would otherwise be replayed verbatim to every
         // cache-hit consumer — leaking session state and misleading
         // downstream clients about their own rate-limit/trace context.
-        let safe_headers = sanitize_cached_headers(response_headers);
+        let mut safe_headers = sanitize_cached_headers(response_headers);
+        if encoding.is_some() {
+            // Validators and lengths describe the encoded representation, not
+            // the decoded body we retain. Never replay them with different bytes.
+            safe_headers.retain(|name, _| {
+                ![
+                    "content-encoding",
+                    "content-length",
+                    "etag",
+                    "content-md5",
+                    "digest",
+                    "content-digest",
+                    "repr-digest",
+                    "content-range",
+                    "accept-ranges",
+                ]
+                .iter()
+                .any(|header| name.eq_ignore_ascii_case(header))
+            });
+        }
         // Consume this instance's staging only after admission succeeds so
         // early skips leave siblings untouched and leave this instance's
         // markers intact if a later retry path re-enters the hook.
@@ -6041,8 +6094,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn admit_redis_hit_reapplies_store_admission_and_sanitizes() {
+    #[tokio::test]
+    async fn admit_redis_hit_reapplies_store_admission_and_sanitizes() {
+        use std::io::Write;
+
+        // Exercise the store -> sealed wire envelope -> L2 admission path using
+        // an encoded origin response, independently of a live Redis service.
+        let cache = AiSemanticCache::new(
+            &json!({"redis_integrity_key": TEST_INTEGRITY_KEY}),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        ctx.metadata
+            .insert(cache.meta_cache_key.clone(), "encoded-response".to_string());
+        let plaintext = br#"{"answer":"Paris"}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plaintext).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-encoding".to_string(), "gzip".to_string()),
+        ]);
+        cache
+            .on_final_response_body(&mut ctx, 200, &headers, &encoded)
+            .await;
+        let local = cache.cache.get("encoded-response").unwrap();
+        let sealed = cache
+            .seal_redis_entry(TEST_REDIS_KEY, 200, &local.headers, &local.body)
+            .unwrap();
+        let wire = serde_json::to_vec(&sealed).unwrap();
+        let hit = cache
+            .admit_redis_hit(serde_json::from_slice(&wire).unwrap(), TEST_REDIS_KEY)
+            .unwrap();
+        assert_eq!(hit.body.as_ref(), plaintext);
+        assert!(!hit.headers.contains_key("content-encoding"));
+        assert!(
+            cache
+                .admit_redis_hit(serde_json::from_slice(&wire).unwrap(), "different-key")
+                .is_none()
+        );
+
         let split_headers = HashMap::from([
             ("a".to_string(), "1".to_string()),
             ("b".to_string(), "2".to_string()),

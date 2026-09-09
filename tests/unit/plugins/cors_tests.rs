@@ -440,7 +440,10 @@ async fn test_preflight_with_disallowed_origin() {
             headers,
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
             // No CORS headers should be present for disallowed origin
             assert!(!headers.contains_key("access-control-allow-origin"));
         }
@@ -836,7 +839,10 @@ async fn test_preflight_disallowed_method() {
             headers,
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS method not allowed: DELETE");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS method not allowed"})
+            );
             assert!(
                 !headers.contains_key("access-control-allow-origin"),
                 "No CORS headers for disallowed method"
@@ -912,7 +918,10 @@ async fn test_non_preflight_disallowed_origin_returns_403() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
         }
         _ => panic!("Expected 403 Reject for disallowed origin on non-preflight request"),
     }
@@ -941,7 +950,10 @@ async fn test_options_without_request_method_header_disallowed_origin_returns_40
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
         }
         _ => panic!("Expected 403 Reject for disallowed origin"),
     }
@@ -1170,7 +1182,10 @@ async fn test_empty_origin_header_returns_403() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
         }
         _ => panic!("Expected 403 Reject for empty origin"),
     }
@@ -1348,7 +1363,10 @@ async fn test_multiple_origins_in_config() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
         }
         _ => panic!("Expected 403 Reject for disallowed origin"),
     }
@@ -1404,7 +1422,10 @@ async fn test_wildcard_subdomain_rejects_non_match() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
         }
         _ => panic!("Expected 403 Reject for non-matching origin"),
     }
@@ -1425,7 +1446,10 @@ async fn test_wildcard_subdomain_does_not_match_bare_domain() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
         }
         _ => panic!("Expected 403 Reject — bare domain should not match wildcard subdomain"),
     }
@@ -1463,7 +1487,10 @@ async fn test_wildcard_subdomain_rejects_non_http_scheme() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
         }
         _ => panic!("Expected 403 Reject — non-http scheme must not match wildcard subdomain"),
     }
@@ -1829,7 +1856,10 @@ async fn test_prefix_origin_rejects_non_match() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "CORS origin not allowed"})
+            );
         }
         _ => panic!("Expected 403 Reject — origin without the prefix must not match"),
     }
@@ -2586,4 +2616,27 @@ fn cors_uses_strict_origin_policy_treats_universal_prefix_and_regex_as_non_stric
     }))
     .expect("narrow regex");
     assert!(narrow_regex.uses_strict_origin_policy());
+}
+
+#[tokio::test]
+async fn denied_preflight_method_has_fixed_json_error() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
+        "allowed_methods": ["GET"]
+    }))
+    .unwrap();
+    for method in [r#"denied"\method"#, "<denied>", &"x".repeat(4096)] {
+        let mut ctx = make_preflight_ctx("https://example.com", method);
+        let PluginResult::Reject {
+            status_code, body, ..
+        } = plugin.on_request_received(&mut ctx).await
+        else {
+            panic!("expected denied preflight");
+        };
+        assert_eq!(status_code, 403);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"error": "CORS method not allowed"})
+        );
+    }
 }

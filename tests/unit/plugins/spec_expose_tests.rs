@@ -381,6 +381,8 @@ async fn test_specz_request_with_unreachable_url_returns_502() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_failure_diagnostics_never_include_spec_path_query_or_fragment() {
+    // Thread-local captures need the global interest floor; see plugin_utils.
+    super::plugin_utils::install_interest_floor();
     let writer = SharedWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -389,6 +391,7 @@ async fn test_failure_diagnostics_never_include_spec_path_query_or_fragment() {
         .with_writer(writer.clone())
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
 
     let secret_path = "private-never-log-this";
     let secret_query = "signed-token-never-log-this";
