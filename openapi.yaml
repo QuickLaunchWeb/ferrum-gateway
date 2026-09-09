@@ -7868,10 +7868,10 @@ components:
             live on this process. `pending`: not yet accepted or rejected.
             `rejected`: a completed poll attempted a covering sequence and
             the runtime rejected the candidate; the write range is durable
-            but not live. `unverifiable`: the cursor's topology was replaced
-            (failover/reconnect/restart) or was never issued by this
-            process — liveness can no longer be proven here; observe config
-            directly instead.
+            but not live. `unverifiable`: the cursor was not issued by this
+            process or its topology was replaced (failover/reconnect/restart)
+            — liveness can no longer be proven here; observe config directly
+            instead.
           enum: [applied, pending, rejected, unverifiable]
         accepted_topology_epoch:
           type: integer
