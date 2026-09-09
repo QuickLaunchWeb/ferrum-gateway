@@ -14,6 +14,9 @@
 //! - Every configured header `value` must parse as an HTTP `HeaderValue`
 //!   (same complete syntax accepted at H1/H2/H3 emission). CR/LF keep a
 //!   dedicated diagnostic; other forbidden control bytes fail the same gate.
+//! - Gateway-owned header destinations (primary egress strip inventory,
+//!   generated forwarding headers, and Host) reject add/update and rename.
+//!   Removal and rename sources remain allowed.
 //! - Query `value` / `new_key` / `key` strings must not contain CR or LF
 //!   (injection into the request-target). Names and values are otherwise
 //!   percent-encoded when authored onto the outbound query.
@@ -413,6 +416,24 @@ impl RequestTransformer {
 
                     if let Some(ref v) = value {
                         validate_configured_header_value(v, idx)?;
+                    }
+                    // Match the primary egress ownership inventory. Removal and
+                    // rename sources stay available, as in response_transformer.
+                    let destination = match hop {
+                        HeaderOp::Add | HeaderOp::Update => Some(key.as_str()),
+                        HeaderOp::Rename => new_key.as_deref(),
+                        HeaderOp::Remove => None,
+                    };
+                    if let Some(dest) = destination
+                        && (crate::proxy::headers::is_backend_request_strip_header(dest)
+                            || crate::proxy::headers::is_proxy_generated_forwarding_header(dest)
+                            || dest == "host")
+                    {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: header destination '{dest}' is \
+                             gateway-owned and cannot be configured; use preserve_host_header \
+                             for Host or trusted-proxy configuration for forwarding identity"
+                        ));
                     }
                     header_rules.push(HeaderRule {
                         operation: hop,

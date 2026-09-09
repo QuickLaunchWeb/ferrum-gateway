@@ -34,7 +34,9 @@ info:
     isolated per namespace — uniqueness constraints (listen_path, proxy/upstream
     name, consumer username, listen_port) apply per namespace, and a request only
     sees resources whose `namespace` field matches the header. The header
-    defaults to `ferrum` when omitted, must match `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`
+    defaults to `ferrum` only when omitted. A present invalid value, including
+    non-ASCII bytes, returns `400` instead of selecting the default namespace.
+    It must match `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`
     (start with an alphanumeric character; alphanumerics, dots, underscores, or
     hyphens after that; max 254 chars — same rules as resource IDs), and is
     enforced on scoped write operations: any `namespace` field in the request
@@ -324,6 +326,18 @@ paths:
         traffic and admin listener failures use the
         same sticky state; authenticated responses include a sanitized
         `listener_failures` snapshot.
+
+        **Stream listeners** (TCP/UDP/TLS/DTLS) also have recoverable readiness:
+        a configured listener with a hard bind/backend-TLS failure or whose task exited
+        returns `503`, `status: "degraded"`, and `ready: false`. A supervisor
+        retries every 30 seconds using current configuration. Readiness recovers
+        when the hard failure clears or the listener is removed. Soft frontend
+        TLS/DTLS deferrals and DTLS config-build failures report `status: "degraded"`
+        with HTTP 200 and `ready: true` when otherwise healthy. A pending
+        asynchronous bind alone does not degrade health or withdraw readiness
+        during runtime reconciliation. Initial hard bind failures remain
+        fatal in file/database mode and non-fatal in DP mode. Detailed failures
+        remain on authenticated `/overload`; `/live` is unaffected.
 
         **Dynamic Gateway API listener ports** (`file`, `database`, and
         data-plane modes) are reported separately and are **recoverable**. A
@@ -2055,7 +2069,9 @@ paths:
         `api_chargeback_sink` plugin-config ID: aggregate queue/spool/export
         totals plus per-instance batch, retry, queue, spool, and export counters
         ordered by `plugin_config_id`. Validation throwaways, uncommitted staged
-        reloads, and superseded generations are excluded. Requires a valid admin
+        reloads, and superseded generations are excluded from instances. Cumulative
+        process totals include retired workers and survive reload/removal. Per-event
+        pending rows are memory exposure, not a persistence guarantee. Requires a valid admin
         JWT because sink status can expose billing topology and ClickHouse
         endpoint metadata. Credentials and URL user-info are never returned.
       tags: [Metrics]
@@ -4356,6 +4372,13 @@ paths:
         Returns the complete gateway configuration as a single JSON document
         suitable for archival or later restoration via `POST /restore`.
 
+        The unmodified JSON can also be provisioned as
+        `FERRUM_DB_CONFIG_BACKUP_PATH` for database-mode startup fallback
+        (stable regular file, at most 64 MiB). Bootstrap admits only the
+        configured namespace's runtime resources and ignores administrative
+        metadata, API specs and gateway trust bundles. Gateway trust remains
+        unresolved until an authoritative database reload.
+
         The output format is compatible with `POST /batch` (additive import)
         and `POST /restore` (full replacement). Consumer credentials are
         included **unredacted** since this is a backup endpoint. Backup
@@ -5572,6 +5595,11 @@ paths:
       summary: Create a plugin configuration
       description: |
         Creates the plugin configuration.
+
+        The complete prospective plugin chain is validated before persistence.
+        Invalid CORS/mesh-dispatch ordering, exclusive-instance conflicts,
+        effective metric-tag plan budgets or global registry ownership return
+        `400` without committing the plugin row or proxy association.
 
         **Proxy-scoped side effect (database mode).** A proxy-scoped plugin
         applies only when the target proxy lists it in `plugins` — `proxy_id`
@@ -12459,11 +12487,13 @@ components:
             DestinationRule `trafficPolicy.tls.sni` and Gateway API
             `BackendTLSPolicy` `validation.hostname` both project to this
             field. Enforced at the backend handshake on every path where
-            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, and the
+            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, terminating
+            `tcp`/`tcp_tls` streams that originate backend TLS, and the
             reqwest HTTP/1.1 dial (which carries the override in the request
             URL authority while pinning the socket to the selected target).
-            It also partitions backend connection pools, so two values never
-            share a connection. Must be an exact DNS hostname — not a
+            It also partitions HTTP-family backend connection pools, so two
+            values never share a connection. Stream proxies do not pool
+            connections. Must be an exact DNS hostname — not a
             wildcard and not an IP literal (RFC 6066 §3). Because the reqwest
             HTTP/1.1 dial serves them, this field is accepted alongside
             effective retry, request-body-buffering plugins, and
@@ -13251,6 +13281,15 @@ components:
               type: string
               default: default
               description: Kubernetes namespace
+            address_type:
+              type: [string, "null"]
+              enum: [IPv4, IPv6, null]
+              description: >-
+                Select one EndpointSlice IP family. When omitted or null, use
+                IPv4 if eligible IPv4 targets exist, otherwise IPv6. Explicit
+                selection never falls back to the other family. Missing,
+                unsupported, or mismatched EndpointSlice addressType values
+                are rejected. Duplicate dial addresses count only once.
             port_name:
               type: [string, "null"]
               description: Named port to select from EndpointSlice
@@ -13837,7 +13876,7 @@ components:
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `gateway_listeners`,
-        `logging`,
+        `logging`, `log_sink_record_loss`,
         `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
         `service_discovery`, `dp_config`, `cp_dp_trust`, `replay_authority`) are
         present only when the caller is
@@ -13859,7 +13898,13 @@ components:
             audit pipeline cannot durably record committed mutations (see
             `audit_pipeline`), an active remote JWKS store is in grace after
             its refresh interval, or a recoverable dynamic Gateway API listener
-            failure is active. These stay ready with HTTP 200 except when
+            failure is active. A configured stream listener with a hard
+            bind/backend-TLS failure or an exited task reports `degraded` with
+            HTTP 503 and `ready: false`. Soft frontend TLS/DTLS deferrals and
+            DTLS config-build failures report `degraded` with HTTP 200 and
+            `ready: true` when otherwise healthy. Pending asynchronous binds
+            alone do not degrade health during runtime reconciliation. The
+            other degraded conditions stay ready with HTTP 200 except when
             `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`, which makes
             the Gateway-listener case not ready with HTTP 503 while preserving
             `status: "degraded"`. Intentional read-only mode does NOT set
@@ -13901,7 +13946,10 @@ components:
         ready:
           type: boolean
           description: |
-            `true` once the gateway has finished startup AND no supervised
+            `true` once the gateway has finished startup AND no configured
+            stream listener has a hard bind/backend-TLS failure or an exited
+            task (soft frontend TLS/DTLS deferrals, DTLS config-build failures,
+            and pending asynchronous binds do not withdraw readiness) AND no supervised
             serving listener (or, in control-plane mode, the database config
             poll task) has failed unexpectedly since AND no active remote JWKS
             store is past its maximum-stale deadline AND no service-discovery
@@ -14139,6 +14187,8 @@ components:
           $ref: "#/components/schemas/AuditPipelineStatus"
         logging:
           $ref: "#/components/schemas/LoggingSinkSnapshot"
+        log_sink_record_loss:
+          $ref: "#/components/schemas/LogSinkRecordLossSnapshot"
         ai_transcript_audit:
           type: array
           description: >-
@@ -14629,9 +14679,11 @@ components:
           type: integer
           format: uint64
           description: >
-            How long every CP has been unreachable. `0` while connected.
-            Diagnostic only — the staleness boundary is the applied-snapshot
-            age, so repeated failed CP cycles cannot postpone it.
+            How long the DP has been without usable applied configuration.
+            `0` once a snapshot has been accepted and applied. Transport connect
+            alone does not clear it. Diagnostic only — the staleness boundary is
+            the applied-snapshot age, so repeated failed CP cycles cannot
+            postpone it.
         max_stale_seconds:
           type: integer
           format: uint64
@@ -15402,7 +15454,7 @@ components:
           properties:
             file_descriptors:
               type: object
-              required: [current, max, ratio]
+              required: [current, max, ratio, enforced]
               properties:
                 current:
                   type: integer
@@ -15410,10 +15462,20 @@ components:
                 max:
                   type: integer
                   format: uint64
+                  description: >-
+                    Enforceable per-process FD ceiling. `0` means no enforceable ceiling could be
+                    determined (non-Unix platform, `getrlimit` failure, or an unlimited hard cap
+                    with no published platform ceiling), and FD-based shedding is disabled.
                 ratio:
                   type: number
                   format: double
-                  description: current / max (0.0–1.0)
+                  description: current / max (0.0–1.0). Always 0.0 when `enforced` is false
+                enforced:
+                  type: boolean
+                  description: >-
+                    False when FD-based load shedding is disabled because no enforceable ceiling
+                    could be determined. Distinguishes "this tier is off" from "FD pressure at 0%".
+                    Connection- and request-based shedding are unaffected.
             connections:
               type: object
               required: [current, max, ratio]
@@ -16068,6 +16130,47 @@ components:
           oneOf:
             - $ref: "#/components/schemas/LoggingSinkState"
             - type: "null"
+
+    LogSinkRecordLossSnapshot:
+      type: object
+      description: >-
+        Authenticated per-plugin logging-sink record loss (issue #4801).
+        Process-cumulative counts with closed-set plugin and reason labels
+        only — never an endpoint, topic, namespace, policy id, or record
+        content. Counters are not reset by a plugin-cache reload. The same
+        data is published on `/metrics` as
+        `ferrum_plugin_log_sink_records_dropped_total` and
+        `ferrum_plugin_log_sink_records_accepted_total`.
+      required: [dropped_total, accepted_total, dropped_by_plugin]
+      properties:
+        dropped_total:
+          type: integer
+          description: Records discarded across every sink and reason since process start.
+        accepted_total:
+          type: integer
+          description: >-
+            Records admitted to a sink's bounded queue across every sink since
+            process start.
+        dropped_by_plugin:
+          type: object
+          description: >-
+            Per-plugin loss, listed only for sinks that have lost a record and
+            only for the reasons with a non-zero count. Keys are the closed
+            sink set (`ai_transcript_audit`, `api_chargeback_sink`,
+            `http_logging`, `kafka_logging`, `loki_logging`, `other`,
+            `statsd_logging`, `tcp_logging`, `udp_logging`, `ws_logging`).
+          additionalProperties:
+            type: object
+            description: >-
+              Loss counts keyed by the closed reason set (`batch_discard`,
+              `byte_budget`, `queue_full`, `record_too_large`, `shutdown`,
+              `sink_error`).
+            additionalProperties:
+              type: integer
+          example:
+            udp_logging:
+              byte_budget: 6000
+              batch_discard: 683
 
     LoggingSinkState:
       type: object
@@ -20053,10 +20156,12 @@ components:
                 type: string
               userinfo_endpoint:
                 type: string
+                description: Optional UserInfo endpoint. When set alongside discovery_url, the explicit value overrides the UserInfo endpoint advertised by the discovery document, including one that omits it.
               jwks_uri:
                 type: string
               end_session_endpoint:
                 type: string
+                description: Optional end-session endpoint used for RP-initiated logout. When set alongside discovery_url, the explicit value overrides the end-session endpoint advertised by the discovery document, including one that omits it.
               post_logout_redirect_uri:
                 type: string
                 description: Absolute HTTPS redirect URI sent to the provider after RP-initiated logout; HTTP is allowed only for localhost or literal loopback development endpoints.
@@ -20639,6 +20744,10 @@ components:
         ambient mTLS streams. DENY rules are evaluated first (first match
         wins); the presence of any ALLOW rule with no match triggers an
         implicit deny.
+        `to.hosts` / `notHosts` match normalized literal request authorities,
+        without service-alias expansion. Explicit decimal ports use one
+        canonical spelling on both request and pattern sides; wildcard ports
+        remain supported. Signed request ports are rejected at admission.
 
         Source matching enforces both the positive identity matchers
         (`principals` in Istio `<trust-domain>/ns/.../sa/...` form,
@@ -21407,7 +21516,11 @@ components:
                       Replacement request path forwarded to the backend. When
                       `match_prefix` is set (the source `match.uri` was a
                       prefix) only that prefix is replaced; otherwise the whole
-                      path is replaced. CRLF is rejected at load time.
+                      path is replaced. Must be a canonical absolute path
+                      without a query or fragment. Percent escapes, dot
+                      segments, backslashes, and CRLF are rejected at load
+                      time. The composed path is checked again before policy
+                      and dispatch; ambiguous paths are refused, not resolved.
                   authority:
                     type: [string, "null"]
                     description: |
@@ -21873,7 +21986,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes authenticated_identity plus a namespace-correct identified_consumer so access_control, consumer rate limiting, logging, retries, and chargeback all observe one SOAP identity. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Both signature paths settle TRUST FIRST: certificate fingerprint match and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body, and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, a supported SubjectConfirmation naming the configured recipient with its own bounded NotOnOrAfter and no InResponseTo, exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Malformed XML returns HTTP 400 with a fixed parser category; document names, positions, and raw parser details are never returned or logged. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes authenticated_identity plus a namespace-correct identified_consumer so access_control, consumer rate limiting, logging, retries, and chargeback all observe one SOAP identity. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Both signature paths settle TRUST FIRST: certificate fingerprint match and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body, and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, a supported SubjectConfirmation naming the configured recipient with its own bounded NotOnOrAfter and no InResponseTo, exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
       additionalProperties: false
       allOf:
         - if:
@@ -22531,7 +22644,9 @@ components:
         Plugin: cors — Cross-Origin Resource Sharing. Unknown keys, null values,
         non-object configs, and an omitted origin policy are rejected. Actual
         requests evaluate origin/credentials/exposure behavior; method/header
-        allow-lists and max age govern preflight only.
+        allow-lists and max age govern preflight only. Denials return a JSON
+        object with a fixed error message, without reflecting method/header
+        values. Successful preflight bodies remain empty.
       allOf:
         - if:
             not:
@@ -23397,7 +23512,15 @@ components:
           const: header
         key:
           type: string
-          description: HTTP header name.
+          description: |
+            HTTP header name. Add/update destinations and rename destinations
+            reject gateway-owned names (case-insensitive): host, content-length,
+            connection, transfer-encoding, keep-alive, proxy-authorization,
+            proxy-connection, te, trailer, upgrade, expect, x-forwarded-for,
+            x-forwarded-proto, x-forwarded-host,
+            x-ferrum-original-content-encoding, and x-grpc-web-mode.
+            Removal and rename sources remain allowed. Use preserve_host_header
+            for Host or trusted-proxy configuration for forwarding identity.
         value:
           type: string
           description: |
@@ -23409,6 +23532,7 @@ components:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Must not be a gateway-owned destination listed under key.
 
     RequestTransformerQueryRule:
       type: object
@@ -23519,6 +23643,13 @@ components:
         `body` only — unlike request_transformer, there is no `query`
         target.
 
+        Body-rule output above the effective response ceiling is refused with
+        HTTP 502 and the Response body too large JSON error with numeric limit, X-Gateway-Error:
+        overload, and error_class: dispatch_policy_rejected. One warning names
+        proxy id, plugin, ceiling, and the produced-size lower bound at the first
+        refused serializer write; no payload is logged. Exactly-at-ceiling
+        output passes. Aggregate retained-buffer exhaustion remains HTTP 503.
+
         When `apply_route_overrides: true`, the plugin accepts an empty `rules`
         array so it can participate in the chain-level response route-header
         final phase for transforms published by `mesh_route_dispatch` onto
@@ -23583,7 +23714,9 @@ components:
             add: insert if absent (does not overwrite).
             update: write the header value.
             remove: delete the header.
-            rename: move old → new header name.
+            rename: move old → new header name. Set-Cookie is rejected as
+            either source or destination (case-insensitive), regardless of
+            cookie count, because its multi-value representation is name-bound.
             Operation-incompatible extras are rejected: only add/update
             may set `value`; only rename may set `new_key`; remove may
             set neither.
@@ -24559,6 +24692,11 @@ components:
         and does not disable an active route limit, and multiple instances
         compose to their minimum. It also bounds the buffered-representation
         decode gate and compression admission.
+        Response-transformer output above this ceiling is a deterministic
+        gateway policy refusal: HTTP 502 with the Response body too large JSON error and limit,
+        X-Gateway-Error: overload, and error_class: dispatch_policy_rejected.
+        It emits one bounded warning. Oversized backend bodies retain backend
+        attribution; actual aggregate-buffer exhaustion remains HTTP 503.
         Repeated identical Content-Length values are parsed per comma-folded
         member and compared against the limit; a declared length that cannot be
         reduced to one agreed value fails closed with HTTP 502. Bodyless
@@ -25492,7 +25630,8 @@ components:
       additionalProperties: false
       description: >-
         Plugin: response_mock — Returns mock responses for API testing before
-        backends are ready. Rule paths are relative to a prefix listen_path;
+        backends are ready. Rule paths are relative to a prefix listen_path
+        with trailing slashes trimmed before stripping;
         exact (`=`), regex (`~`), root (`/`), and host-only scopes match the
         full request path. Supports HTTP and WebSocket upgrade handshakes only:
         a match short-circuits only the HTTP handshake response and does not
@@ -26641,7 +26780,10 @@ components:
         Supports all gRPC timeout units (H, M, S, m, u, n). At least one
         effective rule is required. When both deadline values are configured,
         default_deadline_ms must be less than or equal to max_deadline_ms;
-        runtime validation enforces this cross-field relationship.
+        runtime validation enforces this cross-field relationship. Malformed or
+        zero client values never pass through verbatim: an enforced fallback
+        deadline is rewritten onto the outbound header and invalid client values
+        set bounded transaction-log metadata grpc_timeout_invalid=true.
       anyOf:
         - required: [max_deadline_ms]
         - required: [default_deadline_ms]
@@ -26708,7 +26850,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults. Redacted captures replace malformed function.arguments JSON with [UNPARSEABLE] and set arguments_redaction_failed=true on the captured function object; valid arguments retain member-name redaction. Explicit full_body raw capture is unchanged."
       properties:
         mode:
           type: string
@@ -27349,6 +27491,18 @@ components:
                   - "$.documents[*].text"
                   - "$.retrieved_context[*].content"
                   - "$.tool_results[*].content"
+                  - "$.system"
+                  - "$.contents[*].parts[*].text"
+                  - "$.systemInstruction.parts[*].text"
+                  - "$.inputText"
+                  - "$.data_sources[*].parameters.role_information"
+                  - "$.message"
+                  - "$.preamble"
+                  - "$.chat_history[*].message"
+                  - "$.inputs"
+                  - "$.content"
+                  - "$.instances[*].prompt"
+                  - "$.requests[*].params"
               default:
                 - "$.messages[*].content"
                 - "$.messages[*].function_call.name"
@@ -27365,6 +27519,18 @@ components:
                 - "$.documents[*].text"
                 - "$.retrieved_context[*].content"
                 - "$.tool_results[*].content"
+                - "$.system"
+                - "$.contents[*].parts[*].text"
+                - "$.systemInstruction.parts[*].text"
+                - "$.inputText"
+                - "$.data_sources[*].parameters.role_information"
+                - "$.message"
+                - "$.preamble"
+                - "$.chat_history[*].message"
+                - "$.inputs"
+                - "$.content"
+                - "$.instances[*].prompt"
+                - "$.requests[*].params"
               description: Supported simple request extraction paths. When configured, this list replaces the defaults.
             response_json_paths:
               type: array
@@ -27381,6 +27547,19 @@ components:
                   - "$.output_text"
                   - "$.output[*].content[*].text"
                   - "$.output[*].arguments"
+                  - "$.candidates[*].content.parts[*].text"
+                  - "$.candidates[*].content.parts[*].functionCall.name"
+                  - "$.candidates[*].content.parts[*].functionCall.args"
+                  - "$.content[*].text"
+                  - "$.content[*].name"
+                  - "$.content[*].input"
+                  - "$.output.message.content[*].text"
+                  - "$.content_block_delta.delta.text"
+                  - "$.results[*].outputText"
+                  - "$.text"
+                  - "$.chat_history[*].message"
+                  - "$.response"
+                  - "$[*].generated_text"
               default:
                 - "$.choices[*].text"
                 - "$.choices[*].message.content"
@@ -27392,6 +27571,19 @@ components:
                 - "$.output_text"
                 - "$.output[*].content[*].text"
                 - "$.output[*].arguments"
+                - "$.candidates[*].content.parts[*].text"
+                - "$.candidates[*].content.parts[*].functionCall.name"
+                - "$.candidates[*].content.parts[*].functionCall.args"
+                - "$.content[*].text"
+                - "$.content[*].name"
+                - "$.content[*].input"
+                - "$.output.message.content[*].text"
+                - "$.content_block_delta.delta.text"
+                - "$.results[*].outputText"
+                - "$.text"
+                - "$.chat_history[*].message"
+                - "$.response"
+                - "$[*].generated_text"
               description: Supported simple response extraction paths. When configured, this list replaces the defaults.
         allow_topics:
           type: array
@@ -27854,7 +28046,7 @@ components:
           description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
         max_prompt_characters:
           type: integer
-          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, document/RAG fields (including Anthropic text document source.data), and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
+          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, Bedrock Converse messages[].content[].toolResult content and guardContent text, tools, tool arguments, document/RAG fields (including Anthropic text document source.data), Google Vertex legacy predict instances[].prompt, and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
         temperature_range:
           type: array
           items:
@@ -27887,7 +28079,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate is a conservative chars/4 heuristic, not provider tokenizer parity. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate is a conservative chars/4 heuristic, not provider tokenizer parity. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. When Redis is unavailable at terminal reconciliation, actual usage is charged locally within the existing identity cap and the reservation lifecycle is finalized, including zero-token reservations and committed streams. Successful fallback sets instance-scoped ai_ratelimit_locally_accounted=true. Local usage is not replayed to Redis. Process counters ferrum_ai_rate_limit_local_accounting_tokens_total and ferrum_ai_rate_limit_unaccounted_tokens_total expose fallback charges and capacity-limited accounting gaps. Admission remains fail closed; buffered/federated successful responses still receive 503 and committed streams retain their response."
       required: [token_limit]
       properties:
         token_limit:
@@ -28049,13 +28241,13 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, and system (completions/responses/embeddings/Anthropic-system shapes), including matches split across adjacent text parts. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
+          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, system, inputText, message, preamble, and inputs (completions/responses/embeddings/Anthropic-system/Bedrock-Titan/Cohere-v1/HuggingFace-TGI shapes), Google Gemini contents[].parts[].text and systemInstruction/system_instruction parts, Cohere chat_history[].message, Google Vertex legacy predict instances[].prompt, Bedrock Converse messages[].content[].toolResult content and guardContent text, Anthropic tool_result block content, and Azure On Your Data role_information — including content blocks that carry no type discriminator (Bedrock Converse) and matches split across adjacent text parts. Detection and redaction cover the same field set. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
             type: string
           default: []
-          description: Message roles to skip scanning
+          description: "Message roles to skip scanning. Filters messages[].role, Gemini contents[].role, and Cohere chat_history[].role (matched case-insensitively, since Cohere spells roles USER/CHATBOT/SYSTEM/TOOL); the value 'system' additionally suppresses the top-level system field, the Cohere preamble, and the Gemini system instruction"
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"
@@ -28213,7 +28405,7 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: "Which response fields to scan: 'content' scans supported completion and tool/function-call fields, 'all' scans the entire response body"
+          description: "Which response fields to scan: 'content' scans supported completion and tool/function-call fields (OpenAI chat/Responses, Anthropic content[], Gemini candidates[].content.parts[], Bedrock Converse output.message.content[], Cohere v1 text and chat_history[].message, and Hugging Face TGI's top-level array of generated_text objects), 'all' scans the entire response body"
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"
@@ -28842,8 +29034,11 @@ components:
             type: integer
             minimum: 100
             maximum: 599
+            not:
+              minimum: 200
+              maximum: 299
           default: [429, 500, 502, 503]
-          description: HTTP status codes from a provider that trigger fallback to the next provider.
+          description: Non-2xx HTTP status codes from a provider that trigger fallback to the next provider. Success codes are rejected because the generation has already committed.
         fallback_on_network_errors:
           type: boolean
           default: true
@@ -28851,7 +29046,7 @@ components:
         fallback_on_protocol_errors:
           type: boolean
           default: true
-          description: Try the next provider when a 2xx response is malformed or cannot be losslessly normalized, or when a redirect is returned.
+          description: Try the next provider when a redirect is returned. A completed 2xx that cannot be normalized returns 502 without replay, even when ambiguous-outcome fallback is enabled.
         fallback_on_ambiguous_errors:
           type: boolean
           default: false
@@ -28968,6 +29163,7 @@ components:
 
     A2aGatewayConfig:
       type: object
+      required: [discovery]
       description: "Plugin: a2a_gateway — transparent Agent-to-Agent protocol gateway for HTTP JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs A2A traffic. The implemented A2A protocol version is 0.3.x, whose canonical gRPC service is a2a.v1.A2AService (package a2a.v1); A2A 1.0's lf.a2a.v1.A2AService carries a renumbered AgentCard and is never decoded as 0.3. Detects standard A2A methods, optionally denies methods by gateway policy, rewrites HTTP JSON and unary gRPC Agent Card endpoint URLs to the gateway address, preserves SSE/gRPC streaming for non-card traffic, and emits a2a.* metadata for existing Ferrum logging, tracing, chargeback, WAF, and alerting plugins. It does not manage A2A task state or aggregate multiple agents in V1. Cannot be composed with request_deduplication on the same proxy while discovery.public_base_url is unset and discovery.trust_forwarded_headers is true; admission rejects that pairing with 400 because the rewritten Agent Card origin is then derived from per-request forwarded headers and the connection's TLS SNI, neither of which a replay fingerprint binds. A configured discovery.public_base_url composes normally."
       properties:
         enabled:
@@ -29044,6 +29240,18 @@ components:
               description: Remove Accept-Encoding on non-streaming A2A HTTP requests whose responses may be parsed or rewritten by the plugin. Enabling this plugin with the default true value marks request headers mutable for all traffic on the proxy.
         discovery:
           type: object
+          anyOf:
+            - required: [rewrite_agent_card_urls]
+              properties:
+                rewrite_agent_card_urls:
+                  enum: [false]
+            - required: [public_base_url]
+            - required: [trust_forwarded_headers, allowed_public_origins]
+              properties:
+                trust_forwarded_headers:
+                  enum: [true]
+                allowed_public_origins:
+                  minItems: 1
           properties:
             rewrite_agent_card_urls:
               type: boolean
@@ -29052,11 +29260,18 @@ components:
             public_base_url:
               type: string
               format: uri
-              description: Optional explicit public gateway origin, for example https://agents.example.com. When omitted and trust_forwarded_headers is true, X-Forwarded-* and Host are used after validating http/https scheme and host-only values. Configuring this value is also what makes the Agent Card rewrite a pure function of configuration, which is required to compose this plugin with request_deduplication on the same proxy.
+              description: Explicit public gateway base URL, for example https://agents.example.com. Rewriting defaults to enabled and requires this value or trust_forwarded_headers=true with nonempty allowed_public_origins. Empty plugin configurations fail admission. Explicit rewrite_agent_card_urls=false selects unchanged backend cards. When deriving an origin, X-Forwarded-* and Host must select an allowed normalized origin; missing, malformed, comma-separated or unlisted origins fail closed before backend dispatch with agent_card_public_origin_unavailable (HTTP 502 or gRPC INTERNAL). Configuring this value is also what makes the Agent Card rewrite a pure function of configuration, which is required to compose this plugin with request_deduplication on the same proxy.
             trust_forwarded_headers:
               type: boolean
               default: false
-              description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. In that request-derived mode the origin also depends on whether the connection carried a TLS SNI hostname, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
+              description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. Requires nonempty allowed_public_origins when rewriting is enabled; the trusted front door must replace forwarded headers. Schemes and ports must match an allowed normalized origin. In that request-derived mode the origin also depends on whether the connection carried a TLS SNI hostname, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
+            allowed_public_origins:
+              type: array
+              default: []
+              items:
+                type: string
+                format: uri
+              description: Allowed absolute HTTP(S) origins for request-derived card URLs, without paths, credentials, queries or fragments. Required with trust_forwarded_headers when rewriting is enabled and public_base_url is absent. Compared after URL origin normalization, including scheme and non-default port. A configured public_base_url takes precedence.
         observability:
           type: object
           properties:
@@ -29073,6 +29288,7 @@ components:
               format: uint64
               default: 1048576
               minimum: 1
+              description: Payload logging byte limit. Task and context identifiers, textual errors and protocol-version metadata are capped at min(max_payload_size, 1024) UTF-8 bytes including a trailing ~ marker, with a companion .truncated flag. Task states are normalized to the protocol state set; unrecognized states become unknown with .unrecognized=true, and normalized states too large for this limit are omitted with .truncated=true. Applies to request hints, JSON replies and SSE completion metadata; does not cap response buffering or alter response bytes.
         policy:
           type: object
           properties:
@@ -29080,6 +29296,7 @@ components:
               type: string
               enum: [allow, deny]
               default: allow
+              description: With deny or any per-method deny rule, unrecognized requests inside the configured endpoint, discovery or gRPC-service scope fail closed, including unsupported payloads, methods, paths and disabled bindings. Known batch members are individually policed. Unrelated sibling paths and services are outside scope.
             methods:
               type: object
               description: >-
@@ -29102,7 +29319,32 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports multiplexed SSE sessions: GET with Accept text/event-stream attaches one generation-scoped listener per live downstream session and routes events by a bounded, type-sensitive JSON-RPC request/stream identity over a single retained-event ring with one byte budget. While a listener is attached, every aggregate JSON-RPC request with a representable id opens its identity before catalog refresh or upstream dispatch and answers 202 with its response published on the stream — gateway-authored list/ping/error responses and upstream-routed tools/call, prompts/get, resources/read, and passthrough methods alike — so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed. Notifications, batch members, and initialize are never multiplexed. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed, and a retention refusal terminalizes the identity and answers the POST inline rather than dropping a JSON-RPC response. Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate-router mode also supports multiplexed SSE sessions: GET with Accept text/event-stream attaches one generation-scoped listener per live downstream session and routes events by a bounded, type-sensitive JSON-RPC request/stream identity preserving the exact numeric wire token over a single retained-event ring with one byte budget. While a listener is attached, every aggregate JSON-RPC request with a representable id opens its identity before catalog refresh or upstream dispatch and answers 202 with its response published on the stream — gateway-authored list/ping/error responses and upstream-routed tools/call, prompts/get, resources/read, and passthrough methods alike — so a concurrent notifications/cancelled marks a genuinely open request and its late result is suppressed. Notifications, batch members, and initialize are never multiplexed. Completing, cancelling, or refusing a stream returns its capacity exactly once through a request-owned lease, a late or duplicate response for a terminal identity is refused rather than misattributed; mismatched or ambiguous correlated responses are replaced by a bounded gateway -32603 error that carries the request's own JSON-RPC id token so the pending call still resolves, and are never published or returned as successful inline answers (the id comparison is byte-exact and runs only while a listener is attached; mcp.sse.delivery records refused), and a retention refusal terminalizes the identity and answers the POST inline rather than dropping a JSON-RPC response. Teardown is unconditional on client disconnect, session DELETE, idle eviction, and plugin reload/update/delete; a listener past its configured lifetime is superseded by a fresh GET so a stalled transport can never hold the slot. Duplicate listeners, invalid/unknown/stale identities, and invalid, oversized, unknown, or too-old Last-Event-ID cursors fail closed with fixed, value-redacted diagnostics. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint.path scopes, and endpoint.path may not be \"/\", because the endpoint reserves its whole path subtree. A client JSON-RPC id token reflected into a gateway-authored singleton response is bounded at 4096 wire bytes; a larger id is refused with a fixed -32600 that does not echo it."
+      allOf:
+        - if:
+            properties:
+              mode:
+                const: transparent_proxy
+            required: [mode]
+          then:
+            properties:
+              policy:
+                not:
+                  anyOf:
+                    - required: [default_action]
+                    - required: [tools]
+                    - required: [hide_denied_tools]
+              discovery:
+                not:
+                  anyOf:
+                    - required: [aggregate_tools]
+                    - required: [aggregate_resources]
+                    - required: [aggregate_prompts]
+                    - required: [namespace_separator]
+                    - required: [cache_ttl_seconds]
+                    - required: [hide_denied_items]
+                    - required: [on_new_tool]
+                    - required: [on_schema_change]
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -29117,7 +29359,7 @@ components:
           properties:
             path:
               type: string
-              description: Public MCP endpoint path, such as /mcp.
+              description: Canonical public MCP endpoint path, such as /mcp. Must not be "/" — the endpoint reserves its whole path subtree, so a root endpoint would refuse every other handler on the proxy and is rejected at admission. Only the exact path is served; slash-delimited descendants return 404 in both modes. A trailing-slash endpoint also reserves its unsuffixed scope. Two enabled mcp_gateway instances on one proxy may not have nesting endpoint scopes; admission rejects the pair. Queries do not change selection. Methods other than GET, POST, and DELETE return 405 when they reach this plugin.
             protocol_versions:
               type: array
               minItems: 1
@@ -29127,6 +29369,7 @@ components:
               description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version. Includes 2025-03-26 when JSON-RPC batches are desired; batches are admitted under validation.max_batch_* limits.
         discovery:
           type: object
+          description: Catalog discovery requires aggregate_router. Explicit aggregate_tools, aggregate_resources, aggregate_prompts, namespace_separator, cache_ttl_seconds, hide_denied_items, on_new_tool, and on_schema_change fields are rejected in transparent_proxy, including explicit defaults, because every one of them is inert without a mediated catalog.
           properties:
             aggregate_tools:
               type: boolean
@@ -29351,6 +29594,7 @@ components:
                 description: Overrides sessions.initialize_upstreams for this server; startup is accepted as a V1 alias for lazy.
         policy:
           type: object
+          description: Catalog policy requires aggregate_router. Explicit default_action, tools, and hide_denied_tools fields are rejected in transparent_proxy, including explicit defaults.
           properties:
             default_action:
               type: string
@@ -29466,7 +29710,9 @@ components:
         Ordinary HTTP uses the wire status. Native gRPC and translated
         gRPC-Web use the final client-visible grpc-status mapped to the
         canonical effective HTTP status; missing/malformed/unknown terminal
-        status fails closed to 500.
+        status fails closed to 500. Explicitly zero-priced tiers still meter calls.
+        Successful H1/H2/H3 WebSocket handshakes share the 101 pricing tier;
+        rejected handshakes retain their error status.
         At least one of `pricing_tiers`, `bandwidth_pricing`, or
         `stream_connection_pricing` must be configured.
         Unknown top-level keys and unknown `pricing_tiers[]` keys are
@@ -29653,13 +29899,19 @@ components:
       additionalProperties: false
       required: [clickhouse]
       description: |
-        Plugin: api_chargeback_sink — Durable ClickHouse charge export. Uses the
+        Plugin: api_chargeback_sink — Durable ClickHouse charge export. At most one
+        effective sink is admitted per proxy after scope merging; independent
+        event_id keys would otherwise duplicate durable billing rows. Uses the
         same `pricing_tiers`, `bandwidth_pricing`, `stream_connection_pricing`,
         and `currency` fields as `api_chargeback`, then exports either
         per-transaction events (`mode: per_event`) or periodic accumulator
         deltas (`mode: snapshot`) to ClickHouse. Ordinary HTTP uses its wire
         status for pricing. Native gRPC and translated gRPC-Web use the final
         normalized grpc-status mapped to the canonical effective HTTP status.
+        Explicitly zero-priced tiers still count matching calls. Successful H1/H2/H3
+        WebSocket handshakes use the 101 tier and ws protocol label; rejected
+        handshakes retain their error status. Admission into memory is not durable:
+        pending batches and spool handoffs can be lost on abrupt process termination.
         Durable events preserve that billable status, the raw HTTP status, and
         the normalized gRPC status separately. Snapshot mode aggregates by every
         exported categorical dimension (namespace, consumer_id, consumer_name,
@@ -30010,7 +30262,7 @@ components:
                 of consuming the remaining channel slots.
             buffer_max_bytes:
               type: integer
-              minimum: 9312
+              minimum: 9440
               maximum: 268435456
               default: 16777216
               description: >-
@@ -30393,6 +30645,33 @@ components:
                           type: number
                           description: Accumulated per-connection charge.
 
+    ChargebackSinkEventAccounting:
+      type: object
+      description: |
+        Newly emitted per-event rows at bounded admission (including refusals).
+        Received equals persisted plus dropped plus pending at a settled observation.
+        Retries share one lifetime owner; replay of an already-spooled row and
+        snapshot accumulator deltas are excluded. Process totals include retired
+        workers; instance values are generation-local. Sampling is not transactional.
+        SIGKILL/crashes cannot flush memory or increment final loss counters.
+      required: [received_total, persisted_total, dropped_total, pending]
+      properties:
+        received_total:
+          type: integer
+          minimum: 0
+        persisted_total:
+          type: integer
+          minimum: 0
+          description: Rows acknowledged by ClickHouse or written to spool at least once; the explicit lossy async opt-in weakens acknowledgement durability.
+        dropped_total:
+          type: integer
+          minimum: 0
+          description: Rows whose last memory owner was dropped before acknowledgement or spooling, including refusal, failed delivery, and cancellation.
+        pending:
+          type: integer
+          minimum: 0
+          description: Rows still awaiting acknowledgement or spooling, including pending batches and asynchronous spool handoffs.
+
     ChargebackSinkStatusResponse:
       type: object
       description: |
@@ -30400,7 +30679,8 @@ components:
         accepted generation for every stable `api_chargeback_sink` plugin-config
         ID plus process-wide totals. Instances are ordered by ascending
         `plugin_config_id`. Validation throwaways, uncommitted staged reloads,
-        and superseded generations are excluded.
+        and superseded generations are excluded from instances. Cumulative totals
+        include retired workers and survive reload/removal until process restart.
       required: [enabled, instance_count, snapshot_finalizations_pending, snapshot_finalizations_pending_bytes, snapshot_finalizations_oldest_age_secs, snapshot_finalization_recovery_policy, totals, instances]
       properties:
         enabled:
@@ -30431,12 +30711,18 @@ components:
             count or bytes exceed budget.
         totals:
           type: object
-          description: Aggregates across every accepted live instance.
-          required: [queue, spool, export]
+          description: Live-instance gauges and process-lifetime cumulative counters.
+          required: [queue, spool, export, per_event]
           properties:
+            per_event:
+              $ref: "#/components/schemas/ChargebackSinkEventAccounting"
             queue:
               type: object
               properties:
+                outstanding:
+                  type: integer
+                  minimum: 0
+                  description: Queued, batched, and exporting rows for current instances; retired worker exposure is in per_event.pending.
                 depth:
                   type: integer
                   minimum: 0
@@ -30550,6 +30836,7 @@ components:
         - queue
         - spool
         - export
+        - per_event
       properties:
         plugin_config_id:
           type: string
@@ -30603,9 +30890,15 @@ components:
               maximum: 60000
             jitter:
               type: boolean
+        per_event:
+          $ref: "#/components/schemas/ChargebackSinkEventAccounting"
         queue:
           type: object
           properties:
+            outstanding:
+              type: integer
+              minimum: 0
+              description: Queued, batched, and exporting rows in this generation.
             depth:
               type: integer
             capacity:
@@ -30721,7 +31014,7 @@ components:
               redis_username: false
               redis_password: false
               on_redis_unavailable: false
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, matched proxy namespace and ID, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, and matched proxy namespaces remain isolated even when an explicit Redis prefix is shared, while the same configured instance shares keys across gateways. Per-request completion ownership (logical key, fingerprint, local owner token, and optional Redis lock token) is held in an instance-keyed private structure rather than shared public metadata, so multiple scoped instances with distinct headers mark and token-release independently on the same request. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, effective outbound query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A synthetic short-circuit whose own execution performed the protected external operation — a terminate-mode serverless_function invocation or an ai_federation provider call — declares that provenance and never releases its ownership. Once every response decision is final, a durable non-replayable 409 completion tombstone is published under the key instead of the synthetic body, for buffered, empty/HEAD, streamed-fallthrough, and interrupted-delivery outcomes alike, so an identical idempotency-key retry cannot repeat the billable operation when inflight_ttl_seconds elapses. That tombstone is retained for max(ttl_seconds, inflight_ttl_seconds): it replaces an in-flight marker that blocked duplicates for inflight_ttl_seconds, so a deployment with inflight_ttl_seconds greater than ttl_seconds never becomes re-executable sooner than a bare marker left it, while ordinary replayable completions keep ttl_seconds. Externally executed synthetic plugins that do not declare this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication. Redis mode stores ownership and completion in ONE versioned operation record per logical key: acquisition is a token-owned SET NX before backend dispatch, and publication is a compare-and-set fenced on that still-current token, so publication and the ownership transition are atomic. An owner whose inflight_ttl_seconds lease expired can neither overwrite a successor's completed response nor publish while a successor owns the operation; its local completion is discarded instead. Current-version records with a missing or empty in-flight owner token, impossible state-dependent fields, or mismatched inner/outer replay fingerprints fail closed as unknown writer state. When a completed response cannot be represented within max_entry_size_bytes, a small non-replayable completion tombstone is published so peers receive a deterministic 409 for max(ttl_seconds, inflight_ttl_seconds) instead of becoming free to re-execute when the raw lease expires; a record published without a replay payload never expires sooner than the lease it replaced. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v6 logical keys plus the versioned record format are not backward-compatible with earlier versions. When Redis cannot be consulted, on_redis_unavailable decides between a fail-closed 503 (default) and an explicitly opted-in process-local fallback. Unknown top-level keys are rejected, and Redis-only keys are rejected outside sync_mode='redis'. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to a fixed-size execution barrier that inherits the completion's original insertion time and retention while peers remain blocked. Persistent per-key execution barriers are hard-capped at max_entries; overflow extends one fixed process-global deadline and returns 503 for applicable idempotency-key requests rather than allocating unbounded key state or failing open. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Every retained response, local or Redis, is stamped with the response-side presentation policy it was produced under: a content digest of the published response_transformer RTDS gate map plus a content digest of the effective static presentation rules of the proxy (response_transformer, sse, and a2a_gateway in its configured-public-base mode), folded in configured execution order. A stored response replays only while both digests still match the live policy; a stamp that no longer matches, a record written without provenance, and a record with malformed provenance all return 409 rather than replaying under a superseded policy or re-executing a possibly completed side effect. A response whose request straddled a gate publication, or whose effective presentation policy could not be established, is retained for replay neither in Redis nor locally, while in-flight ownership is kept until its TTL. The non-replayable external-operation completion tombstone is the one exception: its bytes are a fixed 409 refusal that asserts no presentation policy, so it is published even under an unprovable or straddled policy rather than leaving an already-performed operation executable again when inflight_ttl_seconds elapses. Only fixed-size digests are stored, never rule text or header values. The built-in priority 3010 runs after route dispatch and request_transformer header/query rules but before terminate-mode serverless execution. Admission rejects every same-protocol request header/query mutator at or after deduplication (including priority overrides), and rejects any deferred request-body transformer whose final bytes were not already established by pre-before_proxy normalization. request_deduplication cannot be composed with mcp_gateway on the same proxy: admission rejects the pair with 400 (fatal in file mode, rejected update in DP) because an MCP public-URI rewrite is derived from live upstream discovery state that no persisted digest can witness. It also cannot be composed with an a2a_gateway instance that derives its public base from the request - discovery.public_base_url unset while discovery.trust_forwarded_headers is true - because the rewritten Agent Card origin then depends on per-request forwarded headers and the connection's TLS SNI, neither of which the fingerprint binds; that refusal is per instance, so a configured-public-base a2a_gateway composes normally."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Gateway-authored dispatch errors are not completed responses: proven pre-wire failures release the matching owner token at finalization, while any possible execution retains the in-flight lease until inflight_ttl_seconds. Real backend error responses remain replayable; provenance is independent of HTTP status. Logical keys are scoped by stable plugin-config identity, matched proxy namespace and ID, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, and matched proxy namespaces remain isolated even when an explicit Redis prefix is shared, while the same configured instance shares keys across gateways. Per-request completion ownership (logical key, fingerprint, local owner token, and optional Redis lock token) is held in an instance-keyed private structure rather than shared public metadata, so multiple scoped instances with distinct headers mark and token-release independently on the same request. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, effective outbound query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A synthetic short-circuit whose own execution performed the protected external operation — a terminate-mode serverless_function invocation or an ai_federation provider call — declares that provenance and never releases its ownership. Once every response decision is final, a durable non-replayable 409 completion tombstone is published under the key instead of the synthetic body, for buffered, empty/HEAD, streamed-fallthrough, and interrupted-delivery outcomes alike, so an identical idempotency-key retry cannot repeat the billable operation when inflight_ttl_seconds elapses. That tombstone is retained for max(ttl_seconds, inflight_ttl_seconds): it replaces an in-flight marker that blocked duplicates for inflight_ttl_seconds, so a deployment with inflight_ttl_seconds greater than ttl_seconds never becomes re-executable sooner than a bare marker left it, while ordinary replayable completions keep ttl_seconds. Externally executed synthetic plugins that do not declare this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication. Redis mode stores ownership and completion in ONE versioned operation record per logical key: acquisition is a token-owned SET NX before backend dispatch, and publication is a compare-and-set fenced on that still-current token, so publication and the ownership transition are atomic. An owner whose inflight_ttl_seconds lease expired can neither overwrite a successor's completed response nor publish while a successor owns the operation; its local completion is discarded instead. Current-version records with a missing or empty in-flight owner token, impossible state-dependent fields, or mismatched inner/outer replay fingerprints fail closed as unknown writer state. When a completed response cannot be represented within max_entry_size_bytes, a small non-replayable completion tombstone is published so peers receive a deterministic 409 for max(ttl_seconds, inflight_ttl_seconds) instead of becoming free to re-execute when the raw lease expires; a record published without a replay payload never expires sooner than the lease it replaced. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v6 logical keys plus the versioned record format are not backward-compatible with earlier versions. When Redis cannot be consulted, on_redis_unavailable decides between a fail-closed 503 (default) and an explicitly opted-in process-local fallback. Unknown top-level keys are rejected, and Redis-only keys are rejected outside sync_mode='redis'. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to a fixed-size execution barrier that inherits the completion's original insertion time and retention while peers remain blocked. Persistent per-key execution barriers are hard-capped at max_entries; overflow extends one fixed process-global deadline and returns 503 for applicable idempotency-key requests rather than allocating unbounded key state or failing open. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Every retained response, local or Redis, is stamped with the response-side presentation policy it was produced under: a content digest of the published response_transformer RTDS gate map plus a content digest of the effective static presentation rules of the proxy (response_transformer, sse, and a2a_gateway in its configured-public-base mode), folded in configured execution order. A stored response replays only while both digests still match the live policy; a stamp that no longer matches, a record written without provenance, and a record with malformed provenance all return 409 rather than replaying under a superseded policy or re-executing a possibly completed side effect. A response whose request straddled a gate publication, or whose effective presentation policy could not be established, is retained for replay neither in Redis nor locally, while in-flight ownership is kept until its TTL. The non-replayable external-operation completion tombstone is the one exception: its bytes are a fixed 409 refusal that asserts no presentation policy, so it is published even under an unprovable or straddled policy rather than leaving an already-performed operation executable again when inflight_ttl_seconds elapses. Only fixed-size digests are stored, never rule text or header values. The built-in priority 3010 runs after route dispatch and request_transformer header/query rules but before terminate-mode serverless execution. Admission rejects every same-protocol request header/query mutator at or after deduplication (including priority overrides), and rejects any deferred request-body transformer whose final bytes were not already established by pre-before_proxy normalization. request_deduplication cannot be composed with mcp_gateway on the same proxy: admission rejects the pair with 400 (fatal in file mode, rejected update in DP) because an MCP public-URI rewrite is derived from live upstream discovery state that no persisted digest can witness. It also cannot be composed with an a2a_gateway instance that derives its public base from the request - discovery.public_base_url unset while discovery.trust_forwarded_headers is true - because the rewritten Agent Card origin then depends on per-request forwarded headers and the connection's TLS SNI, neither of which the fingerprint binds; that refusal is per instance, so a configured-public-base a2a_gateway composes normally."
       properties:
         header_name:
           type: string
@@ -31069,11 +31362,17 @@ components:
 
     MeshSliceDriftSummary:
       type: object
-      required: [tracked, connected, converged, drifted, rejecting, pending, disconnected]
+      required: [tracked, connected, converged, accepted, drifted, rejecting, pending, disconnected]
       properties:
         tracked: { type: integer, minimum: 0 }
         connected: { type: integer, minimum: 0 }
         converged: { type: integer, minimum: 0 }
+        accepted:
+          type: integer
+          minimum: 0
+          description: >
+            Data planes that accepted the desired slice at install time but have
+            not reported it as the serving generation (issue #4812).
         drifted: { type: integer, minimum: 0 }
         rejecting: { type: integer, minimum: 0 }
         pending: { type: integer, minimum: 0 }
@@ -31101,12 +31400,26 @@ components:
         sent:
           $ref: "#/components/schemas/MeshSliceVersionStamp"
         acknowledged:
-          $ref: "#/components/schemas/MeshSliceVersionStamp"
+          allOf:
+            - $ref: "#/components/schemas/MeshSliceVersionStamp"
+          description: >
+            Data-plane INSTALL-time acceptance watermark: the slice became the
+            DP's received slice. Not proof it is serving.
+        applied:
+          allOf:
+            - $ref: "#/components/schemas/MeshSliceVersionStamp"
+          description: >
+            Data-plane PROXY-RUNTIME acceptance watermark: the generation the DP
+            reported as actually serving (issue #4812).
         rejected:
           $ref: "#/components/schemas/MeshSliceRejectedStamp"
         convergence:
           type: string
-          enum: [converged, drifted, rejecting, pending, disconnected]
+          enum: [converged, accepted, drifted, rejecting, pending, disconnected]
+          description: >
+            `converged` requires the desired version to be applied by the DP's
+            proxy runtime. `accepted` means the DP acknowledged the desired
+            version at install time but has not reported it as serving.
         drift:
           $ref: "#/components/schemas/MeshSliceDriftFlags"
 
@@ -31123,7 +31436,7 @@ components:
 
     MeshSliceRejectedStamp:
       type: object
-      required: [version, at, age_seconds, reason]
+      required: [version, at, age_seconds, stage, reason]
       properties:
         version:
           type: string
@@ -31131,19 +31444,40 @@ components:
           description: Exact opaque version; runtime enforces a 256 UTF-8 byte cap, no controls, and no surrounding whitespace.
         at: { type: string, format: date-time }
         age_seconds: { type: integer, format: int64, minimum: 0 }
+        stage:
+          type: string
+          enum: [install, runtime]
+          description: >
+            Which data-plane gate refused the slice: `install` (receive,
+            subscription-binding and config-revision gates) or `runtime` (the
+            proxy runtime, after a successful install).
         reason:
           type: string
-          enum: [reported_rejection]
+          enum:
+            - install_refused
+            - runtime_config_build
+            - runtime_proxy_refused
+            - runtime_trust_unusable
+            - runtime_tls_reload
+            - runtime_dtls_candidate
           maxLength: 64
-          description: Fixed control-safe label. Caller-supplied NACK text is discarded and never retained.
+          description: >
+            Closed control-safe label mapped from the data plane's wire enum.
+            The data plane never sends free rejection text, so no caller bytes
+            are ever retained here.
 
     MeshSliceDriftFlags:
       type: object
-      required: [desired_vs_sent, desired_vs_acknowledged, sent_vs_acknowledged]
+      required: [desired_vs_sent, desired_vs_acknowledged, sent_vs_acknowledged, desired_vs_applied]
       properties:
         desired_vs_sent: { type: boolean }
         desired_vs_acknowledged: { type: boolean }
         sent_vs_acknowledged: { type: boolean }
+        desired_vs_applied:
+          type: boolean
+          description: >
+            The desired generation is not the one the DP's proxy runtime
+            reported as serving (issue #4812).
 
     ConnectedDpNode:
       type: object

@@ -26,6 +26,8 @@ config:
 
 Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery. Provider endpoints must use HTTPS except for `localhost` or literal loopback development endpoints. Discovery-provided endpoints must preserve the discovery URL's host, scheme, and effective port.
 
+`userinfo_endpoint` and `end_session_endpoint` may be set alongside `discovery_url`. When both are configured, the explicitly configured values take precedence over what the discovery document advertises, and they remain in effect even when the discovery document omits either field. `authorization_endpoint`, `token_endpoint`, and `jwks_uri` remain mutually exclusive with `discovery_url`.
+
 ## Security Behavior
 
 - `redirect_uri` must be an absolute URI and the callback path is handled by the plugin before proxying. Before starting a browser flow, Ferrum requires the request `Host`/`:authority` to identify the same host as `redirect_uri`; DNS names compare case-insensitively, IP literals compare by address, and ports are ignored because cookies are not port-scoped. Trailing-dot DNS callback hosts, missing or malformed request authorities, and different hosts are rejected before state, cookies, or an authorization redirect are issued. In particular, a request on `app.example.com` cannot use a callback on `auth.example.com`; route the initial login through the callback host or configure a same-host callback instead. Forwarded-host headers do not override the request authority for this check.
