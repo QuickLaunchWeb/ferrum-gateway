@@ -166,7 +166,11 @@ fn cookie_name(cookie: &str) -> &str {
 fn assert_host_only_correlation_cookie(cookie: &str, expected_max_age: &str) {
     assert!(cookie_name(cookie).starts_with("__Host-ferrum_oidc_state_"));
     assert_eq!(cookie_attribute(cookie, "domain"), None, "{cookie}");
-    assert_eq!(cookie_attribute(cookie, "path"), Some(Some("/")), "{cookie}");
+    assert_eq!(
+        cookie_attribute(cookie, "path"),
+        Some(Some("/")),
+        "{cookie}"
+    );
     assert_eq!(
         cookie_attribute(cookie, "samesite"),
         Some(Some("Lax")),
@@ -3052,7 +3056,8 @@ async fn logout_requires_a_sealed_session_and_encodes_the_id_token_hint() {
             let mut ctx = html_ctx();
             ctx.path = "/oauth/logout".to_string();
             if let Some(session) = session {
-                ctx.headers.insert("cookie".to_string(), session.to_string());
+                ctx.headers
+                    .insert("cookie".to_string(), session.to_string());
             }
             let PluginResult::Reject {
                 status_code,
@@ -3124,7 +3129,9 @@ async fn logout_revokes_discovered_refresh_tokens_with_best_effort_client_auth()
             loop {
                 let mut ctx = html_ctx();
                 if matches!(
-                    plugin.authenticate(&mut ctx, &ConsumerIndex::new(&[])).await,
+                    plugin
+                        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                        .await,
                     PluginResult::Reject {
                         status_code: 302,
                         ..
