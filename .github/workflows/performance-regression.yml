@@ -253,6 +253,9 @@ jobs:
         env:
           RR_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '' }}
         run: |
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            export RR_BASE_SHA="$(git rev-parse HEAD^)"
+          fi
           python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
           bash .github/scripts/run_rr_selection_comparison.sh
 
