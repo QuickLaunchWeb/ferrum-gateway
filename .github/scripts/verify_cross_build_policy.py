@@ -18216,7 +18216,10 @@ def linux_gnu_producer_contract_errors(
     )
     outside_lines = outside.splitlines()
     for index, uploaded in upload_artifact_steps(outside_lines, 0, len(outside_lines)):
-        if artifact_name in uploaded:
+        if any(
+            artifact_name_can_match(uploaded_name, artifact_name)
+            for uploaded_name in uploaded
+        ):
             errors.append(
                 f"{label} line {index + 1} may not upload the canonical "
                 f"{artifact_name} artifact outside job {job_name!r}"
@@ -30188,6 +30191,21 @@ pre_build = []
             + "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
             + "        with:\n"
             + "          name: binary-x86_64-unknown-linux-gnu\n"
+            + "          path: elsewhere/\n",
+        ),
+        "expression-derived canonical uploader": (
+            gnu_upload_step,
+            gnu_upload_step
+            + "\n"
+            + "  republish:\n"
+            + "    name: Republish\n"
+            + "    steps:\n"
+            + "      - name: Upload artifacts\n"
+            + "        uses: actions/upload-artifact"
+            + "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+            + "        with:\n"
+            + "          name: binary-${{ format('{0}', "
+            + "'x86_64-unknown-linux-gnu') }}\n"
             + "          path: elsewhere/\n",
         ),
         "unguarded published-asset gate": (
