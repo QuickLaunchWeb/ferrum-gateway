@@ -1001,7 +1001,8 @@ fn adaptive_concurrency_global_route_refresh_skips_unrelated_global_descriptor_p
                 "protobuf_descriptor_path": format!(
                     "{}/tests/fixtures/test_validator.bin",
                     env!("CARGO_MANIFEST_DIR")
-                )
+                ),
+                "protobuf_request_type": "test.HelloRequest"
             }
         }))
         .expect("body validator config should deserialize"),
