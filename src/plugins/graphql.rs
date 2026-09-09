@@ -1203,8 +1203,8 @@ fn analyze_selection_set<'a>(
             // `analyze_query` keeps a distinct keyword skip.
             let (ident, after_ident) = read_name(bytes, i);
 
-            // Look past whitespace for an alias `:`.
-            let j = skip_ws_only(bytes, after_ident);
+            // Look past ignored tokens for an alias `:`.
+            let j = skip_ignored(bytes, after_ident);
             if j < len && bytes[j] == b':' {
                 acc.alias_count += 1;
                 // The aliased field name follows and is counted on a later
@@ -1230,15 +1230,6 @@ fn analyze_selection_set<'a>(
     }
 
     Some(())
-}
-
-/// Skip only ASCII whitespace (not commas/comments) starting at `i`.
-fn skip_ws_only(bytes: &[u8], mut i: usize) -> usize {
-    let len = bytes.len();
-    while i < len && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
 }
 
 fn trim_leading_ignored(mut query: &str) -> &str {
@@ -1428,11 +1419,8 @@ fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
                 continue;
             }
 
-            // Skip whitespace after identifier
-            let mut j = i;
-            while j < len && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
+            // Skip ignored tokens after identifier
+            let j = skip_ignored(bytes, i);
 
             // Check if this is an alias (identifier followed by ':')
             if j < len && bytes[j] == b':' {
