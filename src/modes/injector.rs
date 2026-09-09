@@ -1157,8 +1157,7 @@ fn injection_decision(pod: &Value, config: &InjectorConfig) -> InjectionDecision
         log_unrecognized_inject_annotation(annotations, "sidecar.istio.io/inject");
         return InjectionDecision::SkipNotSelected;
     }
-    if inject_metadata_value_blocks_injection(annotations.and_then(|m| m.get("ferrum.io/inject")))
-    {
+    if inject_metadata_value_blocks_injection(annotations.and_then(|m| m.get("ferrum.io/inject"))) {
         log_unrecognized_inject_annotation(annotations, "ferrum.io/inject");
         return InjectionDecision::SkipNotSelected;
     }
@@ -1194,11 +1193,12 @@ fn injection_decision(pod: &Value, config: &InjectorConfig) -> InjectionDecision
         return InjectionDecision::Inject;
     }
 
-    let opted_in = inject_metadata_value_opts_in(annotations.and_then(|m| m.get("ferrum.io/inject")))
-        || inject_metadata_value_opts_in(
-            annotations.and_then(|m| m.get("sidecar.istio.io/inject")),
-        )
-        || mesh_metadata_value_opts_in(labels.and_then(|m| m.get("ferrum.io/mesh")));
+    let opted_in =
+        inject_metadata_value_opts_in(annotations.and_then(|m| m.get("ferrum.io/inject")))
+            || inject_metadata_value_opts_in(
+                annotations.and_then(|m| m.get("sidecar.istio.io/inject")),
+            )
+            || mesh_metadata_value_opts_in(labels.and_then(|m| m.get("ferrum.io/mesh")));
 
     if opted_in {
         InjectionDecision::Inject
@@ -1225,10 +1225,7 @@ fn pod_uses_host_network(pod: &Value) -> bool {
 }
 
 fn host_network_from_string(value: &str) -> bool {
-    if value.eq_ignore_ascii_case("true")
-        || value.eq_ignore_ascii_case("yes")
-        || value == "1"
-    {
+    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") || value == "1" {
         true
     } else if value.eq_ignore_ascii_case("false") || value == "0" {
         false
@@ -3055,8 +3052,8 @@ mod tests {
         for host_network in [Value::Bool(false), Value::Null, json!("false"), json!(0)] {
             let mut pod = host_network_pod(Value::Bool(true));
             pod["spec"]["hostNetwork"] = host_network.clone();
-            let patch = build_sidecar_patch_for_namespace(&pod, &config, Some("payments"))
-                .expect("patch");
+            let patch =
+                build_sidecar_patch_for_namespace(&pod, &config, Some("payments")).expect("patch");
             assert!(
                 patch_has_named_container(&patch, "ferrum-edge"),
                 "expected sidecar container for hostNetwork={host_network:?}"
@@ -3072,8 +3069,8 @@ mod tests {
             .as_object_mut()
             .expect("spec object")
             .remove("hostNetwork");
-        let patch = build_sidecar_patch_for_namespace(&absent, &config, Some("payments"))
-            .expect("patch");
+        let patch =
+            build_sidecar_patch_for_namespace(&absent, &config, Some("payments")).expect("patch");
         assert!(
             patch_has_named_container(&patch, "ferrum-edge"),
             "absent hostNetwork must still inject"
