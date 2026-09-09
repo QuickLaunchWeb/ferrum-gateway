@@ -120,7 +120,7 @@ fn invalid_svid_reject(error: impl std::fmt::Display) -> PluginResult {
     );
     PluginResult::Reject {
         status_code: 403,
-        body: "invalid SPIFFE identity certificate".to_string(),
+        body: serde_json::json!({"error": "invalid SPIFFE identity certificate"}).to_string(),
         headers: std::collections::HashMap::new(),
     }
 }

@@ -858,6 +858,7 @@ impl TestGatewayBuilder {
         }
 
         let mut cmd = Command::new(&binary);
+        cmd.arg("run");
         if self.clear_env {
             cmd.env_clear();
             preserve_base_env(&mut cmd);
@@ -1010,6 +1011,7 @@ impl TestGatewayBuilder {
         }
 
         let mut cmd = Command::new(&binary);
+        cmd.arg("run");
         if self.clear_env {
             cmd.env_clear();
             preserve_base_env(&mut cmd);

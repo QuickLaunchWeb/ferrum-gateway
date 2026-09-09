@@ -999,7 +999,7 @@ impl Plugin for CorsPlugin {
                 debug!("cors: request rejected for disallowed origin");
                 return PluginResult::Reject {
                     status_code: 403,
-                    body: "CORS origin not allowed".to_string(),
+                    body: serde_json::json!({"error": "CORS origin not allowed"}).to_string(),
                     headers: HashMap::new(),
                 };
             }
@@ -1031,7 +1031,7 @@ impl Plugin for CorsPlugin {
             debug!("cors: preflight rejected for disallowed origin");
             return PluginResult::Reject {
                 status_code: 403,
-                body: "CORS origin not allowed".to_string(),
+                body: serde_json::json!({"error": "CORS origin not allowed"}).to_string(),
                 headers: HashMap::new(),
             };
         }
@@ -1058,17 +1058,8 @@ impl Plugin for CorsPlugin {
                 .any(|m| m.eq_ignore_ascii_case(requested_method));
             if !method_allowed {
                 ctx.cors_state.response_allowed = false;
-                debug!("cors: preflight rejected method '{}'", requested_method);
-                let mut body = String::with_capacity(
-                    "CORS method not allowed: ".len() + requested_method.len(),
-                );
-                body.push_str("CORS method not allowed: ");
-                body.push_str(requested_method);
-                return PluginResult::Reject {
-                    status_code: 403,
-                    body,
-                    headers: HashMap::new(),
-                };
+                debug!("cors: preflight rejected for disallowed method");
+                return cors_reject("CORS method not allowed");
             }
         }
 
@@ -1189,10 +1180,10 @@ impl Plugin for CorsFinalizer {
     }
 }
 
-fn cors_reject(body: String) -> PluginResult {
+fn cors_reject(message: &str) -> PluginResult {
     PluginResult::Reject {
         status_code: 403,
-        body,
+        body: serde_json::json!({"error": message}).to_string(),
         headers: HashMap::new(),
     }
 }
@@ -1219,11 +1210,7 @@ fn finalize_cors_request(ctx: &mut RequestContext) -> PluginResult {
             && contains_ascii_case(method_union, requested_method)
             && !contains_ascii_case(methods, requested_method)
         {
-            let mut body =
-                String::with_capacity("CORS method not allowed: ".len() + requested_method.len());
-            body.push_str("CORS method not allowed: ");
-            body.push_str(requested_method);
-            return cors_reject(body);
+            return cors_reject("CORS method not allowed");
         }
         if let Some(requested_headers) = ctx.headers.get("access-control-request-headers") {
             let headers = state
@@ -1237,11 +1224,7 @@ fn finalize_cors_request(ctx: &mut RequestContext) -> PluginResult {
                     && contains_ascii_case(header_union, requested)
                     && !contains_ascii_case(headers, requested)
                 {
-                    let mut body =
-                        String::with_capacity("CORS header not allowed: ".len() + requested.len());
-                    body.push_str("CORS header not allowed: ");
-                    body.push_str(requested);
-                    return cors_reject(body);
+                    return cors_reject("CORS header not allowed");
                 }
             }
         }
