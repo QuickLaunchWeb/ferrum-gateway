@@ -8610,3 +8610,31 @@ async fn soap_depth_screen_does_not_end_a_tag_at_a_quoted_angle_bracket() {
         reject_body(&result)
     );
 }
+
+#[tokio::test]
+async fn malformed_soap_returns_fixed_parser_categories() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    for (body, category) in [
+        (
+            "<private_tag></different_tag>",
+            "element tags are not balanced",
+        ),
+        (
+            "<root>&private_entity;</root>",
+            "entity reference is undeclared or malformed",
+        ),
+        (
+            "<private_namespace:root/>",
+            "namespace declaration is not well-formed",
+        ),
+    ] {
+        let mut ctx = make_ctx_with_soap_body(body);
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut soap_headers()).await;
+        assert_eq!(reject_status(&result), 400);
+        let error: Value = serde_json::from_str(reject_body(&result)).unwrap();
+        assert_eq!(
+            error["error"],
+            format!("WS-Security: malformed or overly complex SOAP XML: {category}")
+        );
+    }
+}

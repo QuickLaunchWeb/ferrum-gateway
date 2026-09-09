@@ -4176,7 +4176,8 @@ impl Plugin for GrpcWebPlugin {
         ) {
             crate::plugins::BoundedResponseBodyConstruction::Replaced(bytes) => bytes,
             crate::plugins::BoundedResponseBodyConstruction::Unchanged
-            | crate::plugins::BoundedResponseBodyConstruction::CapacityRefused => {
+            | crate::plugins::BoundedResponseBodyConstruction::CapacityRefused
+            | crate::plugins::BoundedResponseBodyConstruction::SizeLimitExceeded(_) => {
                 // Once this instance owns the translation, every construction
                 // failure is fail-closed. `after_proxy` has already relabelled
                 // the representation as gRPC-Web, so treating a missing live

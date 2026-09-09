@@ -317,6 +317,7 @@ use super::utils::http_client::PluginHttpClient;
 use super::utils::redis_rate_limiter::{
     REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
+use super::utils::validation_diagnostics::xml_error_category;
 use super::utils::xml_bounds::{XML_MAX_NESTING_DEPTH, xml_nesting_depth_within_limit};
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -5221,7 +5222,8 @@ fn parse_bounded_xml<'a>(xml: &'a str, context: &str) -> Result<Document<'a>, St
     .map_err(|error| {
         format!(
             "WS-Security: malformed or overly complex {} XML: {}",
-            context, error
+            context,
+            xml_error_category(&error)
         )
     })
 }

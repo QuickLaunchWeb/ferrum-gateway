@@ -1577,6 +1577,116 @@ async fn max_prompt_characters_counts_tgi_inputs_field() {
 }
 
 #[tokio::test]
+async fn max_prompt_characters_counts_bedrock_converse_tool_result_and_guard_content() {
+    // A Converse `toolResult` block carries no `type` and no `content` of its
+    // own, so every reader that stops at the generic content-part fallbacks
+    // counted it as zero characters — letting a tool result re-fed to the
+    // model, often the largest text in the turn, dodge the cap entirely.
+    // `guardContent` hides its text one level deeper still, under both the
+    // nested and the flat spelling.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+
+    for body in [
+        json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"toolResult": {
+                    "toolUseId": "tooluse_1",
+                    "content": [{"text": "this tool result is well over ten characters"}]
+                }}]
+            }],
+            "inferenceConfig": {"maxTokens": 128}
+        }),
+        json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"toolResult": {
+                    "toolUseId": "tooluse_1",
+                    "content": ["this tool result is well over ten characters"]
+                }}]
+            }]
+        }),
+        json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"guardContent": {
+                    "text": {"text": "this guarded text is well over ten characters"}
+                }}]
+            }]
+        }),
+        json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"guardContent": {
+                    "text": "this guarded text is well over ten characters"
+                }}]
+            }]
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+
+    // A short tool result under the cap still passes.
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "user",
+            "content": [{"toolResult": {"toolUseId": "t1", "content": [{"text": "ok"}]}}]
+        }]
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn max_prompt_characters_counts_vertex_legacy_predict_instances() {
+    // Google Vertex legacy `predict` carries its prompt in `instances[].prompt`
+    // and no other counted field reaches it, so the whole prompt bypassed the
+    // cap.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "instances": [
+            {"prompt": "hi"},
+            {"prompt": "this vertex prompt is well over ten characters"}
+        ],
+        "parameters": {"maxOutputTokens": 64}
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    // A short instance prompt under the cap still passes.
+    let mut ctx = make_post_ctx(&json!({"instances": [{"prompt": "hi"}]}));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn strict_schema_admits_vertex_legacy_predict_but_not_a_bare_instances_key() {
+    // `instances` is an ordinary word in unrelated JSON and this predicate
+    // decides what strict mode ADMITS, so it is shape-qualified on an entry
+    // that actually carries a `prompt` rather than on the bare key.
+    let plugin = AiRequestGuard::new(&json!({
+        "strict_schema": true,
+        "supported_schema": "provider_native"
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&json!({"instances": [{"prompt": "summarize this"}]}));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = make_post_ctx(&json!({"instances": [{"id": 1, "quantity": 2}]}));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Unsupported AI request schema",
+    );
+}
+
+#[tokio::test]
 async fn max_prompt_characters_counts_responses_function_call_output() {
     // Responses API follow-up requests feed tool results back as
     // `function_call_output` items whose `output` carries model-visible text.
