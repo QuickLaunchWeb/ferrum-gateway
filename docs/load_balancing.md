@@ -830,6 +830,28 @@ proxies:
 - **Open** — All requests immediately return `503 Service Unavailable` with `X-Gateway-Error: circuit_breaker_open` without contacting the backend. After `timeout_seconds`, the circuit transitions to Half-Open.
 - **Half-Open** — The circuit allows up to `half_open_max_requests` concurrent probe requests. Successful responses count toward `success_threshold`; when reached, the circuit closes (recovered). Any failure immediately reopens the circuit.
 
+**Probe-slot release:**
+
+A half-open probe holds one of the `half_open_max_requests` slots for the whole
+request. There is no timer out of Half-Open, so every admitted probe must return
+its slot or the breaker stops admitting probes and keeps shedding traffic with
+`503 circuit_breaker_open`. A slot is returned whenever the request reaches a
+terminal outcome, including outcomes that are not backend results:
+
+- **Gateway-side refusals** before any backend dial (plugin rejects, an oversized
+  or timed-out request body, a connection or admission ceiling, a fail-closed
+  mesh-transport refusal) return the slot **neutrally** — no success, no failure.
+  A gateway refusal is not evidence about the backend, so it neither heals nor
+  reopens the circuit.
+- **A client that disconnects mid-probe** — including a WebSocket upgrade
+  abandoned before the backend handshake completes — also returns the slot
+  neutrally. The next probe is admitted normally once the client goes away.
+- **Backend outcomes** (success, failure, connection error) settle the slot and
+  move breaker health as described above.
+
+This holds identically on HTTP/1.1, HTTP/2, WebSocket, gRPC, HTTP/3 and the
+HBONE relay.
+
 **Failure detection:**
 
 The circuit breaker counts failures from two independent sources:
