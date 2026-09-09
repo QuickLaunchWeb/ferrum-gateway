@@ -5043,9 +5043,10 @@ async fn handle_tcp_connection_inner(
                     // Re-arm stream connection accounting on the new target before the
                     // previous guard drops the abandoned one (issue #4514).
                     _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
-                    current_cb_info.cb_target_key = params.upstream_id.as_ref().map(|_| {
-                        crate::circuit_breaker::target_key(&current_host, current_port)
-                    });
+                    current_cb_info.cb_target_key = params
+                        .upstream_id
+                        .as_ref()
+                        .map(|_| crate::circuit_breaker::target_key(&current_host, current_port));
                     // Update backend info to reflect the retry target.
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
@@ -5139,9 +5140,10 @@ async fn handle_tcp_connection_inner(
                     // Re-arm stream connection accounting on the new target before the
                     // previous guard drops the abandoned one (issue #4514).
                     _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
-                    current_cb_info.cb_target_key = params.upstream_id.as_ref().map(|_| {
-                        crate::circuit_breaker::target_key(&current_host, current_port)
-                    });
+                    current_cb_info.cb_target_key = params
+                        .upstream_id
+                        .as_ref()
+                        .map(|_| crate::circuit_breaker::target_key(&current_host, current_port));
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
@@ -5337,9 +5339,10 @@ async fn handle_tcp_connection_inner(
                     // Re-arm stream connection accounting on the new target before the
                     // previous guard drops the abandoned one (issue #4514).
                     _lb_guard = arm_lb_guard(&current_host, current_port, current_policy_port);
-                    current_cb_info.cb_target_key = params.upstream_id.as_ref().map(|_| {
-                        crate::circuit_breaker::target_key(&current_host, current_port)
-                    });
+                    current_cb_info.cb_target_key = params
+                        .upstream_id
+                        .as_ref()
+                        .map(|_| crate::circuit_breaker::target_key(&current_host, current_port));
                     // Update backend info to reflect the retry target.
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);

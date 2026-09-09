@@ -267,7 +267,8 @@ fn every_circuit_breaker_admission_site_carries_a_probe_guard() {
                 .expect("cache admission must handle refusal")
                 .0;
             assert!(
-                admitted.contains("HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe)"),
+                admitted
+                    .contains("HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe)"),
                 "{signature} must own each slot on the breaker returned by cache admission"
             );
             if file == "src/proxy/tcp_proxy.rs" {
