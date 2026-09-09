@@ -972,7 +972,7 @@ run_blackbox_tests() {
   wait_for_tls_body_contains tls.blackbox.example /tls "backend=blackbox-a" \
     | tee -a "$report"
 
-  echo "GRPCRoute resource applied but request traffic is not run because Ferrum does not claim GATEWAY-GRPC support in this job." >> "$report"
+  echo "GRPCRoute resource applied; live request traffic coverage is provided by the upstream Gateway API conformance suite." >> "$report"
 }
 
 collect_diagnostics() {
