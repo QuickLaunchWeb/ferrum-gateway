@@ -12241,32 +12241,6 @@ fn build_http_egress_for_entry(
             None => (port_spec.port, port_spec.name.clone()),
         };
     for host in proxy_hosts {
-        // A wildcard host with no declared endpoint set has no dialable target:
-        // `build_egress_upstream_targets` would emit the literal `*.example.com`
-        // as the upstream host, which no resolver can answer, while the proxy's
-        // wildcard host tier still MATCHES `foo.example.com` — so every request
-        // would route and then 502 with no apply-time signal. Refuse the host
-        // and do NOT record it in `materialized_http_hosts`, so a later
-        // exact-host ServiceEntry for the same family is not shadowed by it.
-        if crate::modes::mesh::config::egress_host_is_unresolvable_wildcard(
-            host,
-            entry.resolution,
-            entry.endpoints.len(),
-        ) {
-            warn!(
-                service_entry = %entry.name,
-                namespace = %entry.namespace,
-                field = "hosts[]",
-                host = %host,
-                port = port_spec.port,
-                "Skipping wildcard HTTP-family egress ServiceEntry host: without \
-                 resolution: STATIC and a non-empty endpoints[], the wildcard host itself \
-                 becomes the upstream dial target and cannot be resolved. Declare concrete \
-                 endpoints[] or split the family into exact hosts."
-            );
-            continue;
-        }
-
         let targets = build_egress_upstream_targets(
             entry,
             host,
@@ -38286,13 +38260,10 @@ mod tests {
         );
     }
 
-    /// The same wildcard host WITHOUT declared endpoints has no dialable target:
-    /// materializing it would emit the literal `*.api.external.com` as the
-    /// upstream host while the proxy's wildcard host tier still matched
-    /// `foo.api.external.com`, so every request would route and then 502. It must
-    /// be refused outright (issue #4535).
+    /// A DNS/NONE wildcard HTTP target is concretized from the matching request
+    /// authority before the dial path resolves it.
     #[test]
-    fn egress_refuses_wildcard_host_without_declared_endpoints() {
+    fn egress_materializes_http_wildcard_host_without_declared_endpoints() {
         let service_entries = vec![test_external_service_entry(
             "wildcard-api",
             vec!["*.api.external.com".to_string()],
@@ -38308,12 +38279,10 @@ mod tests {
             false,
         );
 
-        assert!(
-            proxies.is_empty(),
-            "an unresolvable wildcard host must not materialize a proxy: {:?}",
-            proxies.iter().map(|p| p.id.clone()).collect::<Vec<_>>()
-        );
-        assert!(upstreams.is_empty(), "and no upstream either");
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].hosts, vec!["*.api.external.com"]);
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].targets[0].host, "*.api.external.com");
     }
 
     #[test]

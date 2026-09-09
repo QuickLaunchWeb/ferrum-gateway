@@ -2902,8 +2902,8 @@ pub enum Resolution {
     None,
 }
 
-/// Whether an egress `ServiceEntry` host is a wildcard that cannot be
-/// materialized into a dialable upstream target.
+/// Whether a stream-family egress `ServiceEntry` host is a wildcard that cannot
+/// be materialized into a dialable upstream target.
 ///
 /// **Invariant: a wildcard host is only materializable when the operator
 /// declared concrete endpoints.** Under `resolution: STATIC` with a non-empty
@@ -2912,18 +2912,15 @@ pub enum Resolution {
 /// perfectly serviceable route selector. Under `DNS`/`NONE` (or `STATIC` with no
 /// endpoints) there is no declared endpoint set, so the ServiceEntry host ITSELF
 /// becomes the upstream target host — and the literal string `*.example.com` is
-/// not resolvable by any resolver, which means every matching request routes and
-/// then fails at dial time with a 502 the operator was never warned about.
+/// not resolvable by any resolver. HTTP-family requests are exempt: dispatch
+/// replaces a matching wildcard target with the concrete request authority
+/// before DNS, SNI, and pool selection.
 ///
 /// Returns `true` for the unresolvable case, i.e. the host must be refused with
 /// a field-named warning rather than materialized.
 ///
-/// Shared (in the style of `service_entry_port_protocol_is_udp`) by the
-/// HTTP-family, stream-family, and datagram egress materialization branches and
-/// by the Istio CRD status writer's `deferred_fields` report, so the three
-/// branches and the status report can never drift about one input. The datagram
-/// branch applies this predicate AND additionally refuses every wildcard — see
-/// `build_udp_egress_destinations_for_entry`.
+/// The datagram branch applies this predicate AND additionally refuses every
+/// wildcard — see `build_udp_egress_destinations_for_entry`.
 pub fn egress_host_is_unresolvable_wildcard(
     host: &str,
     resolution: Resolution,

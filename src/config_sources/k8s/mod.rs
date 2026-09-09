@@ -54,11 +54,6 @@ pub(crate) use istio::{SidecarOutboundPolicy, classify_sidecar_outbound_traffic_
 // predicate, so a UDP ServiceEntry is never reported as fully accepted while its
 // egress lane is silently skipped.
 pub(crate) use istio::service_entry_port_protocol_is_udp;
-// Same shared-predicate contract for the egress wildcard-host refusal (issue
-// #4535): a wildcard `spec.hosts[]` element with no declared `endpoints[]` is
-// skipped by every egress materialization branch, so the status writer reports
-// it as deferred through the SAME predicate rather than re-deriving the rule.
-pub(crate) use istio::service_entry_spec_has_unresolvable_wildcard_host;
 
 use std::collections::{HashMap, HashSet};
 

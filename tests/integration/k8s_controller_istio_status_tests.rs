@@ -1494,14 +1494,10 @@ fn singular_target_ref_on_request_authentication_and_telemetry_reports_invalid()
     }
 }
 
-/// Issue #4535: a wildcard `spec.hosts[]` element on a `resolution: DNS`
-/// ServiceEntry is skipped by every egress materialization branch (the wildcard
-/// string itself would be the unresolvable upstream dial target), so the status
-/// writer must surface it as a deferred field rather than reporting a fully
-/// accepted resource that serves nothing. `FerrumAccepted` stays `True` — the
-/// resource IS translated, just inert for that host.
+/// DNS wildcard HTTP-family entries are live because request dispatch
+/// concretizes their target, so status must not report the host as deferred.
 #[test]
-fn service_entry_unresolvable_wildcard_host_is_reported_as_deferred() {
+fn service_entry_dns_http_wildcard_host_is_not_deferred() {
     let obj = object(
         "networking.istio.io/v1",
         "ServiceEntry",
@@ -1521,7 +1517,7 @@ fn service_entry_unresolvable_wildcard_host_is_reported_as_deferred() {
     assert_eq!(
         condition["status"].as_str(),
         Some("True"),
-        "the resource is still accepted/translated, just inert for that host"
+        "the resource is accepted and materialized"
     );
     let detail = updates[0].ferrum_detail.as_ref().unwrap();
     let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
@@ -1531,15 +1527,14 @@ fn service_entry_unresolvable_wildcard_host_is_reported_as_deferred() {
         .filter_map(Value::as_str)
         .collect();
     assert!(
-        deferred.iter().any(|f| f.starts_with("spec.hosts[]:")),
-        "an unresolvable wildcard host must be reported as deferred: {deferred:?}"
+        deferred.iter().all(|f| !f.starts_with("spec.hosts[]:")),
+        "a routable HTTP wildcard must not be reported as deferred: {deferred:?}"
     );
     assert!(
-        condition["message"]
+        !condition["message"]
             .as_str()
             .unwrap()
-            .contains("deferred fields"),
-        "the condition message must name the deferral: {condition:?}"
+            .contains("deferred fields")
     );
 }
 

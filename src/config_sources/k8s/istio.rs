@@ -16,8 +16,7 @@ use crate::modes::mesh::config::{
     PortPatternAdmission, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
     ServiceEntryLocation, ServicePort, SourceNegationMatch, TagOverrideOperation,
     TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
-    admit_request_match_port_pattern, egress_host_is_unresolvable_wildcard,
-    validate_mesh_condition, validate_mesh_export_to,
+    admit_request_match_port_pattern, validate_mesh_condition, validate_mesh_export_to,
 };
 use crate::modes::mesh::metric_tag_cel::{
     parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
@@ -6689,48 +6688,13 @@ pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool
     matches!(app_protocol(protocol), AppProtocol::Udp | AppProtocol::Dtls)
 }
 
-/// Parse an Istio `ServiceEntry` `spec.resolution` string, defaulting to `NONE`
-/// exactly as Istio does. Shared by the ServiceEntry translator and by
-/// [`service_entry_spec_has_unresolvable_wildcard_host`] so the raw-spec
-/// predicate can never classify a resolution differently from the translation
-/// that feeds materialization.
+/// Parse an Istio `ServiceEntry` `spec.resolution` string, defaulting to `NONE`.
 fn service_entry_resolution(spec: &Value) -> Resolution {
     match string_field(spec, "resolution").unwrap_or("NONE") {
         "DNS" => Resolution::Dns,
         "STATIC" => Resolution::Static,
         _ => Resolution::None,
     }
-}
-
-/// Whether any `spec.hosts[]` element of a raw Istio `ServiceEntry` spec is a
-/// wildcard host the egress materializer cannot turn into a dialable upstream.
-///
-/// A thin raw-spec wrapper over the SHARED
-/// [`egress_host_is_unresolvable_wildcard`] predicate the HTTP-family,
-/// stream-family, and datagram egress branches all apply, reading `resolution`
-/// through [`service_entry_resolution`] (defaulting to `NONE`) and the endpoint
-/// count from `spec.endpoints`. Used by `istio_status::service_entry_status` so
-/// the CRD `deferred_fields` report can never claim a host is materialized that
-/// the materializer skips — the same lock-step contract
-/// [`service_entry_port_protocol_is_udp`] provides for the UDP lane.
-///
-/// Note the datagram branch is deliberately stricter (it refuses every wildcard,
-/// including the `STATIC`-with-endpoints case this predicate admits), so this
-/// wrapper under-reports for a UDP-only wildcard entry rather than over-reporting
-/// a host as deferred that the HTTP/stream branches do materialize.
-pub(crate) fn service_entry_spec_has_unresolvable_wildcard_host(spec: &Value) -> bool {
-    let resolution = service_entry_resolution(spec);
-    let endpoint_count = spec
-        .get("endpoints")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    spec.get("hosts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .any(|host| egress_host_is_unresolvable_wildcard(host.trim(), resolution, endpoint_count))
 }
 
 /// Map a Sidecar `ingress[].port.protocol` string to the `AppProtocol` carried on
