@@ -453,9 +453,9 @@ fn diff_modified<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -
     let old_map: HashMap<ResourceKey<'_>, &T> = old.iter().map(|r| (resource_key(r), r)).collect();
     new.iter()
         .filter(|r| {
-            old_map.get(&resource_key(*r)).is_some_and(|&old| {
-                r.updated_at() != old.updated_at() || !r.content_eq(old)
-            })
+            old_map
+                .get(&resource_key(*r))
+                .is_some_and(|&old| r.updated_at() != old.updated_at() || !r.content_eq(old))
         })
         .cloned()
         .collect()

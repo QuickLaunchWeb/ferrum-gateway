@@ -1043,7 +1043,10 @@ async fn test_unchanged_reload_keeps_compatibility_config_on_accepted_epoch() {
     let mut candidate = accepted.as_ref().clone();
     candidate.loaded_at += chrono::Duration::seconds(10);
 
-    assert_eq!(state.update_config(candidate), ConfigApplyOutcome::Unchanged);
+    assert_eq!(
+        state.update_config(candidate),
+        ConfigApplyOutcome::Unchanged
+    );
     assert!(std::sync::Arc::ptr_eq(&accepted, &state.config.load_full()));
     assert_eq!(
         state.request_epoch.load().config().loaded_at,
@@ -1079,7 +1082,12 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
             None,
         )
         .expect("test proxy state should build");
-        assert!(state.consumer_index.find_by_api_key("old-test-key").is_some());
+        assert!(
+            state
+                .consumer_index
+                .find_by_api_key("old-test-key")
+                .is_some()
+        );
         assert!(
             state
                 .plugin_cache
@@ -1097,10 +1105,23 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
         }
 
         assert_eq!(state.update_config(candidate), ConfigApplyOutcome::Applied);
-        assert!(state.consumer_index.find_by_api_key("old-test-key").is_none());
-        assert!(state.consumer_index.find_by_api_key("new-test-key").is_some());
+        assert!(
+            state
+                .consumer_index
+                .find_by_api_key("old-test-key")
+                .is_none()
+        );
+        assert!(
+            state
+                .consumer_index
+                .find_by_api_key("new-test-key")
+                .is_some()
+        );
         assert_eq!(
-            state.plugin_cache.get_plugins(&default_namespace(), "p1").len(),
+            state
+                .plugin_cache
+                .get_plugins(&default_namespace(), "p1")
+                .len(),
             1
         );
         let epoch = state.request_epoch.load();
