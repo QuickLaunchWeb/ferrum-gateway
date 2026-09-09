@@ -1436,11 +1436,8 @@ async fn test_jwks_auth_trusts_2048_bit_rsa_key_when_mixed_with_below_floor_key(
     .unwrap();
 
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
-    let token = create_rs256_token_with_kid(
-        &json!({"sub": "idp-user"}),
-        strong_private,
-        "strong-key",
-    );
+    let token =
+        create_rs256_token_with_kid(&json!({"sub": "idp-user"}), strong_private, "strong-key");
 
     let mut ctx = make_ctx();
     ctx.headers
