@@ -1,7 +1,7 @@
 //! Regression coverage for TLS store directory permissions (GHSA-62hx-fwcg-mwgr).
 
 use ferrum_edge::tls::events::TlsEventLog;
-use ferrum_edge::tls::managed::ManagedTlsStore;
+use ferrum_edge::tls::managed::{ManagedTlsRecord, ManagedTlsStore};
 
 #[cfg(unix)]
 struct UmaskGuard {
@@ -32,7 +32,7 @@ fn freshly_created_store_dir_is_owner_only_under_permissive_umask() {
     let parent = tempfile::tempdir().expect("tempdir");
     let store_dir = parent.path().join("managed-tls");
 
-    ManagedTlsStore::open(&store_dir).expect("open managed store");
+    let store = ManagedTlsStore::open(&store_dir).expect("open managed store");
 
     use std::os::unix::fs::PermissionsExt;
 
@@ -42,6 +42,15 @@ fn freshly_created_store_dir_is_owner_only_under_permissive_umask() {
         .mode()
         & 0o777;
     assert_eq!(dir_mode, 0o700, "store directory must be owner-only");
+
+    // The document is written on the first mutation, not on open.
+    let record = ManagedTlsRecord::new_ca_bundle(
+        "ca".to_string(),
+        "ca".to_string(),
+        None,
+        "pem".to_string(),
+    );
+    store.upsert(record, false).expect("first write");
 
     let store_file = store_dir.join("managed-tls.json");
     assert!(store_file.is_file(), "managed store file must exist");
