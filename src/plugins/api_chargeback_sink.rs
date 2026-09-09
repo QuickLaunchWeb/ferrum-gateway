@@ -44,13 +44,14 @@ use url::Url;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
-use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
+use super::chargeback::{HttpBillingOutcome, http_billing_outcome, is_websocket_handshake};
 use super::utils::byte_budget::{
     GrowableProcessReservation, JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError,
     ProcessByteReservation, ReservedPayload, RetainedByteCeiling, materialize_reserved_buffer,
     materialize_reserved_payload, process_ceiling,
 };
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
+use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
@@ -79,7 +80,7 @@ const SNAPSHOT_FINALIZE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FIELD_LEN: usize = 512;
 const MAX_METADATA_FIELD_LEN: usize = 256;
 /// Conservative ceiling for one owned [`ChargeEvent`] after field bounding.
-const MAX_CHARGE_EVENT_BYTES: usize = 96 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
+const MAX_CHARGE_EVENT_BYTES: usize = 224 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const SPOOL_JOB_WARN_EVERY: u64 = 100;
 /// Bound refreshes when another process mutates the shared spool during quota eviction.
@@ -1673,6 +1674,46 @@ struct SinkRuntime {
 struct QueuedChargeEvent {
     event: ChargeEvent,
     lease: Arc<ByteLease>,
+    accounting: Option<Arc<PendingCharge>>,
+}
+
+/// One lifetime owner per newly emitted event; retries and spool handoffs share
+/// it. Cancellation runs Drop, but process termination cannot run this code.
+struct PendingCharge {
+    metrics: Arc<SinkMetrics>,
+    persisted: AtomicBool,
+}
+
+impl PendingCharge {
+    fn new(metrics: Arc<SinkMetrics>) -> Self {
+        metrics
+            .per_event_received_total
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            persisted: AtomicBool::new(false),
+        }
+    }
+
+    fn persist(&self) {
+        if !self.persisted.swap(true, Ordering::AcqRel) {
+            self.metrics
+                .per_event_persisted_total
+                .fetch_add(1, Ordering::Relaxed);
+            invalidate_status_cache();
+        }
+    }
+}
+
+impl Drop for PendingCharge {
+    fn drop(&mut self) {
+        if !self.persisted.load(Ordering::Acquire) {
+            self.metrics
+                .per_event_dropped_total
+                .fetch_add(1, Ordering::Relaxed);
+            invalidate_status_cache();
+        }
+    }
 }
 
 enum SpoolJob {
@@ -1996,12 +2037,19 @@ fn start_spool_delivery_with_clone_ceiling(
                             };
                             let (events, leases): (Vec<_>, Vec<_>) = queued_events
                                 .into_iter()
-                                .map(|queued| (queued.event, queued.lease))
+                                .map(|queued| (queued.event, (queued.lease, queued.accounting)))
                                 .unzip();
                             let spool = Arc::clone(&spool);
                             let metrics = Arc::clone(&metrics_for_worker);
                             let write_result = tokio::task::spawn_blocking(move || {
                                 let result = spool.write_events(&events);
+                                if result.is_ok() {
+                                    for (_, accounting) in &leases {
+                                        if let Some(accounting) = accounting {
+                                            accounting.persist();
+                                        }
+                                    }
+                                }
                                 // Keep retained bytes charged until the actual
                                 // blocking write finishes, even if its async
                                 // waiter is cancelled during a timed-out drain.
@@ -2487,88 +2535,183 @@ impl Drop for SnapshotLifecycle {
     }
 }
 
+/// Fixed-cardinality process totals. No policy IDs, retired runtimes, payloads,
+/// or credentials are retained. Late completions update these same atomics.
+static PROCESS_METRICS: OnceLock<SinkMetrics> = OnceLock::new();
+
+fn process_metrics() -> &'static SinkMetrics {
+    PROCESS_METRICS.get_or_init(SinkMetrics::default)
+}
+
+#[derive(Default)]
+struct SinkCounter {
+    value: AtomicU64,
+    process: Option<&'static SinkCounter>,
+}
+
+impl SinkCounter {
+    fn load(&self, ordering: Ordering) -> u64 {
+        self.value.load(ordering)
+    }
+
+    fn fetch_add(&self, value: u64, ordering: Ordering) -> u64 {
+        if let Some(process) = self.process {
+            process.value.fetch_add(value, ordering);
+        }
+        self.value.fetch_add(value, ordering)
+    }
+}
+
 struct SinkMetrics {
-    events_enqueued_total: AtomicU64,
-    events_exported_total: AtomicU64,
-    failures_total: AtomicU64,
+    per_event_dropped_total: SinkCounter,
+    per_event_persisted_total: SinkCounter,
+    per_event_received_total: SinkCounter,
+    events_enqueued_total: SinkCounter,
+    events_exported_total: SinkCounter,
+    failures_total: SinkCounter,
     failure_reasons: FailureReasonCounters,
     /// Observed queue depth at/above the high-water mark (telemetry only).
-    queue_high_water_hits_total: AtomicU64,
+    queue_high_water_hits_total: SinkCounter,
     /// High-water events whose durable spool-delivery handoff actually accepted
     /// the job. Saturation/closure of the delivery queue is counted by spool
     /// loss metrics instead.
-    queue_high_water_diversions_total: AtomicU64,
+    queue_high_water_diversions_total: SinkCounter,
     /// Events lost because the bounded in-memory channel was actually full and
     /// no durable overflow path accepted ownership. Never incremented for
     /// shutdown/unavailable admission.
-    queue_full_drops_total: AtomicU64,
-    queue_byte_budget_exhausted_total: AtomicU64,
-    spool_drops_total: AtomicU64,
+    queue_full_drops_total: SinkCounter,
+    queue_byte_budget_exhausted_total: SinkCounter,
+    spool_drops_total: SinkCounter,
     spool_available: AtomicBool,
-    spool_prepare_failures_total: AtomicU64,
-    spool_jobs_enqueued_total: AtomicU64,
-    spool_jobs_written_total: AtomicU64,
-    spool_jobs_lost_total: AtomicU64,
-    spool_events_lost_total: AtomicU64,
+    spool_prepare_failures_total: SinkCounter,
+    spool_jobs_enqueued_total: SinkCounter,
+    spool_jobs_written_total: SinkCounter,
+    spool_jobs_lost_total: SinkCounter,
+    spool_events_lost_total: SinkCounter,
     /// HTTP attempts made by bounded streaming replay, including isolation
     /// children after a permanent batch rejection.
-    spool_replay_attempts_total: AtomicU64,
+    spool_replay_attempts_total: SinkCounter,
     /// Rejected rows durably handed to the private dead-letter payload store.
-    spool_dead_letter_rows_total: AtomicU64,
+    spool_dead_letter_rows_total: SinkCounter,
     /// Retained spool records this identity does not own: pre-namespace layouts
     /// and namespaces orphaned by a destination/configuration change. Never
     /// replayed, never deleted; reported so operators can reconcile them.
     spool_unbound_files: AtomicU64,
     spool_unbound_namespaces: AtomicU64,
-    snapshot_emits_total: AtomicU64,
-    snapshot_overflow_spooled_total: AtomicU64,
-    snapshot_overflow_pending_total: AtomicU64,
-    snapshot_cardinality_rejections_total: AtomicU64,
+    snapshot_emits_total: SinkCounter,
+    snapshot_overflow_spooled_total: SinkCounter,
+    snapshot_overflow_pending_total: SinkCounter,
+    snapshot_cardinality_rejections_total: SinkCounter,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
     last_failure_reason: RwLock<Option<String>>,
     last_spool_job_warn_at: AtomicI64,
     latency: LatencyHistogram,
+    process_totals: bool,
 }
 
 impl Default for SinkMetrics {
     fn default() -> Self {
         Self {
-            events_enqueued_total: AtomicU64::new(0),
-            events_exported_total: AtomicU64::new(0),
-            failures_total: AtomicU64::new(0),
+            per_event_dropped_total: SinkCounter::default(),
+            per_event_persisted_total: SinkCounter::default(),
+            per_event_received_total: SinkCounter::default(),
+            events_enqueued_total: SinkCounter::default(),
+            events_exported_total: SinkCounter::default(),
+            failures_total: SinkCounter::default(),
             failure_reasons: FailureReasonCounters::default(),
-            queue_high_water_hits_total: AtomicU64::new(0),
-            queue_high_water_diversions_total: AtomicU64::new(0),
-            queue_full_drops_total: AtomicU64::new(0),
-            queue_byte_budget_exhausted_total: AtomicU64::new(0),
-            spool_drops_total: AtomicU64::new(0),
+            queue_high_water_hits_total: SinkCounter::default(),
+            queue_high_water_diversions_total: SinkCounter::default(),
+            queue_full_drops_total: SinkCounter::default(),
+            queue_byte_budget_exhausted_total: SinkCounter::default(),
+            spool_drops_total: SinkCounter::default(),
             spool_available: AtomicBool::new(false),
-            spool_prepare_failures_total: AtomicU64::new(0),
-            spool_jobs_enqueued_total: AtomicU64::new(0),
-            spool_jobs_written_total: AtomicU64::new(0),
-            spool_jobs_lost_total: AtomicU64::new(0),
-            spool_events_lost_total: AtomicU64::new(0),
-            spool_replay_attempts_total: AtomicU64::new(0),
-            spool_dead_letter_rows_total: AtomicU64::new(0),
+            spool_prepare_failures_total: SinkCounter::default(),
+            spool_jobs_enqueued_total: SinkCounter::default(),
+            spool_jobs_written_total: SinkCounter::default(),
+            spool_jobs_lost_total: SinkCounter::default(),
+            spool_events_lost_total: SinkCounter::default(),
+            spool_replay_attempts_total: SinkCounter::default(),
+            spool_dead_letter_rows_total: SinkCounter::default(),
             spool_unbound_files: AtomicU64::new(0),
             spool_unbound_namespaces: AtomicU64::new(0),
-            snapshot_emits_total: AtomicU64::new(0),
-            snapshot_overflow_spooled_total: AtomicU64::new(0),
-            snapshot_overflow_pending_total: AtomicU64::new(0),
-            snapshot_cardinality_rejections_total: AtomicU64::new(0),
+            snapshot_emits_total: SinkCounter::default(),
+            snapshot_overflow_spooled_total: SinkCounter::default(),
+            snapshot_overflow_pending_total: SinkCounter::default(),
+            snapshot_cardinality_rejections_total: SinkCounter::default(),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
             last_failure_reason: RwLock::new(None),
             last_spool_job_warn_at: AtomicI64::new(0),
             latency: LatencyHistogram::default(),
+            process_totals: false,
         }
     }
 }
 
 impl SinkMetrics {
+    fn event_counts(&self) -> (u64, u64, u64, u64) {
+        let persisted = self.per_event_persisted_total.load(Ordering::Relaxed);
+        let dropped = self.per_event_dropped_total.load(Ordering::Relaxed);
+        let received = self.per_event_received_total.load(Ordering::Relaxed);
+        let pending = received.saturating_sub(persisted).saturating_sub(dropped);
+        (received, persisted, dropped, pending)
+    }
+
+    fn event_accounting(&self) -> Value {
+        let (received, persisted, dropped, pending) = self.event_counts();
+        serde_json::json!({
+            "received_total": received,
+            "persisted_total": persisted,
+            "dropped_total": dropped,
+            "pending": pending,
+        })
+    }
+
+    fn with_process_totals() -> Self {
+        let mut metrics = Self {
+            process_totals: true,
+            ..Self::default()
+        };
+        let process = process_metrics();
+        metrics.per_event_dropped_total.process = Some(&process.per_event_dropped_total);
+        metrics.per_event_persisted_total.process = Some(&process.per_event_persisted_total);
+        metrics.per_event_received_total.process = Some(&process.per_event_received_total);
+        metrics.events_enqueued_total.process = Some(&process.events_enqueued_total);
+        metrics.events_exported_total.process = Some(&process.events_exported_total);
+        metrics.failures_total.process = Some(&process.failures_total);
+        metrics.queue_high_water_hits_total.process = Some(&process.queue_high_water_hits_total);
+        metrics.queue_high_water_diversions_total.process =
+            Some(&process.queue_high_water_diversions_total);
+        metrics.queue_full_drops_total.process = Some(&process.queue_full_drops_total);
+        metrics.queue_byte_budget_exhausted_total.process =
+            Some(&process.queue_byte_budget_exhausted_total);
+        metrics.spool_drops_total.process = Some(&process.spool_drops_total);
+        metrics.spool_prepare_failures_total.process = Some(&process.spool_prepare_failures_total);
+        metrics.spool_jobs_enqueued_total.process = Some(&process.spool_jobs_enqueued_total);
+        metrics.spool_jobs_written_total.process = Some(&process.spool_jobs_written_total);
+        metrics.spool_jobs_lost_total.process = Some(&process.spool_jobs_lost_total);
+        metrics.spool_events_lost_total.process = Some(&process.spool_events_lost_total);
+        metrics.spool_replay_attempts_total.process = Some(&process.spool_replay_attempts_total);
+        metrics.spool_dead_letter_rows_total.process = Some(&process.spool_dead_letter_rows_total);
+        metrics.snapshot_emits_total.process = Some(&process.snapshot_emits_total);
+        metrics.snapshot_overflow_spooled_total.process =
+            Some(&process.snapshot_overflow_spooled_total);
+        metrics.snapshot_overflow_pending_total.process =
+            Some(&process.snapshot_overflow_pending_total);
+        metrics.snapshot_cardinality_rejections_total.process =
+            Some(&process.snapshot_cardinality_rejections_total);
+        metrics.failure_reasons.network.process = Some(&process.failure_reasons.network);
+        metrics.failure_reasons.http_4xx.process = Some(&process.failure_reasons.http_4xx);
+        metrics.failure_reasons.http_5xx.process = Some(&process.failure_reasons.http_5xx);
+        metrics.failure_reasons.serialize.process = Some(&process.failure_reasons.serialize);
+        metrics.failure_reasons.tls.process = Some(&process.failure_reasons.tls);
+        metrics.failure_reasons.timeout.process = Some(&process.failure_reasons.timeout);
+        metrics
+    }
+
     fn record_spool_job_loss(&self, events: u64, reason: &'static str) {
         self.spool_jobs_lost_total.fetch_add(1, Ordering::Relaxed);
         self.spool_events_lost_total
@@ -2597,12 +2740,12 @@ impl SinkMetrics {
 
 #[derive(Default)]
 struct FailureReasonCounters {
-    network: AtomicU64,
-    http_4xx: AtomicU64,
-    http_5xx: AtomicU64,
-    serialize: AtomicU64,
-    tls: AtomicU64,
-    timeout: AtomicU64,
+    network: SinkCounter,
+    http_4xx: SinkCounter,
+    http_5xx: SinkCounter,
+    serialize: SinkCounter,
+    tls: SinkCounter,
+    timeout: SinkCounter,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2662,6 +2805,9 @@ impl SinkMetrics {
         self.last_success_at
             .store(unix_timestamp_seconds(), Ordering::Relaxed);
         self.latency.observe(elapsed.as_secs_f64());
+        if self.process_totals {
+            process_metrics().latency.observe(elapsed.as_secs_f64());
+        }
         invalidate_status_cache();
     }
 }
@@ -2866,7 +3012,7 @@ impl ApiChargebackSink {
         } else {
             None
         };
-        let metrics = Arc::new(SinkMetrics::default());
+        let metrics = Arc::new(SinkMetrics::with_process_totals());
         let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let spool = if self.config.spool.enabled {
             // Ownership binds the stable plugin-config id, the Ferrum namespace
@@ -3722,7 +3868,7 @@ pub fn render_prometheus() -> String {
     let sinks = active_sinks().load_full();
     let (pending_finalizations, pending_bytes, oldest_age, _full, _compact) =
         pending_snapshot_finalization_stats();
-    if sinks.is_empty() && pending_finalizations == 0 {
+    if sinks.is_empty() && pending_finalizations == 0 && PROCESS_METRICS.get().is_none() {
         return String::new();
     }
     render_prometheus_for_sinks(
@@ -3766,106 +3912,54 @@ pub fn active_spool_inventory_walks_for_tests() -> u64 {
         .fold(0u64, u64::saturating_add)
 }
 
-fn disabled_status_snapshot() -> Value {
-    let (pending, pending_bytes, oldest_age, _full, _compact) =
-        pending_snapshot_finalization_stats();
-    serde_json::json!({
-        "enabled": false,
-        "instance_count": 0,
-        "snapshot_finalizations_pending": pending,
-        "snapshot_finalizations_pending_bytes": pending_bytes,
-        "snapshot_finalizations_oldest_age_secs": oldest_age,
-        "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
-        "totals": {
-            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0, "high_water_diversions_total": 0, "full_drops_total": 0},
-            "spool": {
-                "files": 0,
-                "bytes": 0,
-                "drops_total": 0,
-                "prepare_failures_total": 0,
-                "available": false
-            },
-            "export": {
-                "events_enqueued_total": 0,
-                "events_exported_total": 0,
-                "failures_total": 0
-            }
-        },
-        "instances": []
-    })
-}
-
 fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Value {
-    if sinks.is_empty() {
-        return disabled_status_snapshot();
-    }
-
     let instances: Vec<Value> = sinks
         .values()
         .map(|runtime| runtime.status_snapshot())
         .collect();
 
     let mut queue_depth = 0u64;
+    let mut queue_outstanding = 0u64;
     let mut queue_capacity = 0u64;
-    let mut high_water = 0u64;
-    let mut high_water_diversions = 0u64;
-    let mut full_drops = 0u64;
+    let high_water = process_metrics()
+        .queue_high_water_hits_total
+        .load(Ordering::Relaxed);
+    let high_water_diversions = process_metrics()
+        .queue_high_water_diversions_total
+        .load(Ordering::Relaxed);
+    let full_drops = process_metrics()
+        .queue_full_drops_total
+        .load(Ordering::Relaxed);
     let mut spool_files = 0u64;
     let mut spool_bytes = 0u64;
-    let mut spool_drops = 0u64;
-    let mut spool_prepare_failures = 0u64;
+    let spool_drops = process_metrics().spool_drops_total.load(Ordering::Relaxed);
+    let spool_prepare_failures = process_metrics()
+        .spool_prepare_failures_total
+        .load(Ordering::Relaxed);
     let mut spool_unbound_files = 0u64;
     let mut spool_unbound_namespaces = 0u64;
-    let mut spool_replay_attempts = 0u64;
-    let mut spool_dead_letter_rows = 0u64;
+    let spool_replay_attempts = process_metrics()
+        .spool_replay_attempts_total
+        .load(Ordering::Relaxed);
+    let spool_dead_letter_rows = process_metrics()
+        .spool_dead_letter_rows_total
+        .load(Ordering::Relaxed);
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
-    let mut events_enqueued = 0u64;
-    let mut events_exported = 0u64;
-    let mut failures = 0u64;
+    let events_enqueued = process_metrics()
+        .events_enqueued_total
+        .load(Ordering::Relaxed);
+    let events_exported = process_metrics()
+        .events_exported_total
+        .load(Ordering::Relaxed);
+    let failures = process_metrics().failures_total.load(Ordering::Relaxed);
 
     for runtime in sinks.values() {
         queue_depth = queue_depth.saturating_add(runtime.logger.queue_depth() as u64);
+        queue_outstanding =
+            queue_outstanding.saturating_add(runtime.logger.outstanding_count() as u64);
         queue_capacity = queue_capacity.saturating_add(runtime.logger.buffer_capacity() as u64);
-        high_water = high_water.saturating_add(
-            runtime
-                .metrics
-                .queue_high_water_hits_total
-                .load(Ordering::Relaxed),
-        );
-        high_water_diversions = high_water_diversions.saturating_add(
-            runtime
-                .metrics
-                .queue_high_water_diversions_total
-                .load(Ordering::Relaxed),
-        );
-        full_drops = full_drops.saturating_add(
-            runtime
-                .metrics
-                .queue_full_drops_total
-                .load(Ordering::Relaxed),
-        );
-        events_enqueued = events_enqueued.saturating_add(
-            runtime
-                .metrics
-                .events_enqueued_total
-                .load(Ordering::Relaxed),
-        );
-        events_exported = events_exported.saturating_add(
-            runtime
-                .metrics
-                .events_exported_total
-                .load(Ordering::Relaxed),
-        );
-        failures = failures.saturating_add(runtime.metrics.failures_total.load(Ordering::Relaxed));
-        spool_prepare_failures = spool_prepare_failures.saturating_add(
-            runtime
-                .metrics
-                .spool_prepare_failures_total
-                .load(Ordering::Relaxed),
-        );
-        spool_drops =
-            spool_drops.saturating_add(runtime.metrics.spool_drops_total.load(Ordering::Relaxed));
+
         let unbound_files = runtime.metrics.spool_unbound_files.load(Ordering::Relaxed);
         spool_unbound_files = spool_unbound_files.saturating_add(unbound_files);
         let unbound_ns = runtime
@@ -3873,18 +3967,7 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
             .spool_unbound_namespaces
             .load(Ordering::Relaxed);
         spool_unbound_namespaces = spool_unbound_namespaces.saturating_add(unbound_ns);
-        spool_replay_attempts = spool_replay_attempts.saturating_add(
-            runtime
-                .metrics
-                .spool_replay_attempts_total
-                .load(Ordering::Relaxed),
-        );
-        spool_dead_letter_rows = spool_dead_letter_rows.saturating_add(
-            runtime
-                .metrics
-                .spool_dead_letter_rows_total
-                .load(Ordering::Relaxed),
-        );
+
         if let Some(spool) = runtime.spool.as_ref() {
             spool_enabled_any = true;
             let stats = spool.cached_stats();
@@ -3899,15 +3982,17 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     let (pending, pending_bytes, oldest_age, _full, _compact) =
         pending_snapshot_finalization_stats();
     serde_json::json!({
-        "enabled": true,
+        "enabled": !sinks.is_empty(),
         "instance_count": sinks.len(),
         "snapshot_finalizations_pending": pending,
         "snapshot_finalizations_pending_bytes": pending_bytes,
         "snapshot_finalizations_oldest_age_secs": oldest_age,
         "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
+            "per_event": process_metrics().event_accounting(),
             "queue": {
                 "depth": queue_depth,
+                "outstanding": queue_outstanding,
                 "capacity": queue_capacity,
                 "high_water_hits_total": high_water,
                 "high_water_diversions_total": high_water_diversions,
@@ -3970,7 +4055,9 @@ impl SinkRuntime {
                 "max_delay_ms": self.summary.retry_max_delay_ms,
                 "jitter": self.summary.retry_jitter,
             },
+            "per_event": self.metrics.event_accounting(),
             "queue": {
+                "outstanding": self.logger.outstanding_count(),
                 "depth": self.logger.queue_depth(),
                 "capacity": self.logger.buffer_capacity(),
                 "high_water_hits_total": self.metrics.queue_high_water_hits_total.load(Ordering::Relaxed),
@@ -4083,105 +4170,69 @@ fn render_prometheus_for_sinks(
 ) -> String {
     let mut output = String::with_capacity(4096 * sinks.len().max(1));
 
-    // Preserve the existing metric names as process-wide aggregates across
-    // every current accepted instance. Per-instance identity and counters live in
-    // the authenticated status endpoint; avoiding generation labels keeps
-    // scrape cardinality stable across reloads and prevents aggregate +
-    // component double-counting in ordinary PromQL sums.
-    let mut events_enqueued = 0u64;
-    let mut events_exported = 0u64;
-    let mut failure_network = 0u64;
-    let mut failure_http_4xx = 0u64;
-    let mut failure_http_5xx = 0u64;
-    let mut failure_serialize = 0u64;
-    let mut failure_tls = 0u64;
-    let mut failure_timeout = 0u64;
+    // Cumulative counters outlive all generations; gauges describe live state.
+    let process = process_metrics();
+    let events_enqueued = process.events_enqueued_total.load(Ordering::Relaxed);
+    let events_exported = process.events_exported_total.load(Ordering::Relaxed);
+    let failure_network = process.failure_reasons.network.load(Ordering::Relaxed);
+    let failure_http_4xx = process.failure_reasons.http_4xx.load(Ordering::Relaxed);
+    let failure_http_5xx = process.failure_reasons.http_5xx.load(Ordering::Relaxed);
+    let failure_serialize = process.failure_reasons.serialize.load(Ordering::Relaxed);
+    let failure_tls = process.failure_reasons.tls.load(Ordering::Relaxed);
+    let failure_timeout = process.failure_reasons.timeout.load(Ordering::Relaxed);
     let mut queue_depth = 0u64;
+    let mut queue_outstanding = 0u64;
     let mut spool_bytes = 0u64;
     let mut spool_files = 0u64;
-    let mut spool_drops = 0u64;
-    let mut spool_prepare_failures = 0u64;
-    let mut spool_jobs_enqueued = 0u64;
-    let mut spool_jobs_written = 0u64;
-    let mut spool_jobs_lost = 0u64;
-    let mut spool_events_lost = 0u64;
+    let spool_drops = process.spool_drops_total.load(Ordering::Relaxed);
+    let spool_prepare_failures = process.spool_prepare_failures_total.load(Ordering::Relaxed);
+    let spool_jobs_enqueued = process.spool_jobs_enqueued_total.load(Ordering::Relaxed);
+    let spool_jobs_written = process.spool_jobs_written_total.load(Ordering::Relaxed);
+    let spool_jobs_lost = process.spool_jobs_lost_total.load(Ordering::Relaxed);
+    let spool_events_lost = process.spool_events_lost_total.load(Ordering::Relaxed);
     let mut spool_unbound_files = 0u64;
     let mut spool_unbound_namespaces = 0u64;
-    let mut spool_replay_attempts = 0u64;
-    let mut spool_dead_letter_rows = 0u64;
+    let spool_replay_attempts = process.spool_replay_attempts_total.load(Ordering::Relaxed);
+    let spool_dead_letter_rows = process.spool_dead_letter_rows_total.load(Ordering::Relaxed);
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
     let mut queue_retained_bytes = 0u64;
-    let mut queue_byte_budget_exhausted = 0u64;
-    let mut queue_high_water_hits = 0u64;
-    let mut queue_high_water_diversions = 0u64;
-    let mut queue_full_drops = 0u64;
-    let mut snapshot_emits = 0u64;
+    let queue_byte_budget_exhausted = process
+        .queue_byte_budget_exhausted_total
+        .load(Ordering::Relaxed);
+    let queue_high_water_hits = process.queue_high_water_hits_total.load(Ordering::Relaxed);
+    let queue_high_water_diversions = process
+        .queue_high_water_diversions_total
+        .load(Ordering::Relaxed);
+    let queue_full_drops = process.queue_full_drops_total.load(Ordering::Relaxed);
+    let snapshot_emits = process.snapshot_emits_total.load(Ordering::Relaxed);
     let mut snapshot_entries = 0u64;
     let mut snapshot_retained_bytes = 0u64;
-    let mut snapshot_overflow_spooled = 0u64;
-    let mut snapshot_overflow_pending = 0u64;
-    let mut snapshot_cardinality_rejections = 0u64;
+    let snapshot_overflow_spooled = process
+        .snapshot_overflow_spooled_total
+        .load(Ordering::Relaxed);
+    let snapshot_overflow_pending = process
+        .snapshot_overflow_pending_total
+        .load(Ordering::Relaxed);
+    let snapshot_cardinality_rejections = process
+        .snapshot_cardinality_rejections_total
+        .load(Ordering::Relaxed);
     let mut any_snapshot = false;
-    let mut latency_counts: Vec<u64> = Vec::new();
-    let mut latency_sum = 0.0f64;
-    let mut latency_total = 0u64;
-    let mut latency_buckets: &'static [f64] = &[];
 
     for runtime in sinks.values() {
         let metrics = &runtime.metrics;
-        events_enqueued =
-            events_enqueued.saturating_add(metrics.events_enqueued_total.load(Ordering::Relaxed));
-        events_exported =
-            events_exported.saturating_add(metrics.events_exported_total.load(Ordering::Relaxed));
-        failure_network =
-            failure_network.saturating_add(metrics.failure_reasons.network.load(Ordering::Relaxed));
-        failure_http_4xx = failure_http_4xx
-            .saturating_add(metrics.failure_reasons.http_4xx.load(Ordering::Relaxed));
-        failure_http_5xx = failure_http_5xx
-            .saturating_add(metrics.failure_reasons.http_5xx.load(Ordering::Relaxed));
-        failure_serialize = failure_serialize
-            .saturating_add(metrics.failure_reasons.serialize.load(Ordering::Relaxed));
-        failure_tls =
-            failure_tls.saturating_add(metrics.failure_reasons.tls.load(Ordering::Relaxed));
-        failure_timeout =
-            failure_timeout.saturating_add(metrics.failure_reasons.timeout.load(Ordering::Relaxed));
+
         queue_depth = queue_depth.saturating_add(runtime.logger.queue_depth() as u64);
-        spool_drops = spool_drops.saturating_add(metrics.spool_drops_total.load(Ordering::Relaxed));
-        spool_prepare_failures = spool_prepare_failures
-            .saturating_add(metrics.spool_prepare_failures_total.load(Ordering::Relaxed));
-        spool_jobs_enqueued = spool_jobs_enqueued
-            .saturating_add(metrics.spool_jobs_enqueued_total.load(Ordering::Relaxed));
-        spool_jobs_written = spool_jobs_written
-            .saturating_add(metrics.spool_jobs_written_total.load(Ordering::Relaxed));
-        spool_jobs_lost =
-            spool_jobs_lost.saturating_add(metrics.spool_jobs_lost_total.load(Ordering::Relaxed));
-        spool_events_lost = spool_events_lost
-            .saturating_add(metrics.spool_events_lost_total.load(Ordering::Relaxed));
-        spool_replay_attempts = spool_replay_attempts
-            .saturating_add(metrics.spool_replay_attempts_total.load(Ordering::Relaxed));
-        spool_dead_letter_rows = spool_dead_letter_rows
-            .saturating_add(metrics.spool_dead_letter_rows_total.load(Ordering::Relaxed));
+        queue_outstanding =
+            queue_outstanding.saturating_add(runtime.logger.outstanding_count() as u64);
+
         let unbound_files = metrics.spool_unbound_files.load(Ordering::Relaxed);
         spool_unbound_files = spool_unbound_files.saturating_add(unbound_files);
         let unbound_ns = metrics.spool_unbound_namespaces.load(Ordering::Relaxed);
         spool_unbound_namespaces = spool_unbound_namespaces.saturating_add(unbound_ns);
         queue_retained_bytes =
             queue_retained_bytes.saturating_add(runtime.byte_budget.used() as u64);
-        queue_byte_budget_exhausted = queue_byte_budget_exhausted.saturating_add(
-            metrics
-                .queue_byte_budget_exhausted_total
-                .load(Ordering::Relaxed),
-        );
-        queue_high_water_hits = queue_high_water_hits
-            .saturating_add(metrics.queue_high_water_hits_total.load(Ordering::Relaxed));
-        queue_high_water_diversions = queue_high_water_diversions.saturating_add(
-            metrics
-                .queue_high_water_diversions_total
-                .load(Ordering::Relaxed),
-        );
-        queue_full_drops =
-            queue_full_drops.saturating_add(metrics.queue_full_drops_total.load(Ordering::Relaxed));
+
         let spool_stats = runtime
             .spool
             .as_ref()
@@ -4197,37 +4248,54 @@ fn render_prometheus_for_sinks(
         }
         if runtime.summary.mode == SinkMode::Snapshot {
             any_snapshot = true;
-            snapshot_emits =
-                snapshot_emits.saturating_add(metrics.snapshot_emits_total.load(Ordering::Relaxed));
-            snapshot_overflow_spooled = snapshot_overflow_spooled.saturating_add(
-                metrics
-                    .snapshot_overflow_spooled_total
-                    .load(Ordering::Relaxed),
-            );
-            snapshot_overflow_pending = snapshot_overflow_pending.saturating_add(
-                metrics
-                    .snapshot_overflow_pending_total
-                    .load(Ordering::Relaxed),
-            );
-            snapshot_cardinality_rejections = snapshot_cardinality_rejections.saturating_add(
-                metrics
-                    .snapshot_cardinality_rejections_total
-                    .load(Ordering::Relaxed),
-            );
+
             if let Some(status) = snapshot_accumulator_gauges(runtime.generation) {
                 snapshot_entries = snapshot_entries.saturating_add(status.0);
                 snapshot_retained_bytes = snapshot_retained_bytes.saturating_add(status.1);
             }
         }
-        if latency_buckets.is_empty() {
-            latency_buckets = metrics.latency.buckets;
-            latency_counts = vec![0u64; latency_buckets.len()];
-        }
-        for (idx, count) in latency_counts.iter_mut().enumerate() {
-            *count = count.saturating_add(metrics.latency.counts[idx].load(Ordering::Relaxed));
-        }
-        latency_sum += f64::from_bits(metrics.latency.sum_bits.load(Ordering::Relaxed));
-        latency_total = latency_total.saturating_add(metrics.latency.count.load(Ordering::Relaxed));
+    }
+
+    let latency_buckets = process.latency.buckets;
+    let latency_counts: Vec<u64> = process
+        .latency
+        .counts
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .collect();
+    let latency_sum = f64::from_bits(process.latency.sum_bits.load(Ordering::Relaxed));
+    let latency_total = process.latency.count.load(Ordering::Relaxed);
+
+    let (received, persisted, dropped, pending) = process.event_counts();
+    for (name, kind, help, value) in [
+        (
+            "per_event_received_total",
+            "counter",
+            "New per-event rows presented to bounded sink admission, including refusals.",
+            received,
+        ),
+        (
+            "per_event_persisted_total",
+            "counter",
+            "New per-event rows acknowledged by ClickHouse or written to spool at least once.",
+            persisted,
+        ),
+        (
+            "per_event_dropped_total",
+            "counter",
+            "New per-event rows whose last memory owner was lost before acknowledgement or spooling.",
+            dropped,
+        ),
+        (
+            "per_event_pending",
+            "gauge",
+            "New per-event rows still awaiting acknowledgement or spooling, including retired workers.",
+            pending,
+        ),
+    ] {
+        output.push_str(&format!(
+            "# HELP chargeback_sink_{name} {help}\n# TYPE chargeback_sink_{name} {kind}\nchargeback_sink_{name} {value}\n"
+        ));
     }
 
     output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events admitted to the in-memory channel or accepted by a durable overflow handoff.\n");
@@ -4257,6 +4325,12 @@ fn render_prometheus_for_sinks(
             reason, value
         ));
     }
+    output.push_str("# HELP chargeback_sink_queue_outstanding Current accepted generations' queued, batched, and exporting rows.\n");
+    output.push_str("# TYPE chargeback_sink_queue_outstanding gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_outstanding {}\n",
+        queue_outstanding
+    ));
     output.push_str("# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n");
     output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
     output.push_str(&format!("chargeback_sink_queue_depth {}\n", queue_depth));
@@ -4302,7 +4376,12 @@ fn render_prometheus_for_sinks(
         "chargeback_sink_snapshot_finalizations_oldest_age_seconds {}\n",
         pending_finalization_oldest_age_secs
     ));
-    if any_snapshot || pending_finalizations > 0 {
+    if any_snapshot
+        || pending_finalizations > 0
+        || snapshot_overflow_spooled > 0
+        || snapshot_overflow_pending > 0
+        || snapshot_cardinality_rejections > 0
+    {
         output.push_str("# HELP chargeback_sink_snapshot_entries Snapshot accumulator identities retained in memory.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_entries gauge\n");
         output.push_str(&format!(
@@ -4459,7 +4538,7 @@ fn render_prometheus_for_sinks(
         "chargeback_sink_export_latency_seconds_count {}\n",
         latency_total
     ));
-    if any_snapshot {
+    if any_snapshot || snapshot_emits > 0 || snapshot_cardinality_rejections > 0 {
         output.push_str("# HELP chargeback_sink_snapshot_emits_total Chargeback sink snapshot delta events emitted.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_emits_total counter\n");
         output.push_str(&format!(
@@ -4747,7 +4826,14 @@ async fn send_batch(
     // this slice borrow here does not release their leases early.
     drop(events);
     match post_json_each_row(cfg, body, event_count).await {
-        DeliveryOutcome::Delivered => Ok(()),
+        DeliveryOutcome::Delivered => {
+            for queued in batch {
+                if let Some(accounting) = &queued.accounting {
+                    accounting.persist();
+                }
+            }
+            Ok(())
+        }
         other => Err(other.safe_message().to_string()),
     }
 }
@@ -12608,7 +12694,11 @@ pub async fn probe_shared_spool_batch_clone_for_tests(
         let lease = budget
             .try_acquire(retained)
             .expect("shared spool clone probe must lease queued events");
-        queued.push(QueuedChargeEvent { event, lease });
+        queued.push(QueuedChargeEvent {
+            event,
+            lease,
+            accounting: None,
+        });
     }
     let shared = Arc::new(queued);
     // Retain a second handle for the whole probe so try_unwrap takes the Err path.
@@ -15647,6 +15737,9 @@ fn event_from_snapshot(
 }
 
 fn infer_http_protocol(summary: &TransactionSummary) -> String {
+    if is_websocket_handshake(summary) {
+        return "ws".to_string();
+    }
     if let Some(protocol) = summary
         .metadata
         .get("request_protocol")
@@ -15654,11 +15747,7 @@ fn infer_http_protocol(summary: &TransactionSummary) -> String {
     {
         return bound_key_field(protocol, MAX_FIELD_LEN);
     }
-    if summary.response_status_code == 101 {
-        "ws".to_string()
-    } else {
-        "http".to_string()
-    }
+    "http".to_string()
 }
 
 fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
@@ -15688,7 +15777,11 @@ fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEve
             let retained = charge_event_retained_bytes(&event);
             match runtime.byte_budget.try_acquire(retained) {
                 Some(lease) => {
-                    let queued = QueuedChargeEvent { event, lease };
+                    let queued = QueuedChargeEvent {
+                        event,
+                        lease,
+                        accounting: None,
+                    };
                     match delivery.try_enqueue_snapshot_overflow(
                         vec![queued],
                         Arc::clone(&lifecycle.accumulator),
@@ -15860,11 +15953,15 @@ fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
 }
 
 fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
-    let retained = charge_event_retained_bytes(&event);
+    let accounting = PendingCharge::new(Arc::clone(&runtime.metrics));
+    // Charge the Arc allocation and lifetime bookkeeping to the existing budget.
+    let retained = charge_event_retained_bytes(&event).saturating_add(128);
     if retained > MAX_CHARGE_EVENT_BYTES {
-        runtime
-            .byte_budget
-            .record_drop("charge event exceeded max retained bytes");
+        let budget = runtime.byte_budget.as_ref();
+        budget.record_drop(
+            SinkLossReason::RecordTooLarge,
+            "charge event exceeded max retained bytes",
+        );
         invalidate_status_cache();
         return;
     }
@@ -15876,10 +15973,11 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
         invalidate_status_cache();
         return;
     };
-    match runtime
-        .logger
-        .try_send_outcome(QueuedChargeEvent { event, lease })
-    {
+    match runtime.logger.try_send_outcome(QueuedChargeEvent {
+        event,
+        lease,
+        accounting: Some(Arc::new(accounting)),
+    }) {
         TrySendOutcome::ChannelAccepted | TrySendOutcome::DiversionAccepted => {
             runtime
                 .metrics
