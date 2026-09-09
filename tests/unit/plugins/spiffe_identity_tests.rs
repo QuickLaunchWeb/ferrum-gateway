@@ -134,7 +134,10 @@ async fn test_http_request_rejects_duplicate_spiffe_uri_sans() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
-            assert!(body.contains("invalid SPIFFE identity"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+                "invalid SPIFFE identity certificate"
+            );
         }
         other => panic!("expected duplicate SPIFFE URI SANs to reject, got {other:?}"),
     }

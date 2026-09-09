@@ -86,6 +86,36 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Exercise the dispatch coordinate rebase and its cloned diagnostic context.
+    pub fn rebase_backend_path_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        path: String,
+        strip_len: &mut usize,
+    ) -> (String, usize) {
+        ctx.matched_path_strip_len = *strip_len;
+        let path = crate::proxy::rebase_route_override_path(ctx, path, strip_len);
+        let cloned_offset = ctx
+            .clone_for_final_request_body_hooks()
+            .matched_path_strip_len;
+        (path, cloned_offset)
+    }
+
+    pub fn websocket_backend_path_for_test(
+        proxy: &crate::config::types::Proxy,
+        path: &str,
+        strip_len: usize,
+    ) -> Result<String, crate::proxy::InvalidBackendPath> {
+        crate::proxy::build_websocket_backend_url_with_target(
+            proxy,
+            path,
+            "",
+            &proxy.backend_host,
+            proxy.backend_port,
+            strip_len,
+            None,
+        )
+    }
+
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,6 +130,7 @@ pub mod _test_support {
     use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
+    use crate::plugins::oidc_relying_party::discovery_test_seams as oidc_discovery_seams;
     use crate::plugins::oidc_relying_party::refresh_flight_test_seams as oidc_refresh_flight_seams;
 
     /// Parse-only URI authority and Host header a Unix WebSocket handshake uses.
@@ -1645,6 +1676,16 @@ pub mod _test_support {
         crate::proxy::x_gateway_error_for_backend_failure(connection_error, status)
     }
 
+    pub fn response_policy_observability_for_test(
+        ctx: &crate::plugins::RequestContext,
+        status: u16,
+    ) -> (Option<crate::retry::ErrorClass>, Option<&'static str>) {
+        (
+            ctx.response_policy_error_class(None),
+            crate::proxy::x_gateway_error_for_response(ctx, false, status),
+        )
+    }
+
     pub fn apply_authoritative_backend_gateway_error_header_for_test(
         response_headers: &mut HashMap<String, String>,
         connection_error: bool,
@@ -2114,6 +2155,36 @@ pub mod _test_support {
             refresh_token,
             refresh_after_unix,
         })
+    }
+
+    // ── OIDC discovery endpoint overrides (issue #4761) ────────────────────
+
+    /// Resolve a live discovery document with optional operator-supplied
+    /// `userinfo_endpoint` / `end_session_endpoint` overrides, returning the
+    /// effective optional endpoints as `(userinfo, end_session)`.
+    pub async fn oidc_resolve_discovery_for_test(
+        http_client: &crate::plugins::PluginHttpClient,
+        discovery_url: &str,
+        explicit_userinfo_endpoint: Option<String>,
+        explicit_end_session_endpoint: Option<String>,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        let resolved = oidc_discovery_seams::resolve_discovery_for_test(
+            http_client,
+            discovery_url,
+            explicit_userinfo_endpoint,
+            explicit_end_session_endpoint,
+        )
+        .await?;
+        Ok((resolved.userinfo_endpoint, resolved.end_session_endpoint))
+    }
+
+    /// Await a plugin's background discovery task and return the resolved
+    /// optional endpoints as `(userinfo, end_session)`. Consumes the plugin so
+    /// the discovery task can be awaited to completion.
+    pub async fn oidc_resolved_discovery_endpoints_for_test(
+        plugin: crate::plugins::oidc_relying_party::OidcRelyingParty,
+    ) -> Option<(Option<String>, Option<String>)> {
+        plugin.resolved_discovery_endpoints_for_tests().await
     }
 
     // ── OIDC refresh single-flight seams (issue #4640) ──────────────────────
@@ -3996,6 +4067,14 @@ pub mod _test_support {
     /// Defined idle-timeout policy Close (RFC 6455 1001).
     pub fn ws_idle_timeout_policy_close_frame_for_test() -> CloseFrame {
         crate::proxy::ws_idle_timeout_policy_close_frame()
+    }
+
+    /// Defined relay-failure policy Close mapping `ErrorClass` to 1002/1011/1001.
+    pub fn ws_relay_failure_close_frame_for_test(
+        error_class: crate::retry::ErrorClass,
+        draining: bool,
+    ) -> CloseFrame {
+        crate::proxy::ws_relay_failure_close_frame(error_class, draining)
     }
 
     /// Class for a WebSocket capacity overflow used when the relay maps
@@ -11187,30 +11266,46 @@ pub mod _test_support {
         )
     }
 
-    pub fn udp_logging_classify_dtls_batch_size_for_test(
-        dtls_enabled: bool,
+    pub fn udp_logging_classify_batch_size_for_test(
         payload_len: usize,
         batch_len: usize,
-        max_plaintext: usize,
+        max_datagram_bytes: usize,
     ) -> &'static str {
-        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
-        match crate::plugins::udp_logging::classify_dtls_batch_size(
-            dtls_enabled,
+        use crate::plugins::udp_logging::BatchSizeDecision;
+        match crate::plugins::udp_logging::classify_batch_size(
             payload_len,
             batch_len,
-            max_plaintext,
+            max_datagram_bytes,
         ) {
-            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
-            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
-            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+            BatchSizeDecision::SendAsIs => "send_as_is",
+            BatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            BatchSizeDecision::SplitPerEntry => "split_per_entry",
         }
+    }
+
+    /// Effective per-datagram ceiling for the active transport.
+    pub fn udp_logging_effective_datagram_limit_for_test(
+        dtls_enabled: bool,
+        remote_addr: Option<std::net::SocketAddr>,
+    ) -> usize {
+        crate::plugins::udp_logging::effective_datagram_limit(dtls_enabled, remote_addr)
+    }
+
+    /// Largest `max_entry_bytes` whose own datagram still fits `limit`.
+    pub fn udp_logging_max_deliverable_entry_bytes_for_test(max_datagram_bytes: usize) -> usize {
+        crate::plugins::udp_logging::max_deliverable_entry_bytes(max_datagram_bytes)
+    }
+
+    /// Process-wide count of records rejected alone by the datagram gate.
+    pub fn udp_logging_local_record_drops_for_test() -> u64 {
+        crate::plugins::udp_logging::local_record_drops_for_test()
     }
 
     pub fn udp_logging_classify_serialized_summaries_for_test(
         summaries: &[crate::plugins::TransactionSummary],
-        max_plaintext: usize,
+        max_datagram_bytes: usize,
     ) -> Result<(&'static str, usize), String> {
-        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
+        use crate::plugins::udp_logging::BatchSizeDecision;
         use crate::plugins::utils::ByteBudget;
         use crate::plugins::utils::byte_budget::accounted_summary_bytes;
         use crate::plugins::utils::summary_log_budget::serialize_under_byte_budget;
@@ -11226,14 +11321,14 @@ pub mod _test_support {
             entries.push(payload);
         }
         let (decision, payload_len) =
-            crate::plugins::udp_logging::classify_serialized_dtls_batch_for_test(
+            crate::plugins::udp_logging::classify_serialized_batch_for_test(
                 &entries,
-                max_plaintext,
+                max_datagram_bytes,
             )?;
         let label = match decision {
-            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
-            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
-            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+            BatchSizeDecision::SendAsIs => "send_as_is",
+            BatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            BatchSizeDecision::SplitPerEntry => "split_per_entry",
         };
         Ok((label, payload_len))
     }
@@ -11485,8 +11580,8 @@ pub mod _test_support {
         crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
     }
 
-    pub fn udp_logging_local_dtls_size_rejection_preserves_sender_for_test() -> bool {
-        crate::plugins::udp_logging::local_dtls_size_rejection_preserves_sender_for_test()
+    pub fn udp_logging_local_size_rejection_preserves_sender_for_test() -> bool {
+        crate::plugins::udp_logging::local_size_rejection_preserves_sender_for_test()
     }
 
     pub fn udp_logging_transport_dtls_failure_requires_sender_reset_for_test() -> bool {
@@ -13827,6 +13922,23 @@ pub mod _test_support {
             cb,
             status,
             is_half_open_probe,
+        )
+    }
+
+    /// The `ai_semantic_firewall` supported extraction paths: the request list
+    /// and the response list, in declaration order.
+    ///
+    /// These are the same arrays `openapi.yaml` publishes as the `enum` and
+    /// `default` of `AiSemanticFirewallConfig.extraction.request_json_paths` /
+    /// `response_json_paths`, and the same set `docs/plugins.md` tabulates
+    /// under "Supported provider shapes". Exposed so the OpenAPI parity test
+    /// can assert that three-way agreement instead of carrying a second copy of
+    /// the list that can silently drift.
+    pub fn ai_semantic_firewall_extraction_paths_for_test()
+    -> (&'static [&'static str], &'static [&'static str]) {
+        (
+            crate::plugins::ai_semantic_firewall::DEFAULT_REQUEST_JSON_PATHS,
+            crate::plugins::ai_semantic_firewall::DEFAULT_RESPONSE_JSON_PATHS,
         )
     }
 

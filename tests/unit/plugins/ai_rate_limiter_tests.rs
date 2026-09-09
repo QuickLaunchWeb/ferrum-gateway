@@ -6506,11 +6506,9 @@ async fn expose_headers_non_2xx_release_refreshes_remaining() {
 //
 // Admission reserves an *estimate*; the authoritative charge is the actual
 // provider token count applied after the response. If centralized enforcement
-// disappears between the two, that charge cannot be recorded — and delivering
-// the upstream 2xx anyway hands the client a completion whose tokens nothing
-// debited. Under the default `redis_failure_policy: "fail_closed"` that is
-// exactly the per-process budget bypass the policy exists to prevent, so the
-// reconciliation path refuses with the same generic 503 admission uses.
+// disappears between the two, terminal accounting falls back to local state.
+// The buffered/federated response still refuses with the generic 503 under
+// `fail_closed`; committed streams cannot be replaced but must still be charged.
 //
 // These drive the production failover seam — a real Redis-backed limiter
 // pointed at an endpoint that is never listening — not a hand-built
@@ -6621,8 +6619,80 @@ async fn fail_closed_admission_refuses_when_enforcement_is_unavailable() {
     assert_generic_enforcement_unavailable(admission);
 }
 
-/// Ordinary buffered response path: a 2xx whose actual token usage could not be
-/// charged must not be delivered.
+#[tokio::test]
+async fn redis_unavailable_stream_reconcile_charges_local_window_and_finalizes_reservation() {
+    let plugin = Arc::new(
+        AiRateLimiter::new(
+            &unreachable_redis_ai_config(None),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry
+        .ai_rate_limit_local_accounting_tokens
+        .load(Ordering::Relaxed);
+    let frame = sse_frame(json!({
+        "choices": [],
+        "usage": {"prompt_tokens": 40, "completion_tokens": 60, "total_tokens": 100}
+    }));
+
+    // The first admission reserved nothing. The second reserved on Redis,
+    // so neither may subtract a remote estimate from the local window.
+    for (reserved, expected_usage) in [(0, "100"), (120, "200")] {
+        let mut ctx = reconcilable_ai_ctx(&plugin, reserved);
+        if reserved == 0 {
+            ctx.metadata
+                .remove(&plugin.metadata_key_for_test("ai_ratelimit_reserved_window_index"));
+        }
+        let (forwarded, inspected) = drive_stream(
+            &plugin,
+            &mut ctx,
+            200,
+            "text/event-stream",
+            &[&frame],
+            BodyOutcome::success(frame.len() as u64),
+        )
+        .await;
+        assert!(inspected);
+        assert_eq!(forwarded, frame);
+        assert_eq!(
+            scoped_meta(&ctx, "ai_ratelimit_usage").map(String::as_str),
+            Some(expected_usage)
+        );
+        assert_eq!(
+            scoped_meta(&ctx, "ai_ratelimit_locally_accounted").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            scoped_meta(&ctx, "ai_ratelimit_reservation_reconciled").map(String::as_str),
+            Some("true")
+        );
+
+        // A later release must not undo the terminal charge.
+        let mut headers = json_headers();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 500, &mut headers, b"{}")
+                .await,
+        );
+    }
+    assert!(
+        registry
+            .ai_rate_limit_local_accounting_tokens
+            .load(Ordering::Relaxed)
+            >= before + 200
+    );
+    let rendered = registry.render();
+    assert!(rendered.contains("# TYPE ferrum_ai_rate_limit_local_accounting_tokens_total counter"));
+    assert!(rendered.contains("# TYPE ferrum_ai_rate_limit_unaccounted_tokens_total counter"));
+    let mut next = ai_request_ctx(200, "next request");
+    let admission = plugin.before_proxy(&mut next, &mut HashMap::new()).await;
+    assert_generic_enforcement_unavailable(admission);
+}
+
+/// Ordinary buffered response path: local accounting does not relax the
+/// existing fail-closed response contract when Redis cannot be charged.
 #[tokio::test]
 async fn fail_closed_reconcile_refuses_uncharged_successful_response() {
     let config = unreachable_redis_ai_config(None);
@@ -6657,6 +6727,20 @@ async fn fail_closed_reconcile_refuses_uncharged_federated_response() {
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
     assert_generic_enforcement_unavailable(reconciled);
+    assert_eq!(
+        scoped_meta(&ctx, "ai_ratelimit_reservation_reconciled").map(String::as_str),
+        Some("true")
+    );
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 503, &mut response_headers)
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&ctx, "ai_ratelimit_usage").map(String::as_str),
+        Some("100"),
+        "replaying the federated reject hooks must not charge twice"
+    );
 }
 
 /// Safe-release semantics are preserved: when the response is already non-2xx,

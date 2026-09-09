@@ -1513,8 +1513,9 @@ where
         }
     }
 
-    /// Test-support variant of local admission with an explicit hard cap.
-    #[allow(dead_code)]
+    /// Local operation with an explicit hard cap. Also used for terminal AI
+    /// accounting when centralized enforcement is unavailable; admission still
+    /// goes through the configured failover policy.
     pub fn check_local_at_with_capacity(
         &self,
         key: K,
