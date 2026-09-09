@@ -166,6 +166,7 @@ fn start_gateway_with_dns(
     let binary_path = gateway_binary_path();
 
     let mut command = std::process::Command::new(binary_path);
+    command.arg("run");
     command
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
