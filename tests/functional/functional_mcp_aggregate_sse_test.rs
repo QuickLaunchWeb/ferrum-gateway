@@ -39,6 +39,8 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::ServeOptions;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -83,6 +85,7 @@ const REATTACH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// a timing assumption.
 struct Arrival {
     id: Value,
+    raw_id: String,
     release: oneshot::Sender<()>,
 }
 
@@ -100,12 +103,14 @@ struct Arrival {
 async fn serve_scripted_mcp_upstream(
     listener: TcpListener,
     arrivals: mpsc::UnboundedSender<Arrival>,
+    requests: Arc<AtomicUsize>,
 ) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
         let arrivals = arrivals.clone();
+        let requests = Arc::clone(&requests);
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
             let mut pending = Vec::new();
@@ -113,6 +118,7 @@ async fn serve_scripted_mcp_upstream(
                 let Some(body) = read_one_http_request(&mut stream, &mut pending).await else {
                     return;
                 };
+                requests.fetch_add(1, Ordering::SeqCst);
                 let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let Some(id) = parsed.get("id").cloned() else {
                     if write_http_response(&mut stream, 202, "").await.is_err() {
@@ -120,10 +126,27 @@ async fn serve_scripted_mcp_upstream(
                     }
                     continue;
                 };
+                let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+                    serde_json::from_slice(&body).unwrap();
+                let raw_id = fields["id"].get().to_string();
+                // Tests may script a different response id without ever
+                // materializing the numeric token through serde_json::Number.
+                let response_id = fields
+                    .get("params")
+                    .and_then(|params| {
+                        serde_json::from_str::<
+                            std::collections::BTreeMap<String, &serde_json::value::RawValue>,
+                        >(params.get())
+                        .ok()
+                    })
+                    .and_then(|params| params.get("responseId").copied())
+                    .map(|id| id.get())
+                    .unwrap_or(&raw_id);
                 let (release, released) = oneshot::channel();
                 if arrivals
                     .send(Arrival {
                         id: id.clone(),
+                        raw_id: raw_id.clone(),
                         release,
                     })
                     .is_err()
@@ -138,12 +161,9 @@ async fn serve_scripted_mcp_upstream(
                     Value::Number(_) => "number",
                     _ => "other",
                 };
-                let payload = serde_json::to_string(&json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": { "kind": kind }
-                }))
-                .expect("scripted upstream response serializes");
+                let payload = format!(
+                    r#"{{"jsonrpc":"2.0","id":{response_id},"result":{{"kind":"{kind}"}}}}"#
+                );
                 if write_http_response(&mut stream, 200, &payload)
                     .await
                     .is_err()
@@ -253,10 +273,15 @@ struct SseFixture {
     gateway: RunningGateway,
     arrivals: mpsc::UnboundedReceiver<Arrival>,
     upstream_task: JoinHandle<()>,
+    requests: Arc<AtomicUsize>,
 }
 
 impl SseFixture {
     async fn start() -> Self {
+        Self::start_mode("aggregate_router").await
+    }
+
+    async fn start_mode(mode: &str) -> Self {
         // Pre-bound fixture listener: the socket is never dropped and rebound,
         // so it cannot race a port the gateway is about to claim.
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
@@ -267,10 +292,25 @@ impl SseFixture {
             .expect("scripted upstream local addr")
             .port();
         let (arrivals_tx, arrivals) = mpsc::unbounded_channel();
-        let upstream_task =
-            tokio::spawn(serve_scripted_mcp_upstream(upstream_listener, arrivals_tx));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let upstream_task = tokio::spawn(serve_scripted_mcp_upstream(
+            upstream_listener,
+            arrivals_tx,
+            Arc::clone(&requests),
+        ));
 
-        let gateway = start_gateway(aggregate_sse_config(upstream_port))
+        let mut config = aggregate_sse_config(upstream_port);
+        if mode == "transparent_proxy" {
+            config.plugin_configs[0].config = json!({
+                "mode": "transparent_proxy",
+                "endpoint": {"path": "/mcp", "protocol_versions": [PROTOCOL_VERSION]},
+                "servers": {"echo": {
+                    "upstream_url": format!("http://127.0.0.1:{upstream_port}/mcp"),
+                    "namespace": "echo"
+                }}
+            });
+        }
+        let gateway = start_gateway(config)
             .await
             .expect("start aggregate MCP SSE gateway");
 
@@ -278,6 +318,7 @@ impl SseFixture {
             gateway,
             arrivals,
             upstream_task,
+            requests,
         }
     }
 
@@ -1352,4 +1393,200 @@ async fn next_message_h3(stream: &mut Http3ResponseStream, cursor: &mut SseCurso
         }
         return parse_sse_message(&record);
     }
+}
+
+fn wire_id(body: &str) -> String {
+    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(body).unwrap();
+    fields["id"].get().to_string()
+}
+
+async fn post_raw_jsonrpc(
+    client: &reqwest::Client,
+    port: u16,
+    session: &str,
+    body: String,
+) -> (u16, String) {
+    let response = client
+        .post(mcp_url(port))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header(SESSION_HEADER, session)
+        .header("mcp-protocol-version", PROTOCOL_VERSION)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    (response.status().as_u16(), response.text().await.unwrap())
+}
+
+#[tokio::test]
+#[ignore]
+async fn functional_mcp_aggregate_sse_endpoint_scope_never_forwards_descendants() {
+    for mode in ["aggregate_router", "transparent_proxy"] {
+        let mut fixture = SseFixture::start_mode(mode).await;
+        let port = fixture.http_port();
+        let client = reqwest::Client::builder()
+            .timeout(READ_TIMEOUT)
+            .build()
+            .unwrap();
+        for suffix in ["/", "//", "/child"] {
+            for method in [
+                reqwest::Method::POST,
+                reqwest::Method::GET,
+                reqwest::Method::DELETE,
+            ] {
+                let response = client
+                    .request(method, format!("{}{suffix}", mcp_url(port)))
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":1,"method":"session/echo"}"#)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), 404, "{mode} {suffix}");
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["error"]["code"], -32600);
+            }
+        }
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+        // Positive controls use the same gateway and backend. A query does
+        // not alter endpoint selection, and the exact endpoint still routes.
+        let session = if mode == "aggregate_router" {
+            initialize_session(&client, port).await
+        } else {
+            "transparent-session".to_string()
+        };
+        for query in ["", "?x=1"] {
+            let post = tokio::spawn({
+                let client = client.clone();
+                let session = session.clone();
+                async move {
+                    client
+                        .post(format!("{}{query}", mcp_url(port)))
+                        .header(SESSION_HEADER, session)
+                        .json(&held_request_body(json!("path-control")))
+                        .send()
+                        .await
+                        .unwrap()
+                }
+            });
+            let arrival = next_arrival(&mut fixture.arrivals).await;
+            assert_eq!(arrival.id, json!("path-control"));
+            arrival.release.send(()).unwrap();
+            let response = post.await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(wire_id(&response.text().await.unwrap()), "\"path-control\"");
+        }
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn functional_mcp_aggregate_sse_raw_numeric_correlation_and_cancellation() {
+    let mut fixture = SseFixture::start().await;
+    let port = fixture.http_port();
+    let client = reqwest::Client::builder()
+        .timeout(READ_TIMEOUT)
+        .build()
+        .unwrap();
+    let session = initialize_session(&client, port).await;
+    let mut listener = attach_sse_h1_expect_attached(port, &session).await;
+    listener.expect_greeting().await;
+    let first_id = "18446744073709551616";
+    let second_id = "18446744073709551617";
+
+    // A wrong numeric reply is neither published nor returned as a successful
+    // inline answer. The held request proves it reached the real backend.
+    let wrong = tokio::spawn({
+        let client = client.clone();
+        let session = session.clone();
+        async move {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":{first_id},"method":"session/echo","params":{{"responseId":{second_id}}}}}"#
+            );
+            post_raw_jsonrpc(&client, port, &session, body).await
+        }
+    });
+    let arrival = next_arrival(&mut fixture.arrivals).await;
+    assert_eq!(arrival.raw_id, first_id);
+    assert!(
+        !wrong.is_finished(),
+        "the upstream is withholding its answer"
+    );
+    arrival.release.send(()).unwrap();
+    let (_, body) = wrong.await.unwrap();
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"]["code"], -32603);
+    assert!(error.get("result").is_none());
+    // The refusal replaces the upstream answer, so it has to name the request
+    // the client is still waiting on — with that request's exact wire token,
+    // not the id the upstream wrongly echoed and not `null`.
+    assert_eq!(
+        wire_id(&body),
+        first_id,
+        "a refusal carrying no id would leave the pending call unresolved"
+    );
+
+    // The adjacent id remains independently admissible. A different session's
+    // cancellation cannot cancel it, even with the exact same numeric token.
+    let other_session = initialize_session(&client, port).await;
+    let exact = tokio::spawn({
+        let client = client.clone();
+        let session = session.clone();
+        async move {
+            let body = format!(r#"{{"jsonrpc":"2.0","id":{second_id},"method":"session/echo"}}"#);
+            post_raw_jsonrpc(&client, port, &session, body).await
+        }
+    });
+    let arrival = next_arrival(&mut fixture.arrivals).await;
+    assert_eq!(arrival.raw_id, second_id);
+    let cancellation = format!(
+        r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{second_id}}}}}"#
+    );
+    let (status, _) = post_raw_jsonrpc(&client, port, &other_session, cancellation).await;
+    assert_eq!(status, 202);
+    arrival.release.send(()).unwrap();
+    let (status, body) = exact.await.unwrap();
+    assert_multiplexed_acknowledgement(status, &body, "exact numeric id");
+    let message = listener.next_message().await;
+    assert_eq!(
+        message.event_id, 1,
+        "the mismatched reply consumed no cursor"
+    );
+    assert_eq!(wire_id(&message.data), second_id);
+
+    // Fractional spellings with the same f64 value also remain distinct.
+    // Cancel only one while both backend requests are held open.
+    let mut held = Vec::new();
+    for id in ["1.00000000000000001", "1.00000000000000002"] {
+        let post = tokio::spawn({
+            let client = client.clone();
+            let session = session.clone();
+            async move {
+                let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"session/echo"}}"#);
+                post_raw_jsonrpc(&client, port, &session, body).await
+            }
+        });
+        let arrival = next_arrival(&mut fixture.arrivals).await;
+        assert_eq!(arrival.raw_id, id);
+        held.push((post, arrival));
+    }
+    let cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1.00000000000000001}}"#;
+    let (status, _) = post_raw_jsonrpc(&client, port, &session, cancellation.to_string()).await;
+    assert_eq!(status, 202);
+    for (post, arrival) in held {
+        arrival.release.send(()).unwrap();
+        let (status, body) = post.await.unwrap();
+        assert_multiplexed_acknowledgement(status, &body, "numeric cancellation");
+    }
+    let message = listener.next_message().await;
+    assert_eq!(
+        message.event_id, 2,
+        "only the uncancelled response is published"
+    );
+    assert_eq!(wire_id(&message.data), "1.00000000000000002");
+    drop(listener);
+    fixture.shutdown().await;
 }

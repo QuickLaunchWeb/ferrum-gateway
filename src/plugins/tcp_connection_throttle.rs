@@ -39,7 +39,7 @@ pub(crate) struct TcpConnectionThrottleState {
 
 impl TcpConnectionThrottleState {
     fn new(pool_shard_amount: usize) -> Arc<Self> {
-        let shard_amount = crate::util::sharding::pool_shard_amount(pool_shard_amount).max(2);
+        let shard_amount = crate::util::sharding::pool_shard_amount(pool_shard_amount);
         Arc::new(Self {
             active_counts: DashMap::with_shard_amount(shard_amount),
             cleanup_task: Mutex::new(CleanupTask {
@@ -334,7 +334,7 @@ mod tests {
             let state = TcpConnectionThrottleState::new(override_value);
             assert_eq!(
                 state.active_counts._shard_count(),
-                crate::util::sharding::pool_shard_amount(override_value).max(2)
+                crate::util::sharding::pool_shard_amount(override_value)
             );
         }
     }
