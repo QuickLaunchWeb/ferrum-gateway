@@ -11251,7 +11251,10 @@ fn tools_list_body(request_id: i64) -> Value {
 }
 
 /// One MCP caller: its request context plus that request's header map.
-type McpCaller = (ferrum_edge::plugins::RequestContext, HashMap<String, String>);
+type McpCaller = (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+);
 
 /// Caller authenticated as a gateway Consumer with the given id and username.
 fn caller_as_consumer(body: Value, id: &str, username: &str) -> McpCaller {
@@ -11311,7 +11314,10 @@ async fn reuse_session_as(
 fn assert_session_refused(result: PluginResult) {
     let (status, body, _) = reject_raw(result);
     assert_eq!(status, 404);
-    assert!(body.is_empty(), "refusal must reuse the session error shape");
+    assert!(
+        body.is_empty(),
+        "refusal must reuse the session error shape"
+    );
 }
 
 fn assert_tools_listed(result: PluginResult) {
