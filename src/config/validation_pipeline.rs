@@ -222,7 +222,7 @@ pub(crate) fn quarantine_unconstructible_plugin_configs(config: &mut GatewayConf
 }
 
 /// Collect the rejecting runtime-config validation contract shared by
-/// database full loads and CP incremental updates.
+/// file and database full loads and CP incremental updates.
 ///
 /// Warning-only validation (for example certificate paths and exact consumer
 /// identity collisions) remains mode-specific and is intentionally excluded.

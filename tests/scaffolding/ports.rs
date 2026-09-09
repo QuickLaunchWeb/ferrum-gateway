@@ -276,6 +276,13 @@ pub struct RefusedTcpPort {
 }
 
 impl RefusedTcpPort {
+    /// Begin listening on this exact reservation without releasing its port.
+    pub fn into_listener(self) -> io::Result<TcpListener> {
+        self._socket.listen(1024)?;
+        self._socket.set_nonblocking(true)?;
+        TcpListener::from_std(self._socket.into())
+    }
+
     /// Return the bound `SocketAddr` without releasing the socket.
     pub fn local_addr(&self) -> SocketAddr {
         SocketAddr::from((Ipv4Addr::LOCALHOST, self.port))

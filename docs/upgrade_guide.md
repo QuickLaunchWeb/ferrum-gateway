@@ -215,13 +215,65 @@ RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Fer
 
 **Operator action:** any HTTP/1.1 client that omitted Host (non-conformant scanners, some raw sockets, misconfigured health probes) will start seeing `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that is the intended protocol.
 
+### Retired reqwest SVID generations honor the drain window (issue #4768)
+
+Reqwest-backed pool entries now leave the pool when their retired SVID
+generation's `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` window expires, just as
+H2, gRPC and H3 entries do. Previously the reqwest key's configuration suffix
+prevented the drain matcher from finding these entries, leaving them until
+idle eviction. Current-generation and operator-supplied static identities are
+retained. The default drain value of `0` still disables timed forced drains;
+committed trust withdrawal continues to retire outgoing generations immediately.
+New requests already used the current generation, so this correction concerns
+prompt retirement of pooled clients rather than a change to request admission.
+
+### EndpointSlice ports take precedence for direct endpoint routing (issue #4817)
+
+For selectorless and headless Services that expand onto EndpointSlice addresses,
+a matching slice port now takes precedence over the Service `targetPort`.
+This includes `targetPort` defaulted by Kubernetes to the Service port and an
+explicitly different numeric value: the served object cannot distinguish them.
+Named Service ports match the slice port name; an unnamed Service port matches
+only a sole unnamed slice port. If no matching slice port is available, the
+numeric target remains the fallback. Named targets also match the Service port
+name first; the prior target-name lookup remains a fallback for manual slices
+that do not publish a matching Service port name. Without a targetPort, a
+matching unnamed slice port also takes precedence over the Service port.
+Selector-based ClusterIP routing still uses the Service DNS name and port.
+
+**Operator action:** verify manually managed EndpointSlices carry the intended
+backend port. Headless DNS fallback also uses a matching slice port, since its
+DNS answers are endpoint addresses rather than a ClusterIP. See Kubernetes'
+[EndpointSlice contract](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/).
+
+### Unsupported Gateway API rule actions are rejected (issue #4816)
+
+HTTPRoute and GRPCRoute translation now validates all rules before emitting any
+route configuration. A known but unimplemented filter, including
+`ResponseHeaderModifier`, `URLRewrite`, `RequestMirror` and `ExtensionRef`, or a
+non-empty `backendRefs[].filters`, rejects the whole route with
+`Accepted=False` / `IncompatibleFilters` and `Programmed=False`. Unknown filter
+types and unimplemented rule fields (including `timeouts` and `retry`) report
+`Accepted=False` / `UnsupportedValue`. Previously these declarations were
+silently discarded while the route could report success.
+
+**Operator action:** remove unsupported actions only if their absence is
+acceptable, or use a supported Ferrum configuration surface that enforces the
+required behavior. RequestHeaderModifier and HTTPRoute RequestRedirect remain
+supported. A valid rule does not partially rescue an unsupported sibling in the
+same route; independently valid routes continue to be programmed. Gateway API
+response-header modification remains deferred; the earlier support claim in
+this guide was incorrect. This remains a documented conformance gap, including
+the GRPCRoute filter-type contract that lists response-header modification as Core.
+
 ### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
 
 Auto-emitted `istio-vs-req-xform-*` / `istio-vs-resp-xform-*` consumers no
 longer shadow global `request_transformer` / `response_transformer` instances.
 Global static rules now run first, followed by the matched route rules. This
 changes existing Gateway API `HTTPRoute` deployments using
-`RequestHeaderModifier` or `ResponseHeaderModifier`; newly supported Istio
+`RequestHeaderModifier`; Gateway API `ResponseHeaderModifier` is not yet
+implemented and is rejected during translation. Newly supported Istio
 VirtualService header transforms follow the same composition contract.
 
 **Operator action:** audit HTTPRoute-backed proxies that relied on the former
