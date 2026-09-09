@@ -7989,6 +7989,14 @@ async fn handle_batch_create(
                 if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
                     validation_errors.extend(errors);
                 }
+                if batch
+                    .proxies
+                    .iter()
+                    .any(|proxy| proxy.dispatch_kind.is_stream())
+                    && let Err(errors) = candidate_config.validate_stream_proxies()
+                {
+                    validation_errors.extend(errors);
+                }
                 // Match single-resource admission: legacy duplicates are
                 // already quarantined at load time and must not block
                 // unrelated batch writes. Re-evaluate the authoritative
@@ -8014,6 +8022,9 @@ async fn handle_batch_create(
                 overlay_batch_proxies(&mut candidate_config, &batch.proxies);
                 overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
                 if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
+                    validation_errors.extend(errors);
+                }
+                if let Err(errors) = candidate_config.validate_stream_proxies() {
                     validation_errors.extend(errors);
                 }
             }
@@ -8073,7 +8084,6 @@ async fn handle_batch_create(
         .validate_regex_listen_paths(ValidationAction::Collect)
         .validate_listen_path_encodings(ValidationAction::Collect)
         .validate_unique_listen_paths(ValidationAction::Collect)
-        .validate_stream_proxies(ValidationAction::Collect)
         .run()
     {
         Ok(errs) => validation_errors.extend(errs),

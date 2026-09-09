@@ -8657,6 +8657,50 @@ async fn test_stream_proxy_admin_persists_only_valid_shared_sni_listener_groups(
     );
 }
 
+#[tokio::test]
+async fn batch_rejects_stream_port_conflict_with_persisted_proxy() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let existing = json!({
+        "id": "batch-port-existing",
+        "backend_scheme": "tcp",
+        "backend_host": "existing.internal",
+        "backend_port": 5432,
+        "listen_port": 19014
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &existing).await;
+    assert_eq!(status, 201, "stream proxy seed failed: {body:?}");
+
+    let conflicting_batch = json!({
+        "proxies": [{
+            "id": "batch-port-conflict",
+            "backend_scheme": "tcp",
+            "backend_host": "conflict.internal",
+            "backend_port": 5432,
+            "listen_port": 19014
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &conflicting_batch).await;
+
+    assert_eq!(
+        status, 400,
+        "batch persisted a conflicting stream port: {body:?}"
+    );
+    assert!(
+        body.to_string().contains("Duplicate listen_port 19014"),
+        "expected the canonical listener-group conflict diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-port-conflict", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected stream proxy must not be persisted"
+    );
+}
+
 /// An L4 `stream_match` group of `tcps` proxies is a shape the shared-port
 /// validator explicitly admits, so Admin admission must admit it too.
 ///
