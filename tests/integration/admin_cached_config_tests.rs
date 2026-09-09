@@ -9361,9 +9361,10 @@ async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
         supports_heartbeat: false,
     });
     let dp_token = generate_dp_jwt(secret, "cluster-dp").unwrap();
-    request
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {dp_token}").parse().unwrap());
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {dp_token}").parse().unwrap(),
+    );
     let stream = server.subscribe(request).await.unwrap();
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
