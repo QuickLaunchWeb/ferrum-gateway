@@ -1066,7 +1066,21 @@ pub(crate) fn dispatch_port_overrides_for_selected_subset(
             let mut resolved =
                 ResolvedPortOverride::from_upstream_override(override_config).unwrap_or_default();
             if let Some(outlier) = override_config.outlier_detection_overlay.as_ref() {
-                let mut passive = inherited_passive.cloned().unwrap_or_default();
+                // Preserve native per-port controls which DestinationRule cannot
+                // express, while rebasing the fields it can express onto the
+                // selected subset (or upstream) before applying the port mask.
+                let inherited = inherited_passive.cloned().unwrap_or_default();
+                let mut passive = resolved
+                    .passive_health_check
+                    .take()
+                    .unwrap_or_else(|| inherited.clone());
+                passive.unhealthy_threshold = inherited.unhealthy_threshold;
+                passive.unhealthy_window_seconds = inherited.unhealthy_window_seconds;
+                passive.healthy_after_seconds = inherited.healthy_after_seconds;
+                passive.max_ejection_percent = inherited.max_ejection_percent;
+                passive.consecutive_error_mode = inherited.consecutive_error_mode;
+                passive.consecutive_5xx_ejection_disabled =
+                    inherited.consecutive_5xx_ejection_disabled;
                 crate::modes::mesh::apply_outlier_detection_to_passive(&mut passive, outlier);
                 resolved.passive_health_check = Some(passive);
             }
