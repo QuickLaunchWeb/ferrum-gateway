@@ -2177,6 +2177,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
             }
         }),
         "a2a_gateway" => json!({
+            "discovery": {"rewrite_agent_card_urls": false},
             "mode": "transparent_proxy",
             "endpoint": {
                 "path": "/a2a",
