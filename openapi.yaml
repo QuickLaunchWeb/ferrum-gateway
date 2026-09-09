@@ -9026,7 +9026,11 @@ components:
         backend_tls_client_key_path:
           type: [string, "null"]
           maxLength: 4096
-          description: Path to mTLS client private key (PEM). Max 4096 characters.
+          description: >-
+            Path to mTLS client private key (PEM), or a pkcs11 signer URI with the
+            optional pkcs11 build feature. Module overrides require admission by
+            FERRUM_PKCS11_MODULE_ALLOWED_PATHS on each node. Without that policy,
+            omit module options to use FERRUM_PKCS11_MODULE_PATH. Max 4096 characters.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
@@ -12458,6 +12462,9 @@ components:
           description: >-
             Path to a PEM-encoded private key matching
             `backend_tls_client_cert_path`. Required when the cert path is set.
+            With the optional pkcs11 build feature, also accepts a pkcs11 signer
+            URI. Module overrides require FERRUM_PKCS11_MODULE_ALLOWED_PATHS on
+            each node; without it, omit module options to use FERRUM_PKCS11_MODULE_PATH.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
