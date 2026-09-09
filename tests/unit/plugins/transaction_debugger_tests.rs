@@ -1158,7 +1158,8 @@ fn test_json_body_redacts_exact_sensitive_field_names_and_data_source_parameters
         }}]
     }}"#
     );
-    let sample = plugin.render_captured_body(body.as_bytes(), BodyKind::Json, 512);
+    // Well above the body's size: this test is about redaction, not truncation.
+    let sample = plugin.render_captured_body(body.as_bytes(), BodyKind::Json, 8_192);
     for secret in [
         AZURE_SEARCH_KEY,
         "passphrase-secret-value",
