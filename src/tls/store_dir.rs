@@ -32,7 +32,7 @@ fn enforce_private_store_dir_mode(path: &Path, existed: bool) -> std::io::Result
     if existed {
         if mode & 0o077 != 0 {
             warn!(
-                path = %path,
+                path = %path.display(),
                 mode = format!("{mode:o}"),
                 "TLS store directory is more permissive than 0700; tighten permissions manually"
             );
