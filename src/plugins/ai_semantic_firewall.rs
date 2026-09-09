@@ -3769,8 +3769,13 @@ impl StreamWindowEngine {
             // A frame the Anthropic path could not fold into the reassembled
             // document leaves this window uninspectable, so block mode keeps
             // holding rather than releasing bytes no verdict ever covered.
-            let inspectable =
-                parsed.fully_parsed && !self.reassembler.provider_stream_uninspectable();
+            let inspectable = parsed.fully_parsed
+                && !self.reassembler.provider_stream_uninspectable()
+                // Gemini candidates are independent client-visible streams, but
+                // release() retains one aggregate overlap. Until overlap is
+                // tracked per candidate, fail closed so padding in one candidate
+                // cannot evict another candidate's cross-frame policy context.
+                && !self.reassembler.has_multiple_gemini_candidates();
             (
                 inspectable,
                 if self.store_frames {

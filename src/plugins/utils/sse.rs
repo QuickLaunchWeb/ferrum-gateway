@@ -518,6 +518,10 @@ pub struct SseReassembler {
     gemini_candidates: Vec<(usize, GeminiCandidateAccumulator)>,
     /// Lookup table for `gemini_candidates`, avoiding linear scans over untrusted indexes.
     gemini_candidate_positions: HashMap<usize, usize>,
+    /// First content-bearing Gemini candidate observed in this stream.
+    gemini_first_candidate: Option<usize>,
+    /// Sticky marker for independently rendered Gemini candidate streams.
+    gemini_multiple_candidates: bool,
     /// Set when part of an identified provider stream (Anthropic Messages or
     /// Gemini `streamGenerateContent`) could not be reassembled into the paths
     /// this type exposes. Sticky for the rest of the stream.
@@ -668,6 +672,16 @@ impl SseReassembler {
     /// content it never scanned. Sticky once set.
     pub fn provider_stream_uninspectable(&self) -> bool {
         self.provider_uninspectable
+    }
+
+    /// Whether this is a Gemini stream with independently rendered candidates.
+    ///
+    /// Buffered inspection can safely inspect every fully reassembled candidate,
+    /// but windowed inspection currently retains one aggregate prose overlap.
+    /// Its caller must therefore fail closed instead of allowing one candidate's
+    /// padding to evict another candidate's cross-frame continuity.
+    pub fn has_multiple_gemini_candidates(&self) -> bool {
+        self.gemini_multiple_candidates
     }
 
     /// Reassembled fragments as of now, **without** consuming the accumulator —
@@ -1395,6 +1409,13 @@ impl SseReassembler {
                 self.provider_uninspectable = true;
                 continue;
             };
+            if !parts.is_empty() {
+                match self.gemini_first_candidate {
+                    Some(first) if first != index => self.gemini_multiple_candidates = true,
+                    None => self.gemini_first_candidate = Some(index),
+                    Some(_) => {}
+                }
+            }
             for part in parts {
                 if !self.absorb_gemini_part(index, part) {
                     self.provider_uninspectable = true;
