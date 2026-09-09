@@ -183,6 +183,8 @@ impl V001SqlBuilder {
         sqlx::query(self.create_audit_events_sql())
             .execute(&mut *connection)
             .await?;
+        self.ensure_proxy_tcp_idle_timeout_column(connection)
+            .await?;
         self.ensure_audit_event_context_columns(connection).await?;
         self.create_audit_event_indexes(connection).await?;
         self.remove_obsolete_listen_port_uniqueness(connection)
@@ -190,6 +192,36 @@ impl V001SqlBuilder {
         self.create_full_load_indexes(connection).await?;
         self.create_config_change_indexes(connection).await?;
         self.ensure_namespaces_registry(connection).await?;
+        Ok(())
+    }
+
+    async fn ensure_proxy_tcp_idle_timeout_column(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        const COLUMN: &str = "tcp_idle_timeout_seconds";
+        if self
+            .table_column_exists(connection, "proxies", COLUMN)
+            .await?
+        {
+            return Ok(());
+        }
+
+        if let Err(error) =
+            sqlx::query("ALTER TABLE proxies ADD COLUMN tcp_idle_timeout_seconds INTEGER")
+                .execute(&mut *connection)
+                .await
+        {
+            // Treat an ALTER raced by another gateway as successful only when
+            // the expected column is now visible.
+            if !self
+                .table_column_exists(connection, "proxies", COLUMN)
+                .await?
+            {
+                return Err(error.into());
+            }
+        }
+
         Ok(())
     }
 
@@ -248,17 +280,27 @@ impl V001SqlBuilder {
         connection: &mut AnyConnection,
         column: &str,
     ) -> Result<bool, anyhow::Error> {
+        self.table_column_exists(connection, "audit_events", column)
+            .await
+    }
+
+    async fn table_column_exists(
+        &self,
+        connection: &mut AnyConnection,
+        table: &str,
+        column: &str,
+    ) -> Result<bool, anyhow::Error> {
         if self.is_sqlite() {
-            let rows = sqlx::query("PRAGMA table_info(audit_events)")
-                .fetch_all(&mut *connection)
-                .await?;
+            let sql = format!("PRAGMA table_info({table})");
+            let rows = sqlx::query(&sql).fetch_all(&mut *connection).await?;
             return Ok(rows.iter().any(|row| {
                 row.try_get::<String, _>("name")
                     .is_ok_and(|name| name == column)
             }));
         }
 
-        Ok(sqlx::query(self.audit_event_column_exists_sql())
+        Ok(sqlx::query(self.table_column_exists_sql())
+            .bind(table)
             .bind(column)
             .fetch_optional(&mut *connection)
             .await?
@@ -543,17 +585,15 @@ impl V001SqlBuilder {
         matches!(self.dialect, SqlDialect::Sqlite)
     }
 
-    fn audit_event_column_exists_sql(&self) -> &'static str {
+    fn table_column_exists_sql(&self) -> &'static str {
         if self.is_mysql() {
             "SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'audit_events' \
-             AND column_name = ?"
+             WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?"
         } else {
             // Postgres native placeholders are $1..$n; a trailing `?` is parsed
             // as an incomplete operator and fails with "syntax error at end of input".
             "SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = current_schema() AND table_name = 'audit_events' \
-             AND column_name = $1"
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2"
         }
     }
 
@@ -2018,8 +2058,8 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_audit_event_column_exists_sql_uses_dialect_placeholders() {
-        let mysql_sql = V001SqlBuilder::new("mysql").audit_event_column_exists_sql();
+    fn test_table_column_exists_sql_uses_dialect_placeholders() {
+        let mysql_sql = V001SqlBuilder::new("mysql").table_column_exists_sql();
         assert!(
             mysql_sql.contains("column_name = ?"),
             "MySQL information_schema probe must use `?` placeholders"
@@ -2029,10 +2069,10 @@ mod tests {
             "MySQL information_schema probe must not use Postgres `$1` placeholders"
         );
 
-        let postgres_sql = V001SqlBuilder::new("postgres").audit_event_column_exists_sql();
+        let postgres_sql = V001SqlBuilder::new("postgres").table_column_exists_sql();
         assert!(
-            postgres_sql.contains("column_name = $1"),
-            "Postgres information_schema probe must use `$1` placeholders"
+            postgres_sql.contains("table_name = $1 AND column_name = $2"),
+            "Postgres information_schema probe must use ordered placeholders"
         );
         assert!(
             !postgres_sql.contains("column_name = ?"),

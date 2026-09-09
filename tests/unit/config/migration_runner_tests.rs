@@ -1061,6 +1061,31 @@ async fn test_v001_schema_includes_tcp_idle_timeout_seconds() {
 }
 
 #[tokio::test]
+async fn test_run_pending_adds_tcp_idle_timeout_to_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    sqlx::query("ALTER TABLE proxies DROP COLUMN tcp_idle_timeout_seconds")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(applied.is_empty(), "V001 must remain already applied");
+
+    sqlx::query(
+        "INSERT INTO proxies (id, name, listen_path, backend_host, backend_port, hosts, \
+         tcp_idle_timeout_seconds, created_at, updated_at) \
+         VALUES ('upgraded-proxy', 'upgraded', '/upgraded', 'localhost', 8080, '[]', \
+         120, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("upgraded V001 database must accept the TCP idle timeout column");
+}
+
+#[tokio::test]
 async fn test_v001_tcp_idle_timeout_seconds_nullable() {
     let pool = test_pool().await;
 
