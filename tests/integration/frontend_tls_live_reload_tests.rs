@@ -976,14 +976,23 @@ async fn admin_https_with_client_ca_refuses_anonymous_tls_client() {
         Arc::new(ArcSwap::new(Arc::new(Some(admin_mtls_server_config(&pki)))));
     let (addr, shutdown_tx, listener) = start_admin_https_listener(slot, 10).await;
 
-    let result = establish_admin_connection(
+    // TLS 1.3 lets the client finish its side of the handshake before the
+    // server's `certificate_required` alert arrives, so a refused anonymous
+    // client surfaces either at connect or on its first request — never as a
+    // served response.
+    let outcome = match establish_admin_connection(
         addr,
         admin_client_config(&pki, false, &[b"http/1.1"]),
         false,
     )
-    .await;
-    assert!(
-        result.is_err(),
+    .await
+    {
+        Err(_) => AdminAttempt::TransportFailed,
+        Ok((mut transport, _driver)) => transport.live_probe().await,
+    };
+    assert_eq!(
+        outcome,
+        AdminAttempt::TransportFailed,
         "anonymous TLS client must be refused when admin client CA is configured"
     );
 
