@@ -2099,10 +2099,10 @@ impl ConfigSync for CpGrpcServer {
         let node_id = inner.node_id;
         let dp_version = inner.ferrum_version;
         let dp_namespace = inner.namespace;
-        // Heartbeat capability is negotiated, not assumed. A DP that predates
-        // `ConfigUpdate.heartbeat` would read an empty heartbeat envelope as an
-        // unusable FULL_SNAPSHOT and churn through reconnects, so only
-        // advertising subscribers ever receive keepalive frames.
+        // Heartbeat capability is negotiated, not assumed. Non-advertising
+        // subscribers receive periodic full snapshots instead: those are safe
+        // for DPs that predate heartbeat envelopes and also keep the immediately
+        // preceding heartbeat-capable DP from tripping its silence watchdog.
         let heartbeats_negotiated = inner.supports_heartbeat;
 
         // Reject DPs with incompatible versions before streaming any config.
@@ -2280,24 +2280,62 @@ impl ConfigSync for CpGrpcServer {
         // silent-partition detection, then wrap in TrackedStream so the DP is
         // automatically de-registered when the gRPC stream is dropped.
         //
-        // The timer is built unconditionally to keep one concrete stream type;
-        // when the DP did not advertise heartbeat support every tick is dropped
-        // and no frame is ever written, so a legacy subscriber sees exactly the
-        // pre-heartbeat stream contents.
+        // The timer is built unconditionally to keep one concrete stream type.
+        // Negotiated subscribers get lightweight heartbeat envelopes. Legacy
+        // subscribers get a current full snapshot because an older DP that
+        // understands heartbeat envelopes but cannot advertise support may have
+        // already armed a silence watchdog. A full snapshot is understood by
+        // both that release and DPs that predate heartbeat envelopes.
         let initial_stream = tokio_stream::once(Ok(initial));
         let heartbeat_config = self.config.clone();
+        let heartbeat_namespace = dp_namespace.clone();
+        let heartbeat_scope = self.scope.clone();
         let heartbeat_stream = IntervalStream::new(interval_at(
             Instant::now() + CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
             CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
         ))
         .filter_map(move |_| {
-            if !heartbeats_negotiated {
-                return None;
-            }
             let current = heartbeat_config.load_full();
-            Some(Ok(Self::build_configsync_heartbeat(
-                current.loaded_at.to_rfc3339(),
-            )))
+            if heartbeats_negotiated {
+                return Some(Ok(Self::build_configsync_heartbeat(
+                    current.loaded_at.to_rfc3339(),
+                )));
+            }
+
+            let (filtered, trust_bundles_json) = match Self::filter_config_and_trust_for_scope(
+                current.as_ref(),
+                &heartbeat_namespace,
+                &heartbeat_scope,
+            ) {
+                Ok(publication) => publication,
+                Err(failure_class) => {
+                    error!(
+                        namespace = %heartbeat_namespace,
+                        failure_class,
+                        "Terminating legacy ConfigSync keepalive because gateway trust is unusable"
+                    );
+                    return Some(Err(Status::internal(
+                        "Failed to prepare legacy ConfigSync keepalive snapshot",
+                    )));
+                }
+            };
+            Some(
+                Self::config_json_for_dp(&filtered)
+                    .map(|config_json| ConfigUpdate {
+                        update_type: 0,
+                        config_json,
+                        version: current.loaded_at.to_rfc3339(),
+                        timestamp: Utc::now().timestamp(),
+                        ferrum_version: FERRUM_VERSION.to_string(),
+                        trust_bundles_json,
+                        heartbeat: false,
+                        heartbeat_negotiated: false,
+                    })
+                    .map_err(|error| {
+                        error!("Failed to serialize legacy ConfigSync keepalive snapshot: {error}");
+                        Status::internal("Failed to serialize legacy ConfigSync keepalive snapshot")
+                    }),
+            )
         });
         let combined = initial_stream.chain(stream::select(stream, heartbeat_stream));
         let tracked = TrackedStream {

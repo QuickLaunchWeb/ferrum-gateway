@@ -5591,8 +5591,8 @@ async fn dp_returns_promptly_on_shutdown_of_a_healthy_idle_stream() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn cp_only_negotiates_heartbeats_with_subscribers_that_advertise_support() {
+#[tokio::test(start_paused = true)]
+async fn cp_uses_compatible_keepalives_for_advertising_and_legacy_subscribers() {
     // Issue #2395 mixed-version, new CP → legacy DP: heartbeats are a negotiated
     // capability. A subscriber that does not advertise support must never be
     // told heartbeats are on, and therefore never receives an empty heartbeat
@@ -5625,6 +5625,21 @@ async fn cp_only_negotiates_heartbeats_with_subscribers_that_advertise_support()
         assert_eq!(
             initial.heartbeat_negotiated, advertises,
             "CP must confirm heartbeats only to subscribers that advertised them"
+        );
+
+        tokio::time::advance(ferrum_edge::grpc::cp_server::CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL)
+            .await;
+        let keepalive = timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("keepalive should arrive")
+            .expect("stream ok")
+            .expect("keepalive present");
+        assert_eq!(keepalive.heartbeat, advertises);
+        assert_eq!(keepalive.heartbeat_negotiated, advertises);
+        assert_eq!(
+            keepalive.config_json.is_empty(),
+            advertises,
+            "advertising DPs get lightweight envelopes; legacy DPs get valid full snapshots"
         );
     }
 }

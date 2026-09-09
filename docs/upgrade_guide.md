@@ -965,7 +965,7 @@ ignore them.
 | CP | DP | Behavior |
 |----|----|----------|
 | New | New | CP sends heartbeat frames; DP arms the 150s application silence watchdog |
-| New | Legacy | DP never advertises support, so the CP sends **no** heartbeat frames — the legacy DP never sees an empty envelope and never churns |
+| New | Legacy | DP never advertises support, so the CP sends periodic current full snapshots instead of heartbeat envelopes. This is safe for pre-heartbeat DPs and prevents silence-watchdog churn in the immediately preceding heartbeat-capable patch. |
 | Legacy | New | CP never confirms, so the DP does **not** arm the silence watchdog — no reconnect the legacy CP was never asked to prevent. HTTP/2 PING and TCP keepalive still cover the stream |
 
 **Delta removal keys stay wire-compatible in both directions.** Incremental

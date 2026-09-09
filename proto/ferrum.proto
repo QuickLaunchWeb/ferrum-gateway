@@ -33,9 +33,10 @@ message SubscribeRequest {
   // Additive ConfigSync capability advertisement: this DP understands
   // `ConfigUpdate.heartbeat` keepalive frames and will arm an application
   // silence watchdog once the CP confirms it will send them. Absent/false on
-  // peers that predate heartbeats, so a CP must never send heartbeats to a DP
-  // that did not advertise support — an unnegotiated empty heartbeat envelope
-  // would read as an unusable FULL_SNAPSHOT to such a DP.
+  // peers that predate heartbeats, so a CP must never send heartbeat envelopes
+  // to a DP that did not advertise support — an unnegotiated empty envelope
+  // would read as an unusable FULL_SNAPSHOT. The CP may use real full snapshots
+  // as backwards-compatible keepalives for non-advertising subscribers.
   bool supports_heartbeat = 5;
 }
 
