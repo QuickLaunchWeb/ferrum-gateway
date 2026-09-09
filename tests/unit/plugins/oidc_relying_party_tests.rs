@@ -69,6 +69,45 @@ fn html_ctx() -> RequestContext {
     ctx
 }
 
+fn callback_config() -> serde_json::Value {
+    let mut config = base_config();
+    // Callback tests exercise cookie binding, not expiry. Allow the maximum
+    // state lifetime so coverage instrumentation does not consume the budget.
+    config["behavior"]["state_ttl_secs"] = json!(3600);
+    config
+}
+
+async fn prepare_callback_jwks(server: &MockServer) {
+    // Callers hold jwks_remote_global_cache: another test must not clear the
+    // store or abort its refresh while this fixture is using it.
+    let uri = format!("{}/jwks", server.uri());
+    let store = ferrum_edge::plugins::utils::jwks_cache::cached_store(&uri)
+        .expect("callback plugin registered its JWKS store");
+    // Await real readiness, not a sleep or a callback retry (state is one-use).
+    // The default client allows 30s to connect and 60s per JWKS request. The
+    // token exchange has its own production 10s timeout; its mock has no delay.
+    // Fetch the mounted document even if wiremock reused a previous server's
+    // address and the global cache retained that fixture's keys.
+    tokio::time::timeout(Duration::from_secs(120), store.fetch_keys())
+        .await
+        .expect("callback JWKS fixture must become ready")
+        .expect("callback JWKS fixture must publish valid keys");
+    assert!(store.has_keys(), "callback JWKS fixture has no keys");
+}
+
+fn assert_callback_redirect(result: PluginResult) -> HashMap<String, String> {
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = result
+    else {
+        panic!("expected callback redirect, got {result:?}");
+    };
+    assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}");
+    headers
+}
+
 #[derive(Clone)]
 struct BrowserChallenge {
     state: String,
@@ -86,15 +125,15 @@ async fn issue_browser_challenge_for_context(
 ) -> BrowserChallenge {
     let PluginResult::Reject {
         status_code,
+        body,
         headers,
-        ..
     } = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await
     else {
         panic!("expected browser challenge");
     };
-    assert_eq!(status_code, 302);
+    assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}");
     let location = Url::parse(headers.get("location").expect("authorization URL"))
         .expect("authorization URL parses");
     let state = location
@@ -1855,6 +1894,7 @@ async fn correlation_cookie_ignores_configured_session_domain() {
     assert_host_only_correlation_cookie(&challenge.cookie, "600");
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn successful_callback_clears_host_only_correlation_cookie_and_preserves_session_domain() {
     let server = MockServer::start().await;
@@ -1868,21 +1908,14 @@ async fn successful_callback_clears_host_only_correlation_cookie_and_preserves_s
         .mount(&server)
         .await;
 
-    let mut config = base_config();
+    let mut config = callback_config();
     config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
     config["session"]["domain"] = json!("example.com");
     let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(&server).await;
     let challenge = issue_browser_challenge(&plugin).await;
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     Mock::given(method("POST"))
         .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1898,15 +1931,7 @@ async fn successful_callback_clears_host_only_correlation_cookie_and_preserves_s
     callback
         .query_params
         .insert("code".to_string(), "authorization-code".to_string());
-    let PluginResult::Reject {
-        status_code,
-        headers,
-        ..
-    } = plugin.on_request_received(&mut callback).await
-    else {
-        panic!("expected successful callback redirect");
-    };
-    assert_eq!(status_code, 302);
+    let headers = assert_callback_redirect(plugin.on_request_received(&mut callback).await);
     let cookies: Vec<&str> = headers
         .get("set-cookie")
         .expect("session and correlation cookies")
@@ -2229,16 +2254,32 @@ async fn mount_token_and_jwks_document(
         })))
         .mount(server)
         .await;
+    prepare_callback_jwks(server).await;
 }
 
-fn plugin_pair_for_server(
+async fn plugin_pair_for_server(
     server: &MockServer,
 ) -> (serde_json::Value, OidcRelyingParty, OidcRelyingParty) {
-    let mut config = base_config();
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    plugin_pair_for_jwks(server, build_rsa_jwks_from_pem(public_key_pem)).await
+}
+
+async fn plugin_pair_for_jwks(
+    server: &MockServer,
+    jwks: serde_json::Value,
+) -> (serde_json::Value, OidcRelyingParty, OidcRelyingParty) {
+    // Construction starts background fetching, so publish the mock first.
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+        .mount(server)
+        .await;
+    let mut config = callback_config();
     config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
     let starter = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
     let completer = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(server).await;
     (config, starter, completer)
 }
 
@@ -2254,30 +2295,23 @@ async fn complete_callback(
     plugin.on_request_received(&mut callback).await
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn cross_replica_callback_accepts_sealed_pending_flow() {
     let server = MockServer::start().await;
-    let (_, starter, completer) = plugin_pair_for_server(&server);
+    let (_, starter, completer) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&starter).await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     mount_token_and_jwks(&server, &id_token).await;
 
     match complete_callback(&completer, &challenge, "authorization-code").await {
         PluginResult::Reject {
             status_code,
+            body,
             headers,
-            ..
         } => {
-            assert_eq!(status_code, 302);
+            assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}");
             assert!(
                 headers
                     .get("set-cookie")
@@ -2289,27 +2323,53 @@ async fn cross_replica_callback_accepts_sealed_pending_flow() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn same_instance_callback_still_completes_with_sealed_pending_flow() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     mount_token_and_jwks(&server, &id_token).await;
 
     match complete_callback(&plugin, &challenge, "authorization-code").await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}"),
         other => panic!("expected same-instance success, got {other:?}"),
     }
+}
+
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn callback_fixture_waits_for_delayed_jwks_before_issuing_state() {
+    let server = MockServer::start().await;
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem))
+                .set_delay(Duration::from_millis(250)),
+        )
+        .mount(&server)
+        .await;
+    let mut config = callback_config();
+    config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(&server).await;
+
+    let challenge = issue_browser_challenge(&plugin).await;
+    let id_token = create_rs256_token(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    mount_token_and_jwks(&server, &id_token).await;
+    assert_callback_redirect(complete_callback(&plugin, &challenge, "authorization-code").await);
 }
 
 fn two_key_oidc_jwks() -> serde_json::Value {
@@ -2327,11 +2387,14 @@ fn two_key_oidc_jwks() -> serde_json::Value {
 }
 
 fn oidc_id_token_claims(challenge: &BrowserChallenge) -> serde_json::Value {
+    // No iat/nbf boundary is needed by these cookie/kid tests. Keep exp far
+    // beyond setup and callback work, including instrumented coverage builds.
     json!({
         "iss": "https://issuer.example.com",
         "aud": "ferrum-gateway",
         "sub": "user-1",
         "nonce": challenge.nonce.as_str(),
+        "exp": chrono::Utc::now().timestamp() + 86_400,
     })
 }
 
@@ -2351,10 +2414,11 @@ fn assert_invalid_id_token(result: PluginResult) {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_callback_rejects_id_token_without_kid() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let id_token = create_rs256_token_no_kid(
         &oidc_id_token_claims(&challenge),
@@ -2364,10 +2428,11 @@ async fn oidc_callback_rejects_id_token_without_kid() {
     assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_callback_rejects_unknown_kid_even_when_another_published_key_verifies() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let id_token = create_rs256_token_with_kid(
         &oidc_id_token_claims(&challenge),
@@ -2378,10 +2443,11 @@ async fn oidc_callback_rejects_unknown_kid_even_when_another_published_key_verif
     assert_invalid_id_token(complete_callback(&plugin, &challenge, "authorization-code").await);
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_callback_rejects_known_kid_signed_by_a_different_published_key() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let id_token = create_rs256_token_with_kid(
         &oidc_id_token_claims(&challenge),
@@ -2399,7 +2465,7 @@ async fn oidc_callback_rejects_known_kid_signed_by_a_different_published_key() {
 #[tokio::test]
 async fn oidc_unknown_kid_reaches_the_shared_store_on_demand_refetch() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let jwks_uri = format!("{}/jwks", server.uri());
     let store = ferrum_edge::plugins::utils::jwks_cache::cached_store(&jwks_uri)
         .expect("the relying party shares the process-wide JWKS store");
@@ -2426,10 +2492,11 @@ async fn oidc_unknown_kid_reaches_the_shared_store_on_demand_refetch() {
     );
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_callback_accepts_id_token_with_matching_kid() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_jwks(&server, two_key_oidc_jwks()).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let id_token = create_rs256_token_with_kid(
         &oidc_id_token_claims(&challenge),
@@ -2438,15 +2505,20 @@ async fn oidc_callback_accepts_id_token_with_matching_kid() {
     );
     mount_token_and_jwks_document(&server, two_key_oidc_jwks(), &id_token).await;
     match complete_callback(&plugin, &challenge, "authorization-code").await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}"),
         other => panic!("expected matching-kid callback success, got {other:?}"),
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn cross_replica_callback_rejects_wrong_encryption_secret() {
     let server = MockServer::start().await;
-    let (mut config, starter, _) = plugin_pair_for_server(&server);
+    let (mut config, starter, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&starter).await;
     config["session"]["encryption_secret"] = json!("abcdefghijklmnopqrstuvwxyz123456");
     let wrong_secret = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
@@ -2462,10 +2534,11 @@ async fn cross_replica_callback_rejects_wrong_encryption_secret() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn cross_replica_callback_rejects_wrong_session_context() {
     let server = MockServer::start().await;
-    let (mut config, starter, _) = plugin_pair_for_server(&server);
+    let (mut config, starter, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&starter).await;
     config["providers"][0]["client_id"] = json!("other-client");
     let other_context = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
@@ -2481,10 +2554,11 @@ async fn cross_replica_callback_rejects_wrong_session_context() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn sealed_pending_flow_rejects_tampered_correlation_cookie() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let mut tampered = challenge.clone();
     let pair = cookie_pair(&challenge.cookie);
@@ -2514,6 +2588,7 @@ async fn sealed_pending_flow_rejects_tampered_correlation_cookie() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn sealed_pending_flow_rejects_expired_state() {
     let server = MockServer::start().await;
@@ -2564,30 +2639,17 @@ async fn sealed_pending_flow_rejects_oversized_correlation_cookie() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn same_instance_rejects_replay_after_sealed_state_is_accepted() {
     let server = MockServer::start().await;
-    let (_, plugin, _) = plugin_pair_for_server(&server);
+    let (_, plugin, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&plugin).await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     mount_token_and_jwks(&server, &id_token).await;
 
-    assert!(matches!(
-        complete_callback(&plugin, &challenge, "authorization-code").await,
-        PluginResult::Reject {
-            status_code: 302,
-            ..
-        }
-    ));
+    assert_callback_redirect(complete_callback(&plugin, &challenge, "authorization-code").await);
     match complete_callback(&plugin, &challenge, "authorization-code").await {
         PluginResult::Reject {
             status_code, body, ..
@@ -2599,27 +2661,15 @@ async fn same_instance_rejects_replay_after_sealed_state_is_accepted() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn provider_authorization_code_remains_one_time_across_replicas() {
     let server = MockServer::start().await;
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let mut config = base_config();
+    let mut config = callback_config();
     config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
-    let starter = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
-    let completer = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
-    let challenge = issue_browser_challenge(&starter).await;
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
-
     Mock::given(method("GET"))
         .and(path("/jwks"))
         .respond_with(
@@ -2627,6 +2677,12 @@ async fn provider_authorization_code_remains_one_time_across_replicas() {
         )
         .mount(&server)
         .await;
+    let starter = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let completer = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(&server).await;
+    let challenge = issue_browser_challenge(&starter).await;
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
+
     let exchanges = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&exchanges);
     Mock::given(method("POST"))
@@ -2648,7 +2704,11 @@ async fn provider_authorization_code_remains_one_time_across_replicas() {
         .await;
 
     match complete_callback(&completer, &challenge, "one-time-code").await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}"),
         other => panic!("expected first replica success, got {other:?}"),
     }
     match complete_callback(&starter, &challenge, "one-time-code").await {
@@ -2663,36 +2723,30 @@ async fn provider_authorization_code_remains_one_time_across_replicas() {
     assert_eq!(exchanges.load(Ordering::SeqCst), 2);
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn previous_encryption_secret_accepts_pending_flow_during_rotation() {
     let server = MockServer::start().await;
     let old_secret = "01234567890123456789012345678901";
     let new_secret = "abcdefghijklmnopqrstuvwxyz123456";
-    let mut starter_config = base_config();
-    starter_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
-    starter_config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
-    starter_config["session"]["encryption_secret"] = json!(old_secret);
+    let (starter_config, starter, _) = plugin_pair_for_server(&server).await;
+    assert_eq!(starter_config["session"]["encryption_secret"], old_secret);
     let mut completer_config = starter_config.clone();
     completer_config["session"]["encryption_secret"] = json!(new_secret);
     completer_config["session"]["encryption_secret_previous"] = json!(old_secret);
 
-    let starter = OidcRelyingParty::new(&starter_config, PluginHttpClient::default()).unwrap();
     let completer = OidcRelyingParty::new(&completer_config, PluginHttpClient::default()).unwrap();
     let challenge = issue_browser_challenge(&starter).await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let id_token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "aud": "ferrum-gateway",
-            "sub": "user-1",
-            "nonce": challenge.nonce.as_str(),
-        }),
-        private_key_pem,
-    );
+    let id_token = create_rs256_token(&oidc_id_token_claims(&challenge), private_key_pem);
     mount_token_and_jwks(&server, &id_token).await;
 
     match complete_callback(&completer, &challenge, "authorization-code").await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 302),
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => assert_eq!(status_code, 302, "body: {body}; headers: {headers:?}"),
         other => panic!("expected previous-secret rotation success, got {other:?}"),
     }
 }
