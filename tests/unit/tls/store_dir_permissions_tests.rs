@@ -61,7 +61,7 @@ fn event_log_store_dir_is_owner_only_under_permissive_umask() {
     let store_dir = parent.path().join("tls-events");
     let event_path = store_dir.join("tls-events.json");
 
-    TlsEventLog::open(16, Some(event_path)).expect("open event log");
+    TlsEventLog::open(16, Some(event_path.clone())).expect("open event log");
 
     use std::os::unix::fs::PermissionsExt;
 
