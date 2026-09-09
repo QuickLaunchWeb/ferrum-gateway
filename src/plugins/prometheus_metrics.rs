@@ -4378,18 +4378,10 @@ impl MetricsRegistry {
             "# HELP ferrum_mesh_dns_upstream_id_exhaustions_total Mesh DNS upstream transaction ID exhaustion events.\n",
         );
         output.push_str("# TYPE ferrum_mesh_dns_upstream_id_exhaustions_total counter\n");
-        if ns_label.is_empty() {
-            output.push_str(&format!(
-                "ferrum_mesh_dns_upstream_id_exhaustions_total {}\n",
-                mesh_dns_exhaustions
-            ));
-        } else {
-            output.push_str(&format!(
-                "ferrum_mesh_dns_upstream_id_exhaustions_total{{{}}} {}\n",
-                namespace_label_body(&ns_label),
-                mesh_dns_exhaustions
-            ));
-        }
+        output.push_str(&format!(
+            "ferrum_mesh_dns_upstream_id_exhaustions_total {}\n",
+            mesh_dns_exhaustions
+        ));
 
         if !self.hbone_relay_failure_counter.is_empty() {
             output.push_str(
