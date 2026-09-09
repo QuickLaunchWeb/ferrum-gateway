@@ -776,7 +776,13 @@ pub fn validate_migration_history_integrity(
                 return Err(integrity_error(backend, &applied.namespace, reason));
             }
 
-            if applied_migration.checksum != declared_migration.checksum {
+            let preserves_v001_compatibility = applied.namespace == MigrationHistoryNamespace::Core
+                && applied_migration.version == 1
+                && v001_initial_schema::COMPATIBLE_UPSTREAMS_PK_FIX_CHECKSUMS
+                    .contains(&applied_migration.checksum.as_str());
+            if applied_migration.checksum != declared_migration.checksum
+                && !preserves_v001_compatibility
+            {
                 return Err(integrity_error(
                     backend,
                     &applied.namespace,

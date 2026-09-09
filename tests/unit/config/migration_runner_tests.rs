@@ -828,6 +828,26 @@ async fn core_checksum_drift_blocks_status_and_compatibility_writes() {
 }
 
 #[tokio::test]
+async fn pre_mysql_upstreams_pk_fix_v001_checksum_remains_compatible() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind("sha256:094e4c56370bba562f1feeafe0b18403e8eb26c22e23d8b083e773a468180038")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let status = runner
+        .status()
+        .await
+        .expect("the historical V001 checksum must remain valid");
+    assert!(status.pending.is_empty());
+    assert!(runner.run_pending().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn unknown_applied_core_version_blocks_compatibility_schema_and_history_writes() {
     let pool = test_pool().await;
     sqlx::query(
