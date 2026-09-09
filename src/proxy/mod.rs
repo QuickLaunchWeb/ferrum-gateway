@@ -38347,6 +38347,14 @@ async fn handle_proxy_request_inner(
             cb_probe.release_neutral();
         }
     } else {
+        // A skipped breaker record must not swallow the probe slot: leave it
+        // with the guard, whose `Drop` settles it NEUTRALLY on the breaker
+        // that granted it.
+        let final_probe_slot = if skip_final_cb_record {
+            false
+        } else {
+            cb_probe.take_slot()
+        };
         backend_dispatch::record_backend_outcome_no_conn_end(
             &state,
             &proxy,
@@ -38357,7 +38365,7 @@ async fn handle_proxy_request_inner(
             recorded_backend_status,
             backend_resp.connection_error,
             backend_error_class,
-            cb_probe.take_slot(),
+            final_probe_slot,
             skip_final_cb_record,
             final_backend_dispatch_elapsed,
         );

@@ -142,7 +142,7 @@ const PROBE_GUARD_HOLDERS: &[&str] = &[
 const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str)] = &[
     (
         "explicit gateway-side refusal",
-        "    pub(crate) fn release_neutral(&self) {",
+        "    pub fn release_neutral(&self) {",
         "\n    }\n",
     ),
     (
@@ -231,7 +231,7 @@ fn taking_the_probe_slot_is_what_disarms_the_guard() {
     let text = source("src/proxy/mod.rs");
     let take = item_body(
         &text,
-        "    pub(crate) fn take_slot(&self) -> bool {",
+        "    pub fn take_slot(&self) -> bool {",
         "\n    }\n",
     );
     assert!(
