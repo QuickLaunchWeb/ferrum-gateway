@@ -745,6 +745,8 @@ pub struct MetricsRegistry {
     pub mesh_grpc_response_messages_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    pub ai_rate_limit_local_accounting_tokens: AtomicU64,
+    pub ai_rate_limit_unaccounted_tokens: AtomicU64,
     /// Live OAuth2 introspection cache entries, partitioned into the fixed
     /// active/negative classes. No provider or credential label is retained.
     oauth2_introspection_cache_entries: [AtomicI64; 2],
@@ -992,6 +994,8 @@ impl MetricsRegistry {
             mesh_grpc_request_messages_counter: DashMap::new(),
             mesh_grpc_response_messages_counter: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            ai_rate_limit_local_accounting_tokens: AtomicU64::new(0),
+            ai_rate_limit_unaccounted_tokens: AtomicU64::new(0),
             oauth2_introspection_cache_entries: std::array::from_fn(|_| AtomicI64::new(0)),
             oauth2_introspection_cache_retained_bytes: std::array::from_fn(|_| AtomicI64::new(0)),
             oauth2_introspection_cache_admission_skips: std::array::from_fn(|_| {
@@ -3645,6 +3649,24 @@ impl MetricsRegistry {
         }
 
         // Rate limit exceeded
+        for (name, help, value) in [
+            (
+                "ferrum_ai_rate_limit_local_accounting_tokens_total",
+                "AI tokens charged locally after centralized reconciliation failed.",
+                self.ai_rate_limit_local_accounting_tokens
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_ai_rate_limit_unaccounted_tokens_total",
+                "AI tokens not charged because local reconciliation capacity was exhausted.",
+                self.ai_rate_limit_unaccounted_tokens
+                    .load(Ordering::Relaxed),
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
         output.push_str("# HELP ferrum_rate_limit_exceeded_total Total rate limit rejections.\n");
         output.push_str("# TYPE ferrum_rate_limit_exceeded_total counter\n");
         if ns_label.is_empty() {

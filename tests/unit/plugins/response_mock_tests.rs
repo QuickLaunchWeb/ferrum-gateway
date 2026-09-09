@@ -1182,3 +1182,31 @@ async fn test_no_body_statuses_suppress_configured_body_on_wire() {
         }
     }
 }
+
+#[tokio::test]
+async fn prefix_trailing_slash_preserves_rule_path_coordinates() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{"path": "/users", "body": "users"}, {"path": "/", "body": "root"}]
+    }))
+    .unwrap();
+    for (listen, path, expected) in [
+        ("/api/", "/api/users", "users"),
+        ("/api", "/api/users", "users"),
+        ("/api/", "/api/", "root"),
+        ("/", "/users", "users"),
+        ("~/users", "/users", "users"),
+        ("=/users", "/users", "users"),
+    ] {
+        let mut ctx = make_ctx("GET", path, listen);
+        let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+        let PluginResult::Reject {
+            status_code, body, ..
+        } = result
+        else {
+            panic!("mock must match {listen} at {path}");
+        };
+        assert_eq!(status_code, 200);
+        assert_eq!(body, expected);
+        assert_eq!(ctx.path, path);
+    }
+}

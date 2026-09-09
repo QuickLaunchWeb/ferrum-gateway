@@ -3722,3 +3722,6 @@ async fn udp_amplification_policy_reload_retires_sessions_with_stale_budget() {
 
     manager.shutdown_all().await;
 }
+
+#[path = "stream_runtime_tests.rs"]
+mod stream_runtime_tests;

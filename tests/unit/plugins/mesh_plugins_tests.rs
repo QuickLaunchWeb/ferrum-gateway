@@ -8327,3 +8327,45 @@ fn mesh_bpf_metrics_accepts_its_documented_key() {
     );
     assert!(plugin.is_ok(), "{:?}", plugin.err());
 }
+
+#[tokio::test]
+async fn mesh_host_port_policy_uses_one_decimal_identity() {
+    for hostname in ["svc", "[2001:db8::1]"] {
+        for pattern_port in ["8080", "08080", "0008080", "*"] {
+            for negative in [false, true] {
+                let field = if negative { "not_hosts" } else { "hosts" };
+                let plugin = MeshAuthz::new(&json!({"mesh_policies": [{
+                    "name": "host-port", "namespace": "default",
+                    "scope": {"kind": "mesh_wide"},
+                    "rules": [{"action": "deny", "to": [{
+                        (field): [format!("{hostname}:{pattern_port}")]
+                    }]}]
+                }]}))
+                .unwrap();
+                for request_port in ["8080", "08080", "0008080", "8081"] {
+                    let mut ctx = RequestContext::new(
+                        "127.0.0.1".to_string(),
+                        "GET".to_string(),
+                        "/".to_string(),
+                    );
+                    ctx.headers
+                        .insert("host".into(), format!("{hostname}:{request_port}"));
+                    let result = plugin.authorize(&mut ctx).await;
+                    let matched = request_port != "8081" || pattern_port == "*";
+                    let denied = if negative { !matched } else { matched };
+                    assert_eq!(
+                        matches!(
+                            result,
+                            PluginResult::Reject {
+                                status_code: 403,
+                                ..
+                            }
+                        ),
+                        denied,
+                        "{hostname}:{pattern_port} vs {request_port}, negative={negative}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+}

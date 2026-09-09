@@ -5565,10 +5565,137 @@ fn two_provider_config(primary: &MockServer, secondary: &MockServer) -> Value {
 }
 
 #[tokio::test]
-async fn malformed_success_response_falls_through_to_next_provider() {
+async fn committed_success_normalization_failure_never_replays() {
+    let completion = json!({
+        "id": "chatcmpl-committed",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Already generated."},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    });
+    let mut drifted_object = completion.clone();
+    drifted_object["object"] = json!("chat.completion.changed");
+    let mut legacy_function_call = completion;
+    legacy_function_call["choices"][0]["finish_reason"] = json!("function_call");
+    legacy_function_call["choices"][0]["message"] = json!({
+        "role": "assistant",
+        "content": null,
+        "function_call": {"name": "lookup", "arguments": "{}"}
+    });
+
+    // Exercise both reported provider shapes, an incomplete schema, and
+    // invalid JSON. Completed non-200 successes share the same boundary.
+    for (status, body) in [
+        (200, drifted_object.to_string()),
+        (201, legacy_function_call.to_string()),
+        (202, "{}".to_string()),
+        (299, "not json".to_string()),
+    ] {
+        for allow_ambiguous in [false, true] {
+            let primary = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body.clone()))
+                .mount(&primary)
+                .await;
+            let secondary = MockServer::start().await;
+            mount_openai_success(&secondary).await;
+            let mut config = two_provider_config(&primary, &secondary);
+            if allow_ambiguous {
+                config["fallback_on_ambiguous_errors"] = json!(true);
+            }
+            let plugin =
+                ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+            let dedup = RequestDeduplication::new(
+                &json!({"applicable_methods": ["POST"], "enforce_required": true}),
+                create_test_http_client(),
+            )
+            .unwrap();
+            let request = json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let mut headers = json_headers();
+            headers.insert(
+                "idempotency-key".to_string(),
+                format!("committed-normalization-{status}-{allow_ambiguous}"),
+            );
+            let mut ctx = post_json_ctx(&request);
+            assert!(matches!(
+                dedup.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+            let (response_status, response_headers, response_body) =
+                match run_federation_final_body(&plugin, &mut ctx, &headers).await {
+                    PluginResult::RejectBinary {
+                        status_code,
+                        headers,
+                        body,
+                    } => (status_code, headers, body),
+                    other => panic!("expected normalization error, got {other:?}"),
+                };
+            assert_eq!(response_status, 502);
+            let parsed: Value = serde_json::from_slice(&response_body).unwrap();
+            assert_eq!(parsed["error"]["code"], "response_normalization_failed");
+            assert_eq!(ctx.metadata["ai_federation_provider"], "primary");
+            assert_eq!(ctx.metadata["ai_federation_status"], status.to_string());
+            assert_eq!(ctx.metadata["ferrum:external_operation_completed"], "true");
+
+            // A synthetic 502 skips the success-only body hook. Its commit
+            // must still publish the completed-operation tombstone so a
+            // client retry cannot restart either provider.
+            dedup
+                .on_response_committed(
+                    &mut ctx,
+                    response_status,
+                    &response_headers,
+                    response_body.as_ref(),
+                )
+                .await;
+            let mut retry_ctx = post_json_ctx(&request);
+            match dedup.before_proxy(&mut retry_ctx, &mut headers).await {
+                PluginResult::RejectBinary {
+                    status_code, body, ..
+                } => {
+                    assert_eq!(status_code, 409);
+                    assert!(String::from_utf8_lossy(&body).contains("cannot be replayed safely"));
+                }
+                other => panic!("expected completed-operation tombstone, got {other:?}"),
+            }
+            assert_eq!(primary.received_requests().await.unwrap().len(), 1);
+            assert!(secondary.received_requests().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn committed_success_status_cannot_be_configured_for_fallback() {
+    let mut config = json!({
+        "providers": [{
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "sk-test"
+        }]
+    });
+    for status in 200..300 {
+        config["fallback_on_status_codes"] = json!([429, status]);
+        let error = ai_federation::AiFederation::new(&config, create_test_http_client())
+            .err()
+            .expect("a completed success must not enable a second generation");
+        assert!(error.contains("cannot replay committed success status"));
+    }
+    config["fallback_on_status_codes"] = json!([100, 199, 300, 429, 599]);
+    assert!(ai_federation::AiFederation::new(&config, create_test_http_client()).is_ok());
+}
+
+#[tokio::test]
+async fn redirect_response_still_falls_through_to_next_provider() {
     let primary = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .respond_with(ResponseTemplate::new(302).set_body_json(json!({})))
         .mount(&primary)
         .await;
     let secondary = MockServer::start().await;
@@ -5602,6 +5729,9 @@ async fn malformed_success_response_falls_through_to_next_provider() {
         ctx.metadata.get("ai_federation_provider"),
         Some(&"secondary".to_string())
     );
+    assert_eq!(primary.received_requests().await.unwrap().len(), 1);
+    assert_eq!(secondary.received_requests().await.unwrap().len(), 1);
+    assert_eq!(ctx.metadata["ai_total_tokens"], "15");
 }
 
 #[tokio::test]
@@ -5710,7 +5840,7 @@ async fn normalized_size_failure_preserves_original_provider_status() {
 }
 
 #[tokio::test]
-async fn invalid_json_sse_and_native_schema_protocol_failures_use_fallback() {
+async fn completed_invalid_json_sse_and_native_schema_failures_never_replay() {
     for (provider_type, malformed_body) in [
         ("openai", "not-json"),
         (
@@ -5753,18 +5883,21 @@ async fn invalid_json_sse_and_native_schema_protocol_failures_use_fallback() {
         });
         let mut ctx = post_json_ctx(&request);
         let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
-        assert!(
-            matches!(
-                result,
-                PluginResult::RejectBinary {
-                    status_code: 200,
-                    ..
-                }
-            ),
-            "{provider_type} malformed protocol response should use fallback"
-        );
+        match result {
+            PluginResult::RejectBinary {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502, "{provider_type}");
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["error"]["code"], "response_normalization_failed");
+            }
+            other => panic!("{provider_type}: expected normalization error, got {other:?}"),
+        }
+        assert_eq!(ctx.metadata["ai_federation_provider"], "primary");
+        assert_eq!(ctx.metadata["ai_federation_status"], "200");
+        assert_eq!(ctx.metadata["ferrum:external_operation_completed"], "true");
         assert_eq!(primary.received_requests().await.unwrap().len(), 1);
-        assert_eq!(secondary.received_requests().await.unwrap().len(), 1);
+        assert!(secondary.received_requests().await.unwrap().is_empty());
     }
 }
 
