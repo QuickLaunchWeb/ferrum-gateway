@@ -155,7 +155,8 @@ async fn dtls_pre_handshake_demux_is_bounded_per_source_ip() {
     let attempts = 32u16;
     let (sprayed, second_source, refusals) =
         ferrum_edge::_test_support::dtls_pre_handshake_per_source_ip_admission_for_test(
-            max_per_source, attempts,
+            max_per_source,
+            attempts,
         )
         .await
         .expect("per-source pre-handshake admission harness");
@@ -184,7 +185,8 @@ async fn dtls_pre_handshake_demux_is_unbounded_when_the_dimension_is_disabled() 
     let attempts = 16u16;
     let (sprayed, second_source, refusals) =
         ferrum_edge::_test_support::dtls_pre_handshake_per_source_ip_admission_for_test(
-            max_per_source, attempts,
+            max_per_source,
+            attempts,
         )
         .await
         .expect("per-source pre-handshake admission harness");
