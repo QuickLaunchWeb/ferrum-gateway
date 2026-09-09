@@ -1752,6 +1752,11 @@ fn optional_status_code_set(
                 "ai_federation: '{field}' contains invalid HTTP status code {status}"
             ));
         }
+        if (200..300).contains(&status) {
+            return Err(format!(
+                "ai_federation: '{field}' cannot replay committed success status {status}"
+            ));
+        }
         out.insert(status);
     }
     Ok(Some(out))
@@ -4369,6 +4374,17 @@ fn insert_normalized_usage(
     }
 }
 
+/// Shared buffered/streamed Anthropic terminal-reason mapping.
+pub(crate) fn map_anthropic_stop_reason(reason: &str) -> Result<&'static str, &'static str> {
+    match reason {
+        "end_turn" | "stop_sequence" | "pause_turn" => Ok("stop"),
+        "max_tokens" => Ok("length"),
+        "tool_use" => Ok("tool_calls"),
+        "refusal" => Ok("content_filter"),
+        _ => Err("upstream provider sent an unsupported Anthropic stop_reason"),
+    }
+}
+
 fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenCounts), String> {
     if resp["type"].as_str() != Some("message") || resp["role"].as_str() != Some("assistant") {
         return Err(
@@ -4434,17 +4450,9 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
             "ai_federation: Anthropic tool_use content and stop_reason disagree".to_string(),
         );
     }
-    let finish_reason = match stop_reason {
-        "end_turn" | "stop_sequence" | "pause_turn" => "stop",
-        "max_tokens" => "length",
-        "tool_use" => "tool_calls",
-        "refusal" => "content_filter",
-        _ => {
-            return Err(
-                "ai_federation: Anthropic response has an unsupported stop_reason".to_string(),
-            );
-        }
-    };
+    let finish_reason = map_anthropic_stop_reason(stop_reason).map_err(|_| {
+        "ai_federation: Anthropic response has an unsupported stop_reason".to_string()
+    })?;
 
     let (input_tokens, output_tokens) = native_usage_pair(
         resp.get("usage"),
@@ -7936,20 +7944,10 @@ impl Plugin for AiFederation {
                         error = %e,
                         "ai_federation: response normalization failed"
                     );
-                    if self.fallback_enabled
-                        && self.fallback_on_protocol_errors
-                        && has_later_provider
-                    {
-                        last_failure_result = Some(self.openai_error_response_with_headers(
-                            502,
-                            "Provider returned a malformed success response",
-                            "server_error",
-                            None,
-                            Some("response_normalization_failed"),
-                            response.headers,
-                        ));
-                        continue;
-                    }
+                    // Only a completed 2xx can fail success normalization.
+                    // The provider already performed the billable operation:
+                    // keep its provenance and dedup tombstone, and never send
+                    // another generation, even with ambiguous replay enabled.
                     return self.openai_error_response_with_headers(
                         502,
                         "Provider returned a malformed success response",

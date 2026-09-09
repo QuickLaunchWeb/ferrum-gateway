@@ -1796,6 +1796,45 @@ async fn sampling_rate_zero_still_captures_on_guardrail() {
     assert_eq!(records[0]["capture_reason"], "guardrail");
 }
 
+/// GHSA-8gc3-h5c8-jjxx: `ai_semantic_firewall` records an AI body it could not
+/// inspect under `*.uninspectable_body`. Under `fail_on_uninspectable_body:
+/// false` or `on_error: allow` it writes NO decision key at all, so without
+/// these keys in `guardrail_fired` the one transaction an operator most needs
+/// captured — an AI body that went to the model unread — is invisible to
+/// `always_capture_on_guardrail`.
+#[tokio::test]
+async fn sampling_rate_zero_captures_on_semantic_firewall_uninspectable_body() {
+    for key in [
+        "ai_semantic_firewall.uninspectable_body",
+        "ai_semantic_firewall.request.uninspectable_body",
+        "ai_semantic_firewall.response.uninspectable_body",
+    ] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let config = config_with_sink(
+            &endpoint,
+            json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
+        );
+        let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        let headers = json_headers();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        ctx.metadata
+            .insert(key.to_string(), "no_extractable_content".to_string());
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "{key} must force capture despite rate 0");
+        assert_eq!(records[0]["capture_reason"], "guardrail", "{key}");
+    }
+}
+
 #[tokio::test]
 async fn sampling_rate_zero_captures_non_empty_guardrail_metadata() {
     let server = mock_sink().await;
@@ -5719,6 +5758,78 @@ async fn reassembled_sse_excerpt(frames: &[&str]) -> String {
         .as_str()
         .expect("response excerpt")
         .to_string()
+}
+
+#[tokio::test]
+async fn malformed_tool_arguments_never_reach_the_stream_audit_sink() {
+    for arguments in [
+        r#"{"password":"prefixfreecredential""#,
+        "benign but incomplete",
+    ] {
+        let frame = json!({
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_a",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": arguments}
+            }]}}]
+        })
+        .to_string();
+        let excerpt = reassembled_sse_excerpt(&[&frame, "[DONE]"]).await;
+        assert!(!excerpt.contains("prefixfreecredential"));
+        assert!(!excerpt.contains("benign but incomplete"));
+        let parsed: Value = serde_json::from_str(&excerpt).unwrap();
+        let function = &parsed["tool_calls"]["0"][0]["function"];
+        assert_eq!(function["name"], "lookup");
+        assert_eq!(function["arguments"], "[UNPARSEABLE]");
+        assert_eq!(function["arguments_redaction_failed"], true);
+    }
+}
+
+#[tokio::test]
+async fn malformed_and_valid_tool_arguments_are_redacted_in_buffered_audit_records() {
+    let server = mock_sink().await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&format!("{}/ingest", server.uri()), json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().unwrap();
+    plugin.commit_background_tasks();
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "assistant", "tool_calls": [
+            {"function": {"name": "broken", "arguments": "{\"password\":\"hiddenbroken\""}},
+            {"function": {"name": "valid", "arguments": "{\"password\":\"hiddenvalid\"}"}}
+        ]}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &body)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &json_headers(), b"{}")
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let wire = serde_json::to_string(&records).unwrap();
+    assert!(!wire.contains("hiddenbroken"));
+    assert!(!wire.contains("hiddenvalid"));
+    let request: Value =
+        serde_json::from_str(records[0]["request_body"].as_str().unwrap()).unwrap();
+    let calls = &request["messages"][0]["tool_calls"];
+    assert_eq!(calls[0]["function"]["arguments"], "[UNPARSEABLE]");
+    assert_eq!(calls[0]["function"]["arguments_redaction_failed"], true);
+    let valid: Value =
+        serde_json::from_str(calls[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert!(valid["password"].as_str().unwrap().contains("REDACTED"));
+    assert!(
+        calls[1]["function"]
+            .get("arguments_redaction_failed")
+            .is_none()
+    );
 }
 
 #[tokio::test]

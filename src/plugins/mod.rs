@@ -2028,6 +2028,8 @@ pub(crate) enum BoundedResponseBodyConstruction {
     Unchanged,
     /// The producer claimed a rewrite, but the ceiling-bounded sink refused.
     CapacityRefused,
+    /// JSON output reached this length before the bounded sink stopped writing.
+    SizeLimitExceeded(usize),
 }
 
 impl BoundedResponseBodyConstruction {
@@ -2043,6 +2045,11 @@ impl BoundedResponseBodyConstruction {
                 ctx.mark_buffered_response_capacity_refusal_pending();
                 None
             }
+            Self::SizeLimitExceeded(produced_bytes) => {
+                ctx.response_transform_size_refusal_pending = Some(produced_bytes);
+                ctx.mark_buffered_response_capacity_refusal_pending();
+                None
+            }
         }
     }
 
@@ -2052,7 +2059,7 @@ impl BoundedResponseBodyConstruction {
     pub(crate) fn into_option(self) -> Option<Vec<u8>> {
         match self {
             Self::Replaced(bytes) => Some(bytes),
-            Self::Unchanged | Self::CapacityRefused => None,
+            Self::Unchanged | Self::CapacityRefused | Self::SizeLimitExceeded(_) => None,
         }
     }
 }
@@ -2108,6 +2115,17 @@ pub(crate) enum A2aGrpcCardSchema {
     /// The configured service declares no Agent Card layout. Detection, method
     /// policy, and metadata still apply; card rewriting fails closed.
     Undeclared,
+}
+
+/// Trusted dispatch provenance, separate from plugin-writable metadata and
+/// HTTP status. A real backend 502 is a response; a gateway 502 is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BackendDispatchState {
+    #[default]
+    NotDispatched,
+    BackendResponse,
+    PreWireFailure,
+    AmbiguousFailure,
 }
 
 /// Context passed through the plugin pipeline for a single request.
@@ -2248,6 +2266,8 @@ pub struct RequestContext {
     /// state without re-parsing the wire query.
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
+    /// Router offset in the current dispatch path; reset when a rewrite replaces it.
+    pub(crate) matched_path_strip_len: usize,
     pub identified_consumer: Option<Arc<Consumer>>,
     /// Identity string set by external auth plugins (e.g., `jwks_auth`) when no
     /// matching `Consumer` exists in the gateway. Used as the rate-limit key and
@@ -2357,8 +2377,12 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Latest dispatch outcome, retaining possible execution across retries.
+    /// Only trusted transport code may set this; it is not serialized.
+    backend_dispatch_state: BackendDispatchState,
     /// Whether the gateway selected the health-neutral retained-response
-    /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) for this request.
+    /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) or its deterministic
+    /// JSON output-policy counterpart (`502`) for this request.
     /// Once set, later body hooks, transforms, final validators, cache stores,
     /// and trailer reframes must preserve that terminal rather than treating
     /// normalize's rewrite bool as an ordinary body rewrite
@@ -2395,6 +2419,11 @@ pub struct RequestContext {
     /// preflight scans); taken when the shared installer runs so it cannot
     /// leak into another phase or retry generation (GHSA-pwcm-6rh8-f2gh).
     buffered_response_capacity_refusal_pending: bool,
+    /// Size evidence from the bounded JSON writer; consumed before the generic
+    /// pending bit so deterministic policy and aggregate capacity stay distinct.
+    response_transform_size_refusal_pending: Option<usize>,
+    /// Refines the shared terminal fence with gateway output-policy provenance.
+    response_transform_size_refusal_selected: bool,
     /// Monotonic request-global proof that at least one response-caching
     /// instance served a HIT or REVALIDATED response. Kept outside public
     /// metadata so sibling/custom plugins cannot clear or forge the signal
@@ -2695,6 +2724,10 @@ pub struct RequestContext {
     /// Kept private so request metadata cannot suppress transforms or inspection,
     /// and unrelated synthetic short-circuits cannot opt into the skip.
     pub(crate) finalized_response_replay: bool,
+    /// A semantic-cache hit contains decoded JSON, so its transport encoding
+    /// must be planned after the synthetic response's final header rules.
+    /// Private provenance keeps ordinary rejection responses out of this path.
+    pub(crate) semantic_cache_response_replay: bool,
     /// Response-side runtime-overlay gate provenance, pinned once for this
     /// request (see [`GatePolicyStamp`]).
     ///
@@ -3171,8 +3204,8 @@ pub struct RequestContext {
     /// `before_proxy` phase (the original `ctx.path` stays intact for logging
     /// and route selection, which already happened). `None` keeps the
     /// request's own path. Honored on the H1/H2/gRPC/reqwest backend dispatch
-    /// path; VS-derived proxies never set `strip_listen_path`, so the override
-    /// is the literal forwarded path.
+    /// path. Replacing the path resets the router strip offset; ordinary
+    /// rewrites still compose with the selected backend base path.
     pub route_override_path: Option<String>,
     /// Backend-effective path that successfully passed the final route policy
     /// boundary. Not exposed through the public plugin API, so custom plugins
@@ -3180,7 +3213,8 @@ pub struct RequestContext {
     /// as request mirroring.
     authorized_backend_path: Option<String>,
     /// Treat `route_override_path` as an absolute backend path by disabling
-    /// `strip_listen_path` on the effective proxy. Used by direct upstream
+    /// `strip_listen_path` and clearing `backend_path` on the effective proxy.
+    /// Used by direct upstream
     /// routers when the override is already the final upstream URL path rather
     /// than a virtual-service rewrite relative to the selected public route.
     pub route_override_path_is_absolute: bool,
@@ -3336,6 +3370,31 @@ fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value
 }
 
 impl RequestContext {
+    /// Record every completed attempt before response hooks or another retry.
+    /// A later connect failure cannot erase an earlier possible execution.
+    pub(crate) fn record_backend_dispatch_outcome(
+        &mut self,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+    ) {
+        self.backend_dispatch_state = if error_class.is_none() {
+            BackendDispatchState::BackendResponse
+        } else if request_on_wire
+            || matches!(
+                self.backend_dispatch_state,
+                BackendDispatchState::BackendResponse | BackendDispatchState::AmbiguousFailure
+            )
+        {
+            BackendDispatchState::AmbiguousFailure
+        } else {
+            BackendDispatchState::PreWireFailure
+        };
+    }
+
+    pub(crate) fn backend_dispatch_state(&self) -> BackendDispatchState {
+        self.backend_dispatch_state
+    }
+
     pub fn new(client_ip: String, method: String, path: String) -> Self {
         Self {
             direct_client_ip: client_ip.clone(),
@@ -3364,6 +3423,7 @@ impl RequestContext {
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: None,
+            matched_path_strip_len: 0,
             identified_consumer: None,
             authenticated_identity: None,
             authenticated_identity_header: None,
@@ -3386,10 +3446,13 @@ impl RequestContext {
             grpc_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            backend_dispatch_state: BackendDispatchState::NotDispatched,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
             buffered_response_capacity_refusal_pending: false,
+            response_transform_size_refusal_pending: None,
+            response_transform_size_refusal_selected: false,
             response_cache_hit: false,
             origin_http_response_status: None,
             request_wire_transport: None,
@@ -3430,6 +3493,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
             finalized_response_replay: false,
+            semantic_cache_response_replay: false,
             response_policy_stamp: None,
             response_presentation_policy_digest: None,
             serverless_pre_invocation_rejection_owners: HashSet::new(),
@@ -3518,6 +3582,24 @@ impl RequestContext {
             mesh_inbound_terminator_ip: None,
             finalized_request_egress_dispatched: false,
         }
+    }
+
+    /// Router offset of the matched path prefix in the current dispatch path.
+    /// The proxy dispatch path owns this value and resets it when a rewrite
+    /// replaces the request path; the reader is public only so external test
+    /// crates can assert the offset a matched route would otherwise produce.
+    #[inline]
+    pub fn matched_path_strip_len(&self) -> usize {
+        self.matched_path_strip_len
+    }
+
+    /// Seed the router offset of the matched path prefix. The proxy dispatch
+    /// path owns this value and resets it when a rewrite replaces the request
+    /// path; the setter is public only so external test crates can build a
+    /// `RequestContext` that a matched route would otherwise produce.
+    #[inline]
+    pub fn set_matched_path_strip_len(&mut self, strip_len: usize) {
+        self.matched_path_strip_len = strip_len;
     }
 
     pub(crate) fn publish_correlation_id(
@@ -3783,17 +3865,19 @@ impl RequestContext {
         std::mem::take(&mut self.final_body_policy_terminal_replacement)
     }
 
-    /// Adopt the gateway terminals the final request-body hook stage selected on
-    /// the throwaway clone (`clone_for_final_request_body_hooks`).
+    /// Adopt gateway terminals and decoded cache-replay provenance selected by
+    /// the final request-body stage on its throwaway clone.
     ///
-    /// The stage's other results travel back through `metadata`, which a plugin
-    /// can write. These two cannot: they authorize the finalizer to publish a
-    /// gateway-authored error payload unchanged, so they are carried as typed
-    /// state and only ever set, never cleared, by the gateway itself.
+    /// Public metadata cannot authorize either a gateway-authored terminal or
+    /// late transport encoding of a decoded cache hit. These private decisions
+    /// are only ever set, never cleared, when adopting the hook stage's state.
     pub(crate) fn adopt_final_request_body_hook_terminals(&mut self, hook_ctx: &RequestContext) {
+        self.semantic_cache_response_replay |= hook_ctx.semantic_cache_response_replay;
         if hook_ctx.gateway_capacity_response_selected() {
             self.mark_gateway_capacity_response_selected();
         }
+        self.response_transform_size_refusal_selected |=
+            hook_ctx.response_transform_size_refusal_selected;
         if hook_ctx.gateway_representation_response_selected() {
             self.mark_gateway_representation_response_selected();
         }
@@ -3808,7 +3892,32 @@ impl RequestContext {
 
     /// Take the one-shot capacity-refusal pending bit.
     pub(crate) fn take_buffered_response_capacity_refusal_pending(&mut self) -> bool {
+        self.response_transform_size_refusal_pending = None;
         std::mem::take(&mut self.buffered_response_capacity_refusal_pending)
+    }
+
+    pub(crate) fn take_response_transform_size_refusal_pending(&mut self) -> Option<usize> {
+        self.response_transform_size_refusal_pending.take()
+    }
+
+    pub(crate) fn mark_response_transform_size_refusal_selected(&mut self) {
+        self.response_transform_size_refusal_selected = true;
+    }
+
+    /// Private gateway provenance; plugin/backend headers cannot forge this decision.
+    pub(crate) fn response_transform_size_refusal_selected(&self) -> bool {
+        self.response_transform_size_refusal_selected
+    }
+
+    pub(crate) fn response_policy_error_class(
+        &self,
+        backend_class: Option<crate::retry::ErrorClass>,
+    ) -> Option<crate::retry::ErrorClass> {
+        if self.response_transform_size_refusal_selected {
+            Some(crate::retry::ErrorClass::DispatchPolicyRejected)
+        } else {
+            backend_class
+        }
     }
 
     /// Remaining whole-millisecond gRPC budget, rounded up so a positive
@@ -4551,6 +4660,7 @@ impl RequestContext {
             query_params_materialized: self.query_params_materialized,
             query_params: self.query_params.clone(),
             matched_proxy: self.matched_proxy.clone(),
+            matched_path_strip_len: self.matched_path_strip_len,
             identified_consumer: self.identified_consumer.clone(),
             authenticated_identity: self.authenticated_identity.clone(),
             authenticated_identity_header: self.authenticated_identity_header.clone(),
@@ -4575,6 +4685,7 @@ impl RequestContext {
             grpc_deadline_at: self.grpc_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            backend_dispatch_state: self.backend_dispatch_state,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
             final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,
@@ -4583,6 +4694,8 @@ impl RequestContext {
             // original context instead of duplicating it into this compatibility
             // clone, where it could be consumed or copied back spuriously.
             buffered_response_capacity_refusal_pending: false,
+            response_transform_size_refusal_pending: None,
+            response_transform_size_refusal_selected: self.response_transform_size_refusal_selected,
             response_cache_hit: self.response_cache_hit,
             origin_http_response_status: self.origin_http_response_status,
             request_wire_transport: self.request_wire_transport,
@@ -4658,6 +4771,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
             finalized_response_replay: self.finalized_response_replay,
+            semantic_cache_response_replay: self.semantic_cache_response_replay,
             response_policy_stamp: self.response_policy_stamp.clone(),
             response_presentation_policy_digest: self.response_presentation_policy_digest,
             serverless_pre_invocation_rejection_owners: self
@@ -7665,23 +7779,36 @@ pub async fn log_with_mirror(
     // trailers-only), gRPC-Web, H1/H2/H3, the HBONE relay, and the WebSocket
     // upgrade summary — so no call site has to remember to carry it.
     //
-    // The clone happens only when this request actually evaluated a trigger and
-    // the summary does not already carry one; the untriggered default
-    // configuration pays one `is_empty()` check and no allocation.
+    // Clone only to stamp a missing trigger carrier, detected WebSocket flavor,
+    // or a gateway output-policy refusal. Ordinary HTTP stays allocation-free.
     // Keep the conditional clone out of this async future's inline state. A
     // `TransactionSummary` is deliberately broad; storing it inline here grows
     // every request future (including the allocation-free, untriggered case)
     // and can exhaust a worker stack under instrumentation. The triggered path
     // already clones owned summary data, so one box does not change the common
     // path and bounds the future itself to a pointer-sized optional value.
-    let mut stamped =
-        if ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty() {
-            Some(Box::new(summary.clone()))
-        } else {
-            None
-        };
+    let stamp_triggers =
+        ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty();
+    let stamp_websocket = matches!(ctx.request_http_flavor(), HttpFlavor::WebSocket);
+    let policy_error_class = ctx.response_policy_error_class(summary.error_class);
+    let stamp_policy = policy_error_class != summary.error_class;
+    let mut stamped = if stamp_triggers || stamp_websocket || stamp_policy {
+        Some(Box::new(summary.clone()))
+    } else {
+        None
+    };
     if let Some(stamped) = stamped.as_deref_mut() {
-        stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+        stamped.error_class = policy_error_class;
+        if stamp_triggers {
+            stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+        }
+        if stamp_websocket {
+            // H2/H3 Extended CONNECT succeeds with 2xx, not H1's 101. Carry
+            // the private, detected flavor through the shared terminal funnel.
+            stamped
+                .metadata
+                .insert("request_protocol".to_string(), "ws".to_string());
+        }
     }
     let summary = stamped.as_deref().unwrap_or(summary);
     let precompute_mesh_key = plugins

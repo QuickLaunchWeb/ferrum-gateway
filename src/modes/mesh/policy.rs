@@ -823,24 +823,19 @@ fn normalize_match_host(host: &str) -> Option<NormalizedHost> {
         let end = host.find(']')?;
         let literal = &host[..=end];
         let suffix = &host[end + 1..];
-        if suffix.is_empty()
-            || suffix
-                .strip_prefix(':')
-                .is_some_and(is_valid_authority_port)
-        {
-            let name = literal.to_ascii_lowercase();
-            let authority = if suffix.is_empty() {
-                name.clone()
-            } else {
-                format!("{name}{suffix}")
-            };
-            return Some(NormalizedHost { name, authority });
-        }
-        return None;
+        let name = literal.to_ascii_lowercase();
+        let authority = if suffix.is_empty() {
+            name.clone()
+        } else {
+            let port = crate::util::http_headers::parse_authority_port(suffix.strip_prefix(':')?)?;
+            format!("{name}:{port}")
+        };
+        return Some(NormalizedHost { name, authority });
     }
 
     match host.rsplit_once(':') {
-        Some((name, port)) if !name.contains(':') && is_valid_authority_port(port) => {
+        Some((name, port)) if !name.contains(':') => {
+            let port = crate::util::http_headers::parse_authority_port(port)?;
             let name = normalize_hostname(name)?;
             Some(NormalizedHost {
                 authority: format!("{name}:{port}"),
@@ -898,10 +893,6 @@ fn format_u16(buf: &mut [u8; 5], port: u16) -> &str {
 fn normalize_hostname(host: &str) -> Option<String> {
     let host = host.strip_suffix('.').unwrap_or(host);
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
-fn is_valid_authority_port(port: &str) -> bool {
-    !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 /// The per-condition facts value matching needs beyond the candidate and the
