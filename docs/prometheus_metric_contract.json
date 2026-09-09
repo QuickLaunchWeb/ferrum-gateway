@@ -2859,9 +2859,7 @@
     "name": "ferrum_mesh_dns_upstream_id_exhaustions_total",
     "type": "counter",
     "help": "Mesh DNS upstream transaction ID exhaustion events.",
-    "labels": [
-      "namespace"
-    ],
+    "labels": [],
     "subsystem": "mesh",
     "export_surface": "/metrics",
     "bundled": "documented_only",
