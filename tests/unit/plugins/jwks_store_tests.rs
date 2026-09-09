@@ -104,13 +104,14 @@ fn jwks_uri_redaction_removes_credentials_query_and_path() {
 #[test]
 fn jwk_key_ops_must_authorize_signature_verification() {
     let jwks = |key_use: Option<&str>, key_ops: Option<serde_json::Value>| {
-        let mut key = json!({
-            "kty": "RSA",
-            "kid": "k1",
-            "alg": "RS256",
-            "n": "AQAB",
-            "e": "AQAB"
-        });
+        // Start from the 2048-bit fixture so the modulus floor is not what
+        // decides these cases; `use` is re-applied per case below.
+        let mut fixture = rsa_jwks_with_kid(
+            include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+            "k1",
+        );
+        let mut key = fixture["keys"][0].take();
+        key.as_object_mut().expect("JWK object").remove("use");
         if let Some(key_use) = key_use {
             key["use"] = json!(key_use);
         }
@@ -192,20 +193,14 @@ fn jwks_requires_unique_non_empty_key_identifiers() {
 
 /// A minimal but well-formed RSA JWKS with one signing key.
 ///
-/// `DecodingKey::from_rsa_raw_components` stores the components without
-/// validating the modulus, so any valid base64url `n`/`e` yields a cached key —
-/// sufficient to populate the store for cache-retention assertions.
+/// A JWKS carrying the 2048-bit fixture key under `kid` `k1`: the store now
+/// applies the RSA modulus floor at load time, so a placeholder modulus would
+/// be discarded as unusable instead of populating the cache.
 fn populated_rsa_jwks() -> serde_json::Value {
-    json!({
-        "keys": [{
-            "kty": "RSA",
-            "kid": "k1",
-            "use": "sig",
-            "alg": "RS256",
-            "n": "AQAB",
-            "e": "AQAB"
-        }]
-    })
+    rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+        "k1",
+    )
 }
 
 /// An empty 200 retains diagnostic/recovery keys only inside the configured
@@ -284,16 +279,10 @@ async fn empty_fetch_expires_bounded_trust_and_valid_recovery_restores_it() {
     );
 
     server.reset().await;
-    let recovered = json!({
-        "keys": [{
-            "kty": "RSA",
-            "kid": "k2",
-            "use": "sig",
-            "alg": "RS256",
-            "n": "AQAB",
-            "e": "AQAB"
-        }]
-    });
+    let recovered = rsa_jwks_with_kid(
+        include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+        "k2",
+    );
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/jwks"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(recovered))

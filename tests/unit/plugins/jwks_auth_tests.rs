@@ -1377,6 +1377,78 @@ async fn test_jwks_auth_validates_rs256_token() {
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
 }
 
+#[test]
+fn test_jwks_auth_skips_below_floor_rsa_key() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_1024_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let error = JwksAuth::new(
+        &json!({
+            "providers": [{ "jwks": jwks }]
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("a JWKS with only below-floor RSA keys must not load");
+    assert!(
+        error.contains("no usable signing keys"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_token_signed_with_below_floor_rsa_key() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_1024_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_1024_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token(&json!({"sub": "idp-user"}), private_key_pem);
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_jwks_auth_trusts_2048_bit_rsa_key_when_mixed_with_below_floor_key() {
+    let strong_private = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let strong_public = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let weak_public = include_bytes!("../../../tests/fixtures/test_rsa_1024_public.pem");
+
+    let jwks = json!({
+        "keys": [
+            build_rsa_jwks_from_pem_with_kid(weak_public, "weak-key")["keys"][0].clone(),
+            build_rsa_jwks_from_pem_with_kid(strong_public, "strong-key")["keys"][0].clone(),
+        ]
+    });
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{ "jwks": jwks }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token =
+        create_rs256_token_with_kid(&json!({"sub": "idp-user"}), strong_private, "strong-key");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
+}
+
 #[tokio::test]
 async fn test_jwks_auth_rejects_missing_exp_by_default() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
