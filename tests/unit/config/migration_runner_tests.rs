@@ -249,6 +249,36 @@ async fn test_run_pending_adds_audit_context_columns_on_existing_v001_db() {
     assert_eq!(row.try_get::<String, _>("outcome").unwrap(), "success");
 }
 
+/// Regression test for columns folded into V001 after it was already recorded.
+#[tokio::test]
+async fn test_run_pending_adds_stream_proxy_protocol_column_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    sqlx::query("ALTER TABLE proxies DROP COLUMN stream_proxy_protocol")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(applied.is_empty(), "V001 must remain already applied");
+
+    let columns = sqlx::query("PRAGMA table_info(proxies)")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(columns.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == "stream_proxy_protocol")
+    }));
+
+    sqlx::query("UPDATE proxies SET stream_proxy_protocol = 1")
+        .execute(&pool)
+        .await
+        .expect("upgraded proxies table must accept stream_proxy_protocol writes");
+}
+
 #[tokio::test]
 async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
     let pool = test_pool().await;
