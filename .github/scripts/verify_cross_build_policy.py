@@ -39,7 +39,13 @@ EXPECTED_PRE_BUILD_COMMANDS = (
     "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/"
     "protoc-25.1-linux-x86_64.zip && unzip -o /tmp/protoc.zip -d /usr/local "
     "bin/protoc && chmod +x /usr/local/bin/protoc && rm /tmp/protoc.zip",
-    "wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add -",
+    # Retry the key download and refuse an empty or non-PGP response: `apt-key`
+    # accepts an empty stream, which turns a momentary apt.llvm.org outage into
+    # an unauthenticated-package failure one step later (issue #4978).
+    "wget --tries=5 --waitretry=5 -qO /tmp/llvm-snapshot.gpg.key "
+    "https://apt.llvm.org/llvm-snapshot.gpg.key && "
+    "grep -q -- '-----BEGIN PGP PUBLIC KEY BLOCK-----' /tmp/llvm-snapshot.gpg.key && "
+    "apt-key add /tmp/llvm-snapshot.gpg.key && rm /tmp/llvm-snapshot.gpg.key",
     "add-apt-repository "
     "'deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-6.0 main'",
     "apt-get update && apt-get install --assume-yes clang-6.0 libclang-6.0-dev",
