@@ -2264,6 +2264,10 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn prometheus_counts_quarantined_owned_spool_bytes() {
+    let preparation_baseline = prometheus_counter(
+        &render_prometheus(),
+        "chargeback_sink_spool_prepare_failures_total",
+    );
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
@@ -2342,9 +2346,10 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
         prom.contains("chargeback_sink_spool_available 1\n"),
         "prepared committed spool must report available; got:\n{prom}"
     );
-    assert!(
-        prom.contains("chargeback_sink_spool_prepare_failures_total 0\n"),
-        "healthy committed spool must have no preparation failures; got:\n{prom}"
+    assert_eq!(
+        prometheus_counter(&prom, "chargeback_sink_spool_prepare_failures_total"),
+        preparation_baseline,
+        "healthy committed spool must add no preparation failures"
     );
     assert_eq!(
         disk_owned_bytes(temp.path()),
@@ -5530,6 +5535,12 @@ fn queue_status_counters() -> (u64, u64, u64, u64, u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn no_spool_uses_full_buffer_capacity_past_high_water() {
+    let baseline = render_prometheus();
+    let diversions_baseline = prometheus_counter(
+        &baseline,
+        "chargeback_sink_queue_high_water_diversions_total",
+    );
+    let drops_baseline = prometheus_counter(&baseline, "chargeback_sink_queue_full_drops_total");
     let mut held_export = HeldClickHouseExport::start().await;
 
     let temp = tempfile::tempdir().unwrap();
@@ -5579,11 +5590,11 @@ async fn no_spool_uses_full_buffer_capacity_past_high_water() {
     let prom = render_prometheus();
     assert_eq!(
         prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total"),
-        0
+        diversions_baseline
     );
     assert_eq!(
         prometheus_counter(&prom, "chargeback_sink_queue_full_drops_total"),
-        0
+        drops_baseline
     );
 
     // The next item follows the configured full-buffer policy (drop).
@@ -5601,18 +5612,46 @@ async fn no_spool_uses_full_buffer_capacity_past_high_water() {
     let prom_after = render_prometheus();
     assert_eq!(
         prometheus_counter(&prom_after, "chargeback_sink_queue_full_drops_total"),
-        1
+        drops_baseline + 1
     );
     assert_eq!(
         prometheus_counter(
             &prom_after,
             "chargeback_sink_queue_high_water_diversions_total"
         ),
-        0
+        diversions_baseline
     );
 
+    // A no-op replacement publishes a fresh instance, but cannot erase loss.
+    let replacement =
+        ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    replacement.start_background_tasks().unwrap();
+    replacement.commit_background_tasks();
+    assert_ne!(plugin.active_generation(), replacement.active_generation());
+    assert_eq!(
+        prometheus_counter(
+            &render_prometheus(),
+            "chargeback_sink_queue_full_drops_total"
+        ),
+        drops_baseline + 1
+    );
+    assert_eq!(
+        queue_status_counters().4,
+        0,
+        "replacement diagnostics are local"
+    );
+    // The old hook is still in flight and can add truthful process loss after publication.
+    plugin.log(&billable_summary("late-old-full")).await;
+    assert_eq!(
+        prometheus_counter(
+            &render_prometheus(),
+            "chargeback_sink_queue_full_drops_total"
+        ),
+        drops_baseline + 2
+    );
     held_export.release_held_connections();
     drop(plugin);
+    drop(replacement);
 }
 
 /// Issue #3038: with spool enabled, high-water diversion remains durable and is
@@ -5620,6 +5659,12 @@ async fn no_spool_uses_full_buffer_capacity_past_high_water() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn spool_enabled_high_water_diversion_is_durable_and_distinct_from_drops() {
+    let baseline = render_prometheus();
+    let drops_baseline = prometheus_counter(&baseline, "chargeback_sink_queue_full_drops_total");
+    let diversions_baseline = prometheus_counter(
+        &baseline,
+        "chargeback_sink_queue_high_water_diversions_total",
+    );
     let mut held_export = HeldClickHouseExport::start().await;
 
     let temp = tempfile::tempdir().unwrap();
@@ -5672,10 +5717,13 @@ async fn spool_enabled_high_water_diversion_is_durable_and_distinct_from_drops()
     );
 
     let prom = render_prometheus();
-    assert!(prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total") >= 1);
+    assert!(
+        prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total")
+            > diversions_baseline
+    );
     assert_eq!(
         prometheus_counter(&prom, "chargeback_sink_queue_full_drops_total"),
-        0
+        drops_baseline
     );
 
     // The delivery worker persists through spawn_blocking. A fixed number of

@@ -12,6 +12,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Cross-protocol bridge](#cross-protocol-bridge)
   - [Mesh transport dispatch for the H3→gRPC bridge](#mesh-transport-dispatch-for-the-h3grpc-bridge)
 - [Buffering policy](#buffering-policy)
+- [Responses without content](#responses-without-content)
 - [Coalescing and frame cadence](#coalescing-and-frame-cadence)
 - [gRPC trailers over H3](#grpc-trailers-over-h3)
 - [Backend trailers and response header policy](#backend-trailers-and-response-header-policy)
@@ -462,6 +463,24 @@ The request pump and response relay run concurrently, so client-streaming and H3
 The relay consumes the request-scoped absolute gRPC deadline across pool acquisition, upload, response headers, response DATA/trailers, downstream H3 flow control, and FIN. Expiry before client-visible response DATA can complete with status-4 trailers; expiry after partial response DATA resets because a length-prefixed message may be incomplete. Without a client deadline, the operator read timeout remains the fallback. A zero-DATA terminal status gets one immediate write opportunity; if flow control would block, the gateway resets the response and drops/cancels the upstream body. Backend `Content-Length` is removed before committing a deadline-capable streaming response.
 
 **Response body — streamed with coalescing when policy permits.** See below. Retry/body-plugin cases retain their existing bounded buffered response behavior.
+
+## Responses without content
+
+Native H3 responses to HEAD and responses with body-forbidden statuses (including
+204, 205, and 304) cancel the backend stream's receive direction at the response
+headers using `H3_REQUEST_CANCELLED`. They finish downstream without DATA or
+backend trailers. Cancellation is stream-scoped: the pooled QUIC connection and
+other request streams remain usable. The gateway does not drain forbidden DATA,
+so a backend that keeps sending cannot prolong the request by refreshing an idle
+read deadline, even when the response byte ceiling or read timeout is disabled.
+
+This applies to streaming and buffered native H3 responses. The decision uses
+the dispatched request method and original backend status before response hooks;
+the buffered writer also enforces the final status after hooks. Header policy
+still runs, and HEAD retains a valid representation `Content-Length` even when
+that length exceeds the response body ceiling. Existing status-specific header
+sanitization remains in effect. Ordinary response bodies retain their size,
+read-timeout, inspection, and trailer-policy handling.
 
 ## Coalescing and frame cadence
 
@@ -1568,7 +1587,15 @@ for the upstream retirement plan.
 
 ## Flow-control window tuning
 
-The default QUIC flow-control windows are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults. Note: the H3 *backend* pool (gateway-to-upstream) uses larger windows internally (8 MiB stream / 32 MiB connection / 8 MiB send) — these are not exposed as env vars. Larger windows do **not** replace the declared-frame-length bound: pooled backend connections still install `max_buffered_frame_len` from `FERRUM_MAX_HEADER_SIZE_BYTES`, because an H3 backend is a hostile network boundary.
+The QUIC flow-control windows are split by **trust plane**, because the frontend listener and the backend pools face different peers.
+
+The *frontend* defaults are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection (`FERRUM_HTTP3_STREAM_RECEIVE_WINDOW`, `FERRUM_HTTP3_RECEIVE_WINDOW`, `FERRUM_HTTP3_SEND_WINDOW`). The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows.
+
+The *backend* pool (gateway-to-upstream) has its own triple — 8 MiB stream / 32 MiB connection / 8 MiB send — tunable with `FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW`, `FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW`, and `FERRUM_HTTP3_BACKEND_SEND_WINDOW`. Keeping the planes separate is the point: a single shared triple meant restoring backend throughput also re-opened the untrusted-client amplification exposure that the hardened frontend defaults closed (issue #4755). Every backend QUIC connection — the pooled direct-backend dial, the explicit-target/retry dial, and the standalone `Http3Client` — is built from one shared `build_backend_transport_config`, so no backend path can silently fall back to quinn's own defaults.
+
+Both triples are validated at startup with the same bounds: `0` is refused (a zero credit budget stalls the connection in that direction) and the four receive windows must fit in a QUIC variable-length integer (`[1, 2^62-1]`).
+
+Larger windows do **not** replace the declared-frame-length bound: pooled backend connections still install `max_buffered_frame_len` from `FERRUM_MAX_HEADER_SIZE_BYTES`, because an H3 backend is a hostile network boundary.
 
 The frontend HTTP/2 listener applies the same conservative-by-default philosophy via `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` (256 KiB), `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` (2 MiB), and `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` (16 KiB). These are independent of the backend pool `FERRUM_POOL_HTTP2_*` env vars. For benchmarking or trusted-network deployments, raise the frontend H2 values to match the backend pool defaults (8 MiB stream / 32 MiB connection / 1 MiB frame).
 
@@ -1577,11 +1604,14 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | Variable | Default | Purpose |
 |---|---|---|
 | `FERRUM_ENABLE_HTTP3` | `false` | Enable the QUIC listener |
-| `FERRUM_HTTP3_IDLE_TIMEOUT` | `30` | QUIC idle timeout (seconds). `0` disables the idle timer (RFC 9000 §10.1). When `FERRUM_HTTP3_CONNECT_UDP_ENABLED=true` the **frontend** listener raises this to at least `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` (never lowers it, and never raises `0`); the raise is logged. H3 backend pools keep the configured value. See [the tunnel/connection idle note](#the-tunnel-idle-timeout-and-the-quic-connection-idle-timeout). |
+| `FERRUM_HTTP3_IDLE_TIMEOUT` | `30` | QUIC idle timeout (seconds). `0` disables the idle timer (RFC 9000 §10.1). When `FERRUM_HTTP3_CONNECT_UDP_ENABLED=true` the **frontend** listener raises this to at least `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` (never lowers it, and never raises `0`); the raise is logged. H3 backend pools install this configured value on their own QUIC transport, and `0` leaves their idle timer disabled too. See [the tunnel/connection idle note](#the-tunnel-idle-timeout-and-the-quic-connection-idle-timeout). |
 | `FERRUM_HTTP3_MAX_STREAMS` | `1000` | Max concurrent streams per QUIC connection |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `262,144` | Per-stream QUIC flow-control window (256 KiB — frontend default; raise for high-throughput workloads) |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | `2,097,152` | Connection-level QUIC flow-control window (2 MiB — frontend default; raise for high-throughput workloads) |
-| `FERRUM_HTTP3_SEND_WINDOW` | `2,097,152` | Connection-level send window (2 MiB — frontend default) |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `262,144` | **Frontend** per-stream QUIC flow-control window (256 KiB; raise for high-throughput workloads). Must be in `[1, 2^62-1]`. |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | `2,097,152` | **Frontend** connection-level QUIC flow-control window (2 MiB; raise for high-throughput workloads). Must be in `[1, 2^62-1]`. |
+| `FERRUM_HTTP3_SEND_WINDOW` | `2,097,152` | **Frontend** connection-level send window (2 MiB). Must be greater than 0. |
+| `FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW` | `8,388,608` | **Backend** pool per-stream QUIC flow-control window (8 MiB). Independent of the frontend knob — see [Flow-control window tuning](#flow-control-window-tuning). Must be in `[1, 2^62-1]`. |
+| `FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW` | `33,554,432` | **Backend** pool connection-level QUIC flow-control window (32 MiB), the aggregate governor for every multiplexed stream on one backend connection. Must be in `[1, 2^62-1]`. |
+| `FERRUM_HTTP3_BACKEND_SEND_WINDOW` | `8,388,608` | **Backend** pool connection-level send window (8 MiB). Must be greater than 0. |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | H3 backend pool connections per target |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 backend connection idle eviction |
 | `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32,768` | Response coalesce flush target. Clamped to `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]`. |

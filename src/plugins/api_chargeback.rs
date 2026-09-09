@@ -627,16 +627,17 @@ fn required_positive_usize(config: &Value, key: &str, default: usize) -> Result<
         .map_err(|_| format!("api_chargeback: '{key}' ({value}) exceeds this platform's usize"))
 }
 
-/// Resolve the enabled `api_chargeback` configs that the plugin cache would
+/// Resolve enabled chargeback plugin configs that the plugin cache would
 /// install for each proxy. Any local proxy/proxy-group instance shadows all
 /// global instances of the same plugin type on that proxy — matching the
 /// general merge contract — but chargeback additionally requires the resulting
 /// effective list to contain at most one instance (issue #2564).
-fn effective_api_chargeback_plugins_by_proxy(
-    config: &crate::config::types::GatewayConfig,
+fn effective_chargeback_plugins_by_proxy<'a>(
+    config: &'a crate::config::types::GatewayConfig,
+    plugin_name: &str,
 ) -> Vec<(
-    &crate::config::types::Proxy,
-    Vec<&crate::config::types::PluginConfig>,
+    &'a crate::config::types::Proxy,
+    Vec<&'a crate::config::types::PluginConfig>,
 )> {
     use crate::config::types::PluginScope;
 
@@ -654,7 +655,7 @@ fn effective_api_chargeback_plugins_by_proxy(
         .filter(|plugin| {
             plugin.enabled
                 && plugin.scope == PluginScope::Global
-                && plugin.plugin_name == "api_chargeback"
+                && plugin.plugin_name == plugin_name
         })
         .collect();
 
@@ -685,7 +686,7 @@ fn effective_api_chargeback_plugins_by_proxy(
                         }
                         PluginScope::Global => false,
                     };
-                    (plugin.enabled && plugin.plugin_name == "api_chargeback" && scope_applies)
+                    (plugin.enabled && plugin.plugin_name == plugin_name && scope_applies)
                         .then_some(plugin)
                 })
                 .collect();
@@ -746,12 +747,24 @@ pub fn validate_composition(
         ));
     }
 
-    for (proxy, effective) in effective_api_chargeback_plugins_by_proxy(config) {
+    for (proxy, effective) in effective_chargeback_plugins_by_proxy(config, "api_chargeback") {
         if effective.len() > 1 {
             let ids: Vec<&str> = effective.iter().map(|plugin| plugin.id.as_str()).collect();
             errors.push(format!(
                 "api_chargeback permits at most one effective instance per proxy \
                  (shared /charges registry is exactly-once); proxy '{}' has: {}",
+                proxy.id,
+                ids.join(", ")
+            ));
+        }
+    }
+
+    for (proxy, effective) in effective_chargeback_plugins_by_proxy(config, "api_chargeback_sink") {
+        if effective.len() > 1 {
+            let ids: Vec<&str> = effective.iter().map(|plugin| plugin.id.as_str()).collect();
+            errors.push(format!(
+                "api_chargeback_sink permits at most one effective instance per proxy \
+                 (independent event_id dedup keys duplicate durable rows); proxy '{}' has: {}",
                 proxy.id,
                 ids.join(", ")
             ));
