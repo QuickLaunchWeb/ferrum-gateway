@@ -27864,6 +27864,8 @@ async fn build_grpc_web_reject_response(
 ) -> Option<Response<ProxyBody>> {
     let (Some(content_type), Some(mut grpc_status)) = (response_content_type, reject.grpc_status)
     else {
+        ctx.metadata
+            .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
         return None;
     };
     let mut message = reject
@@ -27960,6 +27962,12 @@ async fn build_grpc_web_reject_response(
             break;
         }
     }
+    // gRPC-Web defers committed hooks until after its HTTP 200 response has
+    // been framed. The synthetic marker must survive those hooks for ownership
+    // plugins, but it is internal bookkeeping and must not reach rejection
+    // logging performed by the caller.
+    ctx.metadata
+        .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
     Some(build_grpc_web_error_response_from_parts(
         translated,
         grpc_status,

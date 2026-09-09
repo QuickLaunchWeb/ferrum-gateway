@@ -1066,7 +1066,21 @@ pub(crate) fn dispatch_port_overrides_for_selected_subset(
             let mut resolved =
                 ResolvedPortOverride::from_upstream_override(override_config).unwrap_or_default();
             if let Some(outlier) = override_config.outlier_detection_overlay.as_ref() {
-                let mut passive = inherited_passive.cloned().unwrap_or_default();
+                // Preserve native per-port controls which DestinationRule cannot
+                // express, while rebasing the fields it can express onto the
+                // selected subset (or upstream) before applying the port mask.
+                let inherited = inherited_passive.cloned().unwrap_or_default();
+                let mut passive = resolved
+                    .passive_health_check
+                    .take()
+                    .unwrap_or_else(|| inherited.clone());
+                passive.unhealthy_threshold = inherited.unhealthy_threshold;
+                passive.unhealthy_window_seconds = inherited.unhealthy_window_seconds;
+                passive.healthy_after_seconds = inherited.healthy_after_seconds;
+                passive.max_ejection_percent = inherited.max_ejection_percent;
+                passive.consecutive_error_mode = inherited.consecutive_error_mode;
+                passive.consecutive_5xx_ejection_disabled =
+                    inherited.consecutive_5xx_ejection_disabled;
                 crate::modes::mesh::apply_outlier_detection_to_passive(&mut passive, outlier);
                 resolved.passive_health_check = Some(passive);
             }
@@ -5922,6 +5936,15 @@ pub(crate) fn validate_tls_material_source_field(
     if source.is_system_trust_roots() {
         return validate_system_trust_roots_source_field(field_name, value, kind);
     }
+    if let crate::tls::source::CertSource::Uri(uri) = &source
+        && uri.scheme == crate::tls::source::SourceScheme::Pkcs11
+    {
+        #[cfg(feature = "pkcs11")]
+        crate::tls::pkcs11::validate_module_source_uri(uri)
+            .map_err(|error| format!("{field_name}: {error}"))?;
+        #[cfg(not(feature = "pkcs11"))]
+        validate_pkcs11_key_source(field_name, uri)?;
+    }
     match source {
         crate::tls::source::CertSource::InlinePem(_) => {
             validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
@@ -10185,6 +10208,22 @@ impl GatewayConfig {
         backend_allow_ips: &crate::config::BackendEgressPolicy,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        // Distributed frontend keys must pass this node's module policy even
+        // before a listener or material loader is constructed.
+        for key in self.frontend_tls_key_path.iter().chain(
+            self.frontend_tls_certificate_sources
+                .iter()
+                .map(|source| &source.key_path),
+        ) {
+            if let Err(error) = validate_tls_material_source_field(
+                "frontend_tls_key_path",
+                key,
+                crate::tls::source::MaterialKind::Key,
+            ) {
+                errors.push(error);
+            }
+        }
 
         let mut frontend_tls_sources_by_namespace = std::collections::HashMap::new();
         for source in &self.frontend_tls_certificate_sources {

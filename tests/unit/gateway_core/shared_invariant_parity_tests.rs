@@ -100,6 +100,49 @@ fn item_body<'a>(text: &'a str, signature: &str, terminator: &str) -> &'a str {
     &text[start..start + end + terminator.len()]
 }
 
+#[test]
+fn mesh_apply_paths_carry_permission_from_preparation_to_commit() {
+    let mesh = source("src/modes/mesh/mod.rs");
+    let runtime = source("src/modes/mesh/runtime.rs");
+    // Startup, ordinary updates, content-no-op updates, and overlay fallback
+    // all need the same lifecycle. The behavioral gate tests cover admission
+    // races; this inventory catches a caller reintroducing late token minting.
+    for (signature, required) in [
+        (
+            "async fn wait_for_initial_mesh_config(",
+            "return Ok((config, Arc::new(slice.clone()), token))",
+        ),
+        (
+            "async fn serve_mesh_runtime(",
+            "initial_apply: Option<(Arc<MeshSlice>, revision::MeshRevisionApplyToken)>",
+        ),
+        (
+            "async fn arm_mesh_runtime_startup(",
+            "record_applied_slice_with_token(slice, initial_revision_apply_token)",
+        ),
+        (
+            "async fn apply_mesh_slice_generation(",
+            "let Some(revision_apply_token) = revision_apply_token else",
+        ),
+        (
+            "fn start_mesh_slice_apply_task(",
+            "let revision_apply_token = mesh_state.begin_revision_apply(slice)",
+        ),
+    ] {
+        assert!(
+            item_body(&mesh, signature, "\n}").contains(required),
+            "{signature} must carry an apply-begin capability"
+        );
+    }
+    let commit = item_body(
+        &runtime,
+        "    pub fn record_applied_slice_with_token(",
+        "\n    }",
+    );
+    assert!(!commit.contains("begin_revision_apply("));
+    assert!(!runtime.contains("pub fn record_applied_slice("));
+}
+
 // ---------------------------------------------------------------------------
 // (a) Circuit-breaker HALF_OPEN probe-slot release
 //
