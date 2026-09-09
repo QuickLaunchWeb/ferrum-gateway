@@ -204,6 +204,7 @@ impl InjectorConfig {
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
                 .unwrap_or_else(|| "explicit".to_string()),
         )?;
+        validate_capture_image(capture_mode, &sidecar_image)?;
         let proxy_uid = parse_injector_proxy_uid(resolve_ferrum_var("FERRUM_MESH_PROXY_UID"))?;
         let exclude_outbound_ports =
             parse_port_list(resolve_ferrum_var("FERRUM_MESH_EXCLUDE_OUTBOUND_PORTS").as_deref())?;
@@ -282,6 +283,31 @@ impl InjectorConfig {
             admission_review_max_body_bytes,
         })
     }
+}
+
+/// The published tools tag is the deployment contract for shell-driven capture.
+/// A tag may also pin a digest; never rewrite that digest or infer capabilities
+/// from the injector process's own (different) container filesystem.
+fn validate_capture_image(capture_mode: CaptureMode, image: &str) -> Result<(), String> {
+    if capture_mode != CaptureMode::Iptables {
+        return Ok(());
+    }
+    let reference = image.split('@').next().unwrap_or_default();
+    let tag = reference
+        .rsplit('/')
+        .next()
+        .and_then(|component| component.rsplit_once(':'))
+        .map(|(_, tag)| tag);
+    if !tag.is_some_and(|tag| tag.ends_with("-ebpf-tools")) {
+        return Err(
+            "FERRUM_MESH_CAPTURE_MODE=iptables requires FERRUM_INJECTOR_SIDECAR_IMAGE \
+             with a -ebpf-tools tag providing /bin/sh, ip, iptables and ip6tables; \
+             plain and -ebpf images are distroless. Use repository:tag-ebpf-tools \
+             or repository:tag-ebpf-tools@sha256:digest"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_injector_admission_review_max_body_bytes_from_mib(
@@ -1017,6 +1043,8 @@ fn build_sidecar_patch_for_namespace(
         }
         InjectionDecision::SkipNotSelected => return Ok(Vec::new()),
     }
+
+    validate_capture_image(config.capture_mode, &config.sidecar_image)?;
 
     if injected_shape_matches(pod, config, admission_namespace)? {
         return Ok(Vec::new());
@@ -2215,7 +2243,7 @@ mod tests {
         InjectorConfig {
             listen_addr: "127.0.0.1:9443".parse().expect("test addr"),
             namespace: "default".to_string(),
-            sidecar_image: "ferrum-edge:test".to_string(),
+            sidecar_image: "ferrum-edge:test-ebpf-tools".to_string(),
             sidecar_env: vec![(
                 "FERRUM_DP_CP_GRPC_URLS".to_string(),
                 "http://cp:50051".to_string(),
