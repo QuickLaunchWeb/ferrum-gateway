@@ -11562,6 +11562,29 @@ pub mod _test_support {
         crate::dtls::dtls_datagram_metadata_refusal_accounting_for_test(refusals_in_window)
     }
 
+    /// External coverage for the frontend DTLS handshake-timeout diagnostic
+    /// (GHSA-6j9w-xjqj-85x8): every abandoned handshake is counted while the
+    /// warning is rate-limited to one record per window. See
+    /// [`crate::dtls::dtls_handshake_timeout_warning_accounting_for_test`].
+    pub fn dtls_handshake_timeout_warning_accounting_for_test(
+        timeouts_in_window: u64,
+    ) -> Result<(u64, u64, u64), String> {
+        crate::dtls::dtls_handshake_timeout_warning_accounting_for_test(timeouts_in_window)
+    }
+
+    /// External coverage for the frontend DTLS per-source-IP pre-handshake
+    /// bound (GHSA-cc8p-2cqj-7fgg). See
+    /// [`crate::dtls::dtls_pre_handshake_per_source_ip_admission_for_test`].
+    pub async fn dtls_pre_handshake_per_source_ip_admission_for_test(
+        max_per_source: u64,
+        attempts_from_one_source: u16,
+    ) -> Result<(usize, usize, u64), String> {
+        crate::dtls::dtls_pre_handshake_per_source_ip_admission_for_test(
+            max_per_source, attempts_from_one_source,
+        )
+        .await
+    }
+
     /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
     /// the backing allocation is released (issue #3224 loader ownership path).
     pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(
