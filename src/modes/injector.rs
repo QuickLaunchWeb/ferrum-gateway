@@ -1226,12 +1226,11 @@ fn pod_uses_host_network(pod: &Value) -> bool {
 
 fn host_network_from_string(value: &str) -> bool {
     if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") || value == "1" {
-        true
-    } else if value.eq_ignore_ascii_case("false") || value == "0" {
-        false
-    } else {
-        true
+        return true;
     }
+    // Only an explicit false/0 clears the guard; every other spelling fails
+    // closed as host-network.
+    !(value.eq_ignore_ascii_case("false") || value == "0")
 }
 
 fn host_network_from_number(number: &serde_json::Number) -> bool {
