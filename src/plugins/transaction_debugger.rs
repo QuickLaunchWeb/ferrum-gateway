@@ -202,8 +202,49 @@ const SENSITIVE_BODY_KEY_SUBSTRINGS: &[&str] = &[
 /// Short field names that are credential-bearing only as an exact match, so a
 /// benign name such as `pinned` or `keyboard` is not redacted away.
 const SENSITIVE_BODY_KEY_EXACT: &[&str] = &[
-    "auth", "code", "cookie", "jwt", "key", "otp", "pin", "pwd", "sig",
+    "auth",
+    "code",
+    "cookie",
+    "embeddingkey",
+    "jwt",
+    "key",
+    "otp",
+    "pin",
+    "pwd",
+    "sig",
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonBodyRedactionContext {
+    Normal,
+    DataSourceItem,
+}
+
+fn compact_json_field_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_azure_data_sources_field(key: &str) -> bool {
+    compact_json_field_key(key) == "datasources"
+}
+
+fn is_azure_parameters_field(key: &str) -> bool {
+    compact_json_field_key(key) == "parameters"
+}
+
+fn wholesale_redact_data_source_parameters(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for entry in map.values_mut() {
+                *entry = Value::String(REDACTED.to_string());
+            }
+        }
+        _ => *value = Value::String(REDACTED.to_string()),
+    }
+}
 
 /// Capturable textual body families. Everything outside this set is skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -646,7 +687,7 @@ impl TransactionDebugger {
         let (redacted, dropped_lines) = match kind {
             BodyKind::Json => match serde_json::from_str::<Value>(text) {
                 Ok(mut value) => {
-                    self.redact_json_value(&mut value, 0);
+                    self.redact_json_value(&mut value, 0, JsonBodyRedactionContext::Normal);
                     match serde_json::to_string(&value) {
                         Ok(rendered) => (rendered, false),
                         // Serializing an already-parsed, redacted document
@@ -718,24 +759,54 @@ impl TransactionDebugger {
             || lowered.contains("eyj")
     }
 
-    fn redact_json_value(&self, value: &mut Value, depth: usize) {
+    fn redact_json_value(
+        &self,
+        value: &mut Value,
+        depth: usize,
+        ctx: JsonBodyRedactionContext,
+    ) {
         if depth > MAX_JSON_REDACTION_DEPTH {
             *value = Value::String(BODY_DEPTH_MARKER.to_string());
             return;
         }
         match value {
             Value::Object(map) => {
-                for (key, entry) in map.iter_mut() {
-                    if self.is_sensitive_body_key(key) {
+                let keys = map.keys().cloned().collect::<Vec<_>>();
+                for key in keys {
+                    let Some(entry) = map.get_mut(&key) else {
+                        continue;
+                    };
+                    if self.is_sensitive_body_key(&key) {
                         *entry = Value::String(REDACTED.to_string());
+                    } else if ctx == JsonBodyRedactionContext::DataSourceItem
+                        && is_azure_parameters_field(&key)
+                    {
+                        wholesale_redact_data_source_parameters(entry);
+                    } else if ctx == JsonBodyRedactionContext::Normal
+                        && is_azure_data_sources_field(&key)
+                    {
+                        if let Value::Array(sources) = entry {
+                            for source in sources.iter_mut() {
+                                self.redact_json_value(
+                                    source,
+                                    depth + 1,
+                                    JsonBodyRedactionContext::DataSourceItem,
+                                );
+                            }
+                        }
                     } else {
-                        self.redact_json_value(entry, depth + 1);
+                        let next_ctx = if ctx == JsonBodyRedactionContext::DataSourceItem {
+                            JsonBodyRedactionContext::DataSourceItem
+                        } else {
+                            JsonBodyRedactionContext::Normal
+                        };
+                        self.redact_json_value(entry, depth + 1, next_ctx);
                     }
                 }
             }
             Value::Array(items) => {
                 for entry in items.iter_mut() {
-                    self.redact_json_value(entry, depth + 1);
+                    self.redact_json_value(entry, depth + 1, ctx);
                 }
             }
             Value::String(text) if looks_like_credential(text) => {

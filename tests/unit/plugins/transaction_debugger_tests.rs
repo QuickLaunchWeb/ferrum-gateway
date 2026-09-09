@@ -1136,6 +1136,54 @@ fn test_configured_extra_body_fields_are_redacted() {
 }
 
 #[test]
+fn test_json_body_redacts_exact_sensitive_field_names_and_data_source_parameters() {
+    let plugin = capture_plugin();
+    const AZURE_SEARCH_KEY: &str = "AbCdEfGhIjKlMnOpQrStUvWxYz123456";
+    let body = format!(
+        r#"{{
+        "key":"{AZURE_SEARCH_KEY}",
+        "passphrase":"passphrase-secret-value",
+        "access_key":"access-key-secret-value",
+        "signature":"signature-secret-value",
+        "assertion":"assertion-secret-value",
+        "jwt":"jwt-secret-value",
+        "embeddingKey":"{AZURE_SEARCH_KEY}",
+        "keyword":"benign-keyword-value",
+        "monkey":"benign-monkey-value",
+        "data_sources":[{{
+            "parameters":{{
+                "key":"{AZURE_SEARCH_KEY}",
+                "endpoint":"https://search.example.com"
+            }}
+        }}]
+    }}"#
+    );
+    let sample = plugin.render_captured_body(body.as_bytes(), BodyKind::Json, 512);
+    for secret in [
+        AZURE_SEARCH_KEY,
+        "passphrase-secret-value",
+        "access-key-secret-value",
+        "signature-secret-value",
+        "assertion-secret-value",
+        "jwt-secret-value",
+        "https://search.example.com",
+    ] {
+        assert!(!sample.rendered.contains(secret), "{}", sample.rendered);
+    }
+    assert!(
+        sample.rendered.contains("benign-keyword-value"),
+        "{}",
+        sample.rendered
+    );
+    assert!(
+        sample.rendered.contains("benign-monkey-value"),
+        "{}",
+        sample.rendered
+    );
+    assert!(sample.rendered.contains("***REDACTED***"), "{}", sample.rendered);
+}
+
+#[test]
 fn test_capture_decision_exact_cap_and_cap_plus_one() {
     let plugin = TransactionDebugger::new(&json!({
         "log_request_body": true,
