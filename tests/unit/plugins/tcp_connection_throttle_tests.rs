@@ -28,7 +28,7 @@ fn make_consumer(username: &str) -> Consumer {
 fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectionContext {
     make_ctx_in_namespace(
         proxy_id,
-        ferrum_edge::config::types::default_namespace(),
+        &ferrum_edge::config::types::default_namespace(),
         ip,
         consumer,
     )
