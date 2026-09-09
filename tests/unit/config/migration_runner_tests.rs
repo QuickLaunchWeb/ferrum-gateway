@@ -249,6 +249,42 @@ async fn test_run_pending_adds_audit_context_columns_on_existing_v001_db() {
     assert_eq!(row.try_get::<String, _>("outcome").unwrap(), "success");
 }
 
+/// Regression test for plugin priority overrides on databases that recorded
+/// V001 before the column was folded into the baseline schema.
+#[tokio::test]
+async fn test_run_pending_adds_plugin_priority_override_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    sqlx::query("ALTER TABLE plugin_configs DROP COLUMN priority_override")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(applied.is_empty(), "V001 must remain already applied");
+
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, enabled, priority_override, created_at, updated_at) \
+         VALUES ('logging-1', 'ferrum', 'http_logging', '{}', 'global', 1, 250, \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("upgraded plugin_configs must accept priority overrides");
+
+    let row = sqlx::query(
+        "SELECT priority_override FROM plugin_configs \
+         WHERE namespace = 'ferrum' AND id = 'logging-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<i32, _>("priority_override").unwrap(), 250);
+}
+
 #[tokio::test]
 async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
     let pool = test_pool().await;

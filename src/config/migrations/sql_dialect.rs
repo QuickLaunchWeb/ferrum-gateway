@@ -184,6 +184,8 @@ impl V001SqlBuilder {
             .execute(&mut *connection)
             .await?;
         self.ensure_audit_event_context_columns(connection).await?;
+        self.ensure_plugin_config_priority_override_column(connection)
+            .await?;
         self.create_audit_event_indexes(connection).await?;
         self.remove_obsolete_listen_port_uniqueness(connection)
             .await?;
@@ -191,6 +193,57 @@ impl V001SqlBuilder {
         self.create_config_change_indexes(connection).await?;
         self.ensure_namespaces_registry(connection).await?;
         Ok(())
+    }
+
+    async fn ensure_plugin_config_priority_override_column(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        if self
+            .plugin_config_priority_override_column_exists(connection)
+            .await?
+        {
+            return Ok(());
+        }
+
+        if let Err(error) = sqlx::query(
+            "ALTER TABLE plugin_configs ADD COLUMN priority_override INTEGER DEFAULT NULL",
+        )
+        .execute(&mut *connection)
+        .await
+        {
+            // Accept a racing ALTER only after confirming the column now exists.
+            if !self
+                .plugin_config_priority_override_column_exists(connection)
+                .await?
+            {
+                return Err(error.into());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn plugin_config_priority_override_column_exists(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<bool, anyhow::Error> {
+        if self.is_sqlite() {
+            let rows = sqlx::query("PRAGMA table_info(plugin_configs)")
+                .fetch_all(&mut *connection)
+                .await?;
+            return Ok(rows.iter().any(|row| {
+                row.try_get::<String, _>("name")
+                    .is_ok_and(|name| name == "priority_override")
+            }));
+        }
+
+        Ok(
+            sqlx::query(self.plugin_config_priority_override_column_exists_sql())
+                .fetch_optional(&mut *connection)
+                .await?
+                .is_some(),
+        )
     }
 
     async fn ensure_audit_event_context_columns(
@@ -554,6 +607,18 @@ impl V001SqlBuilder {
             "SELECT 1 FROM information_schema.columns \
              WHERE table_schema = current_schema() AND table_name = 'audit_events' \
              AND column_name = $1"
+        }
+    }
+
+    fn plugin_config_priority_override_column_exists_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'plugin_configs' \
+             AND column_name = 'priority_override'"
+        } else {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'plugin_configs' \
+             AND column_name = 'priority_override'"
         }
     }
 
