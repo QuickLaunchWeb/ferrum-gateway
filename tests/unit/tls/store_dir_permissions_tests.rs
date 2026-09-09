@@ -88,8 +88,7 @@ fn preexisting_permissive_store_dir_is_not_tightened() {
     let parent = tempfile::tempdir().expect("tempdir");
     let store_dir = parent.path().join("managed-tls");
     std::fs::create_dir(&store_dir).expect("mkdir");
-    std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod");
+    std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
     ManagedTlsStore::open(&store_dir).expect("open managed store");
 
@@ -99,8 +98,7 @@ fn preexisting_permissive_store_dir_is_not_tightened() {
         .mode()
         & 0o777;
     assert_eq!(
-        dir_mode,
-        0o755,
+        dir_mode, 0o755,
         "pre-existing permissive directory must not be chmodded"
     );
 }
