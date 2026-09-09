@@ -26403,6 +26403,45 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_inbound_proxies_reject_remote_provenance_spoofing_local_cluster() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut remote = workload("reviews", "reviews");
+        remote.cluster = Some("cluster-a".to_string());
+        remote.remote_provenance = true;
+        remote.ports = vec![WorkloadPort {
+            port: 9999,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![remote],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            multi_cluster: Some(MultiClusterConfig {
+                local_cluster: Some("cluster-a".to_string()),
+                ..MultiClusterConfig::default()
+            }),
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .all(|proxy| !proxy.id.starts_with("__mesh-inbound-")),
+            "remote ingestion provenance must override a spoofed local cluster name"
+        );
+    }
+
+    #[test]
     fn sidecar_inbound_proxies_yield_to_regex_operator_route() {
         // An operator regex route (`~...`) on the service host is searched after
         // the prefix tier, so our materialized `/` prefix would shadow it. Yield.
