@@ -5048,6 +5048,16 @@ async fn start_dtls_frontend_listener(
         // NodeWaypoint would otherwise leave the operator domain and survive
         // the CRL edit meant to retire it.
         client_trust_scope: crate::dtls::dtls_client_trust_scope_for_owner(node_waypoint_udp_owner),
+        // Per-effective-source-IP bound on the PRE-HANDSHAKE demux table
+        // (`FERRUM_UDP_MAX_SESSIONS_PER_IP`, issue #4544). `max_sessions` above
+        // is listener-wide, so without this one source address can fill the
+        // demux table with unauthenticated ClientHellos and deny DTLS service
+        // to every other client. The accept path below reserves the session
+        // slot from the SAME gateway-wide counter map, and the demux releases
+        // its pre-handshake slot at accept handoff, so TCP, plain UDP and DTLS
+        // share one accounting and one configuration surface without charging
+        // an established DTLS session twice.
+        per_source_ip_admission: metrics.per_ip_admission.clone(),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
