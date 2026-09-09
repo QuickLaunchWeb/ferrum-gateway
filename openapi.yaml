@@ -31355,7 +31355,7 @@ components:
           example: "spiffe://cluster.local/ns/default/sa/api"
         workload_spiffe_hash:
           type: integer
-          format: int64
+          format: uint64
           description: |
             First 8 bytes of SHA-256 over the SPIFFE ID, big-endian as
             `u64`. Matches the value the eBPF `OrigDst{4,6}` map carries,
