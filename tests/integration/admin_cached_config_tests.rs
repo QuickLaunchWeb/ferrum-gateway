@@ -9335,6 +9335,53 @@ async fn test_cluster_endpoint_requires_auth() {
 }
 
 #[tokio::test]
+async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
+    use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+    use ferrum_edge::grpc::dp_client::generate_dp_jwt;
+    use ferrum_edge::grpc::proto::SubscribeRequest;
+    use ferrum_edge::grpc::proto::config_sync_server::ConfigSync;
+
+    let tc = TestConfig::default();
+    let registry = Arc::new(DpNodeRegistry::new());
+    let mut state = create_pagination_admin_state(&tc);
+    state.mode = "cp".to_string();
+    state.dp_registry = Some(registry.clone());
+    let secret = "test-cluster-configsync-secret";
+    let (server, _tx) = CpGrpcServer::builder(
+        Arc::new(ArcSwap::from_pointee(GatewayConfig::default())),
+        secret.to_string(),
+    )
+    .registry(registry)
+    .build();
+    let mut request = tonic::Request::new(SubscribeRequest {
+        node_id: "cluster-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
+        supports_heartbeat: false,
+    });
+    let dp_token = generate_dp_jwt(secret, "cluster-dp").unwrap();
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {dp_token}").parse().unwrap(),
+    );
+    let stream = server.subscribe(request).await.unwrap();
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["connected_data_planes"], 1);
+    assert_eq!(body["data_planes"][0]["node_id"], "cluster-dp");
+    assert_eq!(body["data_planes"][0]["status"], "online");
+
+    drop(stream);
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["connected_data_planes"], 0);
+}
+
+#[tokio::test]
 async fn test_cluster_endpoint_cp_mode_empty_registry() {
     let tc = TestConfig::default();
     let registry = std::sync::Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
