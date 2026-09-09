@@ -2284,6 +2284,7 @@ fn test_k8s_port_name_too_long() {
         provider: SdProvider::Kubernetes,
         dns_sd: None,
         kubernetes: Some(KubernetesConfig {
+            address_type: None,
             namespace: "default".into(),
             service_name: "my-svc".into(),
             port_name: Some("a".repeat(MAX_SD_STRING_LENGTH + 1)),
@@ -2310,6 +2311,7 @@ fn test_k8s_label_selector_too_long() {
         provider: SdProvider::Kubernetes,
         dns_sd: None,
         kubernetes: Some(KubernetesConfig {
+            address_type: None,
             namespace: "default".into(),
             service_name: "my-svc".into(),
             port_name: None,
@@ -2444,6 +2446,7 @@ fn test_k8s_valid_optional_fields() {
         provider: SdProvider::Kubernetes,
         dns_sd: None,
         kubernetes: Some(KubernetesConfig {
+            address_type: None,
             namespace: "production".into(),
             service_name: "my-svc".into(),
             port_name: Some("http".into()),

@@ -487,7 +487,9 @@ impl Plugin for WafWsSession {
                     BodyDirection::Request => {
                         self.waf.scan_request_body_rules(subject, payload, None)
                     }
-                    BodyDirection::Response => self.waf.scan_response_body_rules(subject, payload),
+                    BodyDirection::Response => {
+                        self.waf.scan_response_body_rules(subject, payload, None)
+                    }
                 }
             })
             .await;

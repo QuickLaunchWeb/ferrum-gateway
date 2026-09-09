@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
-    oidc_open_session_cookie_for_test, oidc_sealed_due_refresh_session_cookie_for_test,
+    oidc_open_session_cookie_for_test, oidc_resolve_discovery_for_test,
+    oidc_resolved_discovery_endpoints_for_test, oidc_sealed_due_refresh_session_cookie_for_test,
     oidc_sealed_refresh_session_cookie_for_test, oidc_sealed_session_cookie_for_test,
     oidc_session_state_from_set_cookie_for_test,
 };
@@ -2833,5 +2834,170 @@ async fn oidc_staged_discovery_store_is_not_exposed_before_commit() {
     );
 
     drop(plugin);
+    clear_jwks_cache();
+}
+
+/// Explicit `userinfo_endpoint` / `end_session_endpoint` fill in the two
+/// optional endpoints when the discovery document omits them.
+#[tokio::test]
+async fn explicit_optional_endpoints_fill_discovery_gaps() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri())
+        })))
+        .mount(&server)
+        .await;
+
+    let (userinfo, end_session) = oidc_resolve_discovery_for_test(
+        &PluginHttpClient::default(),
+        &format!("{}/.well-known/openid-configuration", server.uri()),
+        Some("https://idp.example.com/userinfo".to_string()),
+        Some("https://idp.example.com/end_session".to_string()),
+    )
+    .await
+    .expect("discovery resolves");
+
+    assert_eq!(
+        userinfo.as_deref(),
+        Some("https://idp.example.com/userinfo")
+    );
+    assert_eq!(
+        end_session.as_deref(),
+        Some("https://idp.example.com/end_session")
+    );
+}
+
+/// Explicitly configured optional endpoints win over the values the discovery
+/// document advertises.
+#[tokio::test]
+async fn explicit_optional_endpoints_override_discovered_values() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+            "userinfo_endpoint": format!("{}/userinfo", server.uri()),
+            "end_session_endpoint": format!("{}/end_session", server.uri())
+        })))
+        .mount(&server)
+        .await;
+
+    let (userinfo, end_session) = oidc_resolve_discovery_for_test(
+        &PluginHttpClient::default(),
+        &format!("{}/.well-known/openid-configuration", server.uri()),
+        Some("https://explicit.example.com/userinfo".to_string()),
+        Some("https://explicit.example.com/end_session".to_string()),
+    )
+    .await
+    .expect("discovery resolves");
+
+    assert_eq!(
+        userinfo.as_deref(),
+        Some("https://explicit.example.com/userinfo")
+    );
+    assert_eq!(
+        end_session.as_deref(),
+        Some("https://explicit.example.com/end_session")
+    );
+}
+
+/// With no explicit overrides, the discovery document's advertised optional
+/// endpoints are used unchanged.
+#[tokio::test]
+async fn discovered_optional_endpoints_used_without_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+            "userinfo_endpoint": format!("{}/userinfo", server.uri()),
+            "end_session_endpoint": format!("{}/end_session", server.uri())
+        })))
+        .mount(&server)
+        .await;
+
+    let (userinfo, end_session) = oidc_resolve_discovery_for_test(
+        &PluginHttpClient::default(),
+        &format!("{}/.well-known/openid-configuration", server.uri()),
+        None,
+        None,
+    )
+    .await
+    .expect("discovery resolves");
+
+    let expected_userinfo = format!("{}/userinfo", server.uri());
+    let expected_end_session = format!("{}/end_session", server.uri());
+    assert_eq!(userinfo.as_deref(), Some(expected_userinfo.as_str()));
+    assert_eq!(end_session.as_deref(), Some(expected_end_session.as_str()));
+}
+
+/// A config with `discovery_url` plus explicit optional endpoints must retain
+/// them in the resolved discovery document, even when the provider's discovery
+/// document omits both fields.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn discovery_config_retains_explicit_optional_endpoints() {
+    use ferrum_edge::plugins::utils::jwks_cache::clear_jwks_cache;
+
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = MockServer::start().await;
+    let jwks_uri = format!("{}/oidc-overrides/jwks.json", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/oidc-overrides/jwks.json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oidc-overrides/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/oidc-overrides/authorize", server.uri()),
+            "token_endpoint": format!("{}/oidc-overrides/token", server.uri()),
+            "jwks_uri": jwks_uri,
+        })))
+        .mount(&server)
+        .await;
+
+    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let mut config = base_config();
+    config["providers"][0] = json!({
+        "issuer": "https://issuer.example.com",
+        "discovery_url": format!("{}/oidc-overrides/openid-configuration", server.uri()),
+        "userinfo_endpoint": "https://issuer.example.com/userinfo",
+        "end_session_endpoint": "https://issuer.example.com/end_session",
+        "client_id": "ferrum-gateway",
+        "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
+        "scopes": ["openid", "profile"],
+        "redirect_uri": "https://app.example.com/oauth/callback",
+        "callback_path": "/oauth/callback",
+        "logout_path": "/oauth/logout"
+    });
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default())
+        .expect("discovery config with explicit optional endpoints is valid");
+
+    let (userinfo, end_session) = oidc_resolved_discovery_endpoints_for_test(plugin)
+        .await
+        .expect("discovery task resolved a document");
+
+    assert_eq!(
+        userinfo.as_deref(),
+        Some("https://issuer.example.com/userinfo")
+    );
+    assert_eq!(
+        end_session.as_deref(),
+        Some("https://issuer.example.com/end_session")
+    );
+
     clear_jwks_cache();
 }

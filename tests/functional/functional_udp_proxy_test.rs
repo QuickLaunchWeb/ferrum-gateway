@@ -148,6 +148,7 @@ fn start_gateway_with_extra_env(
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let admin_port = http_port + 1000;
     let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
@@ -180,6 +181,7 @@ fn start_gateway_with_dtls_and_env(
     // Use http_port + 1000 as admin port to avoid collisions
     let admin_port = http_port + 1000;
     let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
