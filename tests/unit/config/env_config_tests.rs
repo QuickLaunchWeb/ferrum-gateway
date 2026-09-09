@@ -1551,9 +1551,8 @@ fn test_env_config_refuses_admin_tls_no_verify_with_client_ca_bundle() {
             ),
         ],
         || {
-            let err = EnvConfig::from_env().expect_err(
-                "admin TLS no-verify paired with a client CA bundle must be refused",
-            );
+            let err = EnvConfig::from_env()
+                .expect_err("admin TLS no-verify paired with a client CA bundle must be refused");
             assert!(err.contains("FERRUM_ADMIN_TLS_NO_VERIFY"), "got: {err}");
             assert!(
                 err.contains("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH"),
