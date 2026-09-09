@@ -43,6 +43,181 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
+/// The backend never FINs the first response: only STOP_SENDING releases its
+/// script to serve the follow-up on the SAME upstream QUIC connection. This
+/// detects an unbounded discard loop even with both read and byte limits off.
+async fn assert_h3_forbidden_data_cancelled(body_mode: &str, waf: bool) {
+    for (method, status) in [("HEAD", 200), ("GET", 204), ("GET", 205), ("GET", 304)] {
+        let ca = TestCa::new("h3-forbidden-data").expect("ca");
+        let (cert, key) = ca.valid().expect("leaf");
+        let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+        let backend_port = tcp.port;
+        let _h2 = spawn_h2_bridge_backend(tcp.into_listener(), &cert, &key, b"fallback");
+        let mut headers = vec![
+            (":status", status.to_string()),
+            ("content-type", "text/plain".into()),
+            ("x-native-h3", "forbidden-data".into()),
+        ];
+        if method == "HEAD" {
+            // Representation metadata may exceed the configured body ceiling.
+            headers.push(("content-length", "1024".into()));
+        }
+        let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+            .step(H3Step::AcceptStream)
+            .step(H3Step::RespondHeaders(headers))
+            .step(H3Step::RespondDataUntilCancelled(Bytes::from_static(
+                b"forbidden-response-marker",
+            )))
+            .step(H3Step::AcceptStream)
+            .step(H3Step::RespondHeaders(vec![
+                (":status", "200".into()),
+                ("content-type", "text/plain".into()),
+                ("x-h3-follow-up", "same-connection".into()),
+            ]))
+            .step(H3Step::RespondData(Bytes::from_static(b"ok")))
+            .step(H3Step::RespondTrailers(vec![("x-finished", "true".into())]))
+            .step(H3Step::AcceptStream)
+            .step(H3Step::RespondHeaders(vec![
+                (":status", "200".into()),
+                ("content-type", "text/plain".into()),
+            ]))
+            .step(H3Step::RespondData(Bytes::from_static(
+                b"forbidden-response-marker",
+            )))
+            .step(H3Step::RespondTrailers(vec![]))
+            .step(H3Step::StallFor(Duration::from_secs(30)))
+            .spawn()
+            .expect("h3 backend");
+        let mut config: Value =
+            serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port)).expect("fixture config");
+        config["proxies"][0]["response_body_mode"] = json!(body_mode);
+        config["proxies"][0]["backend_read_timeout_ms"] = json!(0);
+        if waf {
+            config["proxies"][0]["plugins"] = json!([{"plugin_config_id": "response-waf"}]);
+            config["plugin_configs"] = json!([{
+                "id": "response-waf",
+                "plugin_name": "waf",
+                "scope": "proxy",
+                "proxy_id": "scripted-h3",
+                "enabled": true,
+                "config": {
+                    "include_default_rules": false,
+                    "response_inspection": true,
+                    "response_body_inspection": true,
+                    "custom_rules": [{
+                        "id": "FORBIDDEN-RESPONSE",
+                        "name": "response marker",
+                        "category": "custom",
+                        "severity": "high",
+                        "target": "response_body",
+                        "match_kind": "contains",
+                        "pattern": "forbidden-response-marker",
+                        "action": "enforce"
+                    }]
+                }
+            }]);
+        }
+        let (harness, _, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+            serde_yaml::to_string(&config).expect("yaml"),
+            true,
+            None,
+            &[
+                ("FERRUM_HTTP3_CONNECTIONS_PER_BACKEND", "1"),
+                (
+                    "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
+                    if method == "HEAD" { "64" } else { "0" },
+                ),
+                ("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0"),
+            ],
+        )
+        .await;
+        wait_for_h3_class(&harness, "supported", Duration::from_secs(15))
+            .await
+            .expect("capability probe")
+            .expect("native H3 must be selected");
+        let client = Http3Client::insecure().expect("h3 client");
+        let url = format!("https://127.0.0.1:{https_port}/api/forbidden");
+        let mut connection = client.connect(&url).await.expect("frontend connection");
+        let follow = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = connection
+                .open_stream(
+                    &url,
+                    GetOptions::default().method(method.parse().unwrap()),
+                    true,
+                )
+                .await
+                .expect("open forbidden response");
+            let (received_status, headers) = stream.recv_response().await.expect("headers");
+            assert_eq!(received_status.as_u16(), status);
+            assert_eq!(headers["x-native-h3"], "forbidden-data");
+            if method == "HEAD" {
+                assert_eq!(headers["content-length"], "1024");
+            } else {
+                assert!(!headers.contains_key("content-length"));
+            }
+            assert!(!headers.contains_key("transfer-encoding"));
+            assert!(stream.recv_data().await.expect("clean FIN").is_none());
+            assert!(stream.recv_trailers().await.expect("no trailers").is_none());
+            let mut follow = connection
+                .open_stream(&url, GetOptions::default(), true)
+                .await
+                .expect("same-connection follow-up");
+            let (status, headers) = follow.recv_response().await.expect("follow-up headers");
+            let body = follow
+                .recv_body()
+                .await
+                .expect("follow-up body and clean FIN");
+            let trailers = follow.recv_trailers().await.expect("follow-up trailers");
+            (status, headers, body, trailers)
+        })
+        .await
+        .expect("bodyless response and reuse must not wait for backend EOF or idle timeout");
+        let (follow_status, follow_headers, follow_body, follow_trailers) = follow;
+        assert_eq!(follow_status.as_u16(), 200);
+        assert_eq!(follow_headers["x-h3-follow-up"], "same-connection");
+        assert_eq!(follow_body.as_ref(), b"ok");
+        if !waf {
+            assert_eq!(
+                follow_trailers.expect("ordinary trailers")["x-finished"],
+                "true"
+            );
+        }
+        assert!(backend.step_errors().await.is_empty());
+
+        // An ordinary body still traverses the configured response policy.
+        let control = connection.get(&url).await.expect("ordinary body control");
+        if waf {
+            assert_eq!(control.status.as_u16(), 403);
+            assert!(!control.body_text().contains("forbidden-response-marker"));
+        } else {
+            assert_eq!(control.status.as_u16(), 200);
+            assert_eq!(control.body_bytes.as_ref(), b"forbidden-response-marker");
+        }
+        assert!(control.body_error.is_none(), "{:?}", control.body_error);
+        let requests = backend.received_requests().await;
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(requests[0].method, method);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_forbidden_data_streaming_cancels_and_reuses_connection() {
+    assert_h3_forbidden_data_cancelled("stream", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_forbidden_data_buffered_cancels_and_preserves_response_policy() {
+    assert_h3_forbidden_data_cancelled("buffer", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_forbidden_data_refined_cancels_and_preserves_response_policy() {
+    assert_h3_forbidden_data_cancelled("stream", true).await;
+}
+
 /// Spawn a protocol-honest H2-only TLS responder for capability probes,
 /// reqwest warmup, and H3 cross-protocol bridge requests.
 fn spawn_h2_bridge_backend(

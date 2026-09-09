@@ -869,9 +869,9 @@ impl OidcRelyingParty {
             Some(DiscoveryDoc {
                 authorization_endpoint: auth,
                 token_endpoint: token,
-                userinfo_endpoint,
+                userinfo_endpoint: userinfo_endpoint.clone(),
                 jwks_uri: jwks,
-                end_session_endpoint,
+                end_session_endpoint: end_session_endpoint.clone(),
             })
         } else {
             None
@@ -1068,6 +1068,8 @@ impl OidcRelyingParty {
         let jwks_late_active: Arc<Mutex<Option<LateActiveRequirement>>> =
             Arc::new(Mutex::new(None));
         let jwks_publication_gate = Arc::new(Mutex::new(()));
+        let explicit_userinfo_endpoint = userinfo_endpoint.clone();
+        let explicit_end_session_endpoint = end_session_endpoint.clone();
         let discovery_task = if start_background_tasks {
             discovery_url.clone().map(|url| {
                 spawn_oidc_discovery(
@@ -1079,6 +1081,8 @@ impl OidcRelyingParty {
                     Arc::clone(&jwks_publication_gate),
                     http_client.clone(),
                     url,
+                    explicit_userinfo_endpoint,
+                    explicit_end_session_endpoint,
                 )
             })
         } else {
@@ -2227,6 +2231,23 @@ impl OidcRelyingParty {
             payload.access_token_b64,
             payload.refresh_token_b64,
             payload.refresh_after_unix,
+        ))
+    }
+
+    // Reached only through the lib target's `_test_support` shim by external
+    // unit tests; the bin target recompiles this module without that caller.
+    #[allow(dead_code)]
+    pub(crate) async fn resolved_discovery_endpoints_for_tests(
+        mut self,
+    ) -> Option<(Option<String>, Option<String>)> {
+        if let Some(task) = self.discovery_task.take() {
+            let _ = task.await;
+        }
+        let doc = self.provider.discovery.load();
+        let doc = doc.as_ref().as_ref()?;
+        Some((
+            doc.userinfo_endpoint.clone(),
+            doc.end_session_endpoint.clone(),
         ))
     }
 
@@ -3735,6 +3756,8 @@ fn spawn_oidc_discovery(
     publication_gate: Arc<Mutex<()>>,
     http_client: PluginHttpClient,
     discovery_url: String,
+    explicit_userinfo_endpoint: Option<String>,
+    explicit_end_session_endpoint: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
@@ -3751,6 +3774,11 @@ fn spawn_oidc_discovery(
             }
             match fetch_discovery(&http_client, &discovery_url).await {
                 Ok(doc) => {
+                    let doc = apply_discovery_endpoint_overrides(
+                        doc,
+                        explicit_userinfo_endpoint.clone(),
+                        explicit_end_session_endpoint.clone(),
+                    );
                     // Store creation, local publication, and active-set
                     // registration form one retirement-fenced operation. Do
                     // not create even an inactive cache entry after the owning
@@ -3846,6 +3874,64 @@ async fn fetch_discovery(
         jwks_uri,
         end_session_endpoint,
     })
+}
+
+/// Overlay operator-supplied `userinfo_endpoint` / `end_session_endpoint` onto
+/// a fetched discovery document. Explicit configuration always wins over
+/// whatever the provider's discovery document advertises, so operators can
+/// supply the two optional endpoints for providers whose discovery document
+/// omits them. Unset overrides leave the discovered value intact.
+fn apply_discovery_endpoint_overrides(
+    mut doc: DiscoveryDoc,
+    explicit_userinfo_endpoint: Option<String>,
+    explicit_end_session_endpoint: Option<String>,
+) -> DiscoveryDoc {
+    if explicit_userinfo_endpoint.is_some() {
+        doc.userinfo_endpoint = explicit_userinfo_endpoint;
+    }
+    if explicit_end_session_endpoint.is_some() {
+        doc.end_session_endpoint = explicit_end_session_endpoint;
+    }
+    doc
+}
+
+/// External coverage seams for the issue #4761 discovery endpoint overrides.
+///
+/// Reached only through the lib target's `_test_support` shim by external unit
+/// tests; `src/main.rs` re-declares modules without that bridge, so the module
+/// is unused in the binary target — hence the module-scoped `allow(dead_code)`.
+/// Nothing here is on a request path.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub(crate) mod discovery_test_seams {
+    use super::{PluginHttpClient, apply_discovery_endpoint_overrides, fetch_discovery};
+
+    /// The two discovery endpoints an external unit test can assert after
+    /// resolving a discovery document with optional operator overrides.
+    pub(crate) struct ResolvedDiscoveryEndpoints {
+        pub(crate) userinfo_endpoint: Option<String>,
+        pub(crate) end_session_endpoint: Option<String>,
+    }
+
+    /// Fetch a live discovery document and apply operator-supplied endpoint
+    /// overrides, mirroring the resolution `spawn_oidc_discovery` performs.
+    pub(crate) async fn resolve_discovery_for_test(
+        http_client: &PluginHttpClient,
+        discovery_url: &str,
+        explicit_userinfo_endpoint: Option<String>,
+        explicit_end_session_endpoint: Option<String>,
+    ) -> Result<ResolvedDiscoveryEndpoints, String> {
+        let doc = fetch_discovery(http_client, discovery_url).await?;
+        let doc = apply_discovery_endpoint_overrides(
+            doc,
+            explicit_userinfo_endpoint,
+            explicit_end_session_endpoint,
+        );
+        Ok(ResolvedDiscoveryEndpoints {
+            userinfo_endpoint: doc.userinfo_endpoint,
+            end_session_endpoint: doc.end_session_endpoint,
+        })
+    }
 }
 
 /// External coverage seams for the issue #4640 refresh single-flight registry.

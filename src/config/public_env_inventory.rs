@@ -247,6 +247,9 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_GCP_SECRET_MANAGER_ENDPOINT",
     "FERRUM_H2_COALESCE_TARGET_BYTES",
     "FERRUM_H3_REQUEST_BODY_DRAIN_MS",
+    "FERRUM_HTTP3_BACKEND_RECEIVE_WINDOW",
+    "FERRUM_HTTP3_BACKEND_SEND_WINDOW",
+    "FERRUM_HTTP3_BACKEND_STREAM_RECEIVE_WINDOW",
     "FERRUM_HTTP3_COALESCE_MAX_BYTES",
     "FERRUM_HTTP3_COALESCE_MIN_BYTES",
     "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND",
@@ -631,4 +634,21 @@ pub fn is_public_ferrum_env_coverage_exempt(key: &str) -> bool {
     PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS
         .binary_search(&key)
         .is_ok()
+}
+
+/// Recognized settings-file keys. This does not restrict arbitrary process
+/// environment variables or extend secret-suffix resolution to ferrum.conf.
+pub fn is_recognized_ferrum_setting(key: &str) -> bool {
+    if PUBLIC_FERRUM_ENV_SETTINGS.binary_search(&key).is_ok() {
+        return true;
+    }
+    // Preserve the documented dynamic transcript sink-secret namespace.
+    key.strip_prefix("FERRUM_TRANSCRIPT_SINK_SECRET_")
+        .is_some_and(|name| {
+            let mut bytes = name.bytes();
+            bytes
+                .next()
+                .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+                && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        })
 }

@@ -2411,3 +2411,49 @@ async fn test_runtime_disabled_query_rules_preserve_h3_raw_preauth_map() {
     );
     assert!(!ctx.metadata.contains_key("ferrum:query_params_transformed"));
 }
+
+#[test]
+fn gateway_owned_request_destinations_fail_admission() {
+    for destination in [
+        "Content-Length",
+        "Transfer-Encoding",
+        "Connection",
+        "Host",
+        "X-Forwarded-For",
+        "X-Forwarded-Proto",
+        "X-Forwarded-Host",
+        "Keep-Alive",
+        "Proxy-Authorization",
+        "Proxy-Connection",
+        "TE",
+        "Trailer",
+        "Upgrade",
+        "Expect",
+        "X-Ferrum-Original-Content-Encoding",
+        "X-Grpc-Web-Mode",
+    ] {
+        for operation in ["add", "update", "rename"] {
+            let rule = if operation == "rename" {
+                json!({"target": "header", "operation": operation,
+                    "key": "x-source", "new_key": destination})
+            } else {
+                json!({"target": "header", "operation": operation,
+                    "key": destination, "value": "configured"})
+            };
+            let error = RequestTransformer::new(&json!({"rules": [rule]}))
+                .err()
+                .expect("gateway-owned destination must fail admission");
+            assert!(error.contains(&destination.to_ascii_lowercase()));
+            assert!(error.contains("gateway-owned"));
+        }
+        for rule in [
+            json!({"target": "header", "operation": "remove", "key": destination}),
+            json!({"target": "header", "operation": "rename",
+                "key": destination, "new_key": "x-captured"}),
+            json!({"target": "query", "operation": "update",
+                "key": destination, "value": "ordinary-query-value"}),
+        ] {
+            assert!(RequestTransformer::new(&json!({"rules": [rule]})).is_ok());
+        }
+    }
+}
