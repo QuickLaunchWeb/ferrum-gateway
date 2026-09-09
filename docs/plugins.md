@@ -2396,6 +2396,8 @@ config:
 
 Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions with a sliding idle window and proactive refresh-token rotation, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout. Concurrent refresh-due requests carrying the same refresh token share one token-endpoint call per instance, and a refresh token the provider reports as `invalid_grant` is never re-sealed into a `Set-Cookie`; see [OIDC Relying Party](oidc_relying_party.md#concurrent-refreshes-and-spent-refresh-tokens) for the multi-replica caveat.
 
+Logout expires the browser cookie and, with an authentic session cookie, sends `id_token_hint` to the provider and attempts discovered refresh-token revocation. No cookie or an invalid cookie returns the local logged-out page. Stateless cookie copies remain usable within the claims and absolute/idle lifetime limits even after logout; see [Logout](oidc_relying_party.md#logout) for residual validity and best-effort revocation behavior.
+
 **Priority:** 1075
 
 | Parameter | Type | Description |
@@ -2420,11 +2422,13 @@ Runs a browser-oriented OpenID Connect relying party flow with authorization cod
 | `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies |
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation |
 | `session.store` | String | Session backend; only `cookie` is implemented |
-| `session.cookie_name` | String | Session cookie name (default: `ferrum_session`) |
+| `session.cookie_name` | String (optional) | Explicit name opts out of automatic naming; default is context-derived and prefixed `__Host-` (secure, no domain, root path), `__Secure-` (secure, otherwise), or unprefixed when `session.secure` is false |
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
 | `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
 | `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`) |
-| `session.domain` | String (optional) | Domain for the durable session cookie only; short-lived correlation cookies always remain host-only |
+| `session.domain` | String (optional) | Durable session Domain only; correlation cookies are host-only and scoped to `callback_path` |
+| `session.secure` | Boolean | Default `true`; when false, generated cookie names carry no `__Host-`/`__Secure-` prefix because a prefixed cookie without `Secure` is rejected by browsers |
+| `behavior.rp_initiated_logout` | Boolean | Default `true`; send the sealed session ID token as a logout hint and attempt discovered refresh-token revocation (five-second bound) |
 | `behavior.state_cache_max_entries` | u64 | Per-instance maximum pending login starts (default: `10000`); does not block cross-replica callbacks |
 | `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`) |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
