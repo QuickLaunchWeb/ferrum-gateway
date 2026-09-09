@@ -77,7 +77,9 @@ use crate::modes::mesh::config_consumer::stock_xds_transport::StockXdsTransportP
 use crate::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
-use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::modes::mesh::runtime::{
+    MeshRuntimeState, MeshSliceRuntimeOutcome, MeshSliceRuntimeRejectReason,
+};
 use crate::modes::mesh::slice::{
     MeshSlice, MeshSliceRequest, ServiceEntryHostOwner, destination_host_owner,
     index_service_entry_host_owners, mesh_service_identities,
@@ -4195,6 +4197,16 @@ async fn wait_for_initial_mesh_config(
                     // and a lower-sequence recovery — is eligible instead of
                     // quarantined behind a slice that never served a request.
                     let revision_rolled_back = evaluation.reject();
+                    // Issue #4812: the FIRST slice is gated here rather than in
+                    // the apply task, so this is the runtime refusal the control
+                    // plane must see — otherwise a data plane that never started
+                    // serving still reads as converged.
+                    mesh_state.publish_runtime_verdict(
+                        &slice.version,
+                        MeshSliceRuntimeOutcome::Rejected(
+                            MeshSliceRuntimeRejectReason::ConfigBuild,
+                        ),
+                    );
                     warn!(
                         mesh_slice_version = %slice.version,
                         revision_rolled_back,
@@ -19260,7 +19272,7 @@ async fn apply_mesh_slice_generation(
     has_termination_listener: bool,
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     dns_proxy: &Option<Arc<MeshDnsProxy>>,
-) -> bool {
+) -> MeshSliceRuntimeOutcome {
     // Capture before any asynchronous preparation. An operator reset that
     // lands while this generation is being built invalidates the token, so a
     // late successful apply cannot resurrect the cleared freshness watermark.
@@ -19280,7 +19292,7 @@ async fn apply_mesh_slice_generation(
                 required_mode = ?mode,
                 "Rejecting mesh slice because it makes an overridden inbound app port newly selectable while PeerAuthentication TLS live reload is disabled; restart with the new port present or enable FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED"
             );
-            return false;
+            return MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::TlsReload);
         }
     }
 
@@ -19298,7 +19310,7 @@ async fn apply_mesh_slice_generation(
                 "Rejected mesh slice before proxy config apply because effective gateway trust \
                  was unusable"
             );
-            return false;
+            return MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::TrustUnusable);
         }
     };
     let live_reload = if live_reload_enabled {
@@ -19327,7 +19339,7 @@ async fn apply_mesh_slice_generation(
             mesh_slice_version = %base_slice.version,
             "Rejected mesh slice before proxy config apply because inbound mTLS live reload preparation failed"
         );
-        return false;
+        return MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::TlsReload);
     }
     let staged_inbound_spiffe = if live_reload_enabled {
         None
@@ -19397,7 +19409,9 @@ async fn apply_mesh_slice_generation(
                          last good routing and DTLS serving generation in their entirety; \
                          ordinary operator DTLS listeners are untouched"
                     );
-                    return false;
+                    return MeshSliceRuntimeOutcome::Rejected(
+                        MeshSliceRuntimeRejectReason::DtlsCandidate,
+                    );
                 }
             };
             let publish_node_waypoint_dtls = runtime.topology == MeshTopology::NodeWaypoint;
@@ -19551,7 +19565,11 @@ async fn apply_mesh_slice_generation(
                     "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
                 );
             }
-            accepted
+            if accepted {
+                MeshSliceRuntimeOutcome::Applied
+            } else {
+                MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::ProxyRefused)
+            }
         }
         Err(e) => {
             warn!(
@@ -19559,7 +19577,7 @@ async fn apply_mesh_slice_generation(
                 error = %e,
                 "Ignoring invalid mesh slice update"
             );
-            false
+            MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::ConfigBuild)
         }
     }
 }
@@ -19639,7 +19657,7 @@ fn start_mesh_slice_apply_task(
                     // can fall back to re-applying the overlay against the slice
                     // the proxy is actually serving (codex F7.2 round-4).
                     let last_accepted_base = last_applied_slice.clone();
-                    let received_accepted = apply_mesh_slice_generation(
+                    let received_outcome = apply_mesh_slice_generation(
                         &mesh_state,
                         &proxy_state,
                         &runtime,
@@ -19653,6 +19671,21 @@ fn start_mesh_slice_apply_task(
                         &dns_proxy,
                     )
                     .await;
+                    let received_accepted = received_outcome.accepted();
+                    // Issue #4812: publish the REFUSAL so the configuration
+                    // consumer can report it to the control plane. Acceptance
+                    // is published by `record_applied_slice_with_token`, the
+                    // single commit point every accepting path funnels through.
+                    if !received_accepted {
+                        if let Some(reason) = received_outcome.reject_reason() {
+                            warn!(
+                                mesh_slice_version = %slice.version,
+                                reason = reason.as_metric_label(),
+                                "Reporting mesh slice proxy-runtime refusal to the control plane"
+                            );
+                        }
+                        mesh_state.publish_runtime_verdict(&slice.version, received_outcome);
+                    }
                     // Issue #2473 lifecycle: the freshness gate advanced its
                     // accepted watermark when this slice entered the received
                     // slot, but the proxy runtime is a second, independent
@@ -19714,7 +19747,8 @@ fn start_mesh_slice_apply_task(
                             &mut last_applied_slice,
                             &dns_proxy,
                         )
-                        .await;
+                        .await
+                        .accepted();
                         // Overlay re-apply of last-accepted must NOT clear a
                         // sticky local-source failure unless that base is the
                         // exact pending recovery identity.

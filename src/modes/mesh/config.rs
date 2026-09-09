@@ -8420,16 +8420,18 @@ fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
 /// Mirrors `normalize_match_host` for inbound request authorities so a pattern
 /// `Example.COM:8443` and a request `example.com:8443` produce equal strings.
 /// Lower-cases ASCII, strips a trailing dot from the host portion, and
-/// preserves any explicit `:port` (or `:*`) suffix.
+/// canonicalizes explicit decimal ports while preserving wildcard suffixes.
 pub(crate) fn normalize_request_match_host_pattern(pattern: &str) -> String {
     let pattern = pattern.trim().to_ascii_lowercase();
-    if pattern.starts_with('[') {
-        return pattern;
-    }
     if let Some((name, port)) = pattern.rsplit_once(':')
-        && !name.contains(':')
+        && (!name.contains(':') || (name.starts_with('[') && name.ends_with(']')))
     {
         let name = name.strip_suffix('.').unwrap_or(name);
+        if let Some(port) = crate::util::http_headers::parse_authority_port(port) {
+            return format!("{name}:{port}");
+        }
+        // Preserve wildcard patterns and invalid literals. Invalid port
+        // spellings must not silently turn into an admitted authority.
         return format!("{name}:{port}");
     }
     pattern

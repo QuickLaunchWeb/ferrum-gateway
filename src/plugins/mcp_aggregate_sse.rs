@@ -369,7 +369,7 @@ impl AggregateSseError {
 pub enum StreamIdentity {
     /// JSON-RPC string id, verbatim within the configured byte bound.
     Text(Arc<str>),
-    /// JSON-RPC numeric id in its canonical serialized form.
+    /// JSON-RPC numeric id as its exact wire token.
     Number(Arc<str>),
 }
 
@@ -394,6 +394,11 @@ impl StreamIdentity {
                 Ok(Self::Text(Arc::from(text.as_str())))
             }
             Value::Number(number) => {
+                // A materialized float cannot prove the original wire token.
+                // Production admission must use from_raw_json_rpc_id instead.
+                if number.is_f64() {
+                    return Err(AggregateSseError::StreamIdInvalid);
+                }
                 let canonical = number.to_string();
                 if canonical.len() > max_bytes {
                     return Err(AggregateSseError::StreamIdTooLarge);
@@ -403,6 +408,46 @@ impl StreamIdentity {
             Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => {
                 Err(AggregateSseError::StreamIdInvalid)
             }
+        }
+    }
+
+    /// Admit the exact JSON wire token. Numeric spelling is identity: no
+    /// float parsing, exponent normalization, or integer narrowing is allowed.
+    pub fn from_raw_json_rpc_id(
+        id: &serde_json::value::RawValue,
+        max_bytes: usize,
+    ) -> Result<Self, AggregateSseError> {
+        let raw = id.get();
+        if matches!(raw.as_bytes().first(), Some(b'-' | b'0'..=b'9')) {
+            if raw.len() > max_bytes {
+                return Err(AggregateSseError::StreamIdTooLarge);
+            }
+            return Ok(Self::Number(Arc::from(raw)));
+        }
+        if !raw.starts_with('"') {
+            return Err(AggregateSseError::StreamIdInvalid);
+        }
+        // Each decoded string byte needs at most six wire bytes (\uXXXX),
+        // plus quotes. Refuse larger strings before allocating their decoding.
+        if raw.len() > max_bytes.saturating_mul(6).saturating_add(2) {
+            return Err(AggregateSseError::StreamIdTooLarge);
+        }
+        let value: Value =
+            serde_json::from_str(raw).map_err(|_| AggregateSseError::StreamIdInvalid)?;
+        Self::from_json_rpc_id(&value, max_bytes)
+    }
+
+    /// The identity rendered back as a JSON-RPC `id` wire token.
+    ///
+    /// A numeric identity IS its admitted wire token, so it is returned
+    /// verbatim; a string identity is re-encoded from its decoded form, which
+    /// names the same JSON-RPC id even when the client's escape spelling
+    /// differed. Used only to correlate a gateway-authored refusal back to the
+    /// request that opened this identity — never logged.
+    pub fn json_rpc_id_token(&self) -> String {
+        match self {
+            Self::Number(token) => token.to_string(),
+            Self::Text(text) => Value::String(text.to_string()).to_string(),
         }
     }
 
@@ -1424,9 +1469,9 @@ impl AggregateSseStream {
             return Err(AggregateSseError::StreamCompleted);
         }
         let max_event_bytes = self.0.session.bounds.max_event_bytes;
-        if let Err(error) = validate_event_bytes(encoded, max_event_bytes) {
+        if encoded.len() > max_event_bytes {
             self.0.session.settle_stream(&self.0.identity);
-            return Err(error);
+            return Err(AggregateSseError::EventTooLarge);
         }
         // The HTTP request and its terminal JSON-RPC body must name the same
         // type-sensitive identity. Without this check a broken or hostile
@@ -1441,6 +1486,12 @@ impl AggregateSseStream {
         ) {
             self.0.session.settle_stream(&self.0.identity);
             return Err(AggregateSseError::ResponseEnvelopeInvalid);
+        }
+        // Only a correctly correlated response may use the inline framing
+        // fallback (for example, pretty-printed JSON containing newlines).
+        if let Err(error) = validate_event_bytes(encoded, max_event_bytes) {
+            self.0.session.settle_stream(&self.0.identity);
+            return Err(error);
         }
         self.0.session.publish_terminal(&self.0.identity, encoded)
     }
@@ -1457,9 +1508,9 @@ impl AggregateSseStream {
             return Err(AggregateSseError::StreamCompleted);
         }
         let max_event_bytes = self.0.session.bounds.max_event_bytes;
-        if let Err(error) = validate_event_bytes(encoded, max_event_bytes) {
+        if encoded.len() > max_event_bytes {
             self.0.session.settle_stream(&self.0.identity);
-            return Err(error);
+            return Err(AggregateSseError::EventTooLarge);
         }
         if !response_matches_stream_identity(
             encoded,
@@ -1468,6 +1519,12 @@ impl AggregateSseStream {
         ) {
             self.0.session.settle_stream(&self.0.identity);
             return Err(AggregateSseError::ResponseEnvelopeInvalid);
+        }
+        // Only a correctly correlated response may use the inline framing
+        // fallback (for example, pretty-printed JSON containing newlines).
+        if let Err(error) = validate_event_bytes(encoded, max_event_bytes) {
+            self.0.session.settle_stream(&self.0.identity);
+            return Err(error);
         }
         // Reserve against the framing ceiling rather than today's event-id
         // width. Unrelated direct publications may advance the id before this
@@ -1482,6 +1539,16 @@ impl AggregateSseStream {
             Bytes::copy_from_slice(encoded),
             reserved_bytes,
         ))
+    }
+
+    /// The JSON-RPC `id` wire token of the request that opened this stream.
+    ///
+    /// A gateway-authored refusal that replaces an uncorrelatable upstream
+    /// answer still has to name the request it refuses, otherwise the client's
+    /// pending call never resolves. This is the only reader of the lease's
+    /// identity outside the broker, and its result is never logged.
+    pub fn json_rpc_id_token(&self) -> String {
+        self.0.identity.json_rpc_id_token()
     }
 
     /// Give up the identity without publishing, because this POST answered
@@ -1765,21 +1832,26 @@ fn response_matches_stream_identity(
     if crate::util::json_dup_keys::slice_ambiguity(encoded).is_some() {
         return false;
     }
-    let Ok(response) = serde_json::from_slice::<Value>(encoded) else {
+    let Ok(object) = serde_json::from_slice::<
+        std::collections::BTreeMap<String, &serde_json::value::RawValue>,
+    >(encoded) else {
         return false;
     };
-    let Some(object) = response.as_object() else {
+    let Some(version) = object.get("jsonrpc") else {
         return false;
     };
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-        || object.contains_key("result") == object.contains_key("error")
-    {
+    // The overwhelmingly common spelling is the literal token, so compare the
+    // raw bytes first and only decode the escape-bearing spellings that a
+    // conforming peer may still emit. Neither branch allocates on the hot path.
+    let version_is_2_0 = version.get() == "\"2.0\""
+        || serde_json::from_str::<String>(version.get()).is_ok_and(|value| value == "2.0");
+    if !version_is_2_0 || object.contains_key("result") == object.contains_key("error") {
         return false;
     }
     let Some(id) = object.get("id") else {
         return false;
     };
-    StreamIdentity::from_json_rpc_id(id, max_identity_bytes)
+    StreamIdentity::from_raw_json_rpc_id(id, max_identity_bytes)
         .is_ok_and(|observed| &observed == expected)
 }
 
