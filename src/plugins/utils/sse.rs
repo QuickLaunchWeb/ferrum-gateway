@@ -369,6 +369,10 @@ pub enum SseTextKind {
     /// Google Gemini / Vertex function-call arguments, serialized compactly
     /// (`$.candidates[*].content.parts[*].functionCall.args`).
     GeminiFunctionCallArgs,
+    /// Hugging Face TGI `/generate_stream` completion text, reassembled from
+    /// the `token.text` fragments of one stream into the same field the
+    /// buffered document carries (`$[*].generated_text`).
+    TgiGeneratedText,
 }
 
 /// Ceiling on the number of distinct Anthropic content blocks one stream may
@@ -522,9 +526,21 @@ pub struct SseReassembler {
     gemini_first_candidate: Option<usize>,
     /// Sticky marker for independently rendered Gemini candidate streams.
     gemini_multiple_candidates: bool,
-    /// Set when part of an identified provider stream (Anthropic Messages or
-    /// Gemini `streamGenerateContent`) could not be reassembled into the paths
-    /// this type exposes. Sticky for the rest of the stream.
+    /// Hugging Face TGI `/generate_stream` completion text: the concatenated
+    /// `token.text` fragments, plus a terminal `generated_text` that does not
+    /// merely repeat them. TGI streams exactly one sequence per request, so
+    /// this is a single accumulator with no provider-supplied index and no
+    /// ceiling to enforce.
+    tgi_text: String,
+    /// Set once a TGI frame has been folded, so a later frame of the same
+    /// stream that carries `token` / `generated_text` in a shape outside the
+    /// protocol is recognized as out-of-protocol rather than passed over as an
+    /// unrelated stream's field of the same name.
+    tgi_stream: bool,
+    /// Set when part of an identified provider stream (Anthropic Messages,
+    /// Gemini `streamGenerateContent`, or Hugging Face TGI `/generate_stream`)
+    /// could not be reassembled into the paths this type exposes. Sticky for
+    /// the rest of the stream.
     provider_uninspectable: bool,
 }
 
@@ -556,6 +572,7 @@ impl SseReassembler {
         for (_index, candidate) in &self.gemini_candidates {
             combined.push_str(&candidate.text);
         }
+        combined.push_str(&self.tgi_text);
         combined.push_str(&self.anthropic_error_text);
         combined
     }
@@ -583,6 +600,7 @@ impl SseReassembler {
             .saturating_add(responses)
             .saturating_add(anthropic)
             .saturating_add(gemini)
+            .saturating_add(self.tgi_text.len())
             .saturating_add(self.anthropic_error_text.len())
     }
 
@@ -645,6 +663,7 @@ impl SseReassembler {
             .saturating_add(responses_args)
             .saturating_add(anthropic)
             .saturating_add(gemini)
+            .saturating_add(self.tgi_text.len())
             .saturating_add(self.anthropic_error_text.len())
     }
 
@@ -665,6 +684,14 @@ impl SseReassembler {
     /// `fileData`, `executableCode`, `codeExecutionResult`, a `thought`
     /// summary, or a kind added later), a malformed `functionCall`, or a
     /// candidate index past [`MAX_GEMINI_CANDIDATES`].
+    ///
+    /// Hugging Face TGI `/generate_stream`: a frame naming the shape whose
+    /// `token` is not an object carrying a string `text`, a `generated_text`
+    /// that is neither a string nor `null`, a non-empty `top_tokens`
+    /// alternatives array, or a `details.best_of_sequences` list — the last two
+    /// carry model-authored text that is NOT part of the completion the
+    /// `token.text` deltas reconstruct, so folding them into that prose would
+    /// corrupt it.
     ///
     /// Such a frame may carry client-visible text on a path nothing here reads,
     /// so a caller that promised inspection must treat the whole stream as
@@ -870,6 +897,7 @@ impl SseReassembler {
         for (_index, candidate) in &mut self.gemini_candidates {
             drain_one(&mut candidate.text, &mut remaining);
         }
+        drain_one(&mut self.tgi_text, &mut remaining);
         drain_one(&mut self.anthropic_error_text, &mut remaining);
 
         self.completion_text
@@ -906,6 +934,7 @@ impl SseReassembler {
         self.push_responses_deltas(frame);
         self.push_anthropic_events(event, frame);
         self.push_gemini_frame(frame);
+        self.push_tgi_frame(frame);
     }
 
     /// Consume the accumulator and return the reassembled fragments, dropping any
@@ -1024,6 +1053,19 @@ impl SseReassembler {
                     text: candidate.args_json,
                 });
             }
+        }
+        // TGI reassembles into the same document shape the buffered
+        // `/generate` response has — a top-level ARRAY of
+        // `{"generated_text": …}` objects — so `$[*].generated_text` reads a
+        // streamed response with no provider branching at the caller. A
+        // `/generate_stream` response carries exactly one sequence, so the
+        // locator names element zero.
+        if !self.tgi_text.is_empty() {
+            out.push(SseText {
+                kind: SseTextKind::TgiGeneratedText,
+                json_path: "$[0].generated_text".to_string(),
+                text: self.tgi_text,
+            });
         }
         // A mid-stream `error` event's `error.message` is client-visible free
         // text, so it is reported as assistant prose (its taxonomy) located at
@@ -1521,6 +1563,103 @@ impl SseReassembler {
         &mut self.gemini_candidates[pos].1
     }
 
+    /// Accumulate one Hugging Face TGI `/generate_stream` frame.
+    ///
+    /// TGI streams one sequence per request as
+    /// `{"index": n, "token": {"id": …, "text": "Hel", …}, "generated_text":
+    /// null, "details": null}` frames, with the terminal frame carrying the
+    /// completed `generated_text` string (and `details` when the request asked
+    /// for them). The `token.text` fragments concatenate into exactly the text
+    /// the client renders, which is the same string the buffered `/generate`
+    /// document carries at `$[*].generated_text`.
+    ///
+    /// TGI frames carry no event discriminator, so the shape selects the path
+    /// (see [`is_tgi_stream_frame`]) and a frame that also carries `choices`, a
+    /// `type`, or `candidates` is left to the OpenAI / Anthropic / Gemini paths
+    /// rather than being read twice. A frame that names TGI's shape but
+    /// violates it sets [`provider_uninspectable`], as does one carrying
+    /// alternative-token text this reassembler does not fold.
+    ///
+    /// Selection is structural on the FIRST frame and sticky afterwards: an
+    /// unrelated event stream carrying a string `token` is not claimed, while a
+    /// stream that has identified itself as TGI holds every later
+    /// `token` / `generated_text` frame to the protocol.
+    fn push_tgi_frame(&mut self, frame: &Value) {
+        if !frame_carries_only_tgi_discriminators(frame) {
+            return;
+        }
+        // The selector is structural (see [`is_tgi_stream_frame`]), so an
+        // unrelated stream whose frames happen to carry a string `token` is not
+        // claimed. Once a frame HAS identified the stream as TGI, every later
+        // frame carrying those members is held to the protocol whatever its
+        // type — otherwise an intermediary could hide a fragment by mistyping
+        // the field the reassembler reads and the stream would still be
+        // reported clean.
+        if !is_tgi_stream_frame(frame) && !self.tgi_stream {
+            return;
+        }
+        self.tgi_stream = true;
+        let Some(object) = frame.as_object() else {
+            // Named the shape (`Value::get` reads through no other type), yet
+            // is not an object: outside the protocol.
+            self.provider_uninspectable = true;
+            return;
+        };
+        // `top_n_tokens` adds a `top_tokens` array of alternative tokens per
+        // frame, and `best_of` adds `details.best_of_sequences`. Both are
+        // model-authored text a client can render, but neither belongs to the
+        // completion the `token.text` deltas reconstruct, so folding them into
+        // that prose would corrupt it. Flag instead, exactly as an unfoldable
+        // Gemini part kind does.
+        let alternatives_present = match object.get("top_tokens") {
+            None => false,
+            Some(Value::Array(list)) => !list.is_empty(),
+            // Present but not an array: outside the protocol either way.
+            Some(_) => true,
+        };
+        let best_of_present = object
+            .get("details")
+            .and_then(|details| details.get("best_of_sequences"))
+            .is_some();
+        if alternatives_present || best_of_present {
+            self.provider_uninspectable = true;
+        }
+        if let Some(token) = object.get("token") {
+            match token.get("text").and_then(Value::as_str) {
+                Some(text) => self.tgi_text.push_str(text),
+                // A `token` that is not an object, or whose `text` is absent or
+                // not a string, is outside the protocol and may carry the
+                // fragment on a field nothing here reads.
+                None => self.provider_uninspectable = true,
+            }
+        }
+        match object.get("generated_text") {
+            // Absent, or the `null` every non-terminal frame carries.
+            None | Some(Value::Null) => {}
+            Some(Value::String(full)) => self.absorb_tgi_generated_text(full),
+            Some(_) => self.provider_uninspectable = true,
+        }
+    }
+
+    /// Fold the terminal frame's completed `generated_text` into the TGI
+    /// accumulator.
+    ///
+    /// By protocol this string is the concatenation of the `token.text`
+    /// fragments already accumulated, so appending it unconditionally would
+    /// scan the whole completion twice and let a match straddle the seam
+    /// between the deltas and their own repetition. It is therefore skipped
+    /// when the accumulated text already ends with it, and appended otherwise
+    /// — a terminal full text that diverges from the deltas (or one whose
+    /// accumulated prefix a windowed inspector has already released and
+    /// drained) is client-visible text that must still be scanned at least
+    /// once.
+    fn absorb_tgi_generated_text(&mut self, full: &str) {
+        if full.is_empty() || self.tgi_text.ends_with(full) {
+            return;
+        }
+        self.tgi_text.push_str(full);
+    }
+
     fn completion_text_mut(&mut self, choice: usize) -> &mut String {
         let pos = match self.completion_text_positions.get(&choice).copied() {
             Some(pos) => pos,
@@ -1607,6 +1746,44 @@ pub fn is_gemini_stream_frame(frame: &Value) -> bool {
     frame.get("candidates").is_some()
         && frame.get("choices").is_none()
         && frame.get("type").is_none()
+}
+
+/// Whether one parsed SSE `data:` frame is a Hugging Face TGI
+/// `/generate_stream` frame that [`SseReassembler`] reassembles.
+///
+/// TGI streams carry no `event:` line and no JSON `type` discriminator, so the
+/// shape is the signal: a `token` OBJECT fragment or a string `generated_text`
+/// completion, with none of the three discriminators the other modelled
+/// protocols use beside it (`choices` for OpenAI, `type` for Anthropic / the
+/// Responses API, `candidates` for Gemini).
+///
+/// Unlike the Gemini selector this one is STRUCTURAL rather than by member
+/// presence: `candidates` is distinctive, but `token` is an ordinary field name
+/// on unrelated event streams, and claiming a session or progress stream would
+/// fail it closed on every enforcing caller. A frame that violates the protocol
+/// is not thereby unreachable — a stream one frame has identified as TGI holds
+/// every later `token` / `generated_text` frame to the protocol whatever its
+/// type, so a mistyped field fails the stream closed instead of slipping past
+/// unread (see [`SseReassembler::push_tgi_frame`]).
+///
+/// Callers that decide whether an otherwise segment-less window is a governed
+/// provider stream this build cannot map use this to exclude the frames that
+/// ARE now mapped.
+pub fn is_tgi_stream_frame(frame: &Value) -> bool {
+    if !frame_carries_only_tgi_discriminators(frame) {
+        return false;
+    }
+    frame.get("token").is_some_and(Value::is_object)
+        || frame.get("generated_text").is_some_and(Value::is_string)
+}
+
+/// Whether `frame` carries a `token` / `generated_text` member and none of the
+/// discriminators that route a frame to one of the other modelled protocols.
+fn frame_carries_only_tgi_discriminators(frame: &Value) -> bool {
+    (frame.get("token").is_some() || frame.get("generated_text").is_some())
+        && frame.get("choices").is_none()
+        && frame.get("type").is_none()
+        && frame.get("candidates").is_none()
 }
 
 /// Read a non-negative integer index field (`index`, `output_index`, ...) as a

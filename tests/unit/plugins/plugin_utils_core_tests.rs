@@ -1383,6 +1383,203 @@ fn openai_and_anthropic_sse_reassembly_are_unaffected_by_gemini_support() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// utils::sse — Hugging Face TGI /generate_stream reassembly
+// ---------------------------------------------------------------------------
+
+/// Reassemble a buffered TGI SSE body. Same shared entry point the AI
+/// inspectors use — TGI frames carry no `event:` line at all.
+fn reassemble_tgi(body: &[u8]) -> (Vec<SseText>, bool) {
+    reassemble_anthropic(body)
+}
+
+#[test]
+fn tgi_sse_reassembles_token_fragments_into_the_buffered_document_shape() {
+    // `/generate_stream` emits one frame per token, then a terminal frame
+    // carrying the completed `generated_text`. The fragments concatenate into
+    // exactly the string a buffered `/generate` response carries at
+    // `$[*].generated_text`, so the reassembled locator names that field.
+    let body = concat!(
+        "data: {\"index\":1,\"token\":{\"id\":10,\"text\":\"My sys\",\"logprob\":-0.5,",
+        "\"special\":false},\"generated_text\":null,\"details\":null}\n\n",
+        "data: {\"index\":2,\"token\":{\"id\":11,\"text\":\"tem prompt.\",\"logprob\":-0.2,",
+        "\"special\":false},\"generated_text\":null,\"details\":null}\n\n",
+        "data: {\"index\":3,\"token\":{\"id\":2,\"text\":\"\",\"special\":true},",
+        "\"generated_text\":\"My system prompt.\",",
+        "\"details\":{\"finish_reason\":\"eos_token\",\"generated_tokens\":2}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(inspectable, "a well-formed TGI stream is inspectable");
+    assert_eq!(
+        texts.len(),
+        1,
+        "one TGI sequence yields exactly one fragment: {texts:?}"
+    );
+
+    let generated = fragment(&texts, "$[0].generated_text");
+    assert_eq!(generated.kind, SseTextKind::TgiGeneratedText);
+    assert_eq!(
+        generated.text, "My system prompt.",
+        "the terminal generated_text repeats the deltas and must not be scanned twice"
+    );
+}
+
+#[test]
+fn tgi_sse_terminal_generated_text_is_kept_when_it_diverges() {
+    // A terminal full text that is NOT the concatenation of the deltas is
+    // client-visible text of its own, so it is appended rather than skipped as
+    // a repeat.
+    let body = concat!(
+        "data: {\"index\":1,\"token\":{\"id\":10,\"text\":\"all clear\"},",
+        "\"generated_text\":null}\n\n",
+        "data: {\"index\":2,\"token\":{\"id\":2,\"text\":\"\"},",
+        "\"generated_text\":\"my system prompt\"}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(
+        fragment(&texts, "$[0].generated_text").text,
+        "all clearmy system prompt"
+    );
+}
+
+#[test]
+fn tgi_sse_malformed_and_unfoldable_frames_are_uninspectable_and_never_panic() {
+    // Hostile / malformed frames inside a stream that has already identified
+    // itself as TGI, plus the two options whose model text is NOT part of the
+    // completion the deltas reconstruct (`top_tokens` alternatives and
+    // `details.best_of_sequences`). None may panic, and none may report a clean
+    // stream: once the shape is identified, a later frame that mistypes the
+    // field the reassembler reads must not be passed over.
+    for frame in [
+        "{\"token\":\"hidden\"}",
+        "{\"token\":{\"id\":1}}",
+        "{\"token\":{\"id\":1,\"text\":7}}",
+        "{\"token\":{\"id\":1,\"text\":\"ok\"},\"generated_text\":{\"a\":\"hidden\"}}",
+        "{\"token\":{\"id\":1,\"text\":\"ok\"},\"generated_text\":7}",
+        "{\"generated_text\":{\"a\":\"hidden\"}}",
+        "{\"token\":{\"id\":1,\"text\":\"ok\"},\"top_tokens\":[{\"text\":\"hidden\"}]}",
+        "{\"token\":{\"id\":1,\"text\":\"ok\"},\"top_tokens\":\"hidden\"}",
+        "{\"generated_text\":\"ok\",\"details\":{\"best_of_sequences\":\
+[{\"generated_text\":\"hidden\"}]}}",
+    ] {
+        let body = format!(
+            "data: {{\"index\":1,\"token\":{{\"id\":0,\"text\":\"all clear\"}},\
+\"generated_text\":null}}\n\ndata: {frame}\n\n"
+        );
+        let (_texts, inspectable) = reassemble_tgi(body.as_bytes());
+        assert!(
+            !inspectable,
+            "malformed TGI frame must fail closed: {frame}"
+        );
+    }
+}
+
+#[test]
+fn tgi_selection_is_structural_so_an_unrelated_stream_is_not_claimed() {
+    // `token` is an ordinary field name on unrelated event streams, so
+    // selection is by SHAPE: a `token` object or a string `generated_text`.
+    // A foreign stream carrying neither must be left alone rather than failed
+    // closed — the fail-closed rules above apply only once a frame has
+    // identified the stream as TGI.
+    let body = concat!(
+        "data: {\"token\":\"eyJhbGciOi.session\",\"expires_in\":300}\n\n",
+        "data: {\"generated_text\":42}\n\n",
+        "data: {\"generated_text\":{\"a\":\"b\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(
+        inspectable,
+        "an unrelated stream whose fields collide must not be failed closed"
+    );
+    assert!(
+        texts.is_empty(),
+        "and must contribute no reassembled text: {texts:?}"
+    );
+}
+
+#[test]
+fn tgi_sse_empty_top_tokens_and_absent_generated_text_stay_inspectable() {
+    // The two benign shapes the fail-closed rules above must not catch: an
+    // empty `top_tokens` array (the `top_n_tokens: 0` default some clients
+    // send explicitly) and an ordinary non-terminal frame.
+    let body = concat!(
+        "data: {\"index\":1,\"token\":{\"id\":1,\"text\":\"hel\"},\"top_tokens\":[]}\n\n",
+        "data: {\"index\":2,\"token\":{\"id\":2,\"text\":\"lo\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(inspectable, "a benign TGI stream must not fail closed");
+    assert_eq!(fragment(&texts, "$[0].generated_text").text, "hello");
+}
+
+#[test]
+fn tgi_sse_frame_carrying_another_protocols_discriminator_stays_on_its_own_path() {
+    // Detection is by shape, so a frame that also carries `choices`, an event
+    // `type`, or `candidates` belongs to the OpenAI / Anthropic / Gemini paths
+    // and must not be read a second time as a TGI token.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],",
+        "\"token\":{\"id\":1,\"text\":\"dup\"}}\n\n",
+    );
+
+    let (texts, inspectable) = reassemble_tgi(body.as_bytes());
+    assert!(inspectable);
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hello");
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.kind == SseTextKind::TgiGeneratedText),
+        "an OpenAI frame is not also reassembled as a TGI token"
+    );
+}
+
+#[test]
+fn openai_anthropic_and_gemini_reassembly_are_unaffected_by_tgi_support() {
+    // Behaviour-neutrality for the three protocols that already reassembled:
+    // none carries a bare `token` / `generated_text` member, so none reaches
+    // the TGI path, and none is failed closed by it.
+    let openai = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"content_index\":0,\"delta\":\"lo\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (texts, inspectable) = reassemble_tgi(openai.as_bytes());
+    assert!(inspectable, "an OpenAI stream is not a TGI stream");
+    assert_eq!(fragment(&texts, "$.choices[0].delta.content").text, "Hel");
+
+    let anthropic = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hello world\"}}\n\n",
+    );
+    let (texts, inspectable) = reassemble_tgi(anthropic.as_bytes());
+    assert!(inspectable, "an Anthropic stream is not a TGI stream");
+    assert_eq!(fragment(&texts, "$.content[0].text").text, "hello world");
+
+    let gemini = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",",
+        "\"parts\":[{\"text\":\"hello world\"}]}}]}\n\n",
+    );
+    let (texts, inspectable) = reassemble_tgi(gemini.as_bytes());
+    assert!(inspectable, "a Gemini stream is not a TGI stream");
+    assert_eq!(
+        fragment(&texts, "$.candidates[0].content.parts[*].text").text,
+        "hello world"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.kind == SseTextKind::TgiGeneratedText),
+        "no already-modelled protocol produces TGI fragments"
+    );
+}
+
 #[test]
 fn openai_sse_reassembly_is_unaffected_by_anthropic_support() {
     // Behaviour-neutrality for the OpenAI paths: chat deltas still reassemble

@@ -20,7 +20,7 @@ use super::utils::body_transform::{is_event_stream_content_type, is_json_content
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
     SseEventName, SseReassembler, SseText, SseTextKind, encode_sse_error_event,
-    is_gemini_stream_frame, last_paragraph_boundary, last_sentence_boundary,
+    is_gemini_stream_frame, is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
     parse_sse_data_frames_checked,
 };
 use super::{
@@ -120,12 +120,17 @@ pub(crate) const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.content_block_delta.delta.text",
     // Amazon Bedrock Titan text generation.
     "$.results[*].outputText",
-    // Cohere v1 `/chat` and `/generate` completion text.
+    // Cohere v1 `/chat` and `/generate` completion text, plus the
+    // `chat_history[]` turns `/chat` echoes back to the client — the
+    // response-direction counterpart of the request path of the same name.
     "$.text",
+    "$.chat_history[*].message",
     // Ollama `/api/generate` completion text.
     "$.response",
     // Hugging Face TGI: the completion is a top-level JSON ARRAY of
-    // `{"generated_text": …}` objects rather than an object.
+    // `{"generated_text": …}` objects rather than an object — a buffered
+    // `/generate` response, and the document a streamed `/generate_stream`
+    // response is reassembled into by `SseReassembler`.
     "$[*].generated_text",
 ];
 
@@ -3288,8 +3293,10 @@ fn reassemble_sse_response_segments(
         reassembler.push_event_frame(event, frame);
     }
     // An Anthropic stream carrying an event, `delta.type`, or content-block
-    // index the reassembler cannot fold into the document — or a Gemini stream
-    // carrying a malformed `candidates` frame or an unfoldable part kind — is
+    // index the reassembler cannot fold into the document — a Gemini stream
+    // carrying a malformed `candidates` frame or an unfoldable part kind, or a
+    // TGI stream carrying a malformed `token` / `generated_text` or
+    // alternative-token text outside the reconstructed completion — is
     // uninspectable for the same reason a `data:` payload that will not parse
     // is: it may hold client-visible text on a path nothing here reads.
     let fully_inspectable = parsed.fully_parsed && !reassembler.provider_stream_uninspectable();
@@ -4188,13 +4195,14 @@ impl StreamWindowEngine {
 /// Whether one parsed SSE frame is a provider event that [`SseReassembler`]
 /// does not understand, yet plainly belongs to a governed AI stream.
 ///
-/// The reassembler maps three families: chat-completions frames (a `choices`
-/// array), Responses-API events (a `type` starting `response.`), and the two
-/// provider-native protocols — Anthropic Messages events and Gemini
-/// `streamGenerateContent` frames. Anything else that carries an event `type` —
-/// a future provider's events — or that [`looks_like_governed_response_json`]
-/// recognises is content this build cannot inspect. Role-only chat deltas and
-/// keep-alive frames stay reassembler-shaped and are NOT flagged.
+/// The reassembler maps four families: chat-completions frames (a `choices`
+/// array), Responses-API events (a `type` starting `response.`), and the three
+/// provider-native protocols — Anthropic Messages events, Gemini
+/// `streamGenerateContent` frames, and Hugging Face TGI `/generate_stream`
+/// frames. Anything else that carries an event `type` — a future provider's
+/// events — or that [`looks_like_governed_response_json`] recognises is content
+/// this build cannot inspect. Role-only chat deltas and keep-alive frames stay
+/// reassembler-shaped and are NOT flagged.
 fn frame_is_unmapped_governed(frame: &Value) -> bool {
     let event_type = frame.get("type").and_then(Value::as_str);
     let responses_api_event = event_type.is_some_and(|ty| ty.starts_with("response."));
@@ -4205,13 +4213,15 @@ fn frame_is_unmapped_governed(frame: &Value) -> bool {
     let anthropic_event = event_type
         .map(SseEventName::from_name)
         .is_some_and(|name| matches!(name, SseEventName::Anthropic(_)));
-    // Gemini frames are reassembled per candidate for exactly the same reason,
-    // and a frame that claims the shape while violating it is likewise reported
-    // through `provider_stream_uninspectable`, not here.
+    // Gemini frames are reassembled per candidate, and Hugging Face TGI frames
+    // per stream, for exactly the same reason; a frame of either that claims
+    // the shape while violating it is likewise reported through
+    // `provider_stream_uninspectable`, not here.
     if frame.get("choices").is_some()
         || responses_api_event
         || anthropic_event
         || is_gemini_stream_frame(frame)
+        || is_tgi_stream_frame(frame)
     {
         return false;
     }
@@ -5353,6 +5363,7 @@ fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<T
             &["$.candidates[*].content.parts[*].functionCall.args"],
             SegmentKind::ToolArguments,
         ),
+        SseTextKind::TgiGeneratedText => (&["$[*].generated_text"], SegmentKind::AssistantMessage),
     };
 
     let enabled = path_patterns.iter().any(|pattern| {
@@ -5564,6 +5575,11 @@ fn extract_known_path(
             Some(prefixed_json_path(prefix, "$.preamble".to_string())),
             segments,
         ),
+        // Cohere v1 `/chat` history. Configured in BOTH directions: the request
+        // carries the prior turns, and the response echoes the whole
+        // conversation back, so a `CHATBOT` turn in a response body is
+        // client-visible completion text. The arm is direction-agnostic — the
+        // turn's own `role` decides the segment kind either way.
         "$.chat_history[*].message" => {
             extract_cohere_chat_history(json, direction, prefix, segments)
         }
