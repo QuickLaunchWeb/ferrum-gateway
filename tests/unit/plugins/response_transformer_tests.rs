@@ -2399,15 +2399,60 @@ fn a_disabled_or_header_only_instance_never_pins_a_body() {
     ));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn response_transform_size_policy_admits_the_exact_boundary() {
+    for payload_bytes in [113, 114, 115] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            ResponseTransformer::new(&json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "padding",
+                    "value": "x".repeat(payload_bytes)
+                }]
+            }))
+            .unwrap(),
+        )];
+        let mut ctx = make_ctx();
+        ctx.max_response_body_size_bytes = 128;
+        let mut status = 200;
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+        let mut body = bytes::Bytes::from_static(b"{}");
+        let logs = capture_debug_logs(|| async {
+            let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+                &plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(replaced, payload_bytes > 114);
+        })
+        .await;
+        if payload_bytes <= 114 {
+            assert_eq!(status, 200);
+            assert_eq!(body.len(), payload_bytes + 14);
+            assert!(!logs.contains("WARN"), "{logs}");
+        } else {
+            assert_eq!(status, 502);
+            assert!(logs.contains("produced_bytes_at_least=129"), "{logs}");
+        }
+    }
+}
+
 /// A claimed JSON rewrite that cannot fit the retained ceiling must mark the
 /// pending capacity-refusal signal. Ordinary unclaimed / semantic no-op paths
 /// must leave that signal clear so the shared transform loop keeps treating
 /// them as no-ops (GHSA-pwcm-6rh8-f2gh).
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
     use ferrum_edge::_test_support::{
-        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
-        stamp_original_response_metadata_for_test,
+        response_policy_observability_for_test, stamp_original_response_metadata_for_test,
         take_buffered_response_capacity_refusal_pending_for_test,
         transform_buffered_response_body_with_deadline_full_for_test,
     };
@@ -2464,11 +2509,12 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
         "ordinary unclaimed None must not mark a capacity refusal"
     );
 
-    // Full buffered lifecycle must install the shared HTTP capacity terminal
+    // Full buffered lifecycle must install the deterministic HTTP policy terminal
     // rather than forwarding the original body after a claimed refusal.
     let plugin = Arc::new(amplifying) as Arc<dyn Plugin>;
     let mut loop_ctx = make_ctx();
     loop_ctx.max_response_body_size_bytes = 40;
+    loop_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     let mut status = 200u16;
     let mut loop_headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
@@ -2476,21 +2522,87 @@ async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
     ]);
     stamp_original_response_metadata_for_test(&mut loop_ctx, status, &loop_headers);
     let mut body_buf = bytes::Bytes::from(body.to_vec());
-    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
-        &[plugin],
-        &mut loop_ctx,
-        &mut status,
-        &mut loop_headers,
-        &mut body_buf,
-        None,
-        false,
-    )
+    let logs = capture_debug_logs(|| async {
+        let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+            &[plugin],
+            &mut loop_ctx,
+            &mut status,
+            &mut loop_headers,
+            &mut body_buf,
+            None,
+            false,
+        )
+        .await;
+        assert!(replaced);
+    })
     .await;
-    assert!(replaced);
-    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
-    assert_eq!(&body_buf[..], RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+    assert_eq!(status, 502);
+    assert_eq!(
+        &body_buf[..],
+        br#"{"error":"Response body too large","limit":40}"#,
+    );
+    assert_eq!(loop_headers["x-gateway-error"], "overload");
+    assert_eq!(
+        response_policy_observability_for_test(&loop_ctx, status),
+        (
+            Some(ferrum_edge::retry::ErrorClass::DispatchPolicyRejected),
+            Some("overload"),
+        )
+    );
+    let warnings: Vec<_> = logs.lines().filter(|line| line.contains("WARN")).collect();
+    assert_eq!(warnings.len(), 1, "{logs}");
+    assert!(warnings[0].contains("response_transformer"), "{logs}");
+    assert!(warnings[0].contains("proxy_id="), "{logs}");
+    assert!(
+        warnings[0].contains("produced_bytes_at_least=210"),
+        "{logs}"
+    );
+    assert!(warnings[0].contains("ceiling=40"), "{logs}");
+    assert!(
+        !logs.contains(&"x".repeat(200)),
+        "payload must not be logged"
+    );
     assert!(
         !take_buffered_response_capacity_refusal_pending_for_test(&mut loop_ctx),
         "the shared transform loop must consume the pending signal"
     );
+}
+
+#[test]
+fn cookie_rename_is_refused_in_both_directions() {
+    for (source, destination) in [
+        ("Set-Cookie", "X-Cookie"),
+        ("X-Cookie", "SET-COOKIE"),
+        ("set-cookie", "set-cookie"),
+    ] {
+        let error = ResponseTransformer::new(&json!({"rules": [{
+            "target": "header", "operation": "rename", "key": source, "new_key": destination
+        }]}))
+        .err()
+        .expect("cookie rename must fail before any response is processed");
+        assert!(error.contains("rule[0]"));
+        assert!(error.contains("set-cookie"));
+    }
+}
+
+#[tokio::test]
+async fn ordinary_response_rename_preserves_all_cookie_values() {
+    let plugin = ResponseTransformer::new(&json!({"rules": [{
+        "target": "header", "operation": "rename", "key": "x-old", "new_key": "x-new"
+    }]}))
+    .unwrap();
+    for cookies in [None, Some("one=1"), Some("one=1\ntwo=2\nthree=3")] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        let mut headers = HashMap::from([("x-old".to_string(), "value".to_string())]);
+        if let Some(cookies) = cookies {
+            headers.insert("set-cookie".to_string(), cookies.to_string());
+        }
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(headers.get("set-cookie").map(String::as_str), cookies);
+        assert_eq!(headers.get("x-new").map(String::as_str), Some("value"));
+        assert!(!headers.contains_key("x-old"));
+    }
 }

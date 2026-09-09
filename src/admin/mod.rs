@@ -2197,20 +2197,30 @@ fn paginate_db_response<T: Serialize>(
     })
 }
 
-/// Extract namespace from the X-Ferrum-Namespace header, defaulting to "ferrum".
+/// Only an absent namespace header selects the default. A present value must
+/// decode as visible ASCII and satisfy the namespace identifier rules.
+fn validated_namespace_header(headers: &hyper::HeaderMap) -> Result<&str, String> {
+    let ns = match headers.get("x-ferrum-namespace") {
+        None => crate::config::types::DEFAULT_NAMESPACE,
+        Some(value) => value
+            .to_str()
+            .map_err(|_| "header must contain only visible ASCII characters".to_string())?,
+    };
+    crate::config::types::validate_namespace(ns)?;
+    Ok(ns)
+}
+
+/// Extract the validated namespace or return the documented client error.
 #[allow(clippy::result_large_err)]
 fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full<Bytes>>> {
-    let ns = headers
-        .get("x-ferrum-namespace")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(crate::config::types::DEFAULT_NAMESPACE);
-    if let Err(e) = crate::config::types::validate_namespace(ns) {
-        return Err(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Invalid X-Ferrum-Namespace: {}", e)}),
-        ));
-    }
-    Ok(ns.to_string())
+    validated_namespace_header(headers)
+        .map(str::to_string)
+        .map_err(|error| {
+            json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid X-Ferrum-Namespace: {}", error)}),
+            )
+        })
 }
 
 /// Canonical audit bucket for fleet-global mutations, invalid
@@ -2375,11 +2385,10 @@ pub async fn handle_admin_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let request_path = req.uri().path();
     let request_segments: Vec<&str> = request_path.trim_start_matches('/').split('/').collect();
-    let header_namespace = req
-        .headers()
-        .get("x-ferrum-namespace")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or(crate::config::types::DEFAULT_NAMESPACE);
+    // Invalid headers use the canonical audit bucket; the dispatcher still
+    // rejects them and records backup namespace_status=invalid without raw bytes.
+    let header_namespace = validated_namespace_header(req.headers())
+        .unwrap_or_else(|_| canonical_global_audit_namespace());
     let slot = audit::new_request_slot(
         req.method().as_str(),
         request_path,
@@ -2631,6 +2640,14 @@ async fn handle_admin_request_inner(
             .as_ref()
             .is_some_and(|proxy| proxy.overload.draining.load(Ordering::Acquire));
         let draining = crate::overload::shutdown_drain_announced() || instance_draining;
+        let stream_listeners_not_ready = state
+            .proxy_state
+            .as_ref()
+            .is_some_and(|proxy| !proxy.stream_listener_manager.is_ready());
+        let stream_listeners_degraded = state
+            .proxy_state
+            .as_ref()
+            .is_some_and(|proxy| proxy.stream_listener_manager.has_degraded_listeners());
         let ready = startup_ready
             && !serving_degraded
             && jwks_ready
@@ -2639,9 +2656,10 @@ async fn handle_admin_request_inner(
             && !cp_trust_blocked
             && !replay_authority_unavailable
             && !gateway_listeners_not_ready
+            && !stream_listeners_not_ready
             && !draining;
         health_status["ready"] = json!(ready);
-        if gateway_listeners_degraded {
+        if gateway_listeners_degraded || stream_listeners_degraded || stream_listeners_not_ready {
             health_status["status"] = json!("degraded");
         }
         // Ports, sanitized error detail, config generation, and occurrence
@@ -2874,6 +2892,13 @@ async fn handle_admin_request_inner(
             }
             health_status["logging"] =
                 serde_json::to_value(crate::logging::snapshot()).unwrap_or_default();
+            // Per-plugin sink record loss (issue #4801). Closed-set plugin and
+            // reason labels with process-cumulative counts only — never an
+            // endpoint, topic, policy id, or record payload. Surfaced here so
+            // an audit-trail truncation is visible without a metrics backend.
+            health_status["log_sink_record_loss"] =
+                serde_json::to_value(crate::plugins::utils::sink_loss::snapshot())
+                    .unwrap_or_default();
             health_status["kafka_logging"] =
                 serde_json::to_value(crate::plugins::kafka_logging::snapshots())
                     .unwrap_or_default();
@@ -2941,7 +2966,7 @@ async fn handle_admin_request_inner(
                 "draining"
             } else if lost_authority {
                 "unavailable"
-            } else if gateway_listeners_not_ready {
+            } else if gateway_listeners_not_ready || stream_listeners_not_ready {
                 "degraded"
             } else {
                 "starting"
@@ -3059,6 +3084,7 @@ async fn handle_admin_request_inner(
         metrics_output.push_str(&crate::plugins::utils::jwks_cache::render_prometheus());
         metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::observability_delivery::render_prometheus());
+        metrics_output.push_str(&crate::plugins::utils::sink_loss::render_prometheus());
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());

@@ -1958,7 +1958,19 @@ async fn start_direct_h2_test_gateway(
                     .max_header_list_size(state.max_header_size_bytes as u32);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
-                    async move { handle_proxy_request(req, state, remote_addr, false, None, None).await }
+                    async move {
+                        let request =
+                            handle_proxy_request(req, state, remote_addr, false, None, None);
+                        // This future is embedded in Hyper's service future.
+                        // Do not box it in the fixture: that would hide a
+                        // regression at the production request boundary.
+                        let bytes = std::mem::size_of_val(&request);
+                        assert!(
+                            bytes <= 32 * 1024,
+                            "frontend service future must stay within 32 KiB, got {bytes} bytes"
+                        );
+                        request.await
+                    }
                 });
                 let _ = builder.serve_connection_with_upgrades(io, svc).await;
             });
@@ -1970,6 +1982,18 @@ async fn start_direct_h2_test_gateway(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port() {
+    assert_direct_h2_host_and_authority(false).await;
+}
+
+// Both frontend dispatch stacks must fit the default Tokio worker stack in
+// the unoptimized hosted test profile. Keep the H1 reproducer above as well:
+// H2 streams are polled through a different Hyper task path.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_h2_backend_sees_matching_host_and_authority_from_h2_frontend() {
+    assert_direct_h2_host_and_authority(true).await;
+}
+
+async fn assert_direct_h2_host_and_authority(h2_frontend: bool) {
     let (_backend_handle, port) = start_h2_tls_host_echo_backend()
         .await
         .expect("start host-echo H2 TLS backend");
@@ -2002,23 +2026,39 @@ async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port(
         .expect("connect gateway");
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .expect("h1 handshake");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
     let request = Request::builder()
         .method("GET")
-        .uri("/h2test")
+        .uri(if h2_frontend {
+            "http://client.example:9000/h2test"
+        } else {
+            "/h2test"
+        })
         .header("host", "client.example:9000")
         .body(Full::new(Bytes::new()))
         .expect("request");
-    let response = sender
-        .send_request(request)
-        .await
-        .expect("gateway response");
+    let response = if h2_frontend {
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+            .send_request(request)
+            .await
+            .expect("gateway response")
+    } else {
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .expect("h1 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+            .send_request(request)
+            .await
+            .expect("gateway response")
+    };
     assert_eq!(response.status(), 200, "direct-H2 dispatch should succeed");
     let headers = response.headers();
     assert_eq!(
@@ -2035,5 +2075,10 @@ async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port(
         Some(expected.as_str()),
         "Hyper :authority must include the same non-default port"
     );
-    let _ = response.into_body().collect().await;
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("complete H2 response");
+    assert_eq!(body.to_bytes(), Bytes::from_static(b"ok"));
 }

@@ -20,6 +20,8 @@
 //!   (same complete syntax accepted at H1/H2/H3 emission), including
 //!   rejection of non-CR/LF forbidden control bytes.
 //! - Header keys are pre-lowercased.
+//! - Set-Cookie cannot be renamed from or to: its multi-value encoding is
+//!   bound to that name, regardless of the number of cookies.
 //! - Protocol-managed hop-by-hop and framing destinations (`Connection`,
 //!   `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
 //!   `Transfer-Encoding`, `Upgrade`, `Content-Length`) are rejected for
@@ -590,6 +592,17 @@ impl ResponseTransformer {
                             "response_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue"
                         )
                     })?;
+                }
+
+                // The newline-joined cookie representation is bound to its
+                // header name. Moving it loses values or replaces backend cookies.
+                if matches!(operation, HeaderOp::Rename)
+                    && (key == "set-cookie" || new_key.as_deref() == Some("set-cookie"))
+                {
+                    return Err(format!(
+                        "response_transformer: rule[{idx}]: rename source or destination \
+                         'set-cookie' is not supported; cookie values must retain their header name"
+                    ));
                 }
 
                 // Protocol-managed framing / connection-control destinations are

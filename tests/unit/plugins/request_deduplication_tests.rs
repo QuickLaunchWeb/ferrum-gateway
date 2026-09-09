@@ -1473,7 +1473,10 @@ fn every_conditionally_dynamic_presentation_plugin_reports_both_modes() {
     for name in CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
         let (dynamic_config, provable_config) = match *name {
             "a2a_gateway" => (
-                json!({"discovery": {"trust_forwarded_headers": true}}),
+                json!({"discovery": {
+                    "trust_forwarded_headers": true,
+                    "allowed_public_origins": ["https://agents.example.com"]
+                }}),
                 json!({"discovery": {"public_base_url": "https://agents.example.com"}}),
             ),
             other => panic!("no test config for conditionally dynamic plugin '{other}'"),
