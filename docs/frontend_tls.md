@@ -381,7 +381,7 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 ### No-Verify Mode (Testing Only)
 
 #### **Purpose**
-The no-verify mode is designed for development, testing, and isolated environments where certificate verification is not practical. Outside production it remains an explicit opt-in that logs a loud warning. Under `FERRUM_MESH_PRODUCTION_MODE=true`, both `FERRUM_TLS_NO_VERIFY` and `FERRUM_ADMIN_TLS_NO_VERIFY` are **refused** by the shared `EnvConfig` validation path used by `ferrum-edge validate` and runtime startup (every mesh topology). FIPS enforce independently refuses them as well.
+The no-verify mode is designed for development, testing, and isolated environments where certificate verification is not practical. `FERRUM_TLS_NO_VERIFY` disables verification of backend server certificates; `FERRUM_ADMIN_TLS_NO_VERIFY` makes the admin HTTPS listener neither require nor verify client certificates, and cannot be combined with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`. Outside production each remains an explicit opt-in that logs a loud warning. Under `FERRUM_MESH_PRODUCTION_MODE=true`, both `FERRUM_TLS_NO_VERIFY` and `FERRUM_ADMIN_TLS_NO_VERIFY` are **refused** by the shared `EnvConfig` validation path used by `ferrum-edge validate` and runtime startup (every mesh topology). FIPS enforce independently refuses them as well.
 
 #### **Risks**
 - **Security Risk**: Disables ALL certificate verification
