@@ -2,7 +2,19 @@
 
 `api_chargeback_sink` exports durable charge events to ClickHouse. It is a sibling
 to `api_chargeback`: use either plugin independently, or run both when you want
-the existing in-memory `/charges` view plus a durable event stream.
+the existing in-memory `/charges` view plus a durable event stream. Each proxy
+admits at most one effective `api_chargeback_sink` after scope merging. Multiple
+sinks on disjoint proxies are allowed; fan-out from one transaction is not.
+Independent sinks mint different `event_id` values, so ClickHouse cannot deduplicate
+their rows. A scoped sink replaces the global sink on that proxy.
+
+An explicitly configured `price_per_call: 0` meters matching calls with
+`call_count: 1` and zero call charge, even without bandwidth pricing. An unmatched
+status has no row unless bandwidth pricing applies. Successful WebSocket
+handshakes use the `101` pricing tier and `protocol: ws` for H1 Upgrade and H2/H3
+Extended CONNECT alike. The latter retain `http_status_code: 200` (or their actual
+2xx wire status); rejected handshakes keep their error-status pricing. gRPC
+terminal-status pricing is unchanged.
 
 ## Durability Contract
 
@@ -22,6 +34,48 @@ When `wait_for_async_insert` is omitted from `insert_query_params`, the sink
 pins `wait_for_async_insert=1` on every durable request instead of inheriting a
 potentially lossy ClickHouse user/profile default (including profiles that
 enable `async_insert` while disabling the persistence wait).
+
+### Memory acceptance, shutdown, and abrupt termination
+
+Per-event admission is **not persistence**. A row can reside in the bounded
+channel, the pending batch, an HTTP attempt/retry, or the asynchronous spool
+handoff before any durable copy exists. `queue.depth` covers only the channel;
+`queue.outstanding` also includes pending batches and active exports for the
+current generation. `chargeback_sink_per_event_pending` and `totals.per_event.pending`
+cover newly emitted rows awaiting acknowledgement or spooling across **all**
+generations, including retired workers and spool handoffs. Snapshot accumulator
+exposure remains separately reported by snapshot gauges and pending finalizations.
+
+The per-event ledger counts `received_total` at bounded admission, including
+refusals, then settles each row exactly once as `persisted_total` after a successful
+ClickHouse acknowledgement or spool write, or `dropped_total` when its last memory
+owner disappears without either. At a settled observation:
+`received_total = persisted_total + dropped_total + pending`. Replays of an already
+spooled row do not increment this ledger; they retain the original `event_id`.
+These are row counts, not `call_count` sums or snapshot delta counts. The existing
+`events_enqueued_total` is narrower: it excludes refused admissions. A spool row
+subsequently evicted or dead-lettered is reported by the separate spool counters.
+The lossy async-insert opt-in still weakens the acknowledgement's persistence
+meaning. Independent metric samples are not an atomic transaction snapshot; allow
+for concurrent updates and the status endpoint's one-second cache when reconciling.
+
+Graceful retirement closes admission and drains pending batches through the
+normal delivery path. Graceful process shutdown attempts that drain within its
+configured deadline. Cancellation and failed delivery with no successful spool
+handoff count unresolved rows as dropped when Rust destructors run. Successful
+blocking spool writes retain ownership through completion even when the async
+waiter is cancelled.
+
+**SIGKILL, process crashes, power loss, and forced exit cannot flush memory or
+increment final loss counters.** Rows that had not reached ClickHouse or a
+successful spool write are unrecoverable; the last scrape is only an observation
+of the exposure. `batch.flush_interval_ms` bounds the scheduled batching delay,
+not end-to-end persistence latency: active HTTP timeouts, bounded retry attempts
+and delays, delivery backlog, and filesystem latency add to it. Channel capacity,
+`batch.buffer_max_bytes`, spool delivery capacity, and the process retained-byte
+ceiling bound memory; filesystem stalls do not have a wall-clock durability bound.
+Snapshot mode likewise has a pre-spool accumulator window until its next successful
+snapshot write. No in-memory metric survives a process restart.
 
 ### Credentials and `insert_query_params`
 
@@ -71,10 +125,10 @@ exported categorical field on the resulting `ChargeEvent`:
 
 - `namespace`
 - `consumer_id`
-- `consumer_name` (empty segment when absent)
+- `consumer_name` (custom metadata only; no built-in producer; empty when absent)
 - `proxy_id`
 - `proxy_name`
-- `route_id` (empty segment when absent)
+- `route_id` (custom metadata only; no built-in producer; empty when absent)
 - billable `status_code`
 - raw `http_status_code` (empty when absent, e.g. stream/WebSocket)
 - final `grpc_status` (empty when absent; non-standard codes collapse to a
@@ -692,8 +746,9 @@ an unproven pathname merely because its filename contains an `owner_tag`.
 
 Queued export and spool-delivery events retain the same byte leases under
 `batch.buffer_max_bytes`; transferring an event to the spool worker does not
-escape or double-count that budget. The minimum admitted budget is 9312 bytes,
-the conservative maximum retained size of one field-bounded charge event.
+escape or double-count that budget. The minimum admitted budget is 9440 bytes,
+the conservative maximum retained size of one field-bounded charge event,
+including 128 bytes reserved for shared lifetime accounting.
 
 ### Delivery outcomes
 
@@ -990,7 +1045,16 @@ operators must inspect and reconcile the previous node subtree explicitly.
 
 ## Reconciliation Queries
 
-Raw event count:
+`received_at` is the charge event's emission time, not HTTP request arrival time
+(`timestamp_received`). WebSocket bandwidth and TCP/UDP/DTLS session charges emit
+at disconnect, so all session bandwidth belongs to the closing period, including
+`charges_monthly` and `PARTITION BY toYYYYMM(received_at)`. WebSocket handshake
+call charges emit separately at handshake completion. Snapshot deltas use their
+emission time. No request-arrival column is added to the baseline schema.
+`consumer_name` and `route_id` are optional custom-plugin metadata dimensions;
+built-in paths do not populate them and their exported values are absent/null.
+
+Raw events emitted during the last hour (including sessions that started earlier):
 
 ```sql
 SELECT count(), sum(charge_total)
@@ -1047,7 +1111,9 @@ Response contract:
 - `totals` aggregates queue depth/capacity/high-water hits/high-water
   diversions/full-buffer drops, spool files/bytes/
   drops/prepare failures/replay attempts/durably dead-lettered rows, and export
-  counters across every current accepted instance.
+  counters. Gauges describe current accepted instances; cumulative counters retain
+  process history across reload, removal, and late completion of retired workers.
+  `totals.per_event` reports the process ledger described above.
   `totals.spool.available` is `true` only when every spool-enabled live instance
   is currently writable.
 - `instances` lists the current accepted generation for each sink in ascending
@@ -1060,13 +1126,21 @@ accepted generation replaces the prior status entry for the same stable ID;
 dropping an older in-flight runtime removes nothing unless it is still the
 published generation.
 
-`/metrics` preserves the existing metric names as process-wide aggregates
-across the current accepted sink generation for every stable plugin-config ID:
+`/metrics` keeps cumulative counters and export-latency histogram observations
+for the process lifetime, even after all sinks are removed. It uses fixed-size
+process storage, with no retained policy IDs or retired runtime registry. Current
+instance status counters remain generation-local diagnostics; top-level totals and
+Prometheus counters are cumulative. Existing metric names are preserved:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
+- `chargeback_sink_queue_outstanding`
+- `chargeback_sink_per_event_received_total`
+- `chargeback_sink_per_event_persisted_total`
+- `chargeback_sink_per_event_dropped_total`
+- `chargeback_sink_per_event_pending`
 - `chargeback_sink_queue_high_water_hits_total`
 - `chargeback_sink_queue_high_water_diversions_total`
 - `chargeback_sink_queue_full_drops_total`

@@ -1754,7 +1754,8 @@ pub enum GrpcBackendUnavailableKind {
     InvalidServerName,
     /// The backend rejected an outbound request after the H2 connection was
     /// established and ALPN had succeeded — e.g., `hyper::Error` from
-    /// `sender.send_request(...).await`. **Post-wire by definition:** the
+    /// `sender.send_request(...).await`. Unless a buffered request has a typed
+    /// [`Self::ProtocolNack`] proof, this is **post-wire by definition:** the
     /// request headers may already have been forwarded, so this kind must
     /// NEVER be treated as a pre-wire failure. Maps to
     /// [`crate::retry::ErrorClass::ConnectionReset`] (mid-stream reset) so
@@ -1773,6 +1774,12 @@ pub enum GrpcBackendUnavailableKind {
     /// keep [`Self::BackendRequest`] even on `is_canceled` because the
     /// upload may already be unreplayable.
     DispatchCanceled,
+    /// A buffered request was rejected before response headers by a remote
+    /// RFC 9113 GOAWAY(NO_ERROR) excluding its stream or REFUSED_STREAM reset.
+    /// The peer guarantees no application processing, even if DATA crossed
+    /// the transport. Maps to [`crate::retry::ErrorClass::ConnectionPoolError`]
+    /// so the existing retry budget/backoff can replay the retained body.
+    ProtocolNack,
     /// Gateway trust changed while a mesh transport was being established, or
     /// after a pooled transport was checked out but before it opened a stream.
     /// The request never reached the destination, and the retired transport is
@@ -1813,6 +1820,7 @@ impl GrpcBackendUnavailableKind {
             | Self::H2cHandshake
             | Self::InvalidServerName
             | Self::DispatchCanceled
+            | Self::ProtocolNack
             | Self::TrustWithdrawn
             // Over-cap refusal happens before any dial, so it is pre-wire and
             // `retry_on_connect_failure` may rotate to another LB target (with
@@ -3572,8 +3580,8 @@ impl<'a> GrpcDispatchTransport<'a> {
             })
     }
 
-    /// Drop a stale pooled sender after a provably pre-wire `is_canceled`
-    /// dispatch failure. The mesh pools self-heal instead: the mesh-mTLS
+    /// Drop a stale pooled sender after a provably pre-wire cancellation or
+    /// protocol NACK. The mesh pools self-heal instead: the mesh-mTLS
     /// cached-sender scans skip `is_closed()` senders, and the HBONE gRPC
     /// transport dials a FRESH inner HTTP/2 connection per RPC, so neither has
     /// a stale sender to invalidate.
@@ -4937,7 +4945,8 @@ pub(crate) async fn proxy_grpc_request_core(
             // the next attempt / RPC. Only genuinely unreplayable
             // streaming/channel uploads keep `BackendRequest` — see
             // `proxy_grpc_request_streaming`.
-            if e.is_canceled() {
+            let protocol_nack = crate::retry::error_chain_is_protocol_nack(&e);
+            if e.is_canceled() || protocol_nack {
                 transport.invalidate_on_pre_wire_cancel(proxy);
             }
             error!(
@@ -4951,7 +4960,9 @@ pub(crate) async fn proxy_grpc_request_core(
                     message: format!("Backend timeout: {}", e),
                 }
             } else {
-                let kind = if e.is_canceled() {
+                let kind = if protocol_nack {
+                    GrpcBackendUnavailableKind::ProtocolNack
+                } else if e.is_canceled() {
                     GrpcBackendUnavailableKind::DispatchCanceled
                 } else {
                     GrpcBackendUnavailableKind::BackendRequest

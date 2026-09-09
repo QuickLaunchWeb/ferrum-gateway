@@ -87,6 +87,8 @@ use crate::plugins::utils::fault_roll::MAX_FAULT_DELAY_MS;
 /// "this object is malformed". Emit it verbatim inside a diagnostic that also
 /// names the offending field.
 pub(crate) const UNSUPPORTED_SHAPE_MARKER: &str = "is not implemented by Ferrum";
+/// Shared translator/status marker for known but unimplemented filter actions.
+pub(crate) const INCOMPATIBLE_FILTERS_MARKER: &str = "incompatible Gateway API filters";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sMetadata {
