@@ -1945,19 +1945,20 @@ const GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
 
 /// Scrub secrets and bound captured gateway logs for harness failure diagnostics.
 ///
-/// Replaces every provided non-empty secret (empty strings are skipped because
-/// replacing them would corrupt the entire capture), redacts URL userinfo
+/// Redacts URL userinfo before replacing every provided non-empty secret (empty
+/// strings are skipped because replacing them would corrupt the entire capture)
 /// (`scheme://user:pass@host`), and keeps only the trailing
 /// `GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES` so hosted CI stays actionable without
 /// dumping unbounded child output.
 pub fn scrub_gateway_capture_for_diagnostics(raw: &str, secrets: &[&str]) -> String {
-    let mut text = raw.to_string();
+    // Preserve URL delimiters until userinfo has been removed: a short caller
+    // secret such as `/`, `:`, or `@` could otherwise make the URL unrecognizable.
+    let mut text = scrub_url_userinfo_in_text(raw);
     for secret in secrets {
         if !secret.is_empty() {
             text = text.replace(secret, "***");
         }
     }
-    text = scrub_url_userinfo_in_text(&text);
     truncate_utf8_suffix(&text, GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES)
 }
 
