@@ -252,6 +252,13 @@ fn request_phase_deadline_rejects_preserve_grpc_web_framing() {
     assert!(helper.contains("error_response_for_content_type("));
     assert!(helper.contains("finalize_grpc_web_error_response_headers("));
     assert!(helper.contains("build_grpc_web_error_response_from_parts("));
+    assert_eq!(
+        helper
+            .matches(".remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY)")
+            .count(),
+        2,
+        "gRPC-Web deferred committed-hook exits must clear internal synthetic bookkeeping"
+    );
 }
 
 #[test]
