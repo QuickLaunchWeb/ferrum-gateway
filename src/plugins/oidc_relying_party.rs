@@ -231,6 +231,7 @@ struct DiscoveryDoc {
     userinfo_endpoint: Option<String>,
     jwks_uri: String,
     end_session_endpoint: Option<String>,
+    revocation_endpoint: Option<String>,
 }
 
 struct SessionRuntime {
@@ -872,6 +873,7 @@ impl OidcRelyingParty {
                 userinfo_endpoint: userinfo_endpoint.clone(),
                 jwks_uri: jwks,
                 end_session_endpoint: end_session_endpoint.clone(),
+                revocation_endpoint: None,
             })
         } else {
             None
@@ -879,8 +881,19 @@ impl OidcRelyingParty {
         let discovery = Arc::new(ArcSwap::from_pointee(discovery_doc.clone()));
 
         let context_seed = session_context_seed(provider_obj, session_obj, behavior_obj)?;
-        let cookie_name = optional_string(session_obj, "cookie_name", "session")?
-            .unwrap_or_else(|| derived_cookie_name("ferrum_session", &context_seed));
+        let domain = optional_string(session_obj, "domain", "session")?;
+        let path =
+            optional_string(session_obj, "path", "session")?.unwrap_or_else(|| "/".to_string());
+        let explicit_cookie_name = optional_string(session_obj, "cookie_name", "session")?;
+        let derived_cookie = explicit_cookie_name.is_none();
+        let cookie_name = explicit_cookie_name.unwrap_or_else(|| {
+            let prefix = if domain.is_none() && path == "/" {
+                "__Host-ferrum_session"
+            } else {
+                "__Secure-ferrum_session"
+            };
+            derived_cookie_name(prefix, &context_seed)
+        });
         let session_context = session_context_id(&context_seed, &cookie_name);
         let session_context_id =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_context);
@@ -889,7 +902,7 @@ impl OidcRelyingParty {
         let mut pending_aad = b"ferrum-edge/oidc-pending-flow/v1\0".to_vec();
         pending_aad.extend_from_slice(&session_context);
         let correlation_cookie_name_prefix =
-            derived_cookie_name("ferrum_oidc_state", &session_context);
+            derived_cookie_name("__Host-ferrum_oidc_state", &session_context);
         let store = optional_string(session_obj, "store", "session")?
             .unwrap_or_else(|| "cookie".to_string());
         if store != "cookie" {
@@ -909,7 +922,7 @@ impl OidcRelyingParty {
         if max_cookie_bytes > DEFAULT_SESSION_MAX_COOKIE_BYTES {
             return Err("oidc_relying_party: session.max_cookie_bytes must be <= 8000".to_string());
         }
-        let secure = optional_bool(session_obj, "secure")?.unwrap_or(true);
+        let secure = optional_bool(session_obj, "secure")?.unwrap_or(true) || derived_cookie;
         let http_only = optional_bool(session_obj, "http_only")?.unwrap_or(true);
         let same_site = optional_string(session_obj, "same_site", "session")?
             .unwrap_or_else(|| "lax".to_string())
@@ -922,9 +935,6 @@ impl OidcRelyingParty {
         if same_site == "none" && !secure {
             return Err("oidc_relying_party: SameSite=None requires secure=true".to_string());
         }
-        let domain = optional_string(session_obj, "domain", "session")?;
-        let path =
-            optional_string(session_obj, "path", "session")?.unwrap_or_else(|| "/".to_string());
         let cookie_attrs =
             build_cookie_attrs(secure, http_only, &same_site, domain.as_deref(), &path);
         let state_ttl = Duration::from_secs(optional_behavior_u64(
@@ -975,7 +985,7 @@ impl OidcRelyingParty {
             cookie_attrs,
             context_id: session_context_id,
             correlation_cookie_name_prefix,
-            correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
+            correlation_cookie_attrs: build_correlation_cookie_attrs(),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
@@ -1319,8 +1329,8 @@ impl OidcRelyingParty {
 
     /// POST `application/x-www-form-urlencoded` `params` to the token endpoint,
     /// applying the configured client authentication. Shared by the
-    /// authorization-code exchange and the refresh-token grant so both stay in
-    /// lockstep on client-auth handling.
+    /// authorization-code exchange, refresh-token grant, and logout revocation
+    /// so all three stay in lockstep on client-auth handling.
     async fn post_token_endpoint(
         &self,
         token_endpoint: &str,
@@ -2380,25 +2390,47 @@ impl super::Plugin for OidcRelyingParty {
         } else if ctx.path == self.provider.logout_path {
             let mut headers = HashMap::new();
             headers.insert("set-cookie".to_string(), self.clear_cookie());
+            let payload = cookie_value(ctx, &self.session.cookie_name)
+                .and_then(|value| self.open_session(value));
+            let discovery = self.provider.discovery.load_full();
             if self.behavior.rp_initiated_logout
-                && let Some(discovery) = self.provider.discovery.load().as_ref().as_ref()
-                && let Some(end_session) = &discovery.end_session_endpoint
+                && let Some(payload) = payload
+                && let Some(discovery) = discovery.as_ref().as_ref()
             {
-                let mut location = end_session.clone();
-                if let Some(redirect_uri) = &self.provider.post_logout_redirect_uri
+                if let Some(endpoint) = &discovery.revocation_endpoint
+                    && let Some(token) = payload.refresh_token_b64.as_deref()
+                {
+                    // Best-effort RFC 7009 revocation: reuse client authentication,
+                    // cap the entire operation, and never read or log response bodies.
+                    let params = vec![
+                        ("token".to_string(), token.to_string()),
+                        ("token_type_hint".to_string(), "refresh_token".to_string()),
+                        ("client_id".to_string(), self.provider.client_id.clone()),
+                    ];
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.post_token_endpoint(endpoint, params),
+                    )
+                    .await;
+                }
+                if let Some(end_session) = &discovery.end_session_endpoint
                     && let Ok(mut url) = Url::parse(end_session)
+                    && !payload.id_token_b64.is_empty()
                 {
                     url.query_pairs_mut()
-                        .append_pair("post_logout_redirect_uri", redirect_uri)
+                        .append_pair("id_token_hint", &payload.id_token_b64)
                         .append_pair("client_id", &self.provider.client_id);
-                    location = url.to_string();
+                    if let Some(redirect_uri) = &self.provider.post_logout_redirect_uri {
+                        url.query_pairs_mut()
+                            .append_pair("post_logout_redirect_uri", redirect_uri);
+                    }
+                    headers.insert("location".to_string(), url.to_string());
+                    return PluginResult::Reject {
+                        status_code: 302,
+                        body: String::new(),
+                        headers,
+                    };
                 }
-                headers.insert("location".to_string(), location);
-                return PluginResult::Reject {
-                    status_code: 302,
-                    body: String::new(),
-                    headers,
-                };
             }
             PluginResult::Reject {
                 status_code: 200,
@@ -3459,8 +3491,8 @@ fn build_cookie_attrs(
 /// Unlike the durable session cookie, this cookie must remain host-only: a
 /// parent `Domain` would let sibling hosts receive or overwrite the sealed
 /// authorization-code flow.
-fn build_correlation_cookie_attrs(secure: bool, callback_path: &str) -> String {
-    build_cookie_attrs(secure, true, "Lax", None, callback_path)
+fn build_correlation_cookie_attrs() -> String {
+    build_cookie_attrs(true, true, "Lax", None, "/")
 }
 
 fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
@@ -3867,12 +3899,18 @@ async fn fetch_discovery(
         .and_then(Value::as_str)
         .map(|url| validate_discovered_url(discovery_url, url, "end_session_endpoint"))
         .transpose()?;
+    let revocation_endpoint = body
+        .get("revocation_endpoint")
+        .and_then(Value::as_str)
+        .map(|url| validate_discovered_url(discovery_url, url, "revocation_endpoint"))
+        .transpose()?;
     Ok(DiscoveryDoc {
         authorization_endpoint,
         token_endpoint,
         userinfo_endpoint,
         jwks_uri,
         end_session_endpoint,
+        revocation_endpoint,
     })
 }
 
@@ -4503,7 +4541,7 @@ mod tests {
     }
 
     #[test]
-    fn localhost_http_callback_honors_insecure_correlation_cookie_setting() {
+    fn localhost_http_callback_keeps_prefixed_cookies_secure() {
         for redirect_uri in [
             "http://localhost/oauth/callback",
             "http://127.0.0.1/oauth/callback",
@@ -4514,10 +4552,10 @@ mod tests {
             let plugin = build_plugin_without_workers(&config);
             let correlation_cookie = plugin.correlation_cookie("state", "browser-binding");
 
-            assert!(!plugin.session.cookie_attrs.contains("; Secure"));
+            assert!(plugin.session.cookie_attrs.contains("; Secure"));
             assert!(
-                !correlation_cookie.contains("; Secure"),
-                "local HTTP callback cookie must match session.secure=false for {redirect_uri}"
+                correlation_cookie.contains("; Secure"),
+                "prefixed correlation cookie must stay Secure for {redirect_uri}"
             );
             assert!(correlation_cookie.contains("; HttpOnly"));
             assert!(correlation_cookie.contains("SameSite=Lax"));

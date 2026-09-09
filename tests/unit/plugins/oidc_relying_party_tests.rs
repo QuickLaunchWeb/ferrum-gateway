@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use url::Url;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{basic_auth, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::jwks_auth_support::{
@@ -164,12 +164,9 @@ fn cookie_name(cookie: &str) -> &str {
 }
 
 fn assert_host_only_correlation_cookie(cookie: &str, expected_max_age: &str) {
+    assert!(cookie_name(cookie).starts_with("__Host-ferrum_oidc_state_"));
     assert_eq!(cookie_attribute(cookie, "domain"), None, "{cookie}");
-    assert_eq!(
-        cookie_attribute(cookie, "path"),
-        Some(Some("/oauth/callback")),
-        "{cookie}"
-    );
+    assert_eq!(cookie_attribute(cookie, "path"), Some(Some("/")), "{cookie}");
     assert_eq!(
         cookie_attribute(cookie, "samesite"),
         Some(Some("Lax")),
@@ -1190,7 +1187,7 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
     first_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     first_config["providers"][0]["required_scopes"] = json!(["admin"]);
     first_config["providers"][0]["consumer_identity_claim"] = json!("email");
-    // The selected correlation cookie starts with `ferrum_`; the shorter
+    // The selected correlation cookie starts with `__Host-ferrum_`; the shorter
     // requester cookie name proves conflict checks use the complete name.
     first_config["session"]["cookie_name"] = json!("ferrum");
     let first =
@@ -1242,7 +1239,7 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
         .expect("both response-owned cookies must reach the client");
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
-    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert!(cookies[0].contains("Path=/;"));
     assert!(cookies[1].starts_with("ferrum="));
     assert_eq!(
         cookies
@@ -1350,8 +1347,8 @@ async fn oidc_multi_auth_keeps_later_clear_for_shared_session_cookie() {
         .expect("the selected challenge cookies must reach the client");
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
-    assert!(cookies[0].starts_with("ferrum_oidc_state_"));
-    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert!(cookies[0].starts_with("__Host-ferrum_oidc_state_"));
+    assert!(cookies[0].contains("Path=/;"));
     assert_eq!(
         cookies[1],
         "ferrum=; Max-Age=0; Path=/; SameSite=lax; Secure; HttpOnly"
@@ -1756,11 +1753,8 @@ async fn loopback_http_challenge_remains_available_on_the_same_host() {
 
         let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
         assert_eq!(cookie_attribute(&challenge.cookie, "domain"), None);
-        assert_eq!(
-            cookie_attribute(&challenge.cookie, "path"),
-            Some(Some("/oauth/callback"))
-        );
-        assert_eq!(cookie_attribute(&challenge.cookie, "secure"), None);
+        assert_eq!(cookie_attribute(&challenge.cookie, "path"), Some(Some("/")));
+        assert_eq!(cookie_attribute(&challenge.cookie, "secure"), Some(None));
     }
 }
 
@@ -3000,4 +2994,204 @@ async fn discovery_config_retains_explicit_optional_endpoints() {
     );
 
     clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn generated_session_cookies_enforce_prefix_attributes_and_allow_explicit_names() {
+    for (domain, path, explicit_name, expected_prefix) in [
+        (None, "/", None, "__Host-ferrum_session_"),
+        (Some("example.com"), "/", None, "__Secure-ferrum_session_"),
+        (None, "/app", None, "__Secure-ferrum_session_"),
+        (None, "/", Some("custom_session"), "custom_session="),
+    ] {
+        let mut config = base_config();
+        config["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cookie_name");
+        config["session"]["path"] = json!(path);
+        config["session"]["secure"] = json!(false);
+        if let Some(domain) = domain {
+            config["session"]["domain"] = json!(domain);
+        }
+        if let Some(name) = explicit_name {
+            config["session"]["cookie_name"] = json!(name);
+        }
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+        let cookie =
+            oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false).unwrap();
+        assert!(cookie.starts_with(expected_prefix));
+        assert_eq!(cookie_attribute(&cookie, "path"), Some(Some(path)));
+        assert_eq!(cookie_attribute(&cookie, "domain"), domain.map(Some));
+        assert_eq!(
+            cookie_attribute(&cookie, "secure"),
+            explicit_name.is_none().then_some(None)
+        );
+        let challenge = issue_browser_challenge(&plugin).await;
+        assert_host_only_correlation_cookie(&challenge.cookie, "600");
+    }
+}
+
+#[tokio::test]
+async fn logout_requires_a_sealed_session_and_encodes_the_id_token_hint() {
+    for post_logout_uri in [None, Some("https://app.example.com/goodbye")] {
+        let mut config = base_config();
+        config["providers"][0]["end_session_endpoint"] =
+            json!("https://issuer.example.com/logout?existing=keep");
+        if let Some(uri) = post_logout_uri {
+            config["providers"][0]["post_logout_redirect_uri"] = json!(uri);
+        }
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+        let cookie =
+            oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false).unwrap();
+        for session in [
+            None,
+            Some("ferrum_session=tampered"),
+            Some(cookie_pair(&cookie)),
+        ] {
+            let mut ctx = html_ctx();
+            ctx.path = "/oauth/logout".to_string();
+            if let Some(session) = session {
+                ctx.headers.insert("cookie".to_string(), session.to_string());
+            }
+            let PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } = plugin.on_request_received(&mut ctx).await
+            else {
+                panic!("logout must terminate locally");
+            };
+            assert_eq!(
+                cookie_attribute(&headers["set-cookie"], "max-age"),
+                Some(Some("0"))
+            );
+            if session == Some(cookie_pair(&cookie)) {
+                assert_eq!(status_code, 302);
+                let location = Url::parse(&headers["location"]).unwrap();
+                let query: HashMap<_, _> = location.query_pairs().into_owned().collect();
+                assert_eq!(query["id_token_hint"], "test-id-token");
+                assert_eq!(query["client_id"], "ferrum-gateway");
+                assert_eq!(query["existing"], "keep");
+                assert_eq!(
+                    query.get("post_logout_redirect_uri").map(String::as_str),
+                    post_logout_uri
+                );
+            } else {
+                assert_eq!(status_code, 200);
+                assert!(body.contains("Logged out"));
+                assert!(!headers.contains_key("location"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn logout_revokes_discovered_refresh_tokens_with_best_effort_client_auth() {
+    for (status, delay_secs) in [(200, 0), (503, 0), (200, 6)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/discovery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "authorization_endpoint": format!("{}/authorize", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "jwks_uri": format!("{}/jwks", server.uri()),
+                "end_session_endpoint": format!("{}/logout", server.uri()),
+                "revocation_endpoint": format!("{}/revoke", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .and(basic_auth("ferrum-gateway", "secret"))
+            .and(body_string_contains("token=refresh%2Btoken"))
+            .and(body_string_contains("token_type_hint=refresh_token"))
+            .respond_with(ResponseTemplate::new(status).set_delay(Duration::from_secs(delay_secs)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = base_config();
+        let provider = config["providers"][0].as_object_mut().unwrap();
+        for key in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+            provider.remove(key);
+        }
+        provider.insert(
+            "discovery_url".to_string(),
+            json!(format!("{}/discovery", server.uri())),
+        );
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut ctx = html_ctx();
+                if matches!(
+                    plugin.authenticate(&mut ctx, &ConsumerIndex::new(&[])).await,
+                    PluginResult::Reject {
+                        status_code: 302,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery must become ready");
+        let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+            &plugin,
+            json!({"sub": "alice"}),
+            "refresh+token",
+        )
+        .unwrap();
+        let mut ctx = html_ctx();
+        ctx.path = "/oauth/logout".to_string();
+        ctx.headers
+            .insert("cookie".to_string(), cookie_pair(&cookie).to_string());
+        let PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } = tokio::time::timeout(
+            Duration::from_millis(5500),
+            plugin.on_request_received(&mut ctx),
+        )
+        .await
+        .expect("revocation must not exceed its five-second bound")
+        else {
+            panic!("logout must terminate locally");
+        };
+        assert_eq!(status_code, 302);
+        let location = Url::parse(&headers["location"]).unwrap();
+        assert!(
+            location
+                .query_pairs()
+                .any(|(key, value)| key == "id_token_hint" && value == "test-id-token")
+        );
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn discovery_rejects_untrusted_revocation_endpoints() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discovery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+            "revocation_endpoint": "https://untrusted.example.com/revoke",
+        })))
+        .mount(&server)
+        .await;
+    assert!(
+        oidc_resolve_discovery_for_test(
+            &PluginHttpClient::default(),
+            &format!("{}/discovery", server.uri()),
+            None,
+            None,
+        )
+        .await
+        .is_err()
+    );
 }

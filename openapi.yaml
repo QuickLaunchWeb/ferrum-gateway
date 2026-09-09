@@ -20254,7 +20254,7 @@ components:
               description: Previous encryption secret accepted while rotating session and pending-flow cookies within the same versioned OIDC context
             cookie_name:
               type: string
-              description: Cookie name. When omitted, Ferrum derives a context-specific name from the provider and authorization policy.
+              description: Explicit cookie name opts out of automatic naming. When omitted, the context-derived name uses __Host- with no domain and root path, or __Secure- otherwise; generated names always carry Secure.
             store:
               type: string
               enum: [cookie]
@@ -20275,6 +20275,7 @@ components:
             secure:
               type: boolean
               default: true
+              description: Generated session cookie names and correlation cookies always carry Secure, even when false.
             http_only:
               type: boolean
               default: true
@@ -20284,7 +20285,7 @@ components:
               default: lax
             domain:
               type: string
-              description: Optional Domain attribute for the durable session cookie. The short-lived sealed pending-flow correlation cookie always remains host-only and never inherits this value.
+              description: Optional Domain attribute for the durable session cookie. Correlation cookies always use __Host-, Secure, Path=/, and no Domain.
             path:
               type: string
               default: /
@@ -20333,6 +20334,7 @@ components:
             rp_initiated_logout:
               type: boolean
               default: true
+              description: With an authentic session cookie, send id_token_hint on provider logout and attempt discovered refresh-token revocation within five seconds. Cookie copies remain valid within session and claims lifetime limits. Without a valid cookie, return the local logout page.
             post_login_default_path:
               type: string
               default: /
