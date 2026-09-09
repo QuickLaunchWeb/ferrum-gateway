@@ -6000,6 +6000,25 @@ pub(crate) fn validate_system_trust_roots_verify_pairing(
     None
 }
 
+/// Reject pairing a client-CA bundle with the admin listener no-verify opt-out.
+/// Configuring a client CA means the admin HTTPS listener requires client
+/// certificates; disabling verification contradicts that and would otherwise
+/// silently accept anonymous TLS connections while logs claim mTLS is available.
+pub(crate) fn validate_admin_tls_no_verify_client_ca_pairing(
+    client_ca_field: &str,
+    no_verify_field: &str,
+    client_ca_bundle_path: Option<&str>,
+    no_verify: bool,
+) -> Option<String> {
+    if client_ca_bundle_path.is_some() && no_verify {
+        return Some(format!(
+            "{no_verify_field} cannot be true when {client_ca_field} is set — a configured \
+             client CA bundle requires client certificate verification on the admin listener"
+        ));
+    }
+    None
+}
+
 /// Reject an explicit system-trust-roots selection paired with Istio's
 /// `insecureSkipVerify` opt-out. This is the same trust invariant as
 /// [`validate_system_trust_roots_verify_pairing`], expressed in the polarity
