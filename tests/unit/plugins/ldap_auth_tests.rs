@@ -2169,6 +2169,9 @@ async fn assert_group_search_result(
             .write_all(&bind_response(1, 0))
             .await
             .expect("write direct bind success");
+        // Direct bind reads the canonical identity off the bound entry before
+        // any group lookup; answer it on the same connection.
+        answer_canonical_identity_search(&mut user_stream).await;
         drop(user_stream);
 
         let (mut group_stream, _) = listener.accept().await.expect("accept group search");
