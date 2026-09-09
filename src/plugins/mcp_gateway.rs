@@ -21,13 +21,16 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use url::Url;
 
-use crate::config::types::{BackendScheme, BackendTlsConfig};
+use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
     AggregateSseBounds, AggregateSseBroker, AggregateSseError, StreamIdentity,
 };
-use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
+    meaningful_identity,
+};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 const DEFAULT_SESSION_TTL_SECONDS: u64 = 3600;
@@ -832,6 +835,70 @@ enum McpCatalogError {
     Refresh(String),
 }
 
+/// Authenticated principal that minted a downstream MCP session.
+///
+/// A downstream session is the gateway's per-user isolation boundary: it owns a
+/// private discovery catalog and the mediated upstream sessions reached through
+/// it. Binding the session to the principal that created it keeps the session id
+/// from being a pure bearer capability that any caller who learns it can reuse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum McpSessionPrincipal {
+    /// Gateway-mapped `Consumer`, keyed by namespace plus the stable record id
+    /// (falling back to the username when the record carries no id).
+    Consumer { namespace: String, key: String },
+    /// Externally authenticated identity with no `Consumer` mapping, as set by
+    /// plugins such as `jwks_auth`.
+    Identity(String),
+}
+
+impl McpSessionPrincipal {
+    /// Consumer comparison key: the stable id when present, else the username.
+    fn consumer_key(consumer: &Consumer) -> &str {
+        if consumer.id.trim().is_empty() {
+            consumer.username.as_str()
+        } else {
+            consumer.id.as_str()
+        }
+    }
+
+    /// Whether this request carries any authenticated principal at all. A proxy
+    /// with no authentication plugin has none, and session binding is a no-op
+    /// there rather than a refusal.
+    fn context_has_principal(ctx: &RequestContext) -> bool {
+        ctx.identified_consumer.is_some()
+            || meaningful_identity(ctx.authenticated_identity.as_deref()).is_some()
+    }
+
+    /// Resolve the principal to bind, preferring a gateway-mapped Consumer over
+    /// an external identity, matching `RequestContext::effective_identity`.
+    /// Allocates once per session mint, never on the reuse path.
+    fn from_context(ctx: &RequestContext) -> Option<Self> {
+        if let Some(consumer) = ctx.identified_consumer.as_ref() {
+            return Some(Self::Consumer {
+                namespace: consumer.namespace.clone(),
+                key: Self::consumer_key(consumer).to_string(),
+            });
+        }
+        meaningful_identity(ctx.authenticated_identity.as_deref())
+            .map(|identity| Self::Identity(identity.to_string()))
+    }
+
+    /// Compare the bound principal against the current request without
+    /// allocating: this runs on every session reuse.
+    fn matches_context(&self, ctx: &RequestContext) -> bool {
+        let consumer = ctx.identified_consumer.as_deref();
+        let identity = meaningful_identity(ctx.authenticated_identity.as_deref());
+        match self {
+            Self::Consumer { namespace, key } => consumer.is_some_and(|current| {
+                current.namespace == *namespace && Self::consumer_key(current) == key.as_str()
+            }),
+            // A Consumer-mapped caller is a different principal even when the
+            // mapped username equals the external identity string.
+            Self::Identity(bound) => consumer.is_none() && identity == Some(bound.as_str()),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DownstreamMcpSession {
     #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
@@ -839,6 +906,9 @@ struct DownstreamMcpSession {
     protocol_version: String,
     client_info: Option<Value>,
     client_capabilities: Option<Value>,
+    /// Principal that created this session, or `None` when the request carried
+    /// no authenticated principal (deployments with no authentication plugin).
+    principal: Option<McpSessionPrincipal>,
     upstream_sessions: HashMap<String, UpstreamMcpSession>,
     catalog: Arc<RwLock<McpCatalog>>,
     // Per-session catalog refresh lock: serializes discovery for *this* session's
@@ -1431,11 +1501,41 @@ impl McpGateway {
         session.last_seen.elapsed() >= self.sessions.session_ttl
     }
 
+    /// Whether the caller may reuse this downstream session.
+    ///
+    /// A session minted under an authenticated principal is usable only by that
+    /// same principal; possession of the session id alone is not sufficient. A
+    /// session minted with no principal (a proxy with no authentication plugin)
+    /// stays usable only while the request likewise carries no principal, so the
+    /// check is a no-op for unauthenticated deployments and fail-closed
+    /// otherwise. An unknown session id is left to the liveness check, which
+    /// produces the existing error.
+    fn downstream_session_principal_matches(
+        &self,
+        downstream_session_id: &str,
+        ctx: &RequestContext,
+    ) -> bool {
+        match self.session_store.get(downstream_session_id) {
+            Some(session) => match session.principal.as_ref() {
+                Some(principal) => principal.matches_context(ctx),
+                None => !McpSessionPrincipal::context_has_principal(ctx),
+            },
+            None => true,
+        }
+    }
+
     async fn touch_downstream_session(
         &self,
         downstream_session_id: &str,
         ctx: &RequestContext,
     ) -> bool {
+        // Session ownership is checked before liveness so a caller presenting
+        // someone else's session id can neither extend its idle lifetime nor
+        // observe whether it exists: a mismatch is refused with exactly the
+        // same "session not found" shape as an unknown id.
+        if !self.downstream_session_principal_matches(downstream_session_id, ctx) {
+            return false;
+        }
         let expired = self
             .session_store
             .get(downstream_session_id)
@@ -1493,6 +1593,10 @@ impl McpGateway {
         client_capabilities: Option<Value>,
     ) -> Result<String, AggregateSseError> {
         let downstream_session_id = uuid::Uuid::new_v4().to_string();
+        // Bind the session to the principal that minted it. Resolved before the
+        // admission critical section so the only work under the lock stays the
+        // in-memory scan/insert.
+        let principal = McpSessionPrincipal::from_context(ctx);
 
         // Enforce the cap and reclaim sessions atomically, but keep upstream
         // DELETE I/O *out* of the critical section. Under the admission lock we do
@@ -1561,6 +1665,7 @@ impl McpGateway {
                     protocol_version,
                     client_info,
                     client_capabilities,
+                    principal,
                     upstream_sessions,
                     catalog: Arc::clone(&catalog),
                     catalog_refresh_lock: Arc::new(Mutex::new(())),
