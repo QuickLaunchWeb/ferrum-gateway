@@ -849,12 +849,15 @@ terminal outcome, including outcomes that are not backend results:
 - **Backend outcomes** (success, failure, connection error) settle the slot and
   move breaker health as described above.
 
-HTTP/1.1, HTTP/2, WebSocket, gRPC, HTTP/3, the HBONE relay, and UDP/DTLS session
-setup own their probe slots through the shared `HalfOpenProbeGuard`. Dropping
-UDP/DTLS setup during DNS resolution or backend connect/handshake, or returning
-early before a backend outcome, releases the slot neutrally. UDP/DTLS still
-records success when backend setup completes; the guard does not change that
-boundary.
+HTTP/1.1, HTTP/2, WebSocket, gRPC, HTTP/3, the HBONE relay, UDP/DTLS session
+setup, and TCP passthrough and terminating connections own their probe slots
+through the shared `HalfOpenProbeGuard`. Dropping TCP or UDP/DTLS setup during
+DNS resolution or backend connect/handshake, or returning early before a backend
+outcome, releases the slot neutrally. TCP keeps the guard through relay completion
+and rearms it on each retry admission; dropping the connection future also releases
+an unsettled slot. UDP/DTLS still records success when backend setup completes,
+and TCP still records its successful connection outcome at relay completion; the
+guard does not change those boundaries.
 
 **Failure detection:**
 

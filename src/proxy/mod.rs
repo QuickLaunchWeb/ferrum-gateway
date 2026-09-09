@@ -5013,10 +5013,11 @@ impl Drop for StreamLbSetupFailureGuard {
 /// Siblings that share this invariant and MUST route through this one type
 /// (issue #4792): the H1/H2, WebSocket and gRPC dispatch paths in this module,
 /// the HBONE CONNECT relay in [`crate::proxy::hbone_proxy`], the HTTP/3
-/// request and WebSocket paths in [`crate::http3`], and the UDP/DTLS session
-/// setup paths in [`crate::proxy::udp_proxy`].
+/// request and WebSocket paths in [`crate::http3`], the UDP/DTLS session
+/// setup paths in [`crate::proxy::udp_proxy`], and the passthrough and
+/// terminating TCP paths in [`crate::proxy::tcp_proxy`].
 /// `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts that every
-/// file calling `check_circuit_breaker` and both UDP direct-cache admission
+/// file calling `check_circuit_breaker` and all UDP/TCP direct-cache admission
 /// paths own a guard and that the guard settles NEUTRAL.
 pub struct HalfOpenProbeGuard {
     /// The breaker that granted the slot, resolved ONCE at admission so a
