@@ -4304,7 +4304,7 @@ where
             } else {
                 None
             },
-            cb_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );

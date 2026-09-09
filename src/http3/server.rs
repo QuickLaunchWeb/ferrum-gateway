@@ -12827,7 +12827,7 @@ async fn dispatch_grpc_native_h3(
         state,
         start_time,
         *plugin_execution_ns,
-        &cb_probe,
+        cb_probe,
     )
     .await?
     {
@@ -12959,7 +12959,7 @@ async fn dispatch_grpc_native_h3(
         upstream_target,
         upstream_balancer,
         cb_target_key,
-        &cb_probe,
+        cb_probe,
         plugins,
         initial_response_header_policy_plugins,
         method,
