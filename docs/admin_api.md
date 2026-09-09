@@ -1344,6 +1344,11 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/cluster
 
 Returns all currently connected Data Plane nodes and Mesh nodes. Each registry is independent: a node that subscribes to both `ConfigSync.Subscribe` (DP) and `MeshConfigSync.MeshSubscribe` (mesh) appears in both arrays with separate `connected_at` timestamps.
 
+Both subscription services require the request's trimmed `node_id` to equal the
+authenticated bearer JWT's `sub`. A mismatched identity is rejected before
+registration and cannot replace another node's `GET /cluster` entry. Built-in
+DP token minting uses the node ID as `sub`; external issuers must do the same.
+
 ```json
 {
   "mode": "cp",
