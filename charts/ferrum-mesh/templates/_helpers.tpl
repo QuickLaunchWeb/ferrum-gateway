@@ -12,6 +12,34 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- printf "%s:%s" .Values.image.repository (include "ferrum-mesh.imageTag" .) -}}
 {{- end -}}
 
+{{/* Promote only a tag, never an explicit digest, to the shell-capable image. */}}
+{{- define "ferrum-mesh.toolsImageTag" -}}
+{{- if hasSuffix "-ebpf-tools" . -}}
+{{- . -}}
+{{- else -}}
+{{- printf "%s-ebpf-tools" (trimSuffix "-ebpf" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* The injector's capture mode comes from its own env, not Ambient's mode. */}}
+{{- define "ferrum-mesh.injectorSidecarImage" -}}
+{{- $env := .Values.injector.env | default dict -}}
+{{- $mode := index $env "FERRUM_MESH_CAPTURE_MODE" | default "explicit" | toString | lower -}}
+{{- $override := index $env "FERRUM_INJECTOR_SIDECAR_IMAGE" | default "" | toString -}}
+{{- if $override -}}
+{{- $reference := first (splitList "@" $override) -}}
+{{- $component := last (splitList "/" $reference) -}}
+{{- if and (eq $mode "iptables") (not (and (contains ":" $component) (hasSuffix "-ebpf-tools" $component))) -}}
+{{- fail "iptables injection requires injector.env.FERRUM_INJECTOR_SIDECAR_IMAGE with a -ebpf-tools tag; an explicit image or digest is never rewritten" -}}
+{{- end -}}
+{{- $override -}}
+{{- else if eq $mode "iptables" -}}
+{{- printf "%s:%s" .Values.image.repository (include "ferrum-mesh.toolsImageTag" (include "ferrum-mesh.imageTag" .)) -}}
+{{- else -}}
+{{- include "ferrum-mesh.image" . -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Chart-level imagePullSecrets block for a mesh pod spec. Emits nothing when
 image.pullSecrets is empty, so the default install renders no key at all. The
