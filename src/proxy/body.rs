@@ -3123,6 +3123,10 @@ impl<S> SizeLimitedFrameSource<S> {
 }
 
 impl<S: FrameSource + Unpin> FrameSource for SizeLimitedFrameSource<S> {
+    fn source_is_end_stream(&self) -> bool {
+        self.inner.source_is_end_stream()
+    }
+
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -3148,6 +3152,13 @@ impl<S: FrameSource + Unpin> FrameSource for SizeLimitedFrameSource<S> {
 const COALESCE_TARGET: usize = 128 * 1024;
 
 pub(crate) trait FrameSource {
+    /// A source may prove that no further frames exist before its first poll.
+    /// Unknown stream sources remain conservative; a zero content length alone
+    /// cannot prove completion because trailers or errors may still follow.
+    fn source_is_end_stream(&self) -> bool {
+        false
+    }
+
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -3171,6 +3182,10 @@ where
 }
 
 impl FrameSource for Incoming {
+    fn source_is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(self)
+    }
+
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -3422,6 +3437,10 @@ impl<S> H3FrameSource<S> {
 }
 
 impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
+    fn source_is_end_stream(&self) -> bool {
+        self.state == H3FrameSourceState::Done
+    }
+
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -3846,7 +3865,7 @@ impl<S: FrameSource + Unpin> http_body::Body for Coalescing<S> {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.done
+        (self.done || self.inner.source_is_end_stream())
             && self.buffer.is_empty()
             && self.stashed_trailer.is_none()
             && self.stashed_error.is_none()
@@ -5129,6 +5148,10 @@ where
     B: http_body::Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    fn source_is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(self)
+    }
+
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -5573,6 +5596,28 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_preserves_initial_end_stream_through_size_limit() {
+        struct EndedSource;
+        impl FrameSource for EndedSource {
+            fn source_is_end_stream(&self) -> bool {
+                true
+            }
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+                panic!("initial end-stream inspection must not poll the source");
+            }
+        }
+
+        let body = Coalescing::new(SizeLimitedFrameSource::new(EndedSource, 1024), 128, None);
+        assert!(http_body::Body::is_end_stream(&body));
+        let unknown = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 128, Some(0));
+        assert!(!http_body::Body::is_end_stream(&unknown));
+    }
+
+    #[test]
     fn coalescing_buffer_fills_to_threshold() {
         let mut body = Coalescing::new(
             MockSource::new(vec![
@@ -5607,7 +5652,18 @@ mod tests {
             None,
         );
 
-        let frames = poll_all(&mut body);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let first = match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(frame)) => frame,
+            other => panic!("expected buffered data first, got {other:?}"),
+        };
+        assert!(
+            !body.is_end_stream(),
+            "a stashed terminal frame must still be delivered"
+        );
+        let mut frames = vec![first];
+        frames.extend(poll_all(&mut body));
         assert_eq!(frames.len(), 2);
         assert!(frames[0].as_ref().unwrap().data_ref().is_some());
         let trailer_map = frames[1]
@@ -5649,7 +5705,18 @@ mod tests {
             None,
         );
 
-        let frames = poll_all(&mut body);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let first = match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(frame)) => frame,
+            other => panic!("expected buffered data first, got {other:?}"),
+        };
+        assert!(
+            !body.is_end_stream(),
+            "a stashed terminal frame must still be delivered"
+        );
+        let mut frames = vec![first];
+        frames.extend(poll_all(&mut body));
         assert_eq!(frames.len(), 2);
         assert_eq!(
             frames[0].as_ref().unwrap().data_ref().unwrap().as_ref(),

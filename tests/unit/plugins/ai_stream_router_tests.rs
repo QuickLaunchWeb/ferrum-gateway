@@ -5075,14 +5075,60 @@ async fn final_header_policy_overrides_a_later_authorization_update() {
     assert_no_value_anywhere(&headers, "INTERNAL-BACKEND-SECRET");
 }
 
+// The built-in transformer refuses this reserved destination. A custom plugin
+// can still reintroduce it, so the final provider guard must remain effective.
+struct ProxyAuthorizationReintroducer;
+
+#[async_trait::async_trait]
+impl Plugin for ProxyAuthorizationReintroducer {
+    fn name(&self) -> &str {
+        "custom_proxy_authorization_reintroducer"
+    }
+
+    fn priority(&self) -> u16 {
+        3001
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        assert!(ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(ctx));
+        headers.insert("proxy-authorization".to_string(), "Basic zzz".to_string());
+        PluginResult::Continue
+    }
+}
+
 #[tokio::test]
 async fn final_header_policy_removes_a_later_added_client_credential() {
-    let plugins = router_then_transformer(json!([
+    let mut plugins = router_then_transformer(json!([
         {"operation": "add", "target": "header", "key": "X-Api-Key", "value": "client-token"},
-        {"operation": "add", "target": "header", "key": "Cookie", "value": "session=abc"},
-        {"operation": "add", "target": "header", "key": "Proxy-Authorization", "value": "Basic zzz"}
+        {"operation": "add", "target": "header", "key": "Cookie", "value": "session=abc"}
     ]));
-    let (_ctx, headers) = claimed_final_headers(&plugins, "gpt-4o", json_headers()).await;
+    let later = ProxyAuthorizationReintroducer;
+    assert!(plugins[1].priority() < later.priority());
+    plugins.push(Arc::new(later));
+    let mut ctx = post_ctx(&streaming_request("gpt-4o"));
+    let mut headers = json_headers();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    // Prove all three credentials reach the guard after the router's first strip.
+    assert_eq!(
+        headers.get("x-api-key").map(String::as_str),
+        Some("client-token")
+    );
+    assert_eq!(
+        headers.get("cookie").map(String::as_str),
+        Some("session=abc")
+    );
+    assert_eq!(
+        headers.get("proxy-authorization").map(String::as_str),
+        Some("Basic zzz")
+    );
+    final_header_policy(&plugins, &ctx, &mut headers);
 
     assert!(!headers.contains_key("x-api-key"));
     assert!(!headers.contains_key("cookie"));

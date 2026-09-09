@@ -1824,9 +1824,8 @@ impl Plugin for Waf {
         {
             return PluginResult::Continue;
         }
-        if !self.response_body_eligible_for_scan(
-            response_headers.get("content-type").map(String::as_str),
-        ) {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        if !self.response_body_eligible_for_scan(content_type) {
             return PluginResult::Continue;
         }
         let (body, truncated) = match self.clamp_body(ctx, BodyDirection::Response, body) {
@@ -1834,7 +1833,7 @@ impl Plugin for Waf {
             Err(result) => return result,
         };
         let mut outcome = self
-            .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body))
+            .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
         self.finish_scan(ctx, outcome)

@@ -429,6 +429,8 @@ impl McpMessageKind {
 struct McpEnvelope {
     jsonrpc: String,
     id: Option<Value>,
+    raw_id: Option<Box<RawValue>>,
+    raw_cancel_id: Option<Box<RawValue>>,
     method: Option<String>,
     params: Option<Value>,
     #[allow(dead_code)] // Kept in the parsed envelope shape for response classification.
@@ -447,11 +449,174 @@ struct McpEnvelope {
 /// oversized attacker-controlled id can be neither cloned nor reflected.
 enum BatchMember {
     /// The raw slice was within the per-member cap and materialized cleanly.
-    Admitted(Value),
+    Admitted(Value, Option<Box<RawValue>>, Option<Box<RawValue>>),
     /// The raw slice exceeded the per-member cap (or could not be
     /// materialized). Yields a bounded `id: null` Invalid Request at this
     /// member's input position.
     Rejected,
+}
+
+impl BatchMember {
+    fn raw_id(&self) -> Option<&RawValue> {
+        match self {
+            Self::Admitted(_, id, _) => id.as_deref(),
+            Self::Rejected => None,
+        }
+    }
+}
+
+/// Read an envelope field without ever converting a numeric token to f64.
+fn raw_json_rpc_field<'a>(body: &'a [u8], field: &str) -> Option<&'a RawValue> {
+    let object: BTreeMap<String, &RawValue> = serde_json::from_slice(body).ok()?;
+    object.get(field).copied()
+}
+
+/// Both raw tokens the correlation paths need, from ONE top-level pass.
+///
+/// `id` correlates the response, `params.requestId` names the stream a
+/// `notifications/cancelled` cancels. Reading them separately would re-walk a
+/// body that may be megabytes of `tools/call` arguments for each field.
+fn raw_json_rpc_correlation_ids(body: &[u8]) -> (Option<Box<RawValue>>, Option<Box<RawValue>>) {
+    let Ok(object) = serde_json::from_slice::<BTreeMap<String, &RawValue>>(body) else {
+        return (None, None);
+    };
+    let id = object.get("id").copied().map(ToOwned::to_owned);
+    let cancel_id = object
+        .get("params")
+        .and_then(|params| raw_json_rpc_field(params.get().as_bytes(), "requestId"))
+        .map(ToOwned::to_owned);
+    (id, cancel_id)
+}
+
+/// Byte ceiling on a client-controlled JSON-RPC id token reflected verbatim
+/// into a gateway-authored singleton response.
+///
+/// The batch path is already bounded by `validation.max_batch_response_bytes`
+/// and the SSE identity by `sessions.sse_max_stream_id_bytes`, but a singleton
+/// refusal has no such budget: without this bound a multi-megabyte id would be
+/// mirrored back at request size. An id past the bound is refused with a fixed
+/// `-32600` that does not echo it.
+const MCP_MAX_REFLECTED_ID_BYTES: usize = 4096;
+
+/// Keep the original id token while serializing a mediated envelope. This is
+/// deliberately local to MCP; all other JSON values retain their existing
+/// serde_json semantics. Neither ids nor raw payloads are logged.
+struct JsonRpcWithRawId<'a> {
+    value: &'a Value,
+    id: Option<&'a RawValue>,
+    /// Whether a `null` id in `value` is also replaced by the raw token.
+    ///
+    /// Ordinary mediation must NOT: a notification and a deliberately id-less
+    /// refusal both carry `id: null`, and inventing an id for them would
+    /// misattribute the response. Only a terminal that has no other way to
+    /// name the request it answers — see [`correlate_response_id`] — opts in.
+    replace_null_id: bool,
+}
+
+impl<'a> JsonRpcWithRawId<'a> {
+    fn preserving(value: &'a Value, id: Option<&'a RawValue>) -> Self {
+        Self {
+            value,
+            id,
+            replace_null_id: false,
+        }
+    }
+}
+
+impl serde::Serialize for JsonRpcWithRawId<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let Some(object) = self.value.as_object() else {
+            return serde::Serialize::serialize(self.value, serializer);
+        };
+        let mut map = serializer.serialize_map(Some(object.len()))?;
+        for (key, value) in object {
+            if key == "id"
+                && (self.replace_null_id || !value.is_null())
+                && let Some(id) = self.id
+            {
+                map.serialize_entry(key, id)?;
+                continue;
+            }
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+/// Re-emit `result`'s JSON-RPC id as the exact token `id` carried on the wire,
+/// leaving a legitimately `null` id alone.
+fn restore_response_id(result: PluginResult, id: Option<&RawValue>) -> PluginResult {
+    rewrite_response_id(result, id, false)
+}
+
+/// As [`restore_response_id`], but also names `id` on a response that would
+/// otherwise carry `id: null`. Reserved for a gateway-authored terminal that
+/// replaces an answer the client is still waiting on: an uncorrelated refusal
+/// leaves that call pending forever.
+fn correlate_response_id(result: PluginResult, id: &RawValue) -> PluginResult {
+    rewrite_response_id(result, Some(id), true)
+}
+
+fn rewrite_response_id(
+    result: PluginResult,
+    id: Option<&RawValue>,
+    replace_null_id: bool,
+) -> PluginResult {
+    let Some(id) = id else {
+        return result;
+    };
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = result
+    else {
+        return result;
+    };
+    if id.get().len() > MCP_MAX_REFLECTED_ID_BYTES {
+        return json_rpc_error(
+            None,
+            -32600,
+            "Invalid MCP JSON-RPC request",
+            Some("JSON-RPC id exceeded the reflected-id byte bound".to_string()),
+        );
+    }
+    // serde already emitted the same token: a `tools/list` catalog response can
+    // be megabytes, and re-parsing plus re-serializing it to reach an identical
+    // result is pure cost. The shallow field scan borrows, so nothing but the
+    // token itself is materialized.
+    let already_emitted =
+        raw_json_rpc_field(body.as_bytes(), "id").is_some_and(|current| current.get() == id.get());
+    if already_emitted {
+        return PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        };
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&body) else {
+        return PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        };
+    };
+    match serde_json::to_string(&JsonRpcWithRawId {
+        value: &value,
+        id: Some(id),
+        replace_null_id,
+    }) {
+        Ok(body) => PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        },
+        Err(_) => json_rpc_error(None, -32603, "MCP response serialization failed", None),
+    }
 }
 
 #[derive(Clone)]
@@ -749,6 +914,16 @@ impl McpGateway {
         let endpoint_path = optional_string_from_object(endpoint, "path")?
             .ok_or_else(|| "mcp_gateway: 'endpoint.path' is required".to_string())?;
         validate_path(&endpoint_path, "endpoint.path")?;
+        // The endpoint reserves its whole slash-delimited subtree, so a root
+        // endpoint would reserve the entire origin and 404 every other handler
+        // on the proxy. Refuse it at admission rather than discovering it as a
+        // total outage on the first request after a reload.
+        if endpoint_path == "/" {
+            return Err(
+                "mcp_gateway: 'endpoint.path' must not be '/': an MCP endpoint reserves its whole path subtree, so a root endpoint would refuse every other request on this proxy; use a sub-path such as '/mcp'"
+                    .to_string(),
+            );
+        }
 
         let supported_protocol_versions =
             optional_string_vec_from_object(endpoint, "protocol_versions")?
@@ -778,6 +953,39 @@ impl McpGateway {
                 "mcp_gateway: 'validation.validate_tool_results' requires mode 'aggregate_router' because transparent_proxy has no mediated tool catalog"
                     .to_string(),
             );
+        }
+        if mode == McpGatewayMode::TransparentProxy {
+            // Presence matters: even an explicit default must not promise a
+            // catalog policy that this mode cannot enforce.
+            for (section, fields) in [
+                (
+                    "policy",
+                    &["default_action", "tools", "hide_denied_tools"][..],
+                ),
+                (
+                    "discovery",
+                    &[
+                        "aggregate_prompts",
+                        "aggregate_resources",
+                        "aggregate_tools",
+                        "cache_ttl_seconds",
+                        "hide_denied_items",
+                        "namespace_separator",
+                        "on_new_tool",
+                        "on_schema_change",
+                    ][..],
+                ),
+            ] {
+                if let Some(config) = optional_object(object, section)? {
+                    for field in fields {
+                        if config.contains_key(*field) {
+                            return Err(format!(
+                                "mcp_gateway: '{section}.{field}' requires mode 'aggregate_router' because transparent_proxy has no mediated tool catalog"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         let servers = parse_servers(object, sessions.initialize_upstreams)?;
         if servers.is_empty() {
@@ -897,6 +1105,15 @@ impl McpGateway {
 
     fn matches_endpoint(&self, ctx: &RequestContext) -> bool {
         ctx.path == self.endpoint_path
+    }
+
+    fn within_endpoint_scope(&self, ctx: &RequestContext) -> bool {
+        let scope = self.endpoint_path.trim_end_matches('/');
+        ctx.path == scope
+            || ctx
+                .path
+                .strip_prefix(scope)
+                .is_some_and(|tail| tail.starts_with('/'))
     }
 
     fn content_type_is_json(headers: &HashMap<String, String>) -> bool {
@@ -1878,11 +2095,11 @@ impl McpGateway {
         if !self.sse_broker.has_listener(&session_id) {
             return;
         }
-        let Some(id) = envelope.id.as_ref() else {
+        let Some(id) = envelope.raw_id.as_deref() else {
             return;
         };
         let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
-        let identity = match StreamIdentity::from_json_rpc_id(id, max_id_bytes) {
+        let identity = match StreamIdentity::from_raw_json_rpc_id(id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
                 Self::note_sse_error(ctx, error);
@@ -2053,6 +2270,28 @@ impl McpGateway {
                 Self::note_sse_delivery(ctx, "suppressed");
                 Some(empty_response(202))
             }
+            Err(AggregateSseError::ResponseEnvelopeInvalid) => {
+                Self::note_sse_error(ctx, AggregateSseError::ResponseEnvelopeInvalid);
+                // Distinct from "inline" (the answer was delivered on the POST)
+                // and "suppressed" (the client cancelled): the upstream answer
+                // was DISCARDED and replaced.
+                Self::note_sse_delivery(ctx, "refused");
+                let refusal = json_rpc_error(
+                    None,
+                    -32603,
+                    "Invalid upstream MCP response: id or envelope did not match the request",
+                    None,
+                );
+                // The client is still waiting on this request id. A refusal
+                // carrying `id: null` would never resolve that pending call, so
+                // the identity this request opened names it. Numeric identities
+                // are their exact admitted wire token.
+                let token = serde_json::value::RawValue::from_string(stream.json_rpc_id_token());
+                Some(match token {
+                    Ok(id) => correlate_response_id(refusal, &id),
+                    Err(_) => refusal,
+                })
+            }
             Err(error) => {
                 Self::note_sse_error(ctx, error);
                 Self::note_sse_delivery(ctx, "inline");
@@ -2089,17 +2328,14 @@ impl McpGateway {
         let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
             return;
         };
-        let request_id = envelope
-            .params
-            .as_ref()
-            .and_then(|params| params.get("requestId"));
+        let request_id = envelope.raw_cancel_id.as_deref();
         let Some(request_id) = request_id else {
             let missing = AggregateSseError::StreamIdMissing;
             Self::note_sse_cancel(ctx, missing.reason_token());
             return;
         };
         let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
-        let identity = match StreamIdentity::from_json_rpc_id(request_id, max_id_bytes) {
+        let identity = match StreamIdentity::from_raw_json_rpc_id(request_id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
                 Self::note_sse_cancel(ctx, error.reason_token());
@@ -3854,11 +4090,17 @@ impl McpGateway {
         envelope: &McpEnvelope,
     ) -> PluginResult {
         let Some(server) = self.primary_server() else {
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32002,
-                "Unknown upstream MCP server",
-                None,
+            // Reached from both the singleton and the whole-batch transparent
+            // route, neither of which passes this terminal through the
+            // aggregate dispatch restore, so it echoes its own id token here.
+            return restore_response_id(
+                json_rpc_error(
+                    envelope.id.clone(),
+                    -32002,
+                    "Unknown upstream MCP server",
+                    None,
+                ),
+                envelope.raw_id.as_deref(),
             );
         };
         if self.observability.emit_metadata {
@@ -3945,7 +4187,7 @@ impl McpGateway {
                             self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
                             ctx.metadata
                                 .insert("mcp.route_decision".to_string(), "deny".to_string());
-                            return response;
+                            return restore_response_id(response, envelope.raw_id.as_deref());
                         }
                         responses.push(Value::Null);
                         envelopes.push(Some(envelope));
@@ -3960,26 +4202,29 @@ impl McpGateway {
         }
 
         if invalid {
-            let response_values =
-                responses
-                    .into_iter()
-                    .zip(envelopes.iter())
-                    .filter_map(|(slot, envelope)| match envelope {
-                        // A valid notification never receives a JSON-RPC response,
-                        // even when an invalid sibling prevents the whole HTTP
-                        // batch from being forwarded.
-                        Some(envelope)
-                            if matches!(envelope.message_kind, McpMessageKind::Notification) =>
-                        {
-                            None
-                        }
-                        Some(envelope) => Some(json_rpc_error_value(
+            let response_values = responses
+                .into_iter()
+                .zip(envelopes.iter())
+                .zip(batch.iter())
+                .filter_map(|((slot, envelope), item)| match envelope {
+                    // A valid notification never receives a JSON-RPC response,
+                    // even when an invalid sibling prevents the whole HTTP
+                    // batch from being forwarded.
+                    Some(envelope)
+                        if matches!(envelope.message_kind, McpMessageKind::Notification) =>
+                    {
+                        None
+                    }
+                    Some(envelope) => Some((
+                        item.raw_id(),
+                        json_rpc_error_value(
                             envelope.id.clone(),
                             -32600,
                             "JSON-RPC batch was not forwarded because a sibling member was invalid",
-                        )),
-                        None => Some(slot),
-                    });
+                        ),
+                    )),
+                    None => Some((item.raw_id(), slot)),
+                });
             // Apply the response budget while the synthetic array is assembled,
             // not after serializing the entire result. Admitted member ids are
             // bounded by the request/item caps, but their combined reflected
@@ -3990,10 +4235,11 @@ impl McpGateway {
             // error.
             let mut bounded_responses = Vec::new();
             let mut response_bytes = 2usize;
-            for value in response_values {
+            for (raw_id, value) in response_values {
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut bounded_responses,
                     &mut response_bytes,
+                    raw_id,
                     value,
                 ) {
                     self.clear_batch_item_routing_state(ctx);
@@ -4024,6 +4270,8 @@ impl McpGateway {
             .unwrap_or(McpEnvelope {
                 jsonrpc: "2.0".to_string(),
                 id: None,
+                raw_id: None,
+                raw_cancel_id: None,
                 method: None,
                 params: None,
                 result: None,
@@ -4101,9 +4349,12 @@ impl McpGateway {
                 Ok(envelope) => envelope,
                 Err(error) => {
                     saw_response_bearing = true;
-                    if let Err(response) =
-                        self.push_bounded_batch_response(&mut responses, &mut response_bytes, error)
-                    {
+                    if let Err(response) = self.push_bounded_batch_response(
+                        &mut responses,
+                        &mut response_bytes,
+                        item.raw_id(),
+                        error,
+                    ) {
                         return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                     }
                     continue;
@@ -4117,6 +4368,7 @@ impl McpGateway {
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut responses,
                     &mut response_bytes,
+                    item.raw_id(),
                     json_rpc_error_value(
                         envelope.id.clone(),
                         -32600,
@@ -4143,6 +4395,7 @@ impl McpGateway {
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut responses,
                     &mut response_bytes,
+                    item.raw_id(),
                     json_rpc_error_value(
                         envelope.id.clone(),
                         MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
@@ -4168,6 +4421,7 @@ impl McpGateway {
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut responses,
                     &mut response_bytes,
+                    item.raw_id(),
                     json_rpc_error_value(
                         envelope.id.clone(),
                         MCP_BATCH_UPSTREAM_ROUTING_UNSUPPORTED,
@@ -4213,6 +4467,7 @@ impl McpGateway {
                         if let Err(response) = self.push_bounded_batch_response(
                             &mut responses,
                             &mut response_bytes,
+                            item.raw_id(),
                             json_rpc_error_value(
                                 envelope.id.clone(),
                                 MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
@@ -4228,9 +4483,12 @@ impl McpGateway {
                         }
                         continue;
                     }
-                    if let Err(response) =
-                        self.push_bounded_batch_response(&mut responses, &mut response_bytes, value)
-                    {
+                    if let Err(response) = self.push_bounded_batch_response(
+                        &mut responses,
+                        &mut response_bytes,
+                        item.raw_id(),
+                        value,
+                    ) {
                         return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                     }
                 }
@@ -4248,6 +4506,7 @@ impl McpGateway {
                         if let Err(response) = self.push_bounded_batch_response(
                             &mut responses,
                             &mut response_bytes,
+                            item.raw_id(),
                             json_rpc_error_value(
                                 id,
                                 MCP_BATCH_UPSTREAM_ROUTING_UNSUPPORTED,
@@ -4407,8 +4666,14 @@ impl McpGateway {
                     // Deliberately do not parse or read this member's id.
                     return BatchMember::Rejected;
                 }
+                if crate::util::json_dup_keys::slice_ambiguity(raw.as_bytes()).is_some() {
+                    return BatchMember::Rejected;
+                }
                 match serde_json::from_str::<Value>(raw) {
-                    Ok(value) => BatchMember::Admitted(value),
+                    Ok(value) => {
+                        let (raw_id, raw_cancel_id) = raw_json_rpc_correlation_ids(raw.as_bytes());
+                        BatchMember::Admitted(value, raw_id, raw_cancel_id)
+                    }
                     Err(_) => BatchMember::Rejected,
                 }
             })
@@ -4436,7 +4701,7 @@ impl McpGateway {
     /// `id: null` Invalid Request values; other malformed members reflect only
     /// their already-materialized id.
     fn validate_batch_member(&self, member: &BatchMember) -> Result<McpEnvelope, Value> {
-        let BatchMember::Admitted(item) = member else {
+        let BatchMember::Admitted(item, raw_id, raw_cancel_id) = member else {
             // The raw slice was never materialized, so there is no id to echo.
             return Err(json_rpc_error_value(
                 None,
@@ -4452,31 +4717,37 @@ impl McpGateway {
             ));
         }
         let member_id = item.get("id").cloned();
-        parse_mcp_envelope_value(item)
+        parse_mcp_envelope_value(item, raw_id.clone())
+            .map(|mut envelope| {
+                envelope.raw_cancel_id = raw_cancel_id.clone();
+                envelope
+            })
             .map_err(|_| json_rpc_error_value(member_id, -32600, "Invalid MCP JSON-RPC request"))
     }
 
     fn push_bounded_batch_response(
         &self,
-        responses: &mut Vec<Value>,
+        responses: &mut Vec<Box<RawValue>>,
         response_bytes: &mut usize,
+        id: Option<&RawValue>,
         value: Value,
     ) -> Result<(), PluginResult> {
-        let encoded_item = match serde_json::to_vec(&value) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return Err(json_rpc_error(
-                    None,
-                    -32600,
-                    "Invalid Request",
-                    Some("JSON-RPC batch response could not be measured".to_string()),
-                ));
-            }
-        };
+        let encoded_item =
+            match serde_json::value::to_raw_value(&JsonRpcWithRawId::preserving(&value, id)) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Err(json_rpc_error(
+                        None,
+                        -32600,
+                        "Invalid Request",
+                        Some("JSON-RPC batch response could not be measured".to_string()),
+                    ));
+                }
+            };
         let separator_bytes = usize::from(!responses.is_empty());
         let Some(next_response_bytes) = response_bytes
             .checked_add(separator_bytes)
-            .and_then(|bytes| bytes.checked_add(encoded_item.len()))
+            .and_then(|bytes| bytes.checked_add(encoded_item.get().len()))
         else {
             return Err(json_rpc_error(
                 None,
@@ -4493,7 +4764,7 @@ impl McpGateway {
                 Some("JSON-RPC batch exceeded max_batch_response_bytes".to_string()),
             ));
         }
-        responses.push(value);
+        responses.push(encoded_item);
         *response_bytes = next_response_bytes;
         Ok(())
     }
@@ -4502,16 +4773,22 @@ impl McpGateway {
     /// response header: session lifecycle is singleton-only, so there is no
     /// batch-owned session to advertise (and therefore no way to name a session
     /// the store does not hold).
-    fn bounded_batch_json_response(&self, responses: Vec<Value>) -> PluginResult {
-        let body = Value::Array(responses);
-        match serde_json::to_vec(&body) {
+    fn bounded_batch_json_response(&self, responses: Vec<Box<RawValue>>) -> PluginResult {
+        match serde_json::to_string(&responses) {
             Ok(bytes) if bytes.len() > self.validation.max_batch_response_bytes => json_rpc_error(
                 None,
                 -32600,
                 "Invalid Request",
                 Some("JSON-RPC batch exceeded max_batch_response_bytes".to_string()),
             ),
-            Ok(_) => json_response(200, body, None),
+            Ok(body) => PluginResult::Reject {
+                status_code: 200,
+                body,
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            },
             Err(_) => json_rpc_error(
                 None,
                 -32600,
@@ -4640,7 +4917,7 @@ impl McpGateway {
         if let Some(response) =
             self.unsupported_protocol_version_response(ctx, envelope, protocol_version.as_deref())
         {
-            return response;
+            return restore_response_id(response, envelope.raw_id.as_deref());
         }
         if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
             if self.mode == McpGatewayMode::AggregateRouter
@@ -4674,6 +4951,7 @@ impl McpGateway {
         let result = self
             .dispatch_aggregate_method(ctx, headers, envelope, method, protocol_version)
             .await;
+        let result = restore_response_id(result, envelope.raw_id.as_deref());
         self.deliver_dispatch_result_via_sse(ctx, result)
     }
 
@@ -5084,10 +5362,25 @@ impl Plugin for McpGateway {
         if ctx.has_ai_stream_router_claim() {
             return PluginResult::Continue;
         }
-        if !self.enabled || !self.matches_endpoint(ctx) {
+        if !self.enabled || !self.within_endpoint_scope(ctx) {
             return PluginResult::Continue;
         }
         self.emit_base_metadata(ctx);
+        if !self.matches_endpoint(ctx) {
+            // A reserved descendant is refused, exactly like the 405 below, so
+            // the decision has to read as a denial rather than as this plugin
+            // never having applied.
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return PluginResult::Reject {
+                status_code: 404,
+                body: json_rpc_error_value(None, -32600, "Unknown MCP endpoint").to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        }
 
         if ctx.method.eq_ignore_ascii_case("GET") {
             if self.mode == McpGatewayMode::TransparentProxy {
@@ -5141,19 +5434,16 @@ impl Plugin for McpGateway {
         }
 
         if !ctx.method.eq_ignore_ascii_case("POST") {
-            if self.mode == McpGatewayMode::AggregateRouter {
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
-                return PluginResult::Reject {
-                    status_code: 405,
-                    body: json!({"error": "unsupported MCP aggregate HTTP method"}).to_string(),
-                    headers: HashMap::from([(
-                        "content-type".to_string(),
-                        "application/json".to_string(),
-                    )]),
-                };
-            }
-            return PluginResult::Continue;
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return PluginResult::Reject {
+                status_code: 405,
+                body: json!({"error": "unsupported MCP HTTP method"}).to_string(),
+                headers: HashMap::from([
+                    ("content-type".to_string(), "application/json".to_string()),
+                    ("allow".to_string(), "GET, POST, DELETE".to_string()),
+                ]),
+            };
         }
         if !Self::content_type_is_json(headers) {
             return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None);
@@ -5175,14 +5465,19 @@ impl Plugin for McpGateway {
             };
             return self.handle_jsonrpc_batch(ctx, headers, &batch).await;
         }
+        if crate::util::json_dup_keys::slice_ambiguity(body).is_some() {
+            return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None);
+        }
         let parsed: Value = match serde_json::from_slice(body) {
             Ok(value) => value,
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
         };
-        let envelope = match parse_mcp_envelope_value(&parsed) {
+        let (raw_id, raw_cancel_id) = raw_json_rpc_correlation_ids(body);
+        let mut envelope = match parse_mcp_envelope_value(&parsed, raw_id) {
             Ok(envelope) => envelope,
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
         };
+        envelope.raw_cancel_id = raw_cancel_id;
         self.dispatch_post_envelope(ctx, headers, &envelope).await
     }
 
@@ -5293,7 +5588,8 @@ impl Plugin for McpGateway {
             return None;
         }
         params.insert(param, Value::String(upstream_value));
-        match serde_json::to_vec(&value) {
+        let preserved = JsonRpcWithRawId::preserving(&value, raw_json_rpc_field(body, "id"));
+        match serde_json::to_vec(&preserved) {
             Ok(rewritten) => Some(rewritten),
             Err(_) => {
                 if trusted_tool_rewrite {
@@ -5420,7 +5716,8 @@ impl Plugin for McpGateway {
         // that cannot fit marks the pending capacity-refusal signal so the
         // shared transform loop installs the gateway terminal instead of
         // forwarding the original upstream body.
-        match crate::proxy::response_buffer_budget::bounded_json_vec(&value, retained_ceiling) {
+        let preserved = JsonRpcWithRawId::preserving(&value, raw_json_rpc_field(body, "id"));
+        match crate::proxy::response_buffer_budget::bounded_json_vec(&preserved, retained_ceiling) {
             Some(rewritten) => Some(rewritten),
             None => {
                 ctx.mark_buffered_response_capacity_refusal_pending();
@@ -5550,7 +5847,7 @@ impl Plugin for McpGateway {
             self.enforce_final_response_body(ctx, response_status, response_headers, body);
         if !matches!(enforced, PluginResult::Continue) {
             Self::settle_sse_stream_inline(ctx);
-            return enforced;
+            return restore_response_id(enforced, raw_json_rpc_field(body, "id"));
         }
         match self.multiplex_final_response(ctx, response_status, response_headers, body) {
             Some(replacement) => replacement,
@@ -6009,7 +6306,10 @@ fn expand_public_resource_template(
     (capture_index == captures.len()).then_some(public_uri)
 }
 
-fn parse_mcp_envelope_value(value: &Value) -> Result<McpEnvelope, String> {
+fn parse_mcp_envelope_value(
+    value: &Value,
+    raw_id: Option<Box<RawValue>>,
+) -> Result<McpEnvelope, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "JSON-RPC envelope must be an object".to_string())?;
@@ -6043,6 +6343,8 @@ fn parse_mcp_envelope_value(value: &Value) -> Result<McpEnvelope, String> {
     Ok(McpEnvelope {
         jsonrpc,
         id,
+        raw_id,
+        raw_cancel_id: None,
         method,
         params,
         result,
@@ -7754,9 +8056,133 @@ fn authority_for_host_port(
     }
 }
 
+/// Whether `scope` reserves `other` as a strict slash-delimited descendant.
+fn endpoint_scope_contains(scope: &str, other: &str) -> bool {
+    other
+        .strip_prefix(scope)
+        .is_some_and(|tail| tail.starts_with('/'))
+}
+
+/// Whether two endpoint scopes reserve overlapping request paths.
+///
+/// Scopes are already trailing-slash trimmed, so `/mcp` and `/mcp/` are the
+/// same scope, `/mcp` contains `/mcp/v2`, and `/mcp` is disjoint from `/mcpx`.
+fn endpoint_scopes_nest(left: &str, right: &str) -> bool {
+    left == right || endpoint_scope_contains(left, right) || endpoint_scope_contains(right, left)
+}
+
+/// Reject two enabled `mcp_gateway` instances whose endpoint scopes nest on one
+/// proxy.
+///
+/// Multiple scoped instances of one plugin are ordinarily allowed, but an MCP
+/// endpoint reserves its whole slash-delimited subtree and answers 404 inside
+/// it. A gateway on `/mcp/v2` under one on `/mcp` is therefore unreachable —
+/// deterministically in transparent mode, and non-deterministically in
+/// aggregate mode where both instances share the `MCP_GATEWAY` priority. No
+/// single instance can see the conflict, so it is decided over the merged
+/// configuration here.
+pub fn validate_composition(
+    config: &crate::config::types::GatewayConfig,
+) -> Result<(), Vec<String>> {
+    use crate::config::types::{PluginConfig, PluginScope};
+
+    // Keyed by `(namespace, id)` exactly like the runtime merge's scoped-plugin
+    // map: a proxy only resolves associations in its own namespace.
+    let plugin_by_scoped_id: HashMap<(&str, &str), &PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+        .collect();
+
+    let mut errors = Vec::new();
+    for proxy in &config.proxies {
+        // Shadowing is decided by the outer `enabled` flag alone: a scoped
+        // instance replaces every same-named global for this proxy even when
+        // its own inner switch is off, so the effective set is resolved first
+        // and only then asked which members actually reserve a path.
+        let local: Vec<&PluginConfig> = proxy
+            .plugins
+            .iter()
+            .filter_map(|association| {
+                let plugin = *plugin_by_scoped_id.get(&(
+                    proxy.namespace.as_str(),
+                    association.plugin_config_id.as_str(),
+                ))?;
+                if !plugin.enabled || plugin.plugin_name != "mcp_gateway" {
+                    return None;
+                }
+                let scope_applies = match plugin.scope {
+                    PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                    // Proxy-group instances are required to omit `proxy_id`;
+                    // the explicit association is what makes them applicable.
+                    PluginScope::ProxyGroup => true,
+                    PluginScope::Global => false,
+                };
+                scope_applies.then_some(plugin)
+            })
+            .collect();
+        let effective: Vec<&PluginConfig> = if local.is_empty() {
+            config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| {
+                    plugin.enabled
+                        && plugin.scope == PluginScope::Global
+                        && plugin.plugin_name == "mcp_gateway"
+                })
+                .collect()
+        } else {
+            local
+        };
+
+        // An instance whose inner `enabled` is false returns `Continue` for
+        // every request, so it reserves nothing and cannot pre-empt a sibling.
+        let scopes: Vec<(&str, &str)> = effective
+            .into_iter()
+            .filter(|plugin| {
+                plugin
+                    .config
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            })
+            .filter_map(|plugin| {
+                let path = plugin
+                    .config
+                    .get("endpoint")
+                    .and_then(|endpoint| endpoint.get("path"))
+                    .and_then(Value::as_str)?;
+                Some((plugin.id.as_str(), path.trim_end_matches('/')))
+            })
+            .collect();
+        for (index, (id, scope)) in scopes.iter().enumerate() {
+            for (other_id, other_scope) in scopes.iter().skip(index + 1) {
+                if !endpoint_scopes_nest(scope, other_scope) {
+                    continue;
+                }
+                errors.push(format!(
+                    "mcp_gateway instances '{id}' and '{other_id}' on proxy '{}' have nesting \
+                     endpoint.path scopes: an MCP endpoint reserves its whole path subtree and \
+                     answers 404 inside it, so one of these gateways can never be reached. Give \
+                     them disjoint endpoint.path values, or disable one of them on this proxy",
+                    proxy.id
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 fn validate_path(path: &str, field: &str) -> Result<(), String> {
     if path.is_empty() || !path.starts_with('/') {
         return Err(format!("mcp_gateway: '{field}' must be a non-empty path"));
+    }
+    if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(path) {
+        return Err(format!("mcp_gateway: '{field}' is not canonical: {reason}"));
     }
     Ok(())
 }
