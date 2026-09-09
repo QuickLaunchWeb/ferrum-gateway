@@ -538,7 +538,7 @@ trim, lowercase, accept true/false/1/0 only. Returns canonical "true" or
 */}}
 {{- define "ferrum-mesh.parseEnvBool" -}}
 {{- $field := .field -}}
-{{- $lower := lower (trim (toString (.value | default ""))) -}}
+{{- $lower := lower (trim (toString .value)) -}}
 {{- if not (has $lower (list "true" "false" "1" "0")) -}}
 {{- fail (printf "%s is not a valid boolean; expected true, false, 1, or 0" $field) -}}
 {{- end -}}
