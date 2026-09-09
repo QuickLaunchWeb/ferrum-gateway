@@ -713,6 +713,18 @@ its stale `nextUpdate`, so the
 exported rather than counting further and further negative for material nothing
 staples.
 
+**Every certificate source is enrolled, including the Gateway-API frontend.**
+The operator-configured single-certificate listener and the Gateway-API
+multi-certificate frontend accept a staple through one shared code path that
+validates it against the chain that will serve it, logs the acceptance, fires
+the lead-time warning, and enrols it in the hourly re-check — a certificate
+source cannot admit a staple without also arming its retirement. For the
+SNI-selecting Gateway resolver the retirement republishes the whole name index
+without the staple in a single atomic store, so every name the certificate is
+reachable under — its declared listener hostname, its certificate SAN aliases,
+and the fallback slot — stops offering the expired response on the same
+handshake.
+
 **Refresh is still the operator's job.** Ferrum has **no OCSP responder
 client**: nothing inside the gateway fetches a fresh response, so re-attaching
 one is the operator's own fetch loop plus live reload. Refresh the OCSP source
@@ -918,8 +930,10 @@ verified SubjectPublicKeyInfo from the accepted client-CA bundle (signature
 verified; matching a DN is not enough; identical SPKIs are deduplicated). When
 the signer is not in the accepted bundle, issuer DN and Authority Key
 Identifier cannot prove its key identity: distinct keys can deliberately reuse
-both. Ferrum therefore requires an unambiguous AKI but conservatively includes
-the complete signed CRL in that issuer identity. A reissue from such an
+both. Ferrum therefore conservatively includes the complete signed CRL in that
+issuer identity. A CRL without AKI can be summarized this way, including a CRL
+in the global list whose signer belongs only to a backend trust domain. A
+present malformed or duplicate AKI remains invalid. A reissue from such an
 outside-bundle signer retires established sessions; this availability cost
 prevents colliding issuer metadata from suppressing a new revocation. A CRL
 whose issuer cannot be identified conservatively is refused and the last-good
@@ -1113,7 +1127,7 @@ ACME TLS-ALPN-01 validation still takes precedence over SNI selection, so `acme:
 
 **Rotation and deletion.** Each source carries a content digest (`k8s://<ns>/<secret>#tls.crt?sha256=…`), so a Secret update changes the snapshot and the control plane broadcasts it; the data plane rebuilds the resolver and swaps it atomically for new handshakes. In-flight sessions keep the configuration they negotiated. Deleting a Gateway or listener withdraws exactly its own certificates; when the last Gateway certificate for the namespace goes away, the data plane restores the operator's `FERRUM_FRONTEND_TLS_*` material if any was configured.
 
-**Bounds.** At most 256 Gateway certificates are admitted per configuration snapshot and at most 4096 SNI names are indexed. Certificate admission is listener-atomic: if every `certificateRef` on one listener cannot fit, none of that listener's certificates or routes are materialized. The runtime indexes every explicit listener hostname before adding certificate-derived SAN aliases, so SAN-heavy certificates cannot displace a later listener's declared SNI mapping; only surplus SAN aliases are omitted at the name bound. A stapled OCSP response (`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE`) is bound to one certificate, so it is stapled only when the data plane serves exactly one Gateway certificate; with several it is not stapled to any and a warning is logged.
+**Bounds.** At most 256 Gateway certificates are admitted per configuration snapshot and at most 4096 SNI names are indexed. Certificate admission is listener-atomic: if every `certificateRef` on one listener cannot fit, none of that listener's certificates or routes are materialized. The runtime indexes every explicit listener hostname before adding certificate-derived SAN aliases, so SAN-heavy certificates cannot displace a later listener's declared SNI mapping; only surplus SAN aliases are omitted at the name bound. A stapled OCSP response (`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE`) is bound to one certificate, so it is stapled only when the data plane serves exactly one Gateway certificate; with several it is not stapled to any and a warning is logged. When it is stapled, it is enrolled in the hourly freshness re-check on the same terms as a single-certificate listener and is retired once it reaches its `nextUpdate` — see [Stapled OCSP Responses](#stapled-ocsp-responses).
 
 ### TLS Inventory Visibility and Metrics
 
@@ -1598,10 +1612,19 @@ after that fenced write — but before the final certificate/order publication �
 leaves an authoritative order behind in `pending_challenges`, `ready`, or
 `processing`. Its claim then expires and a successor takes over.
 
+If the CA reports the order itself as terminally `invalid`, the scheduler marks
+that unchanged active order `failed` inside the still-held renewal lease fence.
+The next due scan plans a new order; normal terminal-history pruning applies.
+Timeouts, network errors and other failures without an observed invalid order
+leave the existing order resumable. A lost claim, operator update, deletion or
+newer order prevents the stale failure write. Certificate material is retained
+and no reload is requested on this failure path. Fix the validation problem
+(such as HTTP-01 reachability or DNS-01 publication) so the next order can pass.
+
 The successor **finishes that same order**. It never treats the leftover record
 as a reason to skip the certificate (which would wedge renewal permanently,
 since the record outlives the claim that produced it) and never creates a second
-order with the CA:
+order with the CA while the original remains active:
 
 - **The finalization material is generated first and persisted with the order.**
   The certificate private key and the CSR are produced during *preparation* —
