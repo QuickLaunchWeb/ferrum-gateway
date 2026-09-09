@@ -111,7 +111,7 @@ impl HttpLogging {
         Ok(Self {
             batch_config: build_batch_config(config, "http_logging", batch_defaults)?,
             flush_config,
-            logger: DeferredBatchingLogger::new(),
+            logger: DeferredBatchingLogger::for_plugin("http_logging"),
             endpoint_hostname,
             schema,
             byte_budget: Arc::new(ByteBudget::new_observability(

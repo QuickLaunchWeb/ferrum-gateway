@@ -97,6 +97,14 @@ For `ProxyBody`-backed responses that stream (either below the adaptive buffer m
 
 For those `ProxyBody` builders, the coalescing logic — buffer accumulation, large-frame pass-through, opportunistic flush on `Pending`, optional time-based flush, trailer/error stashing — lives entirely in the generic adapter. There is no separate H1/H2/H3 `ProxyBody` coalescer to keep in sync. The H2/H3 adapters are trailer-safe: gRPC trailers (`grpc-status`, `grpc-message`) and h3 trailers are stashed while buffered data is flushed, then returned on the next poll.
 
+An already-ended backend body also preserves its terminal state before the first
+poll. For a gRPC Trailers-Only response, this lets the HTTP/2 writer set
+`END_STREAM` on the initial `HEADERS`, retaining `grpc-status`, `grpc-message`
+and `grpc-status-details-bin` as terminal metadata. The same rule applies through
+the size-limit and trailer-filter wrappers used by direct gRPC, mesh mTLS and
+HBONE responses. Buffered data, a pending trailer or a pending error prevents
+early completion; a zero content length alone does not establish it.
+
 The H3 frontend → non-H3 backend cross-protocol bridge is the exception because it writes directly to the QUIC stream instead of returning a `ProxyBody`. Its response loops live in `src/http3/cross_protocol.rs::stream_reqwest_response` / `stream_hyper_incoming` and use local `BytesMut` coalescing, while sharing the H3 coalescing knobs below so native-H3 and cross-protocol H3 produce the same QUIC frame cadence.
 
 This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually.

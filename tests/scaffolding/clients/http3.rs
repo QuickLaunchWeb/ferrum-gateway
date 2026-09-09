@@ -1155,6 +1155,16 @@ pub struct Http3ConnectionStream {
 }
 
 impl Http3ConnectionStream {
+    /// Read response trailers after DATA EOF on this multiplexed stream.
+    pub async fn recv_trailers(
+        &mut self,
+    ) -> Result<Option<HeaderMap>, Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(15), self.stream.recv_trailers())
+            .await
+            .map_err(|_| "recv_trailers timed out")?
+            .map_err(|e| format!("recv_trailers: {e}").into())
+    }
+
     /// Peer `STOP_SENDING` on the gateway response direction.
     pub fn cancel_response_download(&mut self) {
         self.stream

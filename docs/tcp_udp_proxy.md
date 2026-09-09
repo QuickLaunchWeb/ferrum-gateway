@@ -76,7 +76,7 @@ through the Admin API in database mode).
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
 | `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol: the v1/v2 connection header on `tcp`/`tcp_tls` (see [Inbound PROXY Protocol](#inbound-proxy-protocol)), or the per-datagram v2 DGRAM envelope on `udp`/`dtls` (see [Datagram Client-Address Metadata](#datagram-client-address-metadata-udp--dtls)). |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
-| `udp_max_response_amplification_factor` | `f32` | `8.0` (every configuration source) | Cumulative per-request backend→client payload-byte budget of `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. Every backend response datagram consumes at least one unit of remaining budget, so a zero-length reply cannot bypass a finite factor. Finite values must be `> 0` and `≤ 1024`. **Omitting the field is not unlimited**: every `udp`/`dtls` proxy that leaves it unset is normalized to `8.0`. `0` is the explicit unlimited opt-out and logs a warning on the affected listener at startup. |
+| `udp_max_response_amplification_factor` | `f32` | `8.0` (every configuration source) | Backend→client payload-byte budget of `request_payload_size × factor` per admitted client request, **accrued** (not reset) across requests and capped at 16× a single request's budget, so a reply in flight for request *N* is charged against *N*'s budget rather than a later, smaller request's while a session's total outbound bytes stay bounded by `factor ×` its total inbound bytes. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. Every backend response datagram consumes at least one unit of remaining budget, so a zero-length reply cannot bypass a finite factor. Finite values must be `> 0` and `≤ 1024`. **Omitting the field is not unlimited**: every `udp`/`dtls` proxy that leaves it unset is normalized to `8.0`. `0` is the explicit unlimited opt-out and logs a warning on the affected listener at startup. |
 
 ### Synthetic `listen_path`
 
@@ -562,7 +562,7 @@ proxies:
 `backend_read_timeout_ms` and `backend_write_timeout_ms` apply to TCP proxies as **per-direction inactivity timeouts**. They are enforced by a watchdog that polls per-direction watermarks:
 
 - **`backend_read_timeout_ms`**: fires when the backend stops producing bytes (b2c direction goes stale). The watermark is refreshed on every successful read from the backend.
-- **`backend_write_timeout_ms`**: fires when progress stalls writing to the backend (c2b direction goes stale). The watermark is refreshed on every partial `write()` that accepts bytes, so a slow-but-progressing backend keeps the watermark fresh.
+- **`backend_write_timeout_ms`**: fires when progress stalls while client bytes are queued for the backend. The watermark is refreshed on every partial `write()` that accepts bytes and disarmed when the queue drains. A client that sends a subscription request and then only receives backend pushes does not trip this timer; a subsequent client write arms it again. This lifecycle is shared by userspace, splice, io_uring and kTLS forwarding.
 
 Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement for long-lived TCP workloads (database keep-alives, message-broker streams, SSH/IMAP passthrough). When disabled, the TCP relay relies solely on `tcp_idle_timeout_seconds` (bidirectional) and the OS TCP keep-alive.
 
@@ -879,8 +879,30 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
 - **Datagram hook concurrency / backpressure**: When any plugin opts into `on_udp_datagram`, each established session gets one bounded client→backend ingress worker (not one task per datagram). The shared listener recv/drain loop only enqueues onto that per-session FIFO and never awaits potentially I/O-bound hooks (for example Redis-backed `udp_rate_limiting` or `fault_injection` delays). Per-session ordering is preserved. Queue depth is capped at 256 datagrams and retained payload is capped at 256 KiB per session, with an additional 16 MiB retained-payload cap across the listener; both byte budgets remain charged while a dequeued payload is held by an in-flight hook/forward future, so one slow hook per session cannot escape the aggregate limit. Overload **fails closed** by dropping the datagram (it is never forwarded without running required hooks). Drops increment the listener's `hook_ingress_drops` counter and emit a rate-limited warning (first drop, then every 100th) without per-client label cardinality. Session stop/expiry wakes an idle worker by dropping the ingress sender, cancels an in-flight hook through a dedicated notification, and drains any residual queue without running hooks or forwarding. It also re-checks stop/expired after each receive and after the hook await so a late plugin return cannot forward into an expired session. Sessions without datagram hooks keep the inline forward path. Backend→client hooks remain on the existing per-session reply task.
 - **Reply send buffers (Linux)**: Each plain-UDP session keeps a `sendmmsg` fallback batch and an optional GSO accumulator. `sendmmsg` slot buffers are allocated lazily at a 2 KiB preferred size (`SEND_MMSG_SLOT_SIZE`) instead of eagerly reserving `64 × 65535` (~4.2 MiB) per session. Datagrams larger than the slot size — including the full valid UDP maximum — use the existing pktinfo-aware direct-send path; GSO same-size batching and sendmmsg fallback remain unchanged for ordinary traffic.
-- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, every backend→client datagram **charges** a remaining payload-byte budget established by the latest admitted client request (`request_payload_size × factor`). Several replies that are each under that product still fail closed once their **sum** exceeds it. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance. A zero-length response still consumes one unit of remaining budget so a finite factor cannot admit an unbounded packet count; nonempty responses charge their payload size exactly. The budget lives on the UDP session (not the selected backend), so weighted multi-backend selection cannot reset or multiply it. Negative, non-finite, and factors above 1024 are rejected at config admission. The guard is on by DEFAULT on every configuration source — file mode, database mode, the admin API, CP→DP distribution, mesh materialization, and Gateway API `UDPRoute` translation all normalize an unset factor to `8.0` in `Proxy::normalize_fields()`, so a UDP proxy is never an open reflector because of who authored it. `0` is the explicit operator opt-out meaning unlimited; it is accepted only on `udp`/`dtls` proxies, and the affected listener emits a startup warning naming its `proxy_id` and `listen_port` (`ferrum-edge validate` exits before listener bind, so it does not surface that warning). A Gateway API dual-acknowledged `mode: Unlimited` override is materialized as the same `0` sentinel.
+- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, every backend→client datagram **charges** a session-level remaining payload-byte budget. Each admitted client request **accrues** `request_payload_size × factor` onto that budget (saturating addition, capped at 16× a single request's budget) instead of resetting it, so a reply in flight for request *N* is charged against *N*'s budget rather than a later, smaller request's, while a session's aggregate outbound bytes stay bounded by `factor ×` its aggregate inbound bytes. Several replies that are each under a single request's product still fail closed once their **sum** exceeds the remaining budget. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance. A zero-length response still consumes one unit of remaining budget so a finite factor cannot admit an unbounded packet count; nonempty responses charge their payload size exactly. The budget lives on the UDP session (not the selected backend), so weighted multi-backend selection cannot reset or multiply it. Negative, non-finite, and factors above 1024 are rejected at config admission. The guard is on by DEFAULT on every configuration source — file mode, database mode, the admin API, CP→DP distribution, mesh materialization, and Gateway API `UDPRoute` translation all normalize an unset factor to `8.0` in `Proxy::normalize_fields()`, so a UDP proxy is never an open reflector because of who authored it. `0` is the explicit operator opt-out meaning unlimited; it is accepted only on `udp`/`dtls` proxies, and the affected listener emits a startup warning naming its `proxy_id` and `listen_port` (`ferrum-edge validate` exits before listener bind, so it does not surface that warning). A Gateway API dual-acknowledged `mode: Unlimited` override is materialized as the same `0` sentinel.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
+
+The finite budget starts at **zero**, including on session creation. Each
+policy-admitted request earns credit exactly once, immediately before its backend
+send, for both plain UDP and terminating DTLS. With remaining credit `R` and new
+request allowance `B`, publication sets `R = max(R, min(R + B, 16 × B))`, using
+saturating arithmetic. A smaller request never removes existing credit, but may
+earn no additional credit when the current balance already exceeds its cap.
+
+Credit stays live until charged or the session expires. Fully consuming an
+exchange's allowance leaves zero credit: a subsequent 100-byte request at factor
+8 permits at most 800 reply bytes, so a 900-byte reply or the third of three
+300-byte replies is dropped. Two requests admitted before their replies can both
+contribute to the balance. UDP has no generic transaction-completion marker;
+receiving a short reply does not prove that all replies have arrived, so unused
+credit is retained within the cap rather than retired after the first reply.
+
+The aggregate guarantee is relative to earned credit: for any interval, response
+charges cannot exceed its opening balance plus the allowances earned during that
+interval. From session creation, or from a fully exhausted balance, that is at
+most `factor × inbound payload bytes`, plus the explicit one-unit allowance for
+each empty request. An arbitrary interval containing delayed replies must include
+their previously earned opening credit; it cannot be bounded by new input alone.
 
 ### Mesh UDP capture is a separate datapath
 
@@ -974,8 +996,8 @@ listeners (different ports), that parent reports the conservative aggregate:
 `ExplicitUnlimited` if any listener is unlimited, `FinitePolicy` only when every
 listener uses a finite policy, and `FiniteDefault` when at least one uses the
 controller default. A missing exact parent does not inherit another parentRef's
-posture. Runtime accounting is cumulative per admitted request; a zero-length
-response consumes one unit of remaining budget. See
+posture. Runtime accounting is cumulative per admitted request (accrued and
+capped, not reset); a zero-length response consumes one unit of remaining budget. See
 [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md).
 
 For a `UDPRoute` the rule's `backendRefs` is a weighted **set**. A single
@@ -1379,6 +1401,31 @@ Stream proxy connections track:
 - Connection duration
 - Connection errors
 - UDP `hook_ingress_drops` (listener counter): client→backend datagrams dropped when a session's bounded `on_udp_datagram` ingress queue is full or closed (fail closed; see [UDP Session Management](#udp-session-management))
+
+## Stream Listener Recovery and Readiness
+
+After initial reconciliation, a supervisor retries non-serving stream listeners every
+30 seconds without requiring a configuration change. It reuses the serialized
+reconciliation path, including current listener ownership, TLS validation, and route
+withdrawal. Healthy listeners continue serving. Shutdown fences reconciliation so
+recovery cannot rebind a draining listener.
+
+A configured listener with a hard bind/backend-TLS failure or whose task exited makes
+`/health` and `/status` return `503`, `status: "degraded"`, and `ready: false`.
+Soft frontend TLS/DTLS deferrals and DTLS config-build failures report
+`status: "degraded"` with HTTP `200` and `ready: true` when otherwise healthy.
+A pending asynchronous bind alone does not degrade health or withdraw readiness
+during runtime reconciliation; startup still waits for listener binds.
+Readiness recovers when the hard failure clears or its configuration is removed.
+Authenticated `/overload` retains the existing stream bind-failure diagnostics;
+unauthenticated health responses still contain only `status` and `ready`. `/live`
+is unaffected. Initial hard bind failures remain fatal in file/database mode and
+non-fatal in DP mode.
+
+TCP+TLS origination honors the upstream's `backend_tls_sni` as both the ClientHello
+SNI and the certificate verification name. The selected target host/IP still controls
+the socket destination. With no override, the selected host remains the TLS name;
+configured mesh identity verification remains enforced by the existing verifier.
 
 ## TCP Accept-Loop Supervision
 

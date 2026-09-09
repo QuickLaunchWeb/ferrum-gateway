@@ -27,6 +27,7 @@ use tracing::warn;
 
 use super::utils::byte_budget::accounted_summary_bytes;
 use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
+use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, ByteBudget, ByteLease,
     DeferredBatchingLogger, PluginHttpClient, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
@@ -674,7 +675,7 @@ impl StatsdLogging {
                 current_addr: None,
                 last_resolve: Instant::now(),
             })),
-            logger: DeferredBatchingLogger::new(),
+            logger: DeferredBatchingLogger::for_plugin("statsd_logging"),
             hostname: socket_host.warmup_hostname,
             byte_budget: Arc::new(ByteBudget::new_observability(
                 "statsd_logging",
@@ -782,7 +783,10 @@ fn render_under_byte_budget(
     };
     render(&mut writer);
     if writer.exceeded {
-        budget.record_drop("rendered entry exceeded max_entry_bytes");
+        budget.record_drop(
+            SinkLossReason::RecordTooLarge,
+            "rendered entry exceeded max_entry_bytes",
+        );
         return None;
     }
     let retained = buf.len();
@@ -790,7 +794,10 @@ fn render_under_byte_budget(
         return None;
     }
     if retained > max_entry_bytes {
-        budget.record_drop("rendered entry exceeded max_entry_bytes");
+        budget.record_drop(
+            SinkLossReason::RecordTooLarge,
+            "rendered entry exceeded max_entry_bytes",
+        );
         return None;
     }
     lease.shrink_to(accounted_summary_bytes(retained));
@@ -839,7 +846,8 @@ impl Plugin for StatsdLogging {
             return;
         }
         let Some(permit) = self.logger.try_reserve() else {
-            self.byte_budget.record_drop("queue slot exhausted");
+            // `try_reserve` already published this loss on the sink family.
+            self.byte_budget.record_drop_local("queue slot exhausted");
             return;
         };
         let prefix = self.flush_config.prefix.as_str();
@@ -852,7 +860,8 @@ impl Plugin for StatsdLogging {
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
         let Some(permit) = self.logger.try_reserve() else {
-            self.byte_budget.record_drop("queue slot exhausted");
+            // `try_reserve` already published this loss on the sink family.
+            self.byte_budget.record_drop_local("queue slot exhausted");
             return;
         };
         let prefix = self.flush_config.prefix.as_str();
@@ -869,7 +878,8 @@ impl Plugin for StatsdLogging {
 
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
         let Some(permit) = self.logger.try_reserve() else {
-            self.byte_budget.record_drop("queue slot exhausted");
+            // `try_reserve` already published this loss on the sink family.
+            self.byte_budget.record_drop_local("queue slot exhausted");
             return;
         };
         let prefix = self.flush_config.prefix.as_str();

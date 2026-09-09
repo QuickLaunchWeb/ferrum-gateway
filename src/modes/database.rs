@@ -1268,6 +1268,17 @@ pub async fn run(
     let initial_load = load_full_config_with_sequence(&db, &env_config.namespace).await;
     let (config, initial_change_cursor) = match initial_load {
         Ok((cfg, cursor)) => {
+            // Exercise the same backup admission on healthy starts so a bad
+            // provisioned file is discovered before an outage. Its candidate
+            // is discarded: only the authoritative DB snapshot is published.
+            if let Some(ref path) = backup_path
+                && let Err(error) = load_config_backup(path, &env_config.namespace)
+            {
+                warn!(
+                    "Configured startup backup is unusable; continuing with database config: {}",
+                    error
+                );
+            }
             // The lazy offline store can recover after the deferred-migration
             // probe above fails but before this first authoritative load. A
             // successful load proves that the database is reachable now; run

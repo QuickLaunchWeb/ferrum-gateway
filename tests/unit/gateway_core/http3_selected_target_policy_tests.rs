@@ -130,7 +130,7 @@ fn h3_deferred_destination_override_is_rebound_before_dispatch() {
         .find("let destination_rebound = !Arc::ptr_eq(&previous_routing_proxy, &routing_proxy);")
         .expect("the rebind must detect a committed destination by routing-proxy identity");
     let rebase = after_deferred
-        .find("path = crate::proxy::rebase_route_override_path(&mut ctx, path);")
+        .find("path = crate::proxy::rebase_route_override_path(&mut ctx, path, &mut strip_len);")
         .expect("deferred destination overrides must rebase the dispatch path");
     let reselect = after_deferred
         .find("upstream_target =")
@@ -530,7 +530,7 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         .find("retry_target_preserves_backend_path(")
         .expect("cross-protocol H3 retry must retain the authorized target path");
     let retry_url = cross_protocol
-        .find("let next_url = crate::proxy::build_backend_url_with_target(")
+        .find("let Ok(next_url) = crate::proxy::build_backend_url_with_target(")
         .expect("cross-protocol retry URL reconstruction must remain present");
     assert!(
         retry_policy < retry_url,
