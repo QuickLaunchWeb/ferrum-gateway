@@ -2622,7 +2622,10 @@ fn breaker_with_admitted_probe() -> (Arc<CircuitBreaker>, HalfOpenProbeGuard) {
     cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
     let is_half_open_probe = cb.can_execute().expect("timeout 0 admits a probe");
-    assert!(is_half_open_probe, "the admission must claim the probe slot");
+    assert!(
+        is_half_open_probe,
+        "the admission must claim the probe slot"
+    );
     assert_eq!(cb.half_open_in_flight(), 1);
     assert!(
         cb.can_execute().is_err(),

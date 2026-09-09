@@ -795,7 +795,10 @@ async fn breaker_state(client: &reqwest::Client, gateway: &TestGateway, proxy_id
 async fn wait_for_backend_request(requests: &Arc<AtomicU32>, baseline: u32, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while requests.load(Ordering::SeqCst) == baseline {
-        assert!(Instant::now() < deadline, "{what} never reached the backend");
+        assert!(
+            Instant::now() < deadline,
+            "{what} never reached the backend"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -837,6 +840,10 @@ async fn abort_probe_after_backend_receives(
     wait_for_backend_request(&backend.requests, baseline, what).await;
     // RST rather than a lingering FIN: a half-closed socket can sit in the
     // kernel long enough to make the assertions below race the abort.
+    // `SO_LINGER = 0` is exactly the RST this test needs and the socket is
+    // dropped on the next line, so the blocking-drop caveat behind the
+    // deprecation does not apply here.
+    #[allow(deprecated)]
     let _ = aborted.set_linger(Some(Duration::ZERO));
     drop(aborted);
     backend.delay_ms.store(0, Ordering::SeqCst);

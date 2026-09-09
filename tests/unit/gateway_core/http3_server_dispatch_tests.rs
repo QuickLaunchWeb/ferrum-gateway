@@ -164,9 +164,7 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         "mesh force-buffer must not drain under the client RPC deadline wrapper"
     );
     assert_eq!(
-        mesh_collection
-            .matches("cb_probe.release_neutral(")
-            .count(),
+        mesh_collection.matches("cb_probe.release_neutral(").count(),
         3,
         "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch"
     );

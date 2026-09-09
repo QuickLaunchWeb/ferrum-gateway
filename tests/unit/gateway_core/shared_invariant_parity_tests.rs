@@ -229,11 +229,7 @@ fn taking_the_probe_slot_is_what_disarms_the_guard() {
     // armed flag, so no path can release the same slot twice (a double release
     // decrements a DIFFERENT probe's slot and over-admits).
     let text = source("src/proxy/mod.rs");
-    let take = item_body(
-        &text,
-        "    pub fn take_slot(&self) -> bool {",
-        "\n    }\n",
-    );
+    let take = item_body(&text, "    pub fn take_slot(&self) -> bool {", "\n    }\n");
     assert!(
         take.contains("self.armed.swap(false"),
         "`take_slot` must atomically clear the armed flag as it hands the slot over"
