@@ -3587,7 +3587,14 @@ every input-size limit, and every execution bound remain as they are.
 
 ### Release build tail: timings, budgets, and the profile experiment (#4674)
 
-**Status: not changeable by a pull request.** `release.yml`'s
+**Status: budgets and timings capture landed directly on `main` (2026-09-09);
+the shipping-profile experiment remains not adopted.** The `build-release-binaries`
+job now carries `timeout-minutes: 180` with 165 on each build step and uploads
+`target/cargo-timings/` as `release-build-timings-<target>` (14-day retention),
+and `build-release-arm64-cross` carries `timeout-minutes: 120`; the frozen
+ARM64 job digest in `verify_cross_build_policy.py` was moved in the same
+commit. Everything below records why those numbers were chosen and why the
+change could not travel through a pull request: `release.yml`'s
 `build-release-arm64-cross` is digest-frozen in `WORKFLOW_CONTRACTS`, and
 `build-release-binaries` is read as Cross-sensitive and held to `main`'s own
 text by the whole-job surface comparison (its former #4301/#4355 generation

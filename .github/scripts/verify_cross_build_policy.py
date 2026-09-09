@@ -97,7 +97,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "0724a370b302f529f12d2aafe5c8e432bd689f65fac16316c4a6a91b241735fb",
+        "480a5f88adf6e8a0cc2cd970dae02213ac4a940b84e41929c49a3dfd46c128eb",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
