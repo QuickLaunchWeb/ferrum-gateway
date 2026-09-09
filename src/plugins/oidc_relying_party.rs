@@ -884,16 +884,14 @@ impl OidcRelyingParty {
         let domain = optional_string(session_obj, "domain", "session")?;
         let path =
             optional_string(session_obj, "path", "session")?.unwrap_or_else(|| "/".to_string());
-        let explicit_cookie_name = optional_string(session_obj, "cookie_name", "session")?;
-        let derived_cookie = explicit_cookie_name.is_none();
-        let cookie_name = explicit_cookie_name.unwrap_or_else(|| {
-            let prefix = if domain.is_none() && path == "/" {
-                "__Host-ferrum_session"
-            } else {
-                "__Secure-ferrum_session"
-            };
-            derived_cookie_name(prefix, &context_seed)
-        });
+        let secure = optional_bool(session_obj, "secure")?.unwrap_or(true);
+        let cookie_name = match optional_string(session_obj, "cookie_name", "session")? {
+            Some(explicit) => explicit,
+            None => {
+                let prefix = cookie_name_prefix(secure, domain.as_deref(), &path);
+                derived_cookie_name(&format!("{prefix}ferrum_session"), &context_seed)
+            }
+        };
         let session_context = session_context_id(&context_seed, &cookie_name);
         let session_context_id =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_context);
@@ -901,8 +899,13 @@ impl OidcRelyingParty {
         session_aad.extend_from_slice(&session_context);
         let mut pending_aad = b"ferrum-edge/oidc-pending-flow/v1\0".to_vec();
         pending_aad.extend_from_slice(&session_context);
-        let correlation_cookie_name_prefix =
-            derived_cookie_name("__Host-ferrum_oidc_state", &session_context);
+        // The correlation cookie is scoped to the callback path and never carries
+        // a `Domain`, so it only earns `__Host-` when that path is the root.
+        let correlation_prefix = cookie_name_prefix(secure, None, &callback_path);
+        let correlation_cookie_name_prefix = derived_cookie_name(
+            &format!("{correlation_prefix}ferrum_oidc_state"),
+            &session_context,
+        );
         let store = optional_string(session_obj, "store", "session")?
             .unwrap_or_else(|| "cookie".to_string());
         if store != "cookie" {
@@ -922,7 +925,6 @@ impl OidcRelyingParty {
         if max_cookie_bytes > DEFAULT_SESSION_MAX_COOKIE_BYTES {
             return Err("oidc_relying_party: session.max_cookie_bytes must be <= 8000".to_string());
         }
-        let secure = optional_bool(session_obj, "secure")?.unwrap_or(true) || derived_cookie;
         let http_only = optional_bool(session_obj, "http_only")?.unwrap_or(true);
         let same_site = optional_string(session_obj, "same_site", "session")?
             .unwrap_or_else(|| "lax".to_string())
@@ -985,7 +987,7 @@ impl OidcRelyingParty {
             cookie_attrs,
             context_id: session_context_id,
             correlation_cookie_name_prefix,
-            correlation_cookie_attrs: build_correlation_cookie_attrs(),
+            correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
@@ -3491,8 +3493,26 @@ fn build_cookie_attrs(
 /// Unlike the durable session cookie, this cookie must remain host-only: a
 /// parent `Domain` would let sibling hosts receive or overwrite the sealed
 /// authorization-code flow.
-fn build_correlation_cookie_attrs() -> String {
-    build_cookie_attrs(true, true, "Lax", None, "/")
+fn build_correlation_cookie_attrs(secure: bool, callback_path: &str) -> String {
+    build_cookie_attrs(secure, true, "Lax", None, callback_path)
+}
+
+/// Pick the `Set-Cookie` name prefix that matches the attributes the cookie is
+/// actually emitted with.
+///
+/// Browsers reject a prefixed cookie whose attributes violate the prefix rules,
+/// so the prefix can never be chosen independently of them: `__Secure-` demands
+/// `Secure`, and `__Host-` additionally demands no `Domain` and `Path=/`. A
+/// deployment that turns `session.secure` off therefore gets no prefix at all
+/// rather than a name the browser silently discards.
+fn cookie_name_prefix(secure: bool, domain: Option<&str>, path: &str) -> &'static str {
+    if !secure {
+        ""
+    } else if domain.is_none() && path == "/" {
+        "__Host-"
+    } else {
+        "__Secure-"
+    }
 }
 
 fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
@@ -4541,7 +4561,7 @@ mod tests {
     }
 
     #[test]
-    fn localhost_http_callback_keeps_prefixed_cookies_secure() {
+    fn localhost_http_callback_honors_insecure_correlation_cookie_setting() {
         for redirect_uri in [
             "http://localhost/oauth/callback",
             "http://127.0.0.1/oauth/callback",
@@ -4552,13 +4572,70 @@ mod tests {
             let plugin = build_plugin_without_workers(&config);
             let correlation_cookie = plugin.correlation_cookie("state", "browser-binding");
 
-            assert!(plugin.session.cookie_attrs.contains("; Secure"));
+            assert!(!plugin.session.cookie_attrs.contains("; Secure"));
             assert!(
-                correlation_cookie.contains("; Secure"),
-                "prefixed correlation cookie must stay Secure for {redirect_uri}"
+                !correlation_cookie.contains("; Secure"),
+                "local HTTP callback cookie must match session.secure=false for {redirect_uri}"
+            );
+            // A cookie without `Secure` cannot carry a prefix at all: the browser
+            // would discard it outright.
+            assert!(
+                !plugin.session.cookie_name.starts_with("__"),
+                "an insecure session cookie must not claim a prefix for {redirect_uri}"
+            );
+            assert!(
+                correlation_cookie.starts_with("ferrum_oidc_state_"),
+                "an insecure correlation cookie must not claim a prefix for {redirect_uri}"
             );
             assert!(correlation_cookie.contains("; HttpOnly"));
             assert!(correlation_cookie.contains("SameSite=Lax"));
+        }
+    }
+
+    #[test]
+    fn cookie_name_prefix_follows_the_attributes_it_will_be_emitted_with() {
+        assert_eq!(cookie_name_prefix(true, None, "/"), "__Host-");
+        assert_eq!(
+            cookie_name_prefix(true, Some("example.com"), "/"),
+            "__Secure-"
+        );
+        assert_eq!(cookie_name_prefix(true, None, "/app"), "__Secure-");
+        assert_eq!(
+            cookie_name_prefix(true, Some("example.com"), "/app"),
+            "__Secure-"
+        );
+        for domain in [None, Some("example.com")] {
+            for path in ["/", "/app"] {
+                assert_eq!(cookie_name_prefix(false, domain, path), "");
+            }
+        }
+    }
+
+    #[test]
+    fn secure_correlation_cookie_prefix_tracks_the_callback_path() {
+        let cases = [("/", "__Host-"), ("/oauth/callback", "__Secure-")];
+        for (callback_path, expected_prefix) in cases {
+            let mut config = plugin_config_without_optional_defaults(&format!(
+                "https://app.example.com{callback_path}"
+            ));
+            config["providers"][0]["callback_path"] = Value::String(callback_path.to_string());
+            let plugin = build_plugin_without_workers(&config);
+            let correlation_cookie = plugin.correlation_cookie("state", "browser-binding");
+            let expected_name = format!("{expected_prefix}ferrum_oidc_state_");
+            let expected_path = format!("Path={callback_path};");
+            let session_name = &plugin.session.cookie_name;
+
+            assert!(
+                correlation_cookie.starts_with(&expected_name),
+                "unexpected correlation cookie name: {correlation_cookie}"
+            );
+            assert!(correlation_cookie.contains("; Secure"));
+            assert!(!correlation_cookie.contains("Domain="));
+            assert!(correlation_cookie.contains(&expected_path));
+            assert!(
+                session_name.starts_with("__Host-ferrum_session_"),
+                "unexpected session cookie name: {session_name}"
+            );
         }
     }
 

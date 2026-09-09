@@ -164,11 +164,16 @@ fn cookie_name(cookie: &str) -> &str {
 }
 
 fn assert_host_only_correlation_cookie(cookie: &str, expected_max_age: &str) {
-    assert!(cookie_name(cookie).starts_with("__Host-ferrum_oidc_state_"));
+    // The correlation cookie is scoped to the callback path, so `__Host-` (which
+    // demands `Path=/`) is not available to it here; `__Secure-` is.
+    assert!(
+        cookie_name(cookie).starts_with("__Secure-ferrum_oidc_state_"),
+        "{cookie}"
+    );
     assert_eq!(cookie_attribute(cookie, "domain"), None, "{cookie}");
     assert_eq!(
         cookie_attribute(cookie, "path"),
-        Some(Some("/")),
+        Some(Some("/oauth/callback")),
         "{cookie}"
     );
     assert_eq!(
@@ -1191,7 +1196,7 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
     first_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     first_config["providers"][0]["required_scopes"] = json!(["admin"]);
     first_config["providers"][0]["consumer_identity_claim"] = json!("email");
-    // The selected correlation cookie starts with `__Host-ferrum_`; the shorter
+    // The selected correlation cookie starts with `__Secure-ferrum_`; the shorter
     // requester cookie name proves conflict checks use the complete name.
     first_config["session"]["cookie_name"] = json!("ferrum");
     let first =
@@ -1243,7 +1248,7 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
         .expect("both response-owned cookies must reach the client");
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
-    assert!(cookies[0].contains("Path=/;"));
+    assert!(cookies[0].contains("Path=/oauth/callback"));
     assert!(cookies[1].starts_with("ferrum="));
     assert_eq!(
         cookies
@@ -1351,8 +1356,8 @@ async fn oidc_multi_auth_keeps_later_clear_for_shared_session_cookie() {
         .expect("the selected challenge cookies must reach the client");
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
-    assert!(cookies[0].starts_with("__Host-ferrum_oidc_state_"));
-    assert!(cookies[0].contains("Path=/;"));
+    assert!(cookies[0].starts_with("__Secure-ferrum_oidc_state_"));
+    assert!(cookies[0].contains("Path=/oauth/callback"));
     assert_eq!(
         cookies[1],
         "ferrum=; Max-Age=0; Path=/; SameSite=lax; Secure; HttpOnly"
@@ -1757,8 +1762,17 @@ async fn loopback_http_challenge_remains_available_on_the_same_host() {
 
         let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
         assert_eq!(cookie_attribute(&challenge.cookie, "domain"), None);
-        assert_eq!(cookie_attribute(&challenge.cookie, "path"), Some(Some("/")));
-        assert_eq!(cookie_attribute(&challenge.cookie, "secure"), Some(None));
+        assert_eq!(
+            cookie_attribute(&challenge.cookie, "path"),
+            Some(Some("/oauth/callback"))
+        );
+        assert_eq!(cookie_attribute(&challenge.cookie, "secure"), None);
+        // Without `Secure` the cookie cannot claim a prefix at all.
+        assert!(
+            cookie_name(&challenge.cookie).starts_with("ferrum_oidc_state_"),
+            "{}",
+            challenge.cookie
+        );
     }
 }
 
@@ -3002,11 +3016,18 @@ async fn discovery_config_retains_explicit_optional_endpoints() {
 
 #[tokio::test]
 async fn generated_session_cookies_enforce_prefix_attributes_and_allow_explicit_names() {
-    for (domain, path, explicit_name, expected_prefix) in [
-        (None, "/", None, "__Host-ferrum_session_"),
-        (Some("example.com"), "/", None, "__Secure-ferrum_session_"),
-        (None, "/app", None, "__Secure-ferrum_session_"),
-        (None, "/", Some("custom_session"), "custom_session="),
+    // A cookie prefix is only legal when the emitted attributes satisfy it:
+    // `__Secure-` requires `Secure`, and `__Host-` additionally requires no
+    // `Domain` and `Path=/`. A prefix a browser would reject is worse than none.
+    for (secure, domain, path, explicit_name, expected_prefix) in [
+        (true, None, "/", None, "__Host-ferrum_session_"),
+        (true, Some("example.com"), "/", None, "__Secure-ferrum_session_"),
+        (true, None, "/app", None, "__Secure-ferrum_session_"),
+        (false, None, "/", None, "ferrum_session_"),
+        (false, Some("example.com"), "/", None, "ferrum_session_"),
+        (false, None, "/app", None, "ferrum_session_"),
+        (true, None, "/", Some("custom_session"), "custom_session="),
+        (false, None, "/", Some("custom_session"), "custom_session="),
     ] {
         let mut config = base_config();
         config["session"]
@@ -3014,7 +3035,7 @@ async fn generated_session_cookies_enforce_prefix_attributes_and_allow_explicit_
             .unwrap()
             .remove("cookie_name");
         config["session"]["path"] = json!(path);
-        config["session"]["secure"] = json!(false);
+        config["session"]["secure"] = json!(secure);
         if let Some(domain) = domain {
             config["session"]["domain"] = json!(domain);
         }
@@ -3024,16 +3045,54 @@ async fn generated_session_cookies_enforce_prefix_attributes_and_allow_explicit_
         let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
         let cookie =
             oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false).unwrap();
-        assert!(cookie.starts_with(expected_prefix));
+        assert!(cookie.starts_with(expected_prefix), "{cookie}");
         assert_eq!(cookie_attribute(&cookie, "path"), Some(Some(path)));
         assert_eq!(cookie_attribute(&cookie, "domain"), domain.map(Some));
         assert_eq!(
             cookie_attribute(&cookie, "secure"),
-            explicit_name.is_none().then_some(None)
+            secure.then_some(None),
+            "{cookie}"
         );
+
+        // The correlation cookie is always host-only and always scoped to the
+        // callback path, so it can never reach `__Host-` with this base config.
         let challenge = issue_browser_challenge(&plugin).await;
-        assert_host_only_correlation_cookie(&challenge.cookie, "600");
+        if secure {
+            assert_host_only_correlation_cookie(&challenge.cookie, "600");
+        } else {
+            assert!(
+                cookie_name(&challenge.cookie).starts_with("ferrum_oidc_state_"),
+                "{}",
+                challenge.cookie
+            );
+            assert_eq!(cookie_attribute(&challenge.cookie, "domain"), None);
+            assert_eq!(
+                cookie_attribute(&challenge.cookie, "path"),
+                Some(Some("/oauth/callback"))
+            );
+            assert_eq!(cookie_attribute(&challenge.cookie, "secure"), None);
+            assert_eq!(cookie_attribute(&challenge.cookie, "httponly"), Some(None));
+        }
     }
+}
+
+#[tokio::test]
+async fn root_scoped_secure_correlation_cookie_uses_the_host_prefix() {
+    let mut config = base_config();
+    config["providers"][0]["redirect_uri"] = json!("https://app.example.com/");
+    config["providers"][0]["callback_path"] = json!("/");
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let challenge = issue_browser_challenge(&plugin).await;
+
+    assert!(
+        cookie_name(&challenge.cookie).starts_with("__Host-ferrum_oidc_state_"),
+        "{}",
+        challenge.cookie
+    );
+    assert_eq!(cookie_attribute(&challenge.cookie, "domain"), None);
+    assert_eq!(cookie_attribute(&challenge.cookie, "path"), Some(Some("/")));
+    assert_eq!(cookie_attribute(&challenge.cookie, "secure"), Some(None));
+    assert_eq!(cookie_attribute(&challenge.cookie, "httponly"), Some(None));
 }
 
 #[tokio::test]
