@@ -217,6 +217,7 @@ fn builtin_parity_meta_matches_registry_set() {
 
 #[tokio::test]
 async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_complete_order_table(EXECUTION_ORDER_DOC);
     assert_unique_names("complete-order table", rows.iter().map(|r| r.name.clone()));
 
@@ -281,6 +282,7 @@ async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
 
 #[tokio::test]
 async fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
+    super::plugin_utils::ensure_basic_auth_test_secret();
     let rows = parse_protocol_matrix(EXECUTION_ORDER_DOC);
     assert_unique_names("protocol matrix", rows.iter().map(|r| r.name.clone()));
 

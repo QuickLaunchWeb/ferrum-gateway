@@ -109,11 +109,10 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
 /// one view. A reading the declaration does not settle — a bare
 /// `charset=utf-16` / `utf-32` with no BOM, an ambiguous `FF FE 00 00`
 /// prefix, or a charset that disagrees with the BOM — yields both candidate
-/// views, capped at [`MAX_WIDE_CHARSET_VIEWS`], and still asks the scanner to
-/// keep the raw/lossy view (`include_lossy`).
+/// views, capped at [`MAX_WIDE_CHARSET_VIEWS`]. The scanner always keeps the
+/// raw/lossy view and its transformations alongside these additional views.
 pub(super) struct WideCharsetViews {
     views: [Option<String>; MAX_WIDE_CHARSET_VIEWS],
-    include_lossy: bool,
     /// The body declares a charset this WAF cannot transcode at all (UTF-7,
     /// ISO-2022-*, HZ-GB-2312, EBCDIC). Its encoded form can hide ASCII text
     /// from the raw scan, so the caller reports it rather than treating the
@@ -125,7 +124,6 @@ impl WideCharsetViews {
     pub(super) fn empty() -> Self {
         Self {
             views: [None, None],
-            include_lossy: false,
             uninspectable_charset: false,
         }
     }
@@ -133,7 +131,6 @@ impl WideCharsetViews {
     fn resolved(text: String) -> Self {
         Self {
             views: [Some(text), None],
-            include_lossy: false,
             uninspectable_charset: false,
         }
     }
@@ -146,23 +143,12 @@ impl WideCharsetViews {
     /// coverage it had before transcoding.
     fn unresolved(first: String, second: String) -> Self {
         if first == second {
-            let mut out = Self::resolved(first);
-            out.include_lossy = true;
-            return out;
+            return Self::resolved(first);
         }
         Self {
             views: [Some(first), Some(second)],
-            include_lossy: true,
             uninspectable_charset: false,
         }
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.views.iter().all(Option::is_none)
-    }
-
-    pub(super) fn include_lossy(&self) -> bool {
-        self.include_lossy
     }
 
     /// Whether the declared charset is one the WAF cannot transcode; see
@@ -230,13 +216,13 @@ enum WideEndian<E> {
     },
 }
 
-/// Decode already-admitted UTF-16 / UTF-32 request bodies into inspection
+/// Decode already-admitted UTF-16 / UTF-32 bodies into inspection
 /// views.
 ///
 /// This helper does not decide whether a body is eligible for WAF inspection;
-/// the request content-type/multipart/binary gates run before the scanner. It
-/// only creates the text views used by active request-body rules. Ordinary
-/// UTF-8 bodies return [`WideCharsetViews::empty`] without allocating.
+/// the direction-specific content-type/multipart/binary gates run first. It
+/// only creates views used by active body rules and encoding specials.
+/// Ordinary UTF-8 returns [`WideCharsetViews::empty`] without allocating.
 ///
 /// UTF-32 BOMs are recognized first (see [`utf32_bom`]): a UTF-32LE BOM is
 /// `FF FE 00 00` and would otherwise be misread as a UTF-16LE BOM. When a
@@ -260,6 +246,34 @@ pub(super) fn decode_wide_charset_body_views(
 }
 
 fn wide_charset_body_views(body: &[u8], content_type: Option<&str>) -> WideCharsetViews {
+    // With no declaration or BOM, require the NUL placement of two ASCII
+    // UTF-16 units or one ASCII UTF-32 unit in the first four octets. Do not
+    // infer a charset from arbitrary interior NULs or try every binary body.
+    // The signature selects only a width; retain both endians and raw text,
+    // using the same fixed view cap as a bare declared wide charset.
+    if charset_value(content_type).is_none()
+        && utf32_bom(body).is_none()
+        && utf16_bom(body).is_none()
+        && let [a, b, c, d, ..] = body
+    {
+        let ascii = |byte: u8| byte != 0 && byte.is_ascii();
+        if (*a == 0 && *b == 0 && *c == 0 && ascii(*d))
+            || (ascii(*a) && *b == 0 && *c == 0 && *d == 0)
+        {
+            return WideCharsetViews::unresolved(
+                decode_utf32(body, Utf32Endian::Little),
+                decode_utf32(body, Utf32Endian::Big),
+            );
+        }
+        if (*a == 0 && ascii(*b) && *c == 0 && ascii(*d))
+            || (ascii(*a) && *b == 0 && ascii(*c) && *d == 0)
+        {
+            return WideCharsetViews::unresolved(
+                decode_utf16(body, Utf16Endian::Little),
+                decode_utf16(body, Utf16Endian::Big),
+            );
+        }
+    }
     if charset_is_unspecified_utf32(content_type) && utf32_bom(body).is_none() {
         return WideCharsetViews::unresolved(
             decode_utf32(body, Utf32Endian::Little),

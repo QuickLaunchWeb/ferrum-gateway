@@ -2354,7 +2354,7 @@ fn every_declared_producer_materialises_through_a_ceiling_aware_writer() {
     // itself serialize through the bound, so the indirection stays honest.
     let body_transform = include_str!("../../../src/plugins/utils/body_transform.rs");
     assert!(
-        body_transform.contains("bounded_json_vec"),
+        body_transform.contains("BoundedResponseBodySink::with_ceiling"),
         "`apply_body_rules_bounded` must serialize the rewritten document \
          through the ceiling-bounded writer"
     );

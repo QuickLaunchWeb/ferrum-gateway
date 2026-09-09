@@ -914,6 +914,26 @@ fn looks_like_provider_native(json: &Value) -> bool {
         // Anthropic Messages and Cohere v2 can be indistinguishable from
         // OpenAI-style chat when they carry only a `messages` array.
         || json.get("messages").and_then(Value::as_array).is_some()
+        // Google Vertex legacy `predict`, whose prompt lives in
+        // `instances[].prompt` and now counts toward `max_prompt_characters`.
+        || looks_like_vertex_predict(json)
+}
+
+/// Google Vertex legacy `predict`: `{"instances": [{"prompt": "..."}], ...}`.
+///
+/// Shape-qualified rather than a bare `instances` key, because this predicate
+/// decides what a strict `supported_schema` config ADMITS: `instances` is an
+/// ordinary word in unrelated JSON, so a bare key would admit non-AI bodies as
+/// provider-native. Requiring an entry that actually carries a `prompt` binds
+/// admission to the same field `count_prompt_characters` counts. This mirrors
+/// the shape-qualification the sibling `ai_semantic_firewall` applies to
+/// Anthropic batch `requests` for the same reason.
+fn looks_like_vertex_predict(json: &Value) -> bool {
+    let Some(instances) = json.get("instances").and_then(Value::as_array) else {
+        return false;
+    };
+    let carries_prompt = |instance: &Value| instance.get("prompt").is_some();
+    instances.iter().any(carries_prompt)
 }
 
 /// Recognizes legacy text-completion and text-generation bodies that carry a
@@ -1382,6 +1402,18 @@ fn count_prompt_characters(json: &Value) -> u64 {
     // model-visible text, consistent with how other RAG fields are counted.
     count_data_source_role_information(json, &mut total);
 
+    // Google Vertex legacy `predict`: the prompt lives in `instances[].prompt`
+    // and no other counted field reaches it, so `{"instances": [{"prompt":
+    // "<huge prompt>"}]}` bypassed the cap entirely. Scoped to `prompt` —
+    // the surrounding instance fields are prediction inputs and identifiers,
+    // not model-visible prose — matching the `$.instances[*].prompt` path the
+    // sibling `ai_semantic_firewall` and `ai_prompt_shield` plugins read.
+    if let Some(instances) = json.get("instances").and_then(Value::as_array) {
+        for instance in instances {
+            count_text_value(instance.get("prompt"), &mut total);
+        }
+    }
+
     count_tool_definition_text(json.get("tools"), &mut total);
     count_tool_definition_text(json.get("functions"), &mut total);
     count_tool_argument_fields(json, &mut total);
@@ -1436,6 +1468,21 @@ fn count_text_value(value: Option<&Value>, total: &mut u64) {
                 count_text_value(Some(parts), total);
             } else if let Some(content) = obj.get("content") {
                 count_text_value(Some(content), total);
+            } else if let Some(tool_result) = obj.get("toolResult") {
+                // Amazon Bedrock Converse tool results:
+                // `messages[].content[].toolResult.content[].text`. The block
+                // carries no `type` and no `content` of its own, so without
+                // this arm a tool result re-fed to the model — often the
+                // largest text in the turn — counted zero characters and
+                // dodged `max_prompt_characters` entirely. Scoped to
+                // `content`: the sibling `toolUseId`/`status` fields are
+                // plumbing, not model-visible prose.
+                count_text_value(tool_result.get("content"), total);
+            } else if let Some(guard_content) = obj.get("guardContent") {
+                // Bedrock Converse guarded text, nested
+                // (`{"text": {"text": "..."}}`) or flat
+                // (`{"text": "..."}`); the recursive call counts either.
+                count_text_value(guard_content.get("text"), total);
             } else if let Some(message) = obj.get("message") {
                 count_text_value(Some(message), total);
             } else if let Some(text) = obj.get("text") {

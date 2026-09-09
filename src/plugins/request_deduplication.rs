@@ -3739,7 +3739,9 @@ impl Plugin for RequestDeduplication {
             self.publish_external_operation_tombstone(ctx).await;
             return;
         }
-        if !outcome.body_completed {
+        if !outcome.body_completed
+            || ctx.backend_dispatch_state() == super::BackendDispatchState::AmbiguousFailure
+        {
             return;
         }
 
@@ -3786,6 +3788,18 @@ impl Plugin for RequestDeduplication {
             || ctx
                 .metadata
                 .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY);
+
+        if !requires_execution_barrier
+            && matches!(
+                ctx.backend_dispatch_state(),
+                super::BackendDispatchState::PreWireFailure
+                    | super::BackendDispatchState::AmbiguousFailure
+            )
+        {
+            // Keep ownership available to the committed hook. A transport
+            // failure carries no authoritative application response to cache.
+            return PluginResult::Continue;
+        }
 
         // Only cache if this instance acquired a completion state in
         // `before_proxy`. Take it before any await so a later hook cannot reuse
@@ -4230,6 +4244,29 @@ impl Plugin for RequestDeduplication {
         {
             self.publish_external_operation_tombstone(ctx).await;
             return;
+        }
+
+        match ctx.backend_dispatch_state() {
+            super::BackendDispatchState::PreWireFailure => {
+                let Some(state) = ctx.request_deduplication_states.remove(&self.instance_id) else {
+                    return;
+                };
+                self.remove_matching_local_inflight(
+                    &state.key,
+                    &state.fingerprint,
+                    &state.local_inflight_owner_token,
+                );
+                if let Some(ownership) = state.redis_lock_token.as_ref() {
+                    self.redis_release_inflight(&state.key, ownership).await;
+                }
+                return;
+            }
+            super::BackendDispatchState::AmbiguousFailure => {
+                // The operation may have completed. Retain the local/Redis
+                // lease until its existing TTL; do not publish a false result.
+                return;
+            }
+            _ => {}
         }
 
         // Generic committed-hook release signals used by non-serverless ownership
