@@ -2658,13 +2658,17 @@ async fn a_live_or_absent_credential_leaves_the_buffered_terminal_summary_untouc
 ///
 /// The bound carries the authorization PLAN, not just the composed instant, so
 /// the phase that ends at it can tell whose deadline it was.
+///
+/// The eighth site is the deferred semantic-cache replay transport encoder
+/// (`encode_semantic_cache_replay`), which runs the compression `after_proxy`
+/// hook after the synthetic header chain and must stay under the same bound.
 #[test]
 fn every_precommit_response_phase_composes_the_authorization_lifetime() {
     assert_eq!(
         PROXY_SOURCE
             .matches("ctx.precommit_response_phase_bound()")
             .count(),
-        7,
+        8,
         "a pre-commitment response phase lost its authorization bound"
     );
     assert!(
