@@ -10,11 +10,12 @@
 //! but not the old are additions; resources in the old but not the new are
 //! removals; resources in both with a different `updated_at` are modifications
 //! (uses `!=` to catch both forward progress and backward clock skew).
-//! Consumers and plugin configurations additionally compare their own
-//! persisted content when `updated_at` is reused, so a rotated credential or a
-//! flipped policy cannot be classified as unchanged (GHSA-2wrj-vq9m-75jg).
-//! That fingerprint deliberately covers a resource's own persisted fields only
-//! — see `HasNamespacedIdAndTimestamp::persisted_content_changed`.
+//! Consumers, plugin configurations and stream-family proxies additionally
+//! compare their own persisted content when `updated_at` is reused, so a
+//! rotated credential, a flipped policy, or a re-pointed TCP/UDP backend cannot
+//! be classified as unchanged (GHSA-2wrj-vq9m-75jg). That fingerprint
+//! deliberately covers a resource's own persisted fields only — see
+//! `HasNamespacedIdAndTimestamp::persisted_content_changed`.
 //! Proxy/plugin association membership is compared directly because
 //! junction-table changes can arrive without advancing the owning proxy's
 //! timestamp.
@@ -83,8 +84,8 @@ impl ConfigDelta {
     /// Compute the delta between an old and new config snapshot.
     ///
     /// Uses `(namespace, id)` for identity and `updated_at` for change detection,
-    /// plus a persisted-content fingerprint for the resource kinds that carry
-    /// no projection-derived state.
+    /// plus a persisted-content fingerprint for the resource kinds whose
+    /// serialized form carries no projection-derived state.
     /// Returns a delta describing exactly which resources were added,
     /// removed, or modified.
     pub fn compute(old: &GatewayConfig, new: &GatewayConfig) -> Self {
@@ -340,7 +341,8 @@ trait HasNamespacedIdAndTimestamp {
     /// `diff_plugin_association_changes`.
     ///
     /// The default is "no content comparison", so a resource kind opts in only
-    /// once its serialized form is entirely operator-owned.
+    /// for the fields whose serialized form is entirely operator-owned:
+    /// consumers, plugin configurations and stream-family proxies.
     fn persisted_content_changed(&self, _other: &Self) -> bool {
         false
     }
@@ -387,10 +389,37 @@ impl HasNamespacedIdAndTimestamp for Proxy {
     fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
-    // No persisted-content fingerprint: a proxy's timestamp-neutral route
-    // content, its DestinationRule projections, and its plugin association
-    // membership each have a dedicated detection path, and none of them may be
-    // reported as a modified Proxy resource.
+    /// Stream-family proxies compare their own persisted row; route-indexed
+    /// proxies never do.
+    ///
+    /// A TCP/UDP/TLS-passthrough proxy has no other timestamp-neutral detection
+    /// path: `ProxyState::projected_route_proxy_content_changed` filters stream
+    /// proxies out, and `projected_mesh_stream_relay_dispatch_content_changed`
+    /// only covers mesh stream-relay dispatch overrides. Without this
+    /// fingerprint a re-pointed `backend_host` / `backend_port`, a moved
+    /// `listen_port`, or a relaxed `backend_tls_verify_server_cert` under a
+    /// reused `updated_at` would be classified as unchanged and the stream
+    /// listeners would keep serving the superseded backend
+    /// (GHSA-2wrj-vq9m-75jg).
+    ///
+    /// Route-indexed proxies keep returning `false`: their timestamp-neutral
+    /// route content is already owned by
+    /// `ProxyState::projected_route_proxy_content_changed`, and reporting it as
+    /// a modified proxy row would drag the DestinationRule projections along
+    /// with it. Those projections are `#[serde(skip)]` and so are excluded from
+    /// the comparison by construction; junction-table `plugins` membership is
+    /// cleared on both sides because it belongs to
+    /// `diff_plugin_association_changes`.
+    fn persisted_content_changed(&self, other: &Self) -> bool {
+        if !self.dispatch_kind.is_stream() && !other.dispatch_kind.is_stream() {
+            return false;
+        }
+        timestamp_neutral_content_changed(other, self, |proxy| {
+            proxy.created_at = DateTime::<Utc>::UNIX_EPOCH;
+            proxy.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+            proxy.plugins.clear();
+        })
+    }
 }
 
 impl HasNamespacedIdAndTimestamp for Consumer {

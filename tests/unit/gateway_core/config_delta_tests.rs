@@ -927,6 +927,82 @@ fn test_same_timestamp_plugin_body_or_enabled_change_is_modification() {
 }
 
 #[test]
+fn test_same_timestamp_stream_backend_change_is_modification() {
+    for scheme in [
+        BackendScheme::Tcp,
+        BackendScheme::Tcps,
+        BackendScheme::Udp,
+        BackendScheme::Dtls,
+    ] {
+        let mut proxy = make_proxy("p1", "/unused", Utc::now());
+        proxy.listen_path = None;
+        proxy.listen_port = Some(9000);
+        proxy.backend_scheme = Some(scheme);
+        proxy.dispatch_kind = DispatchKind::from(scheme);
+        let old = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+        let mut new = old.clone();
+        new.proxies[0].backend_port = 8081;
+
+        let delta = ConfigDelta::compute(&old, &new);
+
+        assert_eq!(old.proxies[0].updated_at, new.proxies[0].updated_at);
+        assert_eq!(delta.modified_proxies.len(), 1, "scheme: {scheme:?}");
+        assert_eq!(delta.modified_proxies[0].backend_port, 8081);
+    }
+}
+
+/// The stream-family fingerprint is scoped from the other side too: the same
+/// persisted change on a route-indexed proxy stays out of `modified_proxies`,
+/// where `ProxyState::projected_route_proxy_content_changed` owns it.
+#[test]
+fn test_same_timestamp_route_indexed_backend_change_is_not_a_modification() {
+    let old = GatewayConfig {
+        proxies: vec![make_proxy("p1", "/api", Utc::now())],
+        ..Default::default()
+    };
+    let mut new = old.clone();
+    new.proxies[0].backend_port = 8081;
+
+    let delta = ConfigDelta::compute(&old, &new);
+
+    assert!(!old.proxies[0].dispatch_kind.is_stream());
+    assert_eq!(old.proxies[0].updated_at, new.proxies[0].updated_at);
+    assert!(delta.modified_proxies.is_empty());
+}
+
+/// Junction-table association membership stays with
+/// `plugin_association_changed_proxy_ids` even on a stream proxy, whose row is
+/// otherwise content-compared.
+#[test]
+fn test_same_timestamp_stream_plugin_association_change_is_not_a_proxy_modification() {
+    let mut proxy = make_proxy("p1", "/unused", Utc::now());
+    proxy.listen_path = None;
+    proxy.listen_port = Some(9000);
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "pc1".to_string(),
+    }];
+    let old = GatewayConfig {
+        proxies: vec![proxy],
+        ..Default::default()
+    };
+    let mut new = old.clone();
+    new.proxies[0].plugins.clear();
+
+    let delta = ConfigDelta::compute(&old, &new);
+
+    assert!(delta.modified_proxies.is_empty());
+    assert_eq!(
+        delta.plugin_association_changed_proxy_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "p1")]
+    );
+}
+
+#[test]
 fn test_identical_content_and_updated_at_remain_unchanged_for_all_resources() {
     let t = Utc::now();
     let old = GatewayConfig {
