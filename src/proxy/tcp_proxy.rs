@@ -1496,7 +1496,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    bidirectional_copy(
+    bidirectional_copy_for_relay(
         client,
         backend,
         idle_timeout,
@@ -1504,7 +1504,6 @@ where
         backend_read_timeout,
         backend_write_timeout,
         buf_size,
-        None,
     )
     .await
 }
@@ -3001,10 +3000,8 @@ struct TcpConnParams {
     backend_scheme: BackendScheme,
     dns_override: Option<String>,
     dns_cache_ttl_seconds: Option<u64>,
-    backend_connect_timeout_ms: u64,
     backend_read_timeout_ms: u64,
     backend_write_timeout_ms: u64,
-    tcp_idle_timeout_seconds: u64,
     /// Hard cap on Phase 2 (half-close drain). Applies even when the session
     /// idle timeout is disabled, preventing a stalled peer from wedging the
     /// drain future forever. `0` disables the cap.
@@ -3778,18 +3775,6 @@ async fn handle_tcp_connection_inner(
             is_half_open_probe: false,
         };
 
-        // Honor DestinationRule per-port `connect_timeout_ms` and
-        // `tcp_idle_timeout_seconds` overrides on the L4/TCP path. The override
-        // is keyed by destination policy port and lives on the proxy's
-        // pre-computed `dispatch_port_overrides` map — single field read, no
-        // DashMap/ArcSwap traversal. `Some(0)` idle is an explicit disable.
-        let port_override = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|m| m.get(&backend_policy_port));
-        let effective_backend_connect_timeout_ms = port_override
-            .and_then(|override_config| override_config.connect_timeout_ms)
-            .unwrap_or(proxy.backend_connect_timeout_ms);
         let params = TcpConnParams {
             backend_host,
             backend_port,
@@ -3797,13 +3782,8 @@ async fn handle_tcp_connection_inner(
             backend_scheme: proxy.effective_scheme(),
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
-            backend_connect_timeout_ms: effective_backend_connect_timeout_ms,
             backend_read_timeout_ms: proxy.backend_read_timeout_ms,
             backend_write_timeout_ms: proxy.backend_write_timeout_ms,
-            tcp_idle_timeout_seconds: port_override
-                .and_then(|override_config| override_config.tcp_idle_timeout_seconds)
-                .or(proxy.tcp_idle_timeout_seconds)
-                .unwrap_or(global_tcp_idle_timeout),
             tcp_half_close_max_wait_seconds,
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
@@ -3975,12 +3955,6 @@ async fn handle_tcp_connection_inner(
             client_local_addr,
         )?;
 
-        let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
-        let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
-            Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
-        } else {
-            None
-        };
         let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
             Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
         } else {
@@ -4166,6 +4140,17 @@ async fn handle_tcp_connection_inner(
                     }
                 };
 
+                // Target rotation can cross DestinationRule policy-port lanes.
+                // Resolve the connect budget for every attempt rather than
+                // retaining the failed target's per-port policy.
+                let (backend_connect_timeout_ms, _) = tcp_timeout_policy(
+                    &params,
+                    params.backend_policy_port,
+                    proxy,
+                    global_tcp_idle_timeout,
+                );
+                let connect_timeout = Duration::from_millis(backend_connect_timeout_ms);
+
                 // Connect plain TCP to backend (no TLS origination — the client's encrypted
                 // stream passes through directly to the backend which terminates TLS).
                 let connect_attempt = crate::dns::connect_candidates(
@@ -4208,7 +4193,7 @@ async fn handle_tcp_connection_inner(
                         .map_err(|error| match error {
                             crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
                                 "Backend TCP connect budget exhausted after {}ms (last={})",
-                                params.backend_connect_timeout_ms,
+                                backend_connect_timeout_ms,
                                 last_addr
                             ),
                             crate::dns::CandidateConnectError::Failed { source, .. } => source,
@@ -4307,6 +4292,16 @@ async fn handle_tcp_connection_inner(
         };
         backend_info.backend_resolved_ip = Some(addr.ip().to_string());
         let passthrough_port_override = resolve_port_override(&params, params.backend_policy_port);
+        // The relay belongs to the target that ultimately connected, so its
+        // idle watchdog must use that target's policy lane as well.
+        let (_, tcp_idle_timeout_seconds) = tcp_timeout_policy(
+            &params,
+            params.backend_policy_port,
+            proxy,
+            global_tcp_idle_timeout,
+        );
+        let idle_timeout =
+            (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
         // backend socket. Best-effort: a `setsockopt` failure logs and
@@ -4479,12 +4474,6 @@ async fn handle_tcp_connection_inner(
     }
 
     let is_backend_tls = params.backend_scheme == BackendScheme::Tcps;
-    let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
-    let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
-        Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
-    } else {
-        None
-    };
     let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
         Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
     } else {
@@ -5257,8 +5246,14 @@ async fn handle_tcp_connection_inner(
             }
         };
 
-        // Attempt backend TCP connection (with optional TLS origination)
-        let current_host_ref = current_host.as_str();
+        // Resolve every attempt from the selected policy lane, including retries
+        // after DNS, circuit-breaker, or connection-limit rejection.
+        let (backend_connect_timeout_ms, _) =
+            tcp_timeout_policy(&params, current_policy_port, proxy, global_tcp_idle_timeout);
+        let connect_timeout = Duration::from_millis(backend_connect_timeout_ms);
+        // The authenticated TLS name is independent of the socket dial host.
+        // Keep the cached verifier (including mesh identity policy) unchanged.
+        let tls_server_name = proxy.resolved_tls.sni.as_deref().unwrap_or(&current_host);
         let params_ref = &params;
         let outbound_pp = outbound_proxy_v2_header.as_deref();
         let connect_attempt = crate::dns::connect_candidates(
@@ -5269,7 +5264,7 @@ async fn handle_tcp_connection_inner(
                 if is_backend_tls {
                     connect_backend_tls_cached(
                         addr,
-                        current_host_ref,
+                        tls_server_name,
                         connect_timeout,
                         cached_backend_tls,
                         params_ref.tcp_fastopen_enabled,
@@ -5334,7 +5329,7 @@ async fn handle_tcp_connection_inner(
             Ok(result) => result.map_err(|error| match error {
                 crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
                     "Backend TCP connect budget exhausted after {}ms (last={})",
-                    params.backend_connect_timeout_ms,
+                    backend_connect_timeout_ms,
                     last_addr
                 ),
                 crate::dns::CandidateConnectError::Failed { source, .. } => source,
@@ -5444,6 +5439,10 @@ async fn handle_tcp_connection_inner(
             }
         }
     };
+    let (_, tcp_idle_timeout_seconds) =
+        tcp_timeout_policy(&params, current_policy_port, proxy, global_tcp_idle_timeout);
+    let idle_timeout =
+        (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
     let (_backend_socket_addr, mut backend_stream, _backend_inflight_guard) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
     let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
@@ -6203,10 +6202,8 @@ mod backend_target_selection_tests {
             backend_scheme: BackendScheme::Tcp,
             dns_override: None,
             dns_cache_ttl_seconds: None,
-            backend_connect_timeout_ms: 1000,
             backend_read_timeout_ms: 0,
             backend_write_timeout_ms: 0,
-            tcp_idle_timeout_seconds: 60,
             tcp_half_close_max_wait_seconds: 0,
             retry: None,
             upstream_id: Some("orders".to_string()),
@@ -6219,6 +6216,52 @@ mod backend_target_selection_tests {
             health_port_scope: None,
             backend_proxy_protocol: None,
         }
+    }
+
+    #[test]
+    fn tcp_retry_timeouts_follow_current_policy_port() {
+        let mut proxy = proxy_with_subset(None);
+        proxy.backend_connect_timeout_ms = 5_000;
+        proxy.tcp_idle_timeout_seconds = Some(300);
+        proxy.dispatch_port_overrides = Some(HashMap::from([
+            (
+                6379,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(9_000),
+                    tcp_idle_timeout_seconds: Some(0),
+                    ..Default::default()
+                },
+            ),
+            (
+                6380,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(250),
+                    tcp_idle_timeout_seconds: Some(2),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        let mut params = retry_params();
+        params.backend_policy_port = 6379;
+        params.dispatch_port_overrides = proxy.dispatch_port_overrides.clone();
+
+        assert_eq!(
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
+            (9_000, 0)
+        );
+
+        params.backend_policy_port = 6380;
+        assert_eq!(
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
+            (250, 2)
+        );
+
+        params.backend_policy_port = 6381;
+        assert_eq!(
+            tcp_timeout_policy(&params, params.backend_policy_port, &proxy, 600),
+            (5_000, 300),
+            "a lane without overrides must not inherit the initial target's values"
+        );
     }
 
     #[test]
@@ -7611,6 +7654,25 @@ fn resolve_port_override(
         .and_then(|m| m.get(&port))
 }
 
+/// Resolve TCP timeouts for the selected policy port on either relay path.
+/// A lane without overrides uses proxy/global defaults, never the first lane.
+fn tcp_timeout_policy(
+    params: &TcpConnParams,
+    policy_port: u16,
+    proxy: &Proxy,
+    global_tcp_idle_timeout: u64,
+) -> (u64, u64) {
+    let port_override = resolve_port_override(params, policy_port);
+    let connect_timeout_ms = port_override
+        .and_then(|override_config| override_config.connect_timeout_ms)
+        .unwrap_or(proxy.backend_connect_timeout_ms);
+    let idle_timeout_seconds = port_override
+        .and_then(|override_config| override_config.tcp_idle_timeout_seconds)
+        .or(proxy.tcp_idle_timeout_seconds)
+        .unwrap_or(global_tcp_idle_timeout);
+    (connect_timeout_ms, idle_timeout_seconds)
+}
+
 /// Try to acquire a per-target open-connection slot for DR
 /// `connectionPool.tcp.maxConnections`, delegating to the shared
 /// `BackendConnectionLimiter`. Returns:
@@ -8331,6 +8393,69 @@ impl CopyDirectionState {
     }
 }
 
+// The queue state and watermark are private. Keep their deterministic
+// transition check here; end-to-end timeout coverage lives in tests/.
+#[cfg(test)]
+mod copy_direction_queue_tests {
+    use super::*;
+    use std::task::Context;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn write_watermark_disarms_only_after_drain_and_rearms_for_new_data() {
+        let (mut client, mut client_peer) = tokio::io::duplex(8);
+        let (mut backend, mut backend_peer) = tokio::io::duplex(1);
+        let mut state = CopyDirectionState::new(8);
+        let bytes = AtomicU64::new(0);
+        let write_watermark = AtomicU64::new(u64::MAX);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        client_peer.write_all(b"abc").await.unwrap();
+        for expected in b"abc" {
+            assert!(
+                poll_copy_direction(
+                    &mut cx,
+                    Pin::new(&mut client),
+                    Pin::new(&mut backend),
+                    &mut state,
+                    &bytes,
+                    None,
+                    None,
+                    Some(&write_watermark),
+                )
+                .is_pending()
+            );
+            if *expected == b'c' {
+                assert!(state.phase == CopyPhase::Reading);
+                assert_eq!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+            } else {
+                assert!(state.phase == CopyPhase::Writing);
+                assert_ne!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+                assert_eq!(backend_peer.read_u8().await.unwrap(), *expected);
+            }
+        }
+        assert_eq!(bytes.load(Ordering::Relaxed), 3);
+        // The final byte still occupies the backend socket buffer. A new
+        // client byte is now queued but cannot make write progress.
+        client_peer.write_all(b"d").await.unwrap();
+        assert!(
+            poll_copy_direction(
+                &mut cx,
+                Pin::new(&mut client),
+                Pin::new(&mut backend),
+                &mut state,
+                &bytes,
+                None,
+                None,
+                Some(&write_watermark),
+            )
+            .is_pending()
+        );
+        assert!(state.phase == CopyPhase::Writing);
+        assert_ne!(write_watermark.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(bytes.load(Ordering::Relaxed), 3);
+    }
+}
+
 enum Phase1Outcome {
     ClientToBackend(Result<(), (StreamIoSide, std::io::Error)>),
     BackendToClient(Result<(), (StreamIoSide, std::io::Error)>),
@@ -8480,6 +8605,11 @@ where
                     }
                 }
 
+                // Nothing remains queued for the backend. Client silence
+                // must not retain the previous write-stall deadline.
+                if let Some(wm) = write_watermark {
+                    wm.store(u64::MAX, Ordering::Relaxed);
+                }
                 state.pos = 0;
                 state.cap = 0;
                 state.phase = CopyPhase::Reading;
@@ -9821,16 +9951,67 @@ fn classify_splice_worker_failure(
     }
 }
 
+/// Tokio's default `max_blocking_threads`, used when `FERRUM_BLOCKING_THREADS`
+/// is unset. Mirrors the value the runtime builder itself defaults to.
+pub const DEFAULT_BLOCKING_THREADS: usize = 512;
+
+/// Divisor applied to the blocking pool to size the io_uring splice relay cap.
+///
+/// Each admitted relay holds TWO blocking threads (one per direction) for the
+/// whole connection lifetime, so a cap of `pool / 4` relays consumes at most
+/// half the pool at saturation and always leaves half for everything else —
+/// including the overload monitor's open-FD count and config reload, which run
+/// on the same pool (issue #4786). Relays beyond the cap transparently fall
+/// back to the async splice path rather than queueing.
+///
+/// At the default 512-thread pool this reproduces the previous hardcoded 128,
+/// so nothing changes for a deployment that never touched
+/// `FERRUM_BLOCKING_THREADS`; a smaller pool now shrinks the cap with it
+/// instead of letting relays claim the whole thing.
+const IO_URING_SPLICE_POOL_DIVISOR: usize = 4;
+
+/// Derive the concurrent io_uring splice relay cap from the configured
+/// blocking pool size.
+///
+/// Never returns 0: a one-thread pool still admits a single relay, because the
+/// alternative is silently disabling io_uring splice on a configuration that
+/// asked for it.
+pub fn derive_io_uring_splice_max_concurrent(blocking_threads: Option<usize>) -> usize {
+    let pool = blocking_threads.unwrap_or(DEFAULT_BLOCKING_THREADS).max(1);
+    (pool / IO_URING_SPLICE_POOL_DIVISOR).max(1)
+}
+
 #[cfg(target_os = "linux")]
-const IO_URING_SPLICE_MAX_CONCURRENT: usize = 128;
+static IO_URING_SPLICE_MAX_CONCURRENT: OnceLock<usize> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 static IO_URING_SPLICE_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+/// Seed the relay cap from the process configuration.
+///
+/// Called once from startup, before any listener is bound, so the first relay
+/// observes the derived value. Idempotent: a later call (or a relay that
+/// arrived first) leaves the already-published cap in place, because the
+/// semaphore it sized cannot be resized without losing outstanding permits.
+#[cfg(target_os = "linux")]
+pub fn initialize_io_uring_splice_limit(blocking_threads: Option<usize>) {
+    let _ =
+        IO_URING_SPLICE_MAX_CONCURRENT.set(derive_io_uring_splice_max_concurrent(blocking_threads));
+}
+
+/// No-op on non-Linux targets, where io_uring splice does not exist.
+#[cfg(not(target_os = "linux"))]
+pub fn initialize_io_uring_splice_limit(_blocking_threads: Option<usize>) {}
+
+#[cfg(target_os = "linux")]
+fn io_uring_splice_max_concurrent() -> usize {
+    *IO_URING_SPLICE_MAX_CONCURRENT.get_or_init(|| derive_io_uring_splice_max_concurrent(None))
+}
+
 #[cfg(target_os = "linux")]
 fn io_uring_splice_limit() -> Arc<Semaphore> {
     IO_URING_SPLICE_LIMIT
-        .get_or_init(|| Arc::new(Semaphore::new(IO_URING_SPLICE_MAX_CONCURRENT)))
+        .get_or_init(|| Arc::new(Semaphore::new(io_uring_splice_max_concurrent())))
         .clone()
 }
 
@@ -9887,7 +10068,7 @@ async fn bidirectional_splice_io_uring_bounded_or_async(
         .await
     } else {
         debug!(
-            max_concurrent = IO_URING_SPLICE_MAX_CONCURRENT,
+            max_concurrent = io_uring_splice_max_concurrent(),
             "io_uring splice concurrency limit reached; falling back to async splice"
         );
         bidirectional_splice(
@@ -10487,12 +10668,8 @@ fn libc_splice_loop(
                 ));
             }
         }
-        // See the io_uring loop's analogous block — the c2b worker must fire
-        // `backend_write_timeout_ms` even when stuck in the Reading phase, to
-        // match `bidirectional_copy`'s parent-watchdog semantics and the
-        // libc-async splice path's parent watchdog. The watermark is
-        // `u64::MAX` until c2b primes it on its first successful read, so
-        // this check stays inert until c2b actually carries data.
+        // The write watermark is disarmed whenever the pipe drains, so
+        // waiting for new client bytes cannot count as a backend write stall.
         if write_wm_active && let Some(wm) = write_watermark {
             let last = wm.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
@@ -10633,6 +10810,9 @@ fn libc_splice_loop(
                     ));
                 }
             }
+            if let Some(wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
+            }
         } else if n == 0 {
             shutdown_write_fd(dst_fd);
             return Ok(total);
@@ -10667,9 +10847,7 @@ fn libc_splice_loop(
                         ));
                     }
                 }
-                // Mirror the outer-loop check: the c2b worker must also
-                // fire backend_write_timeout when stuck in Phase 1 with
-                // stale queued bytes. See the outer-loop comment above.
+                // Keep the same queue-aware watermark as the outer check.
                 if write_wm_active && let Some(wm) = write_watermark {
                     let last = wm.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
@@ -10742,7 +10920,8 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 /// caller (Phase 1 watchdog in `bidirectional_splice`) reads it to fire
 /// `backend_read_timeout_ms` when the b2c direction's backend stops sending.
 /// `write_watermark` is primed when src→pipe produces queued bytes and
-/// refreshed on every successful pipe→dst splice. The caller fires
+/// refreshed on every successful pipe→dst splice, then disarmed when the
+/// pipe drains. The caller fires
 /// `backend_write_timeout_ms` from it for the c2b direction. Both are
 /// `Option<&AtomicU64>` because c2b only carries write_watermark and b2c only
 /// carries read_watermark — they share scope with the watchdog instead of
@@ -10897,6 +11076,9 @@ async fn splice_one_direction_no_guard(
                     half_close_relay_write_side(dst, dst_is_ktls).await?;
                     return Ok(());
                 }
+            }
+            if let Some(ref wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
             }
         } else if n == 0 {
             // EOF — source closed.
@@ -11173,6 +11355,9 @@ async fn resolve_ktls_splice_einval(
             }
             bytes.fetch_add(len as u64, Ordering::Relaxed);
             refresh_splice_write_progress(last_activity, write_watermark);
+            if let Some(wm) = write_watermark {
+                wm.store(u64::MAX, Ordering::Relaxed);
+            }
             KtlsSpliceEinval::Resume
         }
         KtlsRecvOutcome::Control { record_type, len } => {
