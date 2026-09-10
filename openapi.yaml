@@ -22622,6 +22622,7 @@ components:
               description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside its retention window."
 
     CorsExactOrigin:
+      maxLength: 512
       oneOf:
         - type: string
           const: "*"
@@ -22631,7 +22632,9 @@ components:
       description: >-
         Exact HTTP(S) origin. The runtime URL parser additionally validates the
         host and port and canonicalizes scheme/host case, default ports, IDNA,
-        IPv4, and IPv6. Exact `*` is Istio's allow-all value.
+        IPv4, and IPv6. Exact `*` is Istio's allow-all value. JSON Schema
+        maxLength counts characters; runtime admission additionally enforces
+        the 512-byte UTF-8 matcher budget.
 
     CorsAllowedOriginString:
       oneOf:
@@ -22639,8 +22642,18 @@ components:
         - type: string
           minLength: 3
           maxLength: 512
-          pattern: '^\*\.[^*/:\s]+$'
-          description: Native wildcard-subdomain matcher such as `*.example.com`.
+          pattern: '^\*\.[^*/:\\?#@%\s.]+(?:\.[^*/:\\?#@%\s.]+)*\.?$'
+          description: >-
+            Native wildcard-subdomain matcher such as `*.example.com`. The
+            suffix is a DNS hostname, normalized to IDNA ASCII at config load;
+            Unicode `*.bücher.example` matches `shop.xn--bcher-kva.example`.
+            URL delimiters, percent-encoding, whitespace, control characters,
+            IP literals, and empty labels are rejected. After IDNA conversion,
+            labels must contain only ASCII letters, digits, or interior hyphens,
+            at most 63 bytes each and 253 bytes total excluding an optional
+            trailing root dot. A root dot is preserved for matching. The bare
+            domain does not match. Runtime also enforces 512 UTF-8 bytes per
+            matcher; JSON Schema maxLength counts characters.
 
     CorsLiteralExactOrigin:
       type: string
@@ -22668,7 +22681,9 @@ components:
         requests evaluate origin/credentials/exposure behavior; method/header
         allow-lists and max age govern preflight only. Denials return a JSON
         object with a fixed error message, without reflecting method/header
-        values. Successful preflight bodies remain empty.
+        values. Successful preflight bodies remain empty. Participating CORS
+        policies merge Origin into Vary even for originless and unmatched
+        responses, preserving existing Vary tokens and Vary: *.
       allOf:
         - if:
             not:
@@ -22754,7 +22769,11 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           description: >-
             Preflight-only allowed methods returned in
-            Access-Control-Allow-Methods. This list is not evaluated against
+            Access-Control-Allow-Methods. Method tokens are case-sensitive.
+            With credentials disabled, `*` allows any valid method; with
+            credentials enabled, it is a literal token. Multiple policies
+            intersect these permissions without widening a sibling's policy.
+            This list is not evaluated against
             the actual request method. Omission uses the native direct-plugin
             default; with `unmatched_preflights`, omission/empty preserves
             Istio's empty list.
@@ -22766,7 +22785,14 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           description: >-
             Preflight-only allowed request headers returned in
-            Access-Control-Allow-Headers. This list is not evaluated against
+            Access-Control-Allow-Headers. Header names are case-insensitive.
+            With credentials disabled, `*` permits every header except
+            Authorization, which must be listed explicitly by every policy.
+            With credentials enabled, `*` is a literal token. Multiple policies
+            intersect these permissions; a literal `*` is omitted if dropping
+            credentials would give it wildcard meaning in the final response.
+            The same literal-token rule applies to allowed_methods.
+            This list is not evaluated against
             headers on the actual request. Omission uses the native
             direct-plugin default; with `unmatched_preflights`, omission/empty
             preserves Istio's empty list.
@@ -22796,8 +22822,10 @@ components:
           type: integer
           format: uint64
           minimum: 0
+          maximum: 18446744073709551615
           description: >-
-            Preflight cache duration in seconds. Native direct-plugin omission
+            Preflight cache duration in seconds, from 0 through
+            18446744073709551615. Native direct-plugin omission
             defaults to 86400; translated Istio omission remains absent.
         preflight_continue:
           type: boolean
