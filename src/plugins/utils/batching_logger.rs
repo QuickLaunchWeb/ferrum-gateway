@@ -1150,7 +1150,7 @@ async fn flush_with_retry<T, F, Fut>(
                         entry_count,
                         error,
                     );
-                    on_failed_batch(batch, error)
+                    on_failed_batch(batch, error.clone())
                 } else {
                     false
                 };
