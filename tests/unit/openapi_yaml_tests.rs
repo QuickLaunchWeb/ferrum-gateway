@@ -2621,25 +2621,30 @@ fn ldap_auth_schema_matches_runtime_invariants() {
     for config in [
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldap://ldap.example.com:389",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "starttls": true
         }),
         json!({
             "ldap_url": "ldap://directory.example.test:389",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "allow_plaintext": true
         }),
         json!({
             "ldap_url": "ldap://127.0.0.1:389",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldap://LOCALHOST:389",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
@@ -2652,12 +2657,14 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "required_groups": ["admins"]
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "group_filter": "(member={user_dn})",
             "required_groups": ["admins"],
@@ -2675,7 +2682,8 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         json!({"ldap_url": "ldaps://ldap.example.com:636"}),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid=static,dc=example,dc=com"
+            "bind_dn_template": "uid=static,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
@@ -2691,6 +2699,25 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "secret"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "search_filter": "(uid={username})"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
             "search_base_dn": "ou=users,dc=example,dc=com",
             "search_filter": "(uid=static)",
             "canonical_identity_attribute": "uid",
@@ -2700,11 +2727,13 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_groups": ["admins"]
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "group_base_dn": "ou=groups,dc=example,dc=com",
             "group_filter": "(cn=admins)",
             "required_groups": ["admins"]
@@ -2712,44 +2741,53 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "starttls": true
         }),
         json!({
             "ldap_url": "ldap://directory.example.test:389",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://admin:secret@ldap.example.com:636",
-            "bind_dn_template": "uid={username},dc=example,dc=com"
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "connect_timeout_seconds": 0
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "request_timeout_seconds": 301
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "max_concurrent_requests": 0
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "cache_ttl_seconds": 86401
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "max_cache_entries": 0
         }),
         json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
             "required_group": ["admins"]
         }),
     ] {

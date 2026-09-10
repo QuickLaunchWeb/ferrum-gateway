@@ -23,6 +23,105 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+fn trigger_auth_config(port: u16, predicate: serde_json::Value) -> String {
+    let mut config: serde_json::Value =
+        serde_yaml::from_str(&file_mode_yaml_for_backend(port)).expect("base config");
+    config["proxies"][0]["plugins"] = json!([{"plugin_config_id": "auth"}]);
+    config["plugin_configs"] = json!([{
+        "id": "auth",
+        "plugin_name": "key_auth",
+        "scope": "proxy",
+        "proxy_id": "scripted",
+        "enabled": true,
+        "config": {"key_location": "header:x-api-key"},
+        "trigger": {"when": {"match": predicate}}
+    }]);
+    config["consumers"] = json!([{
+        "id": "alice",
+        "username": "alice",
+        "credentials": {"keyauth": [{"key": "trigger-test-key"}]}
+    }]);
+    crate::scaffolding::to_file_mode_yaml(&config)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_auth_trigger_refuses_non_canonical_admission() {
+    for predicate in [
+        json!({"path": {"prefix": ["/%61pi"]}}),
+        json!({"host": {"exact": ["API.EXAMPLE.COM"]}}),
+    ] {
+        let reservation = reserve_port().await.expect("backend port");
+        let result = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(trigger_auth_config(reservation.port, predicate))
+            .spawn()
+            .await;
+        let error = match result {
+            Ok(_) => panic!("non-canonical authentication trigger was admitted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("invalid field(s)"),
+            "unexpected admission error: {error}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_canonical_auth_trigger_requires_credentials() {
+    let reservation = reserve_port().await.expect("backend port");
+    let port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "GET", "/private",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "2".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("backend");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(trigger_auth_config(
+            port,
+            json!({"path": {"prefix": ["/api"]}}),
+        ))
+        .spawn()
+        .await
+        .expect("canonical trigger admitted");
+    harness
+        .wait_healthy(Duration::from_secs(5))
+        .await
+        .expect("healthy");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+    let url = format!("{}/api/private", harness.proxy_base_url());
+    let rejected = client
+        .get(&url)
+        .send()
+        .await
+        .expect("unauthenticated request");
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let accepted = client
+        .get(&url)
+        .header("x-api-key", "trigger-test-key")
+        .send()
+        .await
+        .expect("authenticated request");
+    assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+    assert_eq!(accepted.text().await.expect("body"), "ok");
+    backend.assert_no_matcher_mismatches().await;
+}
+
 #[tokio::test]
 async fn scripted_tcp_backend_end_to_end() {
     let reservation = reserve_port().await.expect("port");

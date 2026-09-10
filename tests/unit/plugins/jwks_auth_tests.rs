@@ -1377,6 +1377,78 @@ async fn test_jwks_auth_validates_rs256_token() {
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
 }
 
+#[test]
+fn test_jwks_auth_skips_below_floor_rsa_key() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_1024_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let error = JwksAuth::new(
+        &json!({
+            "providers": [{ "jwks": jwks }]
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("a JWKS with only below-floor RSA keys must not load");
+    assert!(
+        error.contains("no usable signing keys"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_rejects_token_signed_with_below_floor_rsa_key() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_1024_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_1024_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token(&json!({"sub": "idp-user"}), private_key_pem);
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_jwks_auth_trusts_2048_bit_rsa_key_when_mixed_with_below_floor_key() {
+    let strong_private = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let strong_public = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let weak_public = include_bytes!("../../../tests/fixtures/test_rsa_1024_public.pem");
+
+    let jwks = json!({
+        "keys": [
+            build_rsa_jwks_from_pem_with_kid(weak_public, "weak-key")["keys"][0].clone(),
+            build_rsa_jwks_from_pem_with_kid(strong_public, "strong-key")["keys"][0].clone(),
+        ]
+    });
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{ "jwks": jwks }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token =
+        create_rs256_token_with_kid(&json!({"sub": "idp-user"}), strong_private, "strong-key");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("idp-user"));
+}
+
 #[tokio::test]
 async fn test_jwks_auth_rejects_missing_exp_by_default() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
@@ -4621,6 +4693,131 @@ fn equivalent_providers_that_disagree_on_require_dpop_are_rejected() {
         assert!(
             error.contains("require_dpop") && error.contains("incompatible"),
             "diagnostic should name the disagreeing DPoP requirement: {error}"
+        );
+    }
+}
+
+/// Equivalent providers with matching authorization fields still converge on
+/// one replay lane; disagreement on those fields is refused separately.
+#[test]
+fn equivalent_providers_with_matching_authorization_fields_converge_on_one_replay_lane() {
+    let (_, jwks) = build_dpop_fixture("dpop-auth-fields-converge");
+    let provider = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "require_dpop": true,
+        "dpop_replay_scope": "process",
+        "require_mtls_binding": true,
+        "required_scopes": ["read:data"],
+        "required_roles": ["admin"],
+    });
+
+    let plugin = dpop_plugin_with_providers(
+        json!([provider.clone(), provider]),
+        "dpop-auth-fields-converge",
+    );
+    let markers = plugin.dpop_replay_domain_markers("thumbprint", "proof-id");
+    assert_eq!(
+        markers[0], markers[1],
+        "equivalent providers with matching authorization fields must share one replay lane"
+    );
+}
+
+/// A token that verifies against both siblings is matched to the first success.
+/// If one sibling requires certificate binding and the other does not, matching
+/// order is an authentication bypass of the RFC 8705 gate.
+#[test]
+fn equivalent_providers_that_disagree_on_require_mtls_binding_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("mtls-binding-mix-reject");
+    let with_binding = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "require_mtls_binding": true,
+    });
+    let without_binding = json!({ "jwks": jwks, "issuer": DPOP_TEST_ISSUER });
+
+    for providers in [
+        json!([with_binding.clone(), without_binding.clone()]),
+        json!([without_binding.clone(), with_binding.clone()]),
+    ] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("mtls-binding-mix-reject"),
+        )
+        .map(|_| ())
+        .expect_err("equivalent providers must agree on require_mtls_binding");
+        assert!(
+            error.contains("require_mtls_binding") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing certificate-binding requirement: {error}"
+        );
+    }
+}
+
+/// Matching order would otherwise let a permissive sibling satisfy a token that
+/// lacks scopes the stricter sibling demands.
+#[test]
+fn equivalent_providers_that_disagree_on_required_scopes_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("required-scopes-mix-reject");
+    let strict = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "required_scopes": ["read:data", "write:data"],
+    });
+    let permissive = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "required_scopes": ["read:data"],
+    });
+
+    for providers in [
+        json!([strict.clone(), permissive.clone()]),
+        json!([permissive.clone(), strict.clone()]),
+    ] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("required-scopes-mix-reject"),
+        )
+        .map(|_| ())
+        .expect_err("equivalent providers must agree on required_scopes");
+        assert!(
+            error.contains("required_scopes") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing scope requirement: {error}"
+        );
+    }
+}
+
+/// Matching order would otherwise let a permissive sibling satisfy a token that
+/// lacks roles the stricter sibling demands.
+#[test]
+fn equivalent_providers_that_disagree_on_required_roles_are_rejected() {
+    let (_, jwks) = build_dpop_fixture("required-roles-mix-reject");
+    let strict = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "required_roles": ["admin", "operator"],
+    });
+    let permissive = json!({
+        "jwks": jwks,
+        "issuer": DPOP_TEST_ISSUER,
+        "required_roles": ["admin"],
+    });
+
+    for providers in [
+        json!([strict.clone(), permissive.clone()]),
+        json!([permissive.clone(), strict.clone()]),
+    ] {
+        let error = JwksAuth::new_with_config_id(
+            &json!({ "providers": providers }),
+            default_client(),
+            Some("required-roles-mix-reject"),
+        )
+        .map(|_| ())
+        .expect_err("equivalent providers must agree on required_roles");
+        assert!(
+            error.contains("required_roles") && error.contains("incompatible"),
+            "diagnostic should name the disagreeing role requirement: {error}"
         );
     }
 }

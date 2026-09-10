@@ -1416,9 +1416,11 @@ fn udp_amplification_metrics_are_unlabeled_process_counters() {
 #[tokio::test]
 async fn test_registry_records_mesh_dns_upstream_id_exhaustion() {
     let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 0, 10_000, "ferrum");
 
     let initial_output = registry.render_uncached();
     assert!(initial_output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total 0"));
+    assert!(!initial_output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total{"));
 
     registry.record_mesh_dns_upstream_id_exhaustion();
     registry.record_mesh_dns_upstream_id_exhaustion();
@@ -1432,6 +1434,7 @@ async fn test_registry_records_mesh_dns_upstream_id_exhaustion() {
     let output = registry.render_uncached();
     assert!(output.contains("# TYPE ferrum_mesh_dns_upstream_id_exhaustions_total counter"));
     assert!(output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total 2"));
+    assert!(!output.contains("ferrum_mesh_dns_upstream_id_exhaustions_total{"));
 }
 
 #[tokio::test]

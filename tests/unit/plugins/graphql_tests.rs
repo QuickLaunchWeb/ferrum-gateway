@@ -353,6 +353,62 @@ async fn test_alias_exceeds_limit() {
     assert_reject(result, Some(400));
 }
 
+#[tokio::test]
+async fn test_alias_count_counts_ignored_tokens_before_colon() {
+    let config = json!({ "max_aliases": 2 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let plain = "{ a1: f a2: f a3: f }";
+    let comma = "{ a1,: f a2,: f a3,: f }";
+    let comment = "{ a1# ign\n: f a2# ign\n: f a3# ign\n: f }";
+
+    for query in [plain, comma, comment] {
+        let mut ctx = create_graphql_context(query, None);
+        let mut headers = make_graphql_headers();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400);
+                assert!(
+                    body.contains("Query uses 3 aliases, maximum allowed is 2"),
+                    "expected alias-budget rejection for {query:?}, got {body}"
+                );
+            }
+            other => panic!("Expected Reject(400) for {query:?}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_two_aliases_pass_with_ignored_tokens_before_colon() {
+    let config = json!({ "max_aliases": 2 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let plain = "{ a1: f a2: f }";
+    let comma = "{ a1,: f a2,: f }";
+    let comment = "{ a1# ign\n: f a2# ign\n: f }";
+
+    for query in [plain, comma, comment] {
+        let mut ctx = create_graphql_context(query, None);
+        let mut headers = make_graphql_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+    }
+}
+
+#[tokio::test]
+async fn test_alias_count_unaffected_by_commas_in_argument_lists() {
+    let config = json!({ "max_aliases": 2 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ user(id: 1, status: active) { name } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
 // ── Introspection control ──
 
 #[tokio::test]
