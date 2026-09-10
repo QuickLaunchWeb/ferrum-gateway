@@ -899,9 +899,9 @@ impl OidcRelyingParty {
         session_aad.extend_from_slice(&session_context);
         let mut pending_aad = b"ferrum-edge/oidc-pending-flow/v1\0".to_vec();
         pending_aad.extend_from_slice(&session_context);
-        // The correlation cookie is scoped to the callback path and never carries
-        // a `Domain`, so it only earns `__Host-` when that path is the root.
-        let correlation_prefix = cookie_name_prefix(secure, None, &callback_path);
+        // Secure correlation cookies are root-scoped so `__Host-` gives the
+        // browser-enforced host-only integrity required by the OIDC state flow.
+        let correlation_prefix = if secure { "__Host-" } else { "" };
         let correlation_cookie_name_prefix = derived_cookie_name(
             &format!("{correlation_prefix}ferrum_oidc_state"),
             &session_context,
@@ -3494,7 +3494,8 @@ fn build_cookie_attrs(
 /// parent `Domain` would let sibling hosts receive or overwrite the sealed
 /// authorization-code flow.
 fn build_correlation_cookie_attrs(secure: bool, callback_path: &str) -> String {
-    build_cookie_attrs(secure, true, "Lax", None, callback_path)
+    let path = if secure { "/" } else { callback_path };
+    build_cookie_attrs(secure, true, "Lax", None, path)
 }
 
 /// Pick the `Set-Cookie` name prefix that matches the attributes the cookie is

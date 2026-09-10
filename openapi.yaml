@@ -20285,7 +20285,7 @@ components:
             secure:
               type: boolean
               default: true
-              description: When false, generated session and correlation cookie names carry no __Host-/__Secure- prefix, because a prefixed cookie without Secure is rejected by browsers.
+              description: When false, generated session and correlation cookie names carry no __Host-/__Secure- prefix, because a prefixed cookie without Secure is rejected by browsers. Secure correlation cookies always use __Host- with Path=/ and no Domain.
             http_only:
               type: boolean
               default: true
@@ -20295,7 +20295,7 @@ components:
               default: lax
             domain:
               type: string
-              description: Optional Domain attribute for the durable session cookie. The short-lived sealed pending-flow correlation cookie always remains host-only, is scoped to callback_path, and never inherits this value.
+              description: Optional Domain attribute for the durable session cookie. The short-lived sealed pending-flow correlation cookie never inherits this value; secure correlation cookies use __Host- with Path=/, while insecure loopback-development cookies are scoped to callback_path.
             path:
               type: string
               default: /
