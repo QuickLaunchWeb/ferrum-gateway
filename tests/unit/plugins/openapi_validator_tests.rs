@@ -3983,6 +3983,28 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
     );
 }
 
+#[test]
+fn generic_content_decoder_rejects_large_window_brotli() {
+    // The Large Window marker makes a permissive Brotli state read six more
+    // header bits and request a stream-selected ring buffer. HTTP `br` only
+    // negotiates RFC 7932, whose window is capped at 24 bits, so reject the
+    // extension before any such allocation.
+    const LWB_MARKER_BODY: [u8; 8] = [0x11, 0x1e, 0, 0, 0, 0, 0, 0];
+    let error = decode_content_encoding(
+        Some("br"),
+        &LWB_MARKER_BODY,
+        DecodeLimits {
+            max_decoded_bytes: 1024,
+            max_cumulative_bytes: 1024,
+            max_codings: 2,
+            max_amplification_ratio: 100,
+        },
+    )
+    .expect_err("Large Window Brotli must be rejected by the generic decoder");
+
+    assert_eq!(error, "brotli decompression failed");
+}
+
 #[tokio::test]
 async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
     let plugin = OpenapiValidator::new(&json!({

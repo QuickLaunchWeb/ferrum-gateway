@@ -97,11 +97,10 @@
 //! come from [`crate::plugins::charged_decode`], the module the already-reviewed
 //! response gate uses, so a `br` request body is decoded by the same
 //! Large-Window-refusing [`crate::plugins::charged_decode::StrictBrotliReader`]
-//! that bounds a `br` response body. The permissive generic decoder in
-//! [`crate::plugins::utils::content_encoding`] — which builds `BrotliState::new`
-//! with `large_window = true`, i.e. admits a decoder working set up to 1 GiB for
-//! a coding no client negotiated — is deliberately NOT reachable from this
-//! security gate.
+//! that bounds a `br` response body. The generic decoder in
+//! [`crate::plugins::utils::content_encoding`] now shares that strict codec,
+//! but remains deliberately unreachable from this security gate because it
+//! does not reserve decoder/output memory against the aggregate decode budget.
 //!
 //! The coding-list GRAMMAR is still the shared one: [`classify_codings`] mirrors
 //! [`crate::plugins::utils::content_encoding::parse_content_codings`] exactly, so
