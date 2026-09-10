@@ -2197,6 +2197,39 @@ Replay-authority Redis clients additionally prove the server will not evict a st
 
 **Operational HA requirement.** Any deployment running more than one gateway replica behind a load balancer — including a rolling deployment, where old and new processes serve concurrently — must declare `shared` and provision Redis. `process` scope in a multi-replica deployment means one replay per replica, and the gateway cannot detect that for you; the declaration is the control.
 
+### `spiffe_identity`
+
+Extracts the SPIFFE ID from a trusted peer certificate's URI SAN and publishes it for downstream plugins. This is extraction-only: it is not an authentication plugin, does not map a Consumer, and does not reject a missing identity.
+
+**Priority:** 940
+**Hooks:** `on_request_received`, `on_stream_connect`
+**Protocols:** HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, terminated TCP+TLS, and UDP+DTLS
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| *(none)* | — | `{}` | No configuration keys are admitted. `{}` and `null` are the only valid configs. |
+
+**Admission:** Config must be a JSON object with no properties, or `null`. Any property is rejected (`spiffe_identity: no configuration fields are supported`). Arrays, strings, numbers, and booleans are rejected (`spiffe_identity: config must be an object`).
+
+**Prerequisite:** A frontend-terminated, trusted peer certificate (`tls_client_cert_der`). Plaintext connections and certificates that carry no SPIFFE URI SAN are no-ops. Stream proxies need TLS/DTLS termination the same way [`mtls_auth`](#mtls_auth) does.
+
+**Outputs:**
+- HTTP family: `ctx.peer_spiffe_id`
+- Stream (TCP/UDP/DTLS): `peer_spiffe_id` metadata on `StreamConnectionContext`
+
+**Behavior:**
+- Pre-stamped identity wins. If `ctx.peer_spiffe_id` is already set (HTTP family) or stream metadata already contains `peer_spiffe_id` (for example a node-waypoint eBPF-attested pod identity), the plugin does not re-derive from the peer certificate.
+- Missing certificate, no SPIFFE URI SAN, or unparseable DER: continue without identity.
+- Multiple URI SANs or a malformed `spiffe://` URI: reject HTTP 403 with `{"error":"invalid SPIFFE identity certificate"}`.
+- HTTP-family extraction is cached per mTLS connection so multiplexed requests parse the peer certificate at most once.
+
+**Mesh injection:** Mesh mode auto-injects a global instance with reserved id `__mesh_spiffe_identity` and empty config `{}`. An operator-managed global `spiffe_identity` is an explicit override and suppresses that reserved instance (NodeWaypoint transparent capture still force-injects the reserved id). Standalone (non-mesh) gateways may attach the plugin like any other public plugin when they terminate mTLS/DTLS and want SPIFFE identity for [mesh authorization](mesh.md#authorization) or [`rate_limiting`](#rate_limiting) `limit_by: spiffe_identity`. See [mesh.md — SPIFFE Identity](mesh.md#spiffe-identity).
+
+```yaml
+plugin_name: spiffe_identity
+config: {}
+```
+
 ### `mtls_auth`
 
 Authenticates requests using the client's TLS/DTLS certificate, matching a configurable certificate field against consumer credentials. It supports HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, terminated TCP+TLS, and UDP+DTLS. Stream proxies must set `frontend_tls: true` and `passthrough: false`; invalid combinations are rejected at configuration admission. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake. On UDP stream proxies, it runs after the frontend DTLS handshake completes. In both cases, the client certificate is mapped to a Consumer before later stream plugins run.
@@ -2208,8 +2241,8 @@ For UDP+DTLS frontends, Ferrum preserves the complete verified leaf-first client
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `cert_field` | String | `subject_cn` | Certificate field to use as identity |
-| `allowed_issuers` | Object[] | *(none)* | Per-proxy issuer filters cryptographically bound to pinned CA certificates |
-| `allowed_ca_fingerprints_sha256` | String[] | *(none)* | SHA-256 fingerprints of allowed CA/intermediate certs |
+| `allowed_issuers` | Object[] | *(none)* | Per-proxy issuer filters cryptographically bound to pinned CA certificates. DN fields (`cn`/`o`/`ou`) are trimmed; whitespace-only values are rejected. |
+| `allowed_ca_fingerprints_sha256` | String[] | *(none)* | SHA-256 fingerprints of allowed CA/intermediate certs. Surrounding whitespace is trimmed before hex decoding; uppercase and lowercase hex are accepted. |
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
@@ -3726,8 +3759,8 @@ At least one rate window must be configured in every rule. Do not combine the cu
 **Behavior by mode:**
 - `limit_by: "ip"` — Enforces in `on_request_received` phase (before auth), keyed by client IP.
 - `limit_by: "consumer"` — Enforces in `authorize` phase (after auth), keyed by the authenticated identity: mapped consumer username when present, otherwise external `authenticated_identity`. Falls back to client IP if neither exists.
-- `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after `spiffe_identity`), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
-- Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream `spiffe_identity` hook. Both modes fall back to client IP when their identity is absent.
+- `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after [`spiffe_identity`](#spiffe_identity)), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
+- Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream [`spiffe_identity`](#spiffe_identity) hook. Both modes fall back to client IP when their identity is absent.
 
 The resolved request client identity canonicalizes IPv4-mapped IPv6 to native IPv4 once before plugin execution. Every local or Redis fallback key therefore uses the same canonical text without reparsing it in each limiter.
 
@@ -5505,17 +5538,17 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allow_methods` | String[] | *(none)* | Only these gRPC methods are permitted (allowlist) |
-| `deny_methods` | String[] | `[]` | These gRPC methods are explicitly blocked (checked before allow) |
-| `method_rate_limits` | Object | `{}` | Per-method rate limits keyed by full method path. Each entry accepts only `max_requests` (1–1000000) and `window_seconds` (1–2678400); unknown keys are rejected |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
-| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for method rate-limit counters |
+| `allow_methods` | String[] or null | *(none)* | Only these gRPC methods are permitted (allowlist). `null` is the same as omission. `[]` is valid block-all policy. |
+| `deny_methods` | String[] or null | `[]` | These gRPC methods are explicitly blocked (checked before allow). `null` is the same as omission. |
+| `method_rate_limits` | Object or null | `{}` | Per-method rate limits keyed by full method path. Each entry accepts only `max_requests` (1–1000000) and `window_seconds` (1–2678400); unknown keys are rejected. `null` is the same as omission. |
+| `limit_by` | String or null | `ip` | Rate limit key: `ip` or `consumer`. ASCII case is ignored (`CONSUMER` and `Ip` are admitted). `null` is the same as omission (`ip`). Other values are rejected at plugin load time. |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for method rate-limit counters. ASCII case is ignored (`LOCAL` and `Redis` are admitted). `redis_failure_policy` remains case-sensitive. |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY` |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:grpc_method_router:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
-| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen on those connections. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
-| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0 and at most `18446744073709551615`). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen on those connections. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be > 0 and at most `18446744073709551615`) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 | `redis_failure_policy` | String | `fail_closed` | Behavior when the centralized store cannot be consulted (outage, egress/DNS screen failure, or an endpoint rejected as Redis Cluster). `fail_closed` refuses with `503`; `local_fallback` explicitly opts into per-process budgets for availability. Only meaningful when `sync_mode: "redis"`, but validated in either mode |
@@ -5524,7 +5557,7 @@ Each configured method accepts one optional leading slash and must use protobuf 
 
 Each rate limit entry is `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit. In Redis mode, `redis_url` and `redis_key_prefix` must be non-empty, the URL must use `redis://` or `rediss://` with an authority and must not carry a URL fragment, and pool/connect/health numeric settings must be positive.
 
-The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, or a non-empty `method_rate_limits`) — an empty config is rejected. Unknown top-level keys are rejected so a valid method rule cannot mask a misspelled synchronization, identity, or Redis field that would otherwise silently fall back to local, IP-keyed, or shared-prefix enforcement. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, or a non-empty `method_rate_limits`) — an empty config is rejected. Explicit `null` on those optional fields is the same as omitting them, so a config whose only present rules are null is still a no-op and is rejected. Unknown top-level keys are rejected so a valid method rule cannot mask a misspelled synchronization, identity, or Redis field that would otherwise silently fall back to local, IP-keyed, or shared-prefix enforcement. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
 
 `on_request_received` may populate provisional client-path metadata for early consumers. After the first backend target is selected, `on_backend_path_resolved` clears those three fields, replaces them from the backend-effective method, and enforces allow/deny/rate policy exactly once. Deferred external routing-header hooks run only after that enforcement and cannot change the pinned target. An invalid backend-effective gRPC path fails closed for every policy shape, including deny-only and rate-only configurations. Retries may rotate hosts or ports but do not rotate to a target-specific path that would change the already authorized method.
 
@@ -5551,7 +5584,7 @@ config:
 
 ### `grpc_deadline`
 
-Manages the `grpc-timeout` metadata header at the gateway. Can enforce maximum deadlines, inject defaults when clients omit `grpc-timeout`, and subtract gateway processing time before forwarding.
+Manages the `grpc-timeout` metadata header at the gateway. Can enforce maximum deadlines, inject defaults when clients omit `grpc-timeout`, and optionally treat the plugin-checkpoint header as the remaining receipt-anchored budget. Backend H2/H3 dispatch always rewrites `grpc-timeout` to that remaining budget.
 
 **Priority:** 3050
 **Protocol:** gRPC only
@@ -5563,9 +5596,9 @@ its ordinary `before_proxy` position and behavior.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds). Must be positive — `0` is rejected at plugin load time (it would reject every request). |
-| `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it. Must be positive — `0` is rejected. If both are set, `default_deadline_ms` cannot exceed `max_deadline_ms`. |
-| `subtract_gateway_processing` | bool | `false` | Subtract elapsed gateway time before forwarding |
+| `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds). Must be a positive unsigned 64-bit integer (`1`–`18446744073709551615`). `0` is rejected at plugin load time (it would reject every request). |
+| `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it. Must be a positive unsigned 64-bit integer. `0` is rejected. If both are set, `default_deadline_ms` cannot exceed `max_deadline_ms`. |
+| `subtract_gateway_processing` | bool | `false` | Plugin-checkpoint remaining-budget control. When true, the plugin writes remaining receipt-anchored milliseconds into `grpc-timeout` and `grpc_adjusted_deadline_ms`, and rejects with `DEADLINE_EXCEEDED` if that remaining time is already zero. Backend dispatch always rewrites `grpc-timeout` to the remaining absolute budget independently of this flag. |
 | `reject_no_deadline` | bool | `false` | Reject requests missing a positive `grpc-timeout` (native H2/H3 clients receive HTTP 200 with a non-OK trailers-only `grpc-status`) |
 
 The plugin requires at least one effective rule — empty configs and configs containing only `false` boolean rules are rejected at load time so it cannot be a no-op. Configuration is strict: unknown keys, explicit `null`, and incorrect field types are rejected with the property name. This prevents a misspelled enforcement rule from silently weakening policy.
@@ -5574,7 +5607,7 @@ It parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m`
 
 Forwarded deadlines are re-encoded to stay within the gRPC wire-format limit of 8 digits, preserving millisecond precision whenever it fits.
 
-The gateway establishes one monotonic absolute deadline at request receipt, before IP/geo/bot restrictions, authentication, authorization, body buffering, or plugin I/O. This phase-0 ordering is intentional and fail closed: when `reject_no_deadline` is enabled, a missing or malformed deadline is rejected before security plugins, so the deadline-policy response can precede the `401`/`403` that the same request would otherwise receive. It prevents unauthenticated requests from bypassing the configured total RPC resource ceiling. That same instant bounds connection acquisition, all H2/H3 attempts and retry backoff, and response headers/body/trailers. The header sent to a backend remains a relative duration; when `subtract_gateway_processing` is true it is derived from the absolute deadline. Later plugin instances and transports reuse the typed instant and never subtract elapsed time from that rewritten header again.
+The gateway establishes one monotonic absolute deadline at request receipt, before IP/geo/bot restrictions, authentication, authorization, body buffering, or plugin I/O. This phase-0 ordering is intentional and fail closed: when `reject_no_deadline` is enabled, a missing or malformed deadline is rejected before security plugins, so the deadline-policy response can precede the `401`/`403` that the same request would otherwise receive. It prevents unauthenticated requests from bypassing the configured total RPC resource ceiling. That same instant bounds connection acquisition, all H2/H3 attempts and retry backoff, and response headers/body/trailers. The header sent to a backend is always a relative remaining duration derived from that absolute deadline at dispatch: native H2 and H3 transports rewrite `grpc-timeout` on every deadline-bearing attempt, independently of `subtract_gateway_processing`. The flag only changes the earlier plugin checkpoint: when true, `before_proxy` writes remaining milliseconds into the outbound header and `grpc_adjusted_deadline_ms` and rejects with `DEADLINE_EXCEEDED` if remaining time is already zero; when false, that checkpoint keeps the original effective milliseconds. Later plugin instances reuse the typed instant and never subtract elapsed time from that rewritten header again.
 
 When the absolute deadline is exhausted, the gateway returns gRPC status `DEADLINE_EXCEEDED` (status code 4). Upload expiry in every buffering phase uses the normal finalized rejection lifecycle, so rejection decorators, committed observers, gRPC-Web response translation/CORS, logging, and admission cleanup are not skipped. If H2 or H3 response headers were already committed but no client-visible DATA bytes were forwarded, it emits a terminal status-4 trailer frame; after partial DATA it aborts the stream because a complete gRPC message boundary cannot be assumed. Response-inspector buffering does not count as client-visible DATA. H3 downstream writes and coalescer flushes are bounded by the same absolute instant, preventing QUIC flow-control stalls from outliving the RPC. Deadline-capable streaming relays remove an upstream `Content-Length` before committing headers because the terminal replacement has a different representation length.
 

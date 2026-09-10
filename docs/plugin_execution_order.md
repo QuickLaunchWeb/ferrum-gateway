@@ -2110,7 +2110,7 @@ An **absent** `Content-Type` is treated as JSON, and the representation gate's c
 
 All plugins in the execution pipeline work transparently with gRPC requests. gRPC metadata maps directly to HTTP/2 headers, so:
 
-- **Authentication plugins** (JWKS, JWT, API key, Basic) inspect the `authorization` header, which gRPC clients send as metadata.
+- **Authentication plugins** split by credential location. JWKS, JWT, and Basic inspect the `authorization` header, which gRPC clients send as metadata. `key_auth` uses its configured `key_location` and defaults to `x-api-key` metadata (`header:X-API-Key`); it does not read `authorization` unless you set `key_location: header:Authorization`. Configure `key_location: query:<name>` only when the gRPC request URI actually carries that query parameter.
 - **Rate limiting** works identically for gRPC — keyed by IP or consumer identity.
 - **Request/Response transformers** can add, modify, or remove gRPC metadata (HTTP/2 headers).
 - **Logging plugins** receive the same `TransactionSummary` with the gRPC path (e.g., `/my.Service/MyMethod`) and HTTP status. For gateway-generated gRPC errors, `metadata.grpc_status` and `metadata.grpc_message` are also populated so sinks can distinguish gRPC failures despite the HTTP `200`.
