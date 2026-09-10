@@ -103,6 +103,16 @@ define_header_name_set! {
     ]
 }
 
+/// Returns `true` for the gateway-owned consumer assertion namespace.
+///
+/// Consumer plugins may attach additional attributes beneath this prefix, so
+/// backend boundaries must reject the whole namespace rather than only the two
+/// built-in identity fields.
+#[inline]
+pub(crate) fn is_consumer_assertion_header(name: &str) -> bool {
+    name.starts_with("x-consumer-")
+}
+
 define_header_name_set! {
     // Public inventory is consumed by library tests, not the binary target.
     #[allow(dead_code)]

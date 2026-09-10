@@ -357,11 +357,8 @@ fn collect_forwardable_h3_headers(
         ":path",
         ":protocol",
         ":status",
-        // Reserved gateway assertion headers. Strip the mutable map so the
-        // authenticated principal and private GeoIP value can be re-injected
-        // below with single-value override semantics.
-        "x-consumer-username",
-        "x-consumer-custom-id",
+        // Reserved gateway assertion header. Consumer assertions are matched
+        // by prefix below; GeoIP remains an exact-name assertion.
         "x-geo-country",
     ];
 
@@ -369,7 +366,9 @@ fn collect_forwardable_h3_headers(
         .iter()
         .filter_map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
-            if SKIP_HEADERS.contains(&lower.as_str()) {
+            if SKIP_HEADERS.contains(&lower.as_str())
+                || crate::proxy::headers::is_consumer_assertion_header(&lower)
+            {
                 return None;
             }
             Some((lower, value.clone()))
@@ -2315,6 +2314,7 @@ mod tests {
         let headers = make_headers(&[
             ("X-Consumer-Username", "spoofed-or-injected"),
             ("X-Consumer-Custom-Id", "spoofed-or-injected-id"),
+            ("X-Consumer-Role", "admin"),
             ("X-Geo-Country", "ATTACKER"),
             ("x-trace-id", "keepme"),
         ]);
@@ -2326,6 +2326,10 @@ mod tests {
         assert!(
             !has_key(&out, "x-consumer-custom-id"),
             "reserved x-consumer-custom-id must be stripped from the forwarded map"
+        );
+        assert!(
+            !has_key(&out, "x-consumer-role"),
+            "the complete consumer assertion namespace must be stripped"
         );
         assert!(
             !has_key(&out, "x-geo-country"),
