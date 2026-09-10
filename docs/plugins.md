@@ -3919,11 +3919,11 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `allowed_origins` | (String \| Object)[] | required, max 64 | Permitted origins. Use `["*"]` only for intentional allow-all. Plain strings are NATIVE syntax: exact origins are canonicalized at config load and matched case-insensitively, and `*.suffix.com` is the wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex` and keep LITERAL source semantics — object `exact` is a byte-for-byte case-sensitive match with no canonicalization or wildcard interpretation, so `{exact: "*.example.com"}` matches only that literal string; `{exact: "*"}` is Istio allow-all. Matcher values are bounded at 512 bytes and regexes compile once at config construction/reload under explicit complexity limits. |
-| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
-| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
+| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Case-sensitive preflight-only allowed methods; `*` allows any valid method when credentials are disabled and is literal when credentials are enabled. Not evaluated on actual requests. |
+| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Case-insensitive preflight-only allowed headers; with credentials disabled, `*` permits every header except `Authorization`, which requires an explicit entry. With credentials enabled, `*` is literal. Not evaluated on actual requests. |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
 | `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true`. Exact `*` drops credentials; opaque exact `null` and an effectively universal prefix or regex are refused. A credentialed prefix must be the host-bounded `scheme://host:` form, because prefix matching is an unbounded `starts_with`. |
-| `max_age` | u64 | `86400` | Preflight cache duration in seconds |
+| `max_age` | u64 | `86400` | Preflight cache duration in seconds, from 0 through 18446744073709551615; translated Istio omission remains absent. |
 | `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
 | `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
 
@@ -3932,6 +3932,25 @@ values, and an omitted `allowed_origins` policy fail startup/reload instead of
 falling back to wildcard access. Multiple attached CORS instances compose
 origin/credential/exposure policy on actual requests and additionally
 intersect method/header/max-age policy on preflight.
+
+Wildcard method/header permissions intersect with explicit lists, preserving
+each sibling's restrictions and requiring every sibling to name `Authorization`
+explicitly. A credentialed policy's literal `*` is omitted if the aggregate
+disables credentials, so it cannot become a wildcard in the final response.
+Responses vary on `Origin` even when Origin is absent or unmatched; preflights
+also vary on the requested method and headers. Existing `Vary` tokens and
+`Vary: *` are preserved.
+
+Native wildcard suffixes are DNS hostnames normalized to IDNA ASCII at config
+load (`*.bücher.example` matches `shop.xn--bcher-kva.example`). URL delimiters,
+percent-encoding, whitespace, control characters, IP literals, and empty labels
+are rejected. Normalized labels contain ASCII letters, digits, or interior
+hyphens, at most 63 bytes each and 253 bytes total excluding an optional trailing
+root dot; that root dot is preserved for matching. OpenAPI limits all origin
+matchers to 512 characters; runtime admission additionally enforces 512 UTF-8
+bytes. For file-mode per-proxy policies, use object associations containing
+`plugin_config_id` and set the matching `proxy_id` on each proxy-scoped config;
+see the [complete example](cors_plugin.md#example-3-per-proxy-cors).
 
 **WebSocket upgrades:** CORS does not govern WebSocket handshake `Origin` checks.
 Configure per-proxy `allowed_ws_origins` for Cross-Site WebSocket Hijacking (CSWSH)
