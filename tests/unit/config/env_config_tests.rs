@@ -1539,6 +1539,30 @@ fn test_env_config_mesh_production_refuses_tls_no_verify() {
 }
 
 #[test]
+fn test_env_config_refuses_admin_tls_no_verify_with_client_ca_bundle() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_ADMIN_TLS_NO_VERIFY", "true"),
+            (
+                "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH",
+                "/etc/ferrum/admin-client-ca.pem",
+            ),
+        ],
+        || {
+            let err = EnvConfig::from_env()
+                .expect_err("admin TLS no-verify paired with a client CA bundle must be refused");
+            assert!(err.contains("FERRUM_ADMIN_TLS_NO_VERIFY"), "got: {err}");
+            assert!(
+                err.contains("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH"),
+                "got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_mesh_production_refuses_admin_tls_no_verify() {
     let mut vars = mesh_production_tls_guard_base_env();
     vars.push(("FERRUM_ADMIN_TLS_NO_VERIFY", "true"));

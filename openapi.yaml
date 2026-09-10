@@ -7868,10 +7868,10 @@ components:
             live on this process. `pending`: not yet accepted or rejected.
             `rejected`: a completed poll attempted a covering sequence and
             the runtime rejected the candidate; the write range is durable
-            but not live. `unverifiable`: the cursor's topology was replaced
-            (failover/reconnect/restart) or was never issued by this
-            process — liveness can no longer be proven here; observe config
-            directly instead.
+            but not live. `unverifiable`: the cursor was not issued by this
+            process or its topology was replaced (failover/reconnect/restart)
+            — liveness can no longer be proven here; observe config directly
+            instead.
           enum: [applied, pending, rejected, unverifiable]
         accepted_topology_epoch:
           type: integer
@@ -9026,7 +9026,11 @@ components:
         backend_tls_client_key_path:
           type: [string, "null"]
           maxLength: 4096
-          description: Path to mTLS client private key (PEM). Max 4096 characters.
+          description: >-
+            Path to mTLS client private key (PEM), or a pkcs11 signer URI with the
+            optional pkcs11 build feature. Module overrides require admission by
+            FERRUM_PKCS11_MODULE_ALLOWED_PATHS on each node. Without that policy,
+            omit module options to use FERRUM_PKCS11_MODULE_PATH. Max 4096 characters.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
@@ -10452,12 +10456,15 @@ components:
         path:
           description: >-
             Canonical policy path (the same value every security decision uses),
-            never the raw request target.
+            never the raw request target. Exact/prefix values must start with
+            / and be canonical: no percent escapes, backslashes, or literal dot
+            segments. Regex patterns reject percent escapes but retain regex syntax.
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         host:
           description: >-
             Request authority host, ASCII-lowercased with the trailing DNS dot
-            and any port removed.
+            and any port removed. Uppercase ASCII in exact/prefix values or regex
+            patterns requires case_insensitive: true; otherwise admission rejects it.
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         sni:
           description: >-
@@ -12458,6 +12465,9 @@ components:
           description: >-
             Path to a PEM-encoded private key matching
             `backend_tls_client_cert_path`. Required when the cert path is set.
+            With the optional pkcs11 build feature, also accepts a pkcs11 signer
+            URI. Module overrides require FERRUM_PKCS11_MODULE_ALLOWED_PATHS on
+            each node; without it, omit module options to use FERRUM_PKCS11_MODULE_PATH.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
@@ -20254,7 +20264,7 @@ components:
               description: Previous encryption secret accepted while rotating session and pending-flow cookies within the same versioned OIDC context
             cookie_name:
               type: string
-              description: Cookie name. When omitted, Ferrum derives a context-specific name from the provider and authorization policy.
+              description: Explicit cookie name opts out of automatic naming. When omitted, the context-derived name is prefixed __Host- when secure with no domain and a root path, __Secure- when secure otherwise, and left unprefixed when secure is false because browsers reject a prefixed cookie without Secure.
             store:
               type: string
               enum: [cookie]
@@ -20275,6 +20285,7 @@ components:
             secure:
               type: boolean
               default: true
+              description: When false, generated session and correlation cookie names carry no __Host-/__Secure- prefix, because a prefixed cookie without Secure is rejected by browsers.
             http_only:
               type: boolean
               default: true
@@ -20284,7 +20295,7 @@ components:
               default: lax
             domain:
               type: string
-              description: Optional Domain attribute for the durable session cookie. The short-lived sealed pending-flow correlation cookie always remains host-only and never inherits this value.
+              description: Optional Domain attribute for the durable session cookie. The short-lived sealed pending-flow correlation cookie always remains host-only, is scoped to callback_path, and never inherits this value.
             path:
               type: string
               default: /
@@ -20333,6 +20344,7 @@ components:
             rp_initiated_logout:
               type: boolean
               default: true
+              description: With an authentic session cookie, send id_token_hint on provider logout and attempt discovered refresh-token revocation within five seconds. Cookie copies remain valid within session and claims lifetime limits. Without a valid cookie, return the local logout page.
             post_login_default_path:
               type: string
               default: /
@@ -20425,20 +20437,30 @@ components:
         the complete candidate set and each imminent dial under the active backend
         egress policy, and retains the configured hostname for TLS/SNI verification.
         Non-loopback plaintext `ldap://` is rejected unless the development-only
-        `allow_plaintext` override is explicitly enabled. Search-then-bind requires
-        a canonical identity attribute, rejects ambiguous searches, and exports the
-        selected entry's canonical value rather than the presented username.
+        `allow_plaintext` override is explicitly enabled. Exactly one authentication
+        mode may be configured; combining `bind_dn_template` with `search_base_dn`/
+        `search_filter` is rejected. Both modes require a canonical identity
+        attribute, reject ambiguous or duplicate values, and export the authenticated
+        entry's canonical value rather than the presented username: direct bind reads
+        it with a base-scope search on the bound DN, and search-then-bind takes it
+        from the uniquely selected search entry.
       required:
         - ldap_url
       allOf:
         - anyOf:
-            - required: [bind_dn_template]
+            - required: [bind_dn_template, canonical_identity_attribute]
+              not:
+                anyOf:
+                  - required: [search_base_dn]
+                  - required: [search_filter]
             - required:
                 - search_base_dn
                 - search_filter
                 - canonical_identity_attribute
                 - service_account_dn
                 - service_account_password
+              not:
+                required: [bind_dn_template]
         - if:
             required: [search_base_dn, search_filter]
           then:
@@ -20506,7 +20528,7 @@ components:
         canonical_identity_attribute:
           type: string
           minLength: 1
-          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
+          description: "Required in both bind modes. Exactly one value from the authenticated entry (the uniquely selected search entry, or a base-scope read of the directly bound DN) becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
           minLength: 1
@@ -20524,7 +20546,7 @@ components:
         group_filter:
           type: string
           minLength: 1
-          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity: the presented username for direct bind, or canonical_identity_attribute for search-then-bind. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
+          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity read from canonical_identity_attribute in both bind modes, never the presented login. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:
@@ -31689,7 +31711,7 @@ components:
           example: "spiffe://cluster.local/ns/default/sa/api"
         workload_spiffe_hash:
           type: integer
-          format: int64
+          format: uint64
           description: |
             First 8 bytes of SHA-256 over the SPIFFE ID, big-endian as
             `u64`. Matches the value the eBPF `OrigDst{4,6}` map carries,

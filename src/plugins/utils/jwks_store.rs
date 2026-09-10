@@ -887,11 +887,12 @@ impl JwksKeyStore {
             .decode(e)
             .map_err(|e| format!("invalid base64url in 'e': {}", e))?;
 
-        // Approved RSA strength, when FIPS mode is enforced. A JWKS is fetched
-        // from an operator-configured issuer, so a weak signing key admitted
-        // here would make that issuer's compromise Ferrum's authentication
-        // failure. Only public components are inspected, and diagnostics
-        // report strength/form without reproducing key bytes.
+        // Approved RSA strength. A JWKS is fetched from an operator-configured
+        // issuer, so a weak signing key admitted here would make that issuer's
+        // compromise Ferrum's authentication failure. Only public components
+        // are inspected, and diagnostics report strength/form without
+        // reproducing key bytes.
+        crate::fips::keys::check_jwk_rsa_modulus_enforced(&n_bytes)?;
         crate::fips::keys::check_jwk_rsa_public_key(&n_bytes, &e_bytes)?;
 
         let algorithm = match jwk.alg.as_deref() {

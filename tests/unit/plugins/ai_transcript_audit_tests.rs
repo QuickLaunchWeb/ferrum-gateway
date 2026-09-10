@@ -1465,6 +1465,83 @@ async fn redacted_body_redacts_sensitive_parent_keys_and_json_encoded_tool_argum
 }
 
 #[tokio::test]
+async fn redacted_body_redacts_exact_sensitive_json_field_names() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({ "mode": "redacted_body" })),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    // Prefix-free 32-character Azure Cognitive Search admin key shape.
+    const AZURE_SEARCH_KEY: &str = "AbCdEfGhIjKlMnOpQrStUvWxYz123456";
+    let request = format!(
+        r#"{{
+        "model":"gpt-4o",
+        "messages":[],
+        "key":"{AZURE_SEARCH_KEY}",
+        "passphrase":"passphrase-secret-value",
+        "access_key":"access-key-secret-value",
+        "signature":"signature-secret-value",
+        "assertion":"assertion-secret-value",
+        "jwt":"jwt-secret-value",
+        "embeddingKey":"{AZURE_SEARCH_KEY}",
+        "keyword":"benign-keyword-value",
+        "monkey":"benign-monkey-value",
+        "data_sources":[{{
+            "parameters":{{
+                "key":"{AZURE_SEARCH_KEY}",
+                "endpoint":"https://search.example.com",
+                "embeddingKey":"{AZURE_SEARCH_KEY}"
+            }}
+        }}],
+        "dataSources":[{{
+            "parameters":{{
+                "key":"{AZURE_SEARCH_KEY}",
+                "endpoint":"https://search.example.com",
+                "embeddingKey":"{AZURE_SEARCH_KEY}"
+            }}
+        }}]
+    }}"#
+    );
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, request.as_bytes())
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    plugin
+        .on_response_committed(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    let captured = records[0]["request_body"].as_str().unwrap();
+    for secret in [
+        AZURE_SEARCH_KEY,
+        "passphrase-secret-value",
+        "access-key-secret-value",
+        "signature-secret-value",
+        "assertion-secret-value",
+        "jwt-secret-value",
+        "https://search.example.com",
+    ] {
+        assert!(!captured.contains(secret), "secret leaked: {captured}");
+    }
+    assert!(
+        captured.contains("benign-keyword-value"),
+        "keyword must not be redacted: {captured}"
+    );
+    assert!(
+        captured.contains("benign-monkey-value"),
+        "monkey must not be redacted: {captured}"
+    );
+    assert!(captured.contains("[REDACTED]"), "{captured}");
+}
+
+#[tokio::test]
 async fn request_capture_redacts_decoded_json_string_escapes() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());

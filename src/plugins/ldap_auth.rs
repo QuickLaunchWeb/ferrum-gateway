@@ -8,6 +8,11 @@
 //! - **Search-then-bind**: Uses a service account to search for the user's DN,
 //!   then binds as that user. More flexible (supports any search filter).
 //!
+//! Exactly one mode may be configured, and both require
+//! `canonical_identity_attribute`: the Ferrum identity is always read off the
+//! directory entry that authenticated, never taken from the client-presented
+//! login (which directories match case- and whitespace-insensitively).
+//!
 //! Optionally checks LDAP/AD group membership after authentication. When
 //! `required_groups` is set, the user must belong to at least one of the
 //! listed groups (OR logic) for authentication to succeed.
@@ -264,6 +269,18 @@ impl LdapAuth {
             );
         }
 
+        // Direct bind and search-then-bind are alternatives, not layers. Taking
+        // the direct-bind branch while a search block is configured would leave
+        // the search keys silently inert, so refuse the ambiguous shape outright.
+        if has_direct_bind && (search_base_dn.is_some() || search_filter.is_some()) {
+            return Err(
+                "ldap_auth: 'bind_dn_template' (direct bind) cannot be combined with the \
+                 search-then-bind keys 'search_base_dn'/'search_filter'; configure exactly \
+                 one authentication mode"
+                    .to_string(),
+            );
+        }
+
         if has_search_bind && (service_account_dn.is_none() || service_account_password.is_none()) {
             return Err(
                 "ldap_auth: search-then-bind mode requires 'service_account_dn' and \
@@ -272,9 +289,9 @@ impl LdapAuth {
             );
         }
 
-        if has_search_bind && !has_direct_bind && canonical_identity_attribute.is_none() {
+        if canonical_identity_attribute.is_none() {
             return Err(
-                "ldap_auth: search-then-bind mode requires 'canonical_identity_attribute' so the authenticated directory entry, not the presented username, defines the Ferrum identity"
+                "ldap_auth: both bind modes require 'canonical_identity_attribute' so the authenticated directory entry, not the presented username, defines the Ferrum identity"
                     .to_string(),
             );
         }
@@ -762,10 +779,18 @@ impl LdapAuth {
                 .await
                 .map_err(|e| AuthError::Backend(format!("ldap_auth: bind failed: {e}")))?;
             classify_user_bind_result(bind_result, "bind")?;
+
+            // The presented login is not an identity. Directories match and fold
+            // login attributes case- and whitespace-insensitively, so one
+            // account would otherwise mint an unbounded set of distinct Ferrum
+            // principals. Read the canonical attribute off the entry that
+            // actually authenticated, over that entry's own bound connection,
+            // exactly as search-then-bind does.
+            let canonical_identity = self.read_canonical_identity(&mut ldap, &dn).await?;
             let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
             AuthenticatedUser {
                 dn,
-                canonical_identity: username.to_string(),
+                canonical_identity,
             }
         } else {
             // Search-then-bind: find user DN via service account
@@ -878,6 +903,73 @@ impl LdapAuth {
         };
 
         Ok(authenticated_user)
+    }
+
+    /// Read the configured canonical identity attribute off an already
+    /// authenticated entry with a base-scope search on that entry's own DN.
+    ///
+    /// Used by direct bind, where the presented login never becomes the Ferrum
+    /// identity. Failures are [`AuthError::Backend`]: the credentials were
+    /// already accepted, so an unreadable or ambiguous canonical value is a
+    /// directory/configuration problem, and the flow fails closed rather than
+    /// falling back to the client-supplied string.
+    async fn read_canonical_identity(
+        &self,
+        ldap: &mut Ldap,
+        entry_dn: &str,
+    ) -> Result<String, AuthError> {
+        let Some(attribute) = self.canonical_identity_attribute.as_deref() else {
+            return Err(AuthError::Backend(
+                "ldap_auth: canonical identity attribute is missing in direct-bind mode"
+                    .to_string(),
+            ));
+        };
+
+        let (entries, _result) = ldap
+            .with_search_options(
+                SearchOptions::new()
+                    .sizelimit(LDAP_AUTH_USER_SEARCH_SIZE_LIMIT)
+                    .timelimit(self.search_time_limit_seconds),
+            )
+            .with_timeout(self.connect_timeout)
+            .search(entry_dn, Scope::Base, "(objectClass=*)", vec![attribute])
+            .await
+            .map_err(|e| {
+                AuthError::Backend(format!("ldap_auth: canonical identity search failed: {e}"))
+            })?
+            .success()
+            .map_err(|e| {
+                AuthError::Backend(format!("ldap_auth: canonical identity search error: {e}"))
+            })?;
+
+        let result_entry = match entries.len() {
+            0 => {
+                return Err(AuthError::Backend(
+                    "ldap_auth: the bound entry returned no canonical identity result".to_string(),
+                ));
+            }
+            1 => entries.into_iter().next().ok_or_else(|| {
+                AuthError::Backend(
+                    "ldap_auth: canonical identity entry disappeared after uniqueness check"
+                        .to_string(),
+                )
+            })?,
+            _ => {
+                return Err(AuthError::Backend(
+                    "ldap_auth: base-scope canonical identity search returned multiple entries"
+                        .to_string(),
+                ));
+            }
+        };
+
+        let entry = SearchEntry::construct(result_entry);
+        let canonical_identity =
+            unique_ldap_attribute_value(&entry.attrs, attribute, "canonical identity")?;
+        canonical_identity.ok_or_else(|| {
+            AuthError::Backend(format!(
+                "ldap_auth: the bound entry is missing canonical identity attribute '{attribute}'"
+            ))
+        })
     }
 
     /// Check if the authenticated user belongs to at least one of the required groups.
@@ -1022,8 +1114,8 @@ impl LdapAuth {
 
     fn group_search_filter(&self, user_dn: &str, canonical_identity: &str) -> String {
         // Group authorization must use the authenticated account identity, not
-        // the client-presented login value that may be an alias in
-        // search-then-bind mode.
+        // the client-presented login value, which may be an alias or a
+        // case/whitespace variant of the directory entry's own attribute.
         match self.group_filter.as_ref() {
             Some(filter) => {
                 let mut resolved_filter = filter.clone();
@@ -1761,6 +1853,7 @@ mod tests {
                 &serde_json::json!({
                     "ldap_url": "ldap://127.0.0.1:389",
                     "bind_dn_template": "uid={username},dc=example,dc=com",
+                    "canonical_identity_attribute": "uid",
                     "cache_ttl_seconds": 60,
                     "max_cache_entries": max_cache_entries
                 }),
@@ -1777,6 +1870,7 @@ mod tests {
                 &serde_json::json!({
                     "ldap_url": "ldap://127.0.0.1:389",
                     "bind_dn_template": "uid={username},dc=example,dc=com",
+                    "canonical_identity_attribute": "uid",
                     "connect_timeout_seconds": 60
                 }),
                 PluginHttpClient::default(),
