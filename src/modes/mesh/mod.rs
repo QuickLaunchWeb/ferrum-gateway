@@ -12508,9 +12508,9 @@ fn egress_health_checks() -> Option<HealthCheckConfig> {
     })
 }
 
-/// Build upstream targets from a `ServiceEntry`. When the entry uses static
-/// resolution with explicit endpoints, those addresses become targets. When
-/// endpoints are empty (DNS or None resolution), each host becomes a target.
+/// Build upstream targets from a `ServiceEntry`. Static resolution uses only
+/// operator-declared endpoints and therefore yields no targets when none are
+/// usable. DNS and None resolution use each host as a target.
 fn build_egress_upstream_targets(
     entry: &ServiceEntry,
     host: &str,
@@ -12518,7 +12518,7 @@ fn build_egress_upstream_targets(
     backend_port: u16,
     port_name: &Option<String>,
 ) -> Vec<UpstreamTarget> {
-    if entry.resolution == Resolution::Static && !entry.endpoints.is_empty() {
+    if entry.resolution == Resolution::Static {
         entry
             .endpoints
             .iter()
