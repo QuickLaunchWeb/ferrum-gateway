@@ -4250,6 +4250,7 @@ impl Plugin for AiTranscriptAudit {
             on_failed_batch: Some(Arc::new(
                 move |_batch: Arc<Vec<QueuedAuditRecord>>, _error: String| {
                     healthy.store(false, Ordering::Relaxed);
+                    false
                 },
             )),
             ..LoggerHooks::default()

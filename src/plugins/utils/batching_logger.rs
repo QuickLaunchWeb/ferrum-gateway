@@ -191,8 +191,9 @@ impl<T: Send + Sync + 'static> Drop for BatchingLoggerPermit<T> {
 }
 
 /// Terminal failure handoff. Receives the same immutable shared batch every
-/// flush attempt used — never a deep-cloned `Vec<T>` of owned records.
-type FailedBatchHook<T> = Arc<dyn Fn(Arc<Vec<T>>, String) + Send + Sync>;
+/// flush attempt used — never a deep-cloned `Vec<T>` of owned records. Returns
+/// `true` only when durable fallback ownership was accepted.
+type FailedBatchHook<T> = Arc<dyn Fn(Arc<Vec<T>>, String) -> bool + Send + Sync>;
 /// Overflow handoff. Returns `true` only when the hook actually accepted
 /// ownership of the item (durable diversion, intentional shed, or equivalent).
 /// Returning `false` means the item was not accepted; callers must not treat
@@ -282,8 +283,9 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
     ///
     /// If `flush` returns `Err`, the retry policy is applied. After the final
     /// attempt fails, the shared batch is handed to `on_failed_batch` when
-    /// present; otherwise it is dropped and a warning is logged. A successful
-    /// flush drops the shared batch immediately (no post-success retention).
+    /// present. If the hook is absent or declines durable ownership, the batch
+    /// is counted as discarded and a warning is logged. A successful flush
+    /// drops the shared batch immediately (no post-success retention).
     pub fn spawn<F, Fut>(cfg: BatchConfig, flush: F) -> Self
     where
         F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
@@ -1139,7 +1141,7 @@ async fn flush_with_retry<T, F, Fut>(
                 tokio::time::sleep(cfg.retry.backoff_delay(attempt)).await;
             }
             Err(error) => {
-                if let Some(on_failed_batch) = on_failed_batch {
+                let fallback_accepted = if let Some(on_failed_batch) = on_failed_batch {
                     warn!(
                         plugin = cfg.plugin_name,
                         "{}: handing failed batch to fallback after {} attempts ({} entries): {}",
@@ -1148,8 +1150,11 @@ async fn flush_with_retry<T, F, Fut>(
                         entry_count,
                         error,
                     );
-                    on_failed_batch(batch, error);
+                    on_failed_batch(batch, error)
                 } else {
+                    false
+                };
+                if !fallback_accepted {
                     // Terminal loss: no durable fallback owns these records.
                     // Count every lost RECORD, not the discard event, so the
                     // published loss matches the entries the warning names.

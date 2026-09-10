@@ -1111,6 +1111,7 @@ async fn terminal_failure_with_fallback_receives_shared_batch_without_clones() {
                 *fallback_ptr_hook.lock().unwrap() = Some(Arc::as_ptr(&batch) as usize);
                 assert_eq!(clone_count_hook.load(Ordering::Relaxed), 0);
                 notify_hook.notify_one();
+                true
             })),
             ..LoggerHooks::default()
         },
