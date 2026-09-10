@@ -3097,19 +3097,20 @@ impl ApiChargebackSink {
             on_failed_batch: Some(Arc::new(
                 move |batch: Arc<Vec<QueuedChargeEvent>>, error| {
                     if snapshot_events_are_pre_spooled {
-                        return;
+                        return true;
                     }
                     if let Some(enqueue) = failed_enqueue.as_ref() {
                         // Terminal failure receives the shared batch handle; spool
                         // ownership continues under the same Arc without cloning
                         // ChargeEvent records.
-                        let _ = enqueue.try_enqueue(batch, "export failure");
+                        enqueue.try_enqueue(batch, "export failure")
                     } else {
                         warn!(
                             plugin = PLUGIN_NAME,
                             error = %error,
                             "Chargeback sink export failed and spool is disabled; batch was lost"
                         );
+                        false
                     }
                 },
             )),
