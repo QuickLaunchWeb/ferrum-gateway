@@ -3877,17 +3877,17 @@ When route-sensitive backend-path policy such as `grpc_method_router` is active,
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `abort.status_code` | u16 | required when `abort` is set | Final HTTP status to return, 200-599 |
+| `abort.status_code` | u16 | required when `abort` is set | Final HTTP status to return, 200-599. JSON numbers with a zero fractional part (for example `503.0`) are accepted as integers |
 | `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
-| `abort.grpc_status` | u32 (optional) | — | gRPC status to emit only for actual native gRPC requests (excluding gRPC-Web and WebSocket even if an earlier plugin rewrites or preserves `application/grpc`), 0-16 |
-| `abort.body` | String | `""` | HTTP response body for aborts |
-| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-60,000 ms |
+| `abort.grpc_status` | u32 (optional) | — | gRPC status to emit only for actual native gRPC requests (excluding gRPC-Web and WebSocket even if an earlier plugin rewrites or preserves `application/grpc`), 0-16. JSON numbers with a zero fractional part (for example `14.0`) are accepted as integers |
+| `abort.body` | String or null | `""` | HTTP response body for aborts. `null` is equivalent to omission and yields an empty body. Non-gRPC responses label a body that parses as JSON `application/json` and every other body, including empty, `text/plain` |
+| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-60,000 ms. JSON numbers with a zero fractional part (for example `80.0`) are accepted as integers |
 | `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
-| `runtime_overlay_scope` | String or null (optional) | — | RTDS scope with at least one non-whitespace character (outer whitespace is trimmed) for `ferrum.fault_injection.<scope>.{abort,delay}_percent`; null is equivalent to omission |
+| `runtime_overlay_scope` | String or null (optional) | — | RTDS scope with at least one non-whitespace character after Rust `str::trim` Unicode `White_Space` trimming (including U+0085, excluding U+FEFF) for `ferrum.fault_injection.<scope>.{abort,delay}_percent`; null is equivalent to omission |
 
 Each plugin instance owns a process-random sampling stream and makes independent delay/abort rolls. Multiple scoped instances therefore all decide in configured priority order: a delaying instance does not suppress a later sibling, while the first abort naturally short-circuits the remaining plugin chain. Route-local VirtualService faults still deduplicate against proxy-scoped faults through a private source marker, so route translation does not accidentally stack the same policy surface. The plugin rejects static no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
 
-`abort` and `delay` may be omitted or set to `null` to represent an unused side, but at least one must be an object. `runtime_overlay_scope: null` is likewise equivalent to omitting the optional scope. RTDS zero materialization treats a null sibling exactly like an omitted sibling, so removing the only configured side disables that plugin instance for the accepted generation.
+`abort` and `delay` may be omitted or set to `null` to represent an unused side, but at least one must be an object. `abort.body: null` is equivalent to omitting `body` and yields an empty abort body. `runtime_overlay_scope: null` is likewise equivalent to omitting the optional scope. RTDS zero materialization treats a null sibling exactly like an omitted sibling, so removing the only configured side disables that plugin instance for the accepted generation.
 
 When `runtime_overlay_scope` is set, a mesh request epoch captures the matching RTDS values atomically with the plugin config. Missing or malformed keys fall back independently to the static percentage. RTDS layers are ordered lexicographically by Runtime resource name, with later names winning; duplicate Runtime names are rejected. A numeric RTDS value may be `0` to temporarily disable one configured fault kind.
 
@@ -3972,6 +3972,8 @@ The response body and `Content-Type` are rendered **once** at construction time 
 
 When `content_type` classifies as JSON (`json` or `+json`) and `message` is a complete, unambiguous JSON value, that value is the response body: the parsed document is compactly serialized rather than string-escaped inside the legacy `{"message":...,"status_code":...}` envelope. Objects, arrays, strings, numbers, booleans, and `null` all pass through this way. Malformed JSON, duplicate object member names, and other parser-ambiguous documents fail safe into that envelope so the response stays valid JSON and construction never panics. XML media types keep the `<response><message>…</message><status_code>…</status_code></response>` envelope. Every other content type emits `message` as plain text. Use `body` when the exact bytes must be preserved (including pretty-printed JSON).
 
+**Native gRPC.** Support for gRPC means the RPC is terminated with a mapped error, not that the configured HTTP status, Content-Type, and body are returned. Native `application/grpc` requests on H2/H3 receive HTTP 200, `content-type: application/grpc`, a nonzero `grpc-status` from the gateway HTTP-to-gRPC map, and no DATA body. Default `status_code: 503` maps to UNAVAILABLE (`14`); a configured HTTP 200 becomes INTERNAL (`13`) rather than a successful mocked RPC. `grpc-message` is derived from the canned body text (JSON `message` / `error` / `details` / `grpc_message` keys when present, otherwise the body text). gRPC-Web uses browser framing instead of the configured JSON/XML/plain body. WebSocket support applies to the handshake only.
+
 Configuration must be a top-level object. Accepted keys are `status_code`, `content_type`, `body`, `message`, and `trigger`; unknown top-level or nested `trigger` keys are rejected instead of being ignored (a typo such as `triger` must not silently become unconditional termination). Scalar/array/`null` configs are rejected, and explicit `null` is rejected for every property; omit an optional property to select its documented default. When present, `trigger` must select exactly one mode: `path_prefix`, or `header` with an optional `header_value`; an empty trigger or a detached `header_value` is rejected. `{}` remains the intentional maintenance-mode default.
 
 **Priority:** 125
@@ -3979,12 +3981,12 @@ Configuration must be a top-level object. Accepted keys are `status_code`, `cont
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `status_code` | u16 | `503` | Final HTTP status (200–599). Informational statuses including `101` and out-of-range values are rejected at construction. `204`/`205`/`304` force an empty body (explicit non-empty `body` is rejected). A configured 2xx never establishes a CONNECT/Extended CONNECT tunnel — those requests fail closed with `403`. |
-| `body` | String | _(omit)_ | Explicit response body. Field presence — including `body: ""` — is authoritative and suppresses `message`. Omitting the field selects the default renderer. |
-| `content_type` | String | `application/json` | Response `Content-Type` header. Default-body formatting uses exact subtype `json`/`xml` or RFC 6838 `+json`/`+xml` suffixes after parameter stripping — not arbitrary substrings (`application/notjson` is plain text). |
+| `status_code` | u16 | `503` | Final HTTP status (200–599), including JSON numbers with a zero fractional part (for example `503.0`). Informational statuses including `101` and out-of-range values are rejected at construction. `204`/`205`/`304` force an empty body (explicit non-empty `body` is rejected). A configured 2xx never establishes a CONNECT/Extended CONNECT tunnel — those requests fail closed with `403`. Native gRPC maps this code to `grpc-status` under HTTP 200 instead of returning it as the wire status. |
+| `body` | String | _(omit)_ | Explicit response body. Field presence — including `body: ""` — is authoritative and suppresses `message`. Omitting the field selects the default renderer. Native gRPC does not send these bytes as RPC DATA. |
+| `content_type` | String | `application/json` | Response `Content-Type` header for ordinary HTTP. Surrounding whitespace is trimmed; the result must be a nonempty valid HTTP header value. Default-body formatting uses exact subtype `json`/`xml` or RFC 6838 `+json`/`+xml` suffixes after parameter stripping — not arbitrary substrings (`application/notjson` is plain text). Native gRPC overwrites this with `application/grpc`. |
 | `message` | String | `"Service unavailable"` | Builds the default body when `body` is omitted. For JSON media types, a complete unambiguous JSON `message` is emitted as the body; malformed or parser-ambiguous JSON fails safe into the `{message,status_code}` envelope. XML types wrap the message in `<message>` (XML 1.0-legal characters only; illegal controls are rejected). Other types emit `message` as plain text. |
-| `trigger.path_prefix` | String | _(none)_ | Only terminate when the [canonical policy path](request_path_canonicalization.md) starts with this prefix. Must start with `/` (or be exactly `*` to match the asterisk-form target of a server-wide `OPTIONS *` request) and contain no control characters; any other value can never match a request path. The prefix must itself already be canonical: no percent escape (none survives canonicalization), no literal `\`, and no literal `.`/`..` segment (no canonical path can contain one). `/%61dmin`, `/api%20name`, `/api/../admin`, and `/api\admin` are rejected at admission rather than silently never matching — a request spelled the first way arrives as `/admin`, and the other three are refused with `400` before the plugin runs. A `.` inside a segment (`/v1.0/`) is fine. Mutually exclusive with `trigger.header`. |
-| `trigger.header` | String | _(none)_ | Only terminate when this request header is present on any raw field line (including non-UTF-8 values). Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
+| `trigger.path_prefix` | String | _(none)_ | Only terminate when the [canonical policy path](request_path_canonicalization.md) starts with this prefix. Must start with `/` (or be exactly `*` to match the asterisk-form target of a server-wide `OPTIONS *` request) and contain no control characters, query delimiter (`?`), fragment delimiter (`#`), or literal space; any other value can never match a parsed request path. The prefix must itself already be canonical: no percent escape (none survives canonicalization), no literal `\`, and no literal `.`/`..` segment (no canonical path can contain one). `/%61dmin`, `/api%20name`, `/api/../admin`, `/a?b`, `/api name`, and `/api\admin` are rejected at admission rather than silently never matching — a request spelled the first way arrives as `/admin`, a query or space can never appear in `Uri::path()`, and the other forms are refused with `400` before the plugin runs. A `.` inside a segment (`/v1.0/`) is fine. Mutually exclusive with `trigger.header`. |
+| `trigger.header` | String | _(none)_ | Only terminate when this request header is present on any raw field line (including non-UTF-8 values). Surrounding whitespace is trimmed; the result must be a nonempty HTTP field name. Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
 | `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches presence. A non-empty value matches any individual field line exactly — never a comma-folded multi-line serialization. |
 
 Without a trigger every request on the proxy is terminated (maintenance-mode default). HEAD responses keep representation metadata (including `Content-Length`) but never send content bytes; H1/H2/H3 share that wire rule.
@@ -4011,6 +4013,12 @@ config:
   message: Forbidden
   trigger:
     path_prefix: /admin
+
+# Native gRPC still terminates as trailers-only UNAVAILABLE, not this JSON body
+plugin_name: request_termination
+config:
+  status_code: 503
+  message: Service unavailable
 ```
 
 ---
