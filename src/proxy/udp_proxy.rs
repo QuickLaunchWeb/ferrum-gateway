@@ -46,13 +46,13 @@ use crate::plugins::{
     StreamConnectionContext, StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection,
     UdpDatagramVerdict, UdpMetadataSink,
 };
-use crate::proxy::LoadBalancerConnectionGuard;
 use crate::proxy::datagram_client_address::{
     DatagramClientAddressGate, DatagramClientIdentity, DatagramMetadataError,
 };
 use crate::proxy::stream_error::{
     StreamSetupError, StreamSetupKind, find_stream_setup_error, stream_dns_setup_error,
 };
+use crate::proxy::{HalfOpenProbeGuard, LoadBalancerConnectionGuard};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
 /// Maximum datagram size for UDP forwarding.
@@ -6863,14 +6863,13 @@ async fn handle_dtls_client_inner(
     );
 
     // Circuit breaker check — reject before creating backend connection if open.
-    // When admitted, capture whether this is a half-open probe so downstream
-    // record_failure/record_success calls only decrement the in-flight counter
-    // for actual probe requests.
+    // Own an admitted HALF_OPEN slot through setup so early returns and dropped
+    // session futures release it neutrally (GHSA-4cq4-3f3f-mq76).
     let cb_target_key = proxy
         .upstream_id
         .as_ref()
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
-    let mut cb_is_half_open_probe = false;
+    let mut cb_probe = HalfOpenProbeGuard::none();
     if let Some(ref cb_config) = proxy.circuit_breaker {
         match circuit_breaker_cache.can_execute(
             &proxy.namespace,
@@ -6878,8 +6877,8 @@ async fn handle_dtls_client_inner(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((_cb, is_half_open_probe)) => {
-                cb_is_half_open_probe = is_half_open_probe;
+            Ok((cb, is_half_open_probe)) => {
+                cb_probe = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
             }
             Err(_) => {
                 warn!(
@@ -6901,28 +6900,13 @@ async fn handle_dtls_client_inner(
     // session is counted and stamped exactly once no matter which phase ended
     // it (issue #3816).
     let auth_termination_latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-    // Release a claimed HALF_OPEN probe slot NEUTRALLY on an authorization
-    // expiry: the gateway dialed nothing on behalf of this credential, so the
-    // breaker must record neither success nor failure, and the slot must not
-    // leak or the breaker could never recover.
-    let release_half_open_probe = || {
-        if let Some(ref cb_config) = proxy.circuit_breaker {
-            let cb = circuit_breaker_cache.get_or_create(
-                &proxy.namespace,
-                proxy_id,
-                cb_target_key.as_deref(),
-                cb_config,
-            );
-            cb.record_neutral(cb_is_half_open_probe);
-        }
-    };
 
     let candidates = match dtls_setup_stage_under_bounds(
         auth_deadline,
         &auth_termination_latch,
         &datagram_metadata,
         client_trust,
-        &release_half_open_probe,
+        || cb_probe.release_neutral(),
         || {
             dns_cache.resolve_candidates(
                 &backend_host,
@@ -6948,9 +6932,9 @@ async fn handle_dtls_client_inner(
                     cb_config,
                 );
                 if crate::dns::is_egress_policy_denial(&e) {
-                    cb.record_neutral(cb_is_half_open_probe);
+                    cb.record_neutral(cb_probe.take_slot());
                 } else {
-                    cb.record_failure(502, true, cb_is_half_open_probe);
+                    cb.record_failure(502, true, cb_probe.take_slot());
                 }
             }
             return Err(stream_dns_setup_error(&backend_host, e));
@@ -6974,7 +6958,7 @@ async fn handle_dtls_client_inner(
         &auth_termination_latch,
         &datagram_metadata,
         client_trust,
-        &release_half_open_probe,
+        || cb_probe.release_neutral(),
         || {
             connect_udp_backend_candidates(
                 &candidates,
@@ -6998,7 +6982,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true, cb_is_half_open_probe);
+                cb.record_failure(502, true, cb_probe.take_slot());
             }
             return Err(error);
         }
@@ -7024,13 +7008,13 @@ async fn handle_dtls_client_inner(
     // released NEUTRALLY — the operator's authorization decision is not evidence
     // about this upstream.
     if client_trust.is_retired() {
-        release_half_open_probe();
+        cb_probe.release_neutral();
         return Err(client_trust.settle_withdrawal());
     }
     if let Some(termination) =
         dtls_authorization_expired_before_relay(auth_deadline, tokio::time::Instant::now())
     {
-        release_half_open_probe();
+        cb_probe.release_neutral();
         settle_dtls_auth_expiry(termination, &auth_termination_latch, &datagram_metadata);
         return Err(dtls_authorization_setup_error());
     }
@@ -7043,7 +7027,7 @@ async fn handle_dtls_client_inner(
             cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(cb_is_half_open_probe);
+        cb.record_success(cb_probe.take_slot());
     }
 
     debug!(
@@ -7805,14 +7789,13 @@ async fn create_session(
     );
 
     // Circuit breaker check — reject before creating backend socket if open.
-    // When admitted, capture whether this is a half-open probe so downstream
-    // record_failure/record_success calls only decrement the in-flight counter
-    // for actual probe requests.
+    // Own an admitted HALF_OPEN slot through setup so early returns and dropped
+    // session futures release it neutrally (GHSA-4cq4-3f3f-mq76).
     let cb_target_key = proxy
         .upstream_id
         .as_ref()
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
-    let mut cb_is_half_open_probe = false;
+    let mut cb_probe = HalfOpenProbeGuard::none();
     if let Some(ref cb_config) = proxy.circuit_breaker {
         match circuit_breaker_cache.can_execute(
             &proxy.namespace,
@@ -7820,8 +7803,8 @@ async fn create_session(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((_cb, is_half_open_probe)) => {
-                cb_is_half_open_probe = is_half_open_probe;
+            Ok((cb, is_half_open_probe)) => {
+                cb_probe = HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe);
             }
             Err(_) => {
                 warn!(
@@ -7838,22 +7821,6 @@ async fn create_session(
         }
     }
 
-    // Release a claimed HALF_OPEN probe slot NEUTRALLY on an authorization
-    // expiry: the gateway dialed nothing on behalf of this credential, so the
-    // breaker must record neither success nor failure, and the slot must not
-    // leak or the breaker could never recover.
-    let release_half_open_probe = || {
-        if let Some(ref cb_config) = proxy.circuit_breaker {
-            let cb = circuit_breaker_cache.get_or_create(
-                &proxy.namespace,
-                proxy_id,
-                cb_target_key.as_deref(),
-                cb_config,
-            );
-            cb.record_neutral(cb_is_half_open_probe);
-        }
-    };
-
     // DNS resolve, bounded by the admitted credential's absolute authorization
     // deadline (issue #3816). An already-elapsed plan resolves no name at all.
     let candidates = match stream_udp_setup_stage_under_authorization(
@@ -7861,7 +7828,7 @@ async fn create_session(
         auth_latch,
         setup_metadata,
         UDP_SESSION_SETUP_CONTEXT,
-        &release_half_open_probe,
+        || cb_probe.release_neutral(),
         || {
             dns_cache.resolve_candidates(
                 &backend_host,
@@ -7887,9 +7854,9 @@ async fn create_session(
                     cb_config,
                 );
                 if crate::dns::is_egress_policy_denial(&e) {
-                    cb.record_neutral(cb_is_half_open_probe);
+                    cb.record_neutral(cb_probe.take_slot());
                 } else {
-                    cb.record_failure(502, true, cb_is_half_open_probe);
+                    cb.record_failure(502, true, cb_probe.take_slot());
                 }
             }
             return Err(stream_dns_setup_error(&backend_host, e));
@@ -7906,7 +7873,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true, cb_is_half_open_probe);
+                    cb.record_failure(502, true, cb_probe.take_slot());
                 }
                 return Err(StreamSetupError::new(
                     StreamSetupKind::NoHealthyTargets,
@@ -7941,7 +7908,7 @@ async fn create_session(
         auth_latch,
         setup_metadata,
         UDP_SESSION_SETUP_CONTEXT,
-        &release_half_open_probe,
+        || cb_probe.release_neutral(),
         || {
             connect_udp_backend_candidates(
                 &candidates,
@@ -7965,7 +7932,7 @@ async fn create_session(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true, cb_is_half_open_probe);
+                cb.record_failure(502, true, cb_probe.take_slot());
             }
             return Err(error);
         }
@@ -7990,7 +7957,7 @@ async fn create_session(
     if let Some(termination) =
         udp_authorization_expired_before_commit(auth_deadline, tokio::time::Instant::now())
     {
-        release_half_open_probe();
+        cb_probe.release_neutral();
         settle_stream_udp_auth_expiry(termination, auth_latch, setup_metadata);
         if let Some(ref dtls) = dtls_conn {
             dtls.close().await;
@@ -8006,7 +7973,7 @@ async fn create_session(
             cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(cb_is_half_open_probe);
+        cb.record_success(cb_probe.take_slot());
     }
 
     // Admission preceded DNS and backend setup. Re-check immediately before

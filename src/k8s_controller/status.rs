@@ -646,7 +646,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         objects: &'a [K8sObject],
         route_conflicts: &'a [GatewayApiRouteConflict],
         materialized_route_parents: &HashSet<GatewayApiMaterializedRouteParent>,
-        translation: &crate::config_sources::k8s::K8sTranslation,
+        translation: &'a crate::config_sources::k8s::K8sTranslation,
     ) -> Self {
         let mut gateway_classes_by_name = HashMap::new();
         let mut gateways_by_ns_name = HashMap::new();
@@ -758,14 +758,15 @@ impl<'a> GatewayApiStatusIndexes<'a> {
 
         let mut listenersets_on_managed_gateways = HashSet::new();
         let mut listenersets_not_allowed = HashSet::new();
-        for ((namespace, name), listenerset) in &listenersets_by_ns_name {
-            if translation.listenerset_statuses.iter().any(|status| {
-                status.resource.matches_object(listenerset)
-                    && !status.accepted
-                    && status.accepted_reason == "NotAllowed"
-            }) {
-                listenersets_not_allowed.insert((*namespace, *name));
+        for status in &translation.listenerset_statuses {
+            if !status.accepted && status.accepted_reason == "NotAllowed" {
+                listenersets_not_allowed.insert((
+                    status.resource.namespace.as_str(),
+                    status.resource.name.as_str(),
+                ));
             }
+        }
+        for ((namespace, name), listenerset) in &listenersets_by_ns_name {
             if let Some(parent_ref) = listenerset.spec.get("parentRef") {
                 let group = parent_ref
                     .get("group")

@@ -169,6 +169,22 @@ const PROBE_ADMISSION_SITES: &[&str] = &[
 /// The one RAII type every admitting path must construct.
 const SHARED_PROBE_GUARD: &str = "HalfOpenProbeGuard::new(";
 
+/// UDP and TCP bypass the shared admission helper. Count admissions per body,
+/// then check each admission arm independently (issue #4979).
+const DIRECT_PROBE_ADMISSION_SITES: &[(&str, &str, usize)] = &[
+    (
+        "src/proxy/udp_proxy.rs",
+        "async fn handle_dtls_client_inner(",
+        1,
+    ),
+    ("src/proxy/udp_proxy.rs", "async fn create_session(", 1),
+    (
+        "src/proxy/tcp_proxy.rs",
+        "async fn handle_tcp_connection_inner(",
+        2,
+    ),
+];
+
 /// Files that must own a guard rather than re-deriving the release: the
 /// admission sites plus every module they hand the guard to.
 const PROBE_GUARD_HOLDERS: &[&str] = &[
@@ -178,6 +194,8 @@ const PROBE_GUARD_HOLDERS: &[&str] = &[
     "src/http3/websocket.rs",
     "src/proxy/hbone_proxy.rs",
     "src/proxy/mod.rs",
+    "src/proxy/tcp_proxy.rs",
+    "src/proxy/udp_proxy.rs",
 ];
 
 /// Every settle path on the shared guard: `(label, signature, terminator)`.
@@ -224,6 +242,43 @@ fn every_circuit_breaker_admission_site_carries_a_probe_guard() {
             SHARED_PROBE_GUARD
         );
     }
+
+    for &(file, signature, count) in DIRECT_PROBE_ADMISSION_SITES {
+        let text = source(file);
+        let expected_count: usize = DIRECT_PROBE_ADMISSION_SITES
+            .iter()
+            .filter(|(path, _, _)| *path == file)
+            .map(|(_, _, count)| count)
+            .sum();
+        assert_eq!(
+            text.matches("circuit_breaker_cache.can_execute(").count(),
+            expected_count,
+            "every direct-cache admission in {file} must be listed and own a probe guard"
+        );
+        let body = item_body(&text, signature, "\n}");
+        assert_eq!(
+            body.matches("circuit_breaker_cache.can_execute(").count(),
+            count,
+            "{signature} must retain its direct-cache admission checks"
+        );
+        for admission in body.split("circuit_breaker_cache.can_execute(").skip(1) {
+            let admitted = admission
+                .split_once("Err(_) =>")
+                .expect("cache admission must handle refusal")
+                .0;
+            assert!(
+                admitted
+                    .contains("HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe)"),
+                "{signature} must own each slot on the breaker returned by cache admission"
+            );
+            if file == "src/proxy/tcp_proxy.rs" {
+                assert!(
+                    admitted.contains("cb_probe.rearm(&cb, is_half_open_probe)"),
+                    "TCP retries must rearm the guard on the newly admitted breaker"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -238,9 +293,12 @@ fn no_dispatch_path_carries_a_bare_probe_flag_beside_the_guard() {
             "{file} must carry the shared `HalfOpenProbeGuard` as `cb_probe`"
         );
         for banned in [
+            "let mut cb_is_half_open_probe",
+            "let release_half_open_probe =",
             "ws_cb_probe_slot_available",
             "grpc_cb_probe_slot",
             "cb_retry_probe_slot_available",
+            "cb_info.is_half_open_probe",
         ] {
             assert!(
                 !text.contains(banned),

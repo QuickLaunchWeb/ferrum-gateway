@@ -1368,6 +1368,42 @@ fn se_http_egress_materializes_dns_wildcard_host() {
     assert_eq!(upstream.targets[0].host, "*.api.external.com");
 }
 
+/// A STATIC HTTP-family ServiceEntry without declared endpoints has no dial
+/// set. In particular, a wildcard route must not become a client-selected DNS
+/// target through request-authority concretization.
+#[test]
+fn se_http_egress_static_without_endpoints_fails_closed() {
+    let translation = translate_k8s_objects(
+        &[wildcard_se(
+            "static-wildcard-api",
+            "*.api.external.com",
+            443,
+            "TLS",
+            "STATIC",
+            Vec::new(),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+    let prepared =
+        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .all(|p| !p.id.starts_with("mesh-egress")),
+        "STATIC wildcard without endpoints must not materialize a route"
+    );
+    assert!(
+        prepared
+            .upstreams
+            .iter()
+            .all(|u| !u.id.starts_with("mesh-egress-up")),
+        "STATIC wildcard without endpoints must not materialize a dial target"
+    );
+}
+
 /// The same refusal on the stream family — and the refused entry must NOT
 /// consume the listen port, so a following exact-host ServiceEntry on the same
 /// port still materializes.
