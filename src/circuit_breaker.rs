@@ -432,11 +432,11 @@ impl CircuitBreaker {
         }
         // Record the debt the next release consumes, so the leaked probe
         // settling late cannot decrement a second time.
-        let _ = self
-            .half_open_reclaim_debt
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |debt| {
-                Some(debt.saturating_add(1))
-            });
+        let _ =
+            self.half_open_reclaim_debt
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |debt| {
+                    Some(debt.saturating_add(1))
+                });
         self.probe_reclaimed.fetch_add(1, Ordering::Relaxed);
         warn!(
             "Circuit breaker reclaimed a half-open probe slot for {} after {}s without a settle: \
