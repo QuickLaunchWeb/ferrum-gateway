@@ -799,9 +799,10 @@ default would otherwise silently change security state are handled explicitly:
   `200`. A `PUT` body that is a JSON object without an `enabled` key is
   rejected with `400` and nothing is mutated:
   `{"error":"PUT is a full replace: 'enabled' is required (openapi.yaml declares it required). Send the field explicitly."}`.
-  `openapi.yaml` already lists `enabled` in the `PluginConfig` `required` set;
-  this makes the implementation match it. `POST /plugins/config` still defaults
-  `enabled` to `true` when the key is absent.
+  `openapi.yaml` requires `enabled` on `PluginConfigReplace` (`PUT
+  /plugins/config/{id}`) and on the stored `PluginConfig` response. `POST
+  /plugins/config` uses `PluginConfigCreate`, which omits `enabled` from
+  `required` so the server can default it to `true`.
 - **An omitted `Proxy.plugins` preserves the stored associations.** Its default
   is the empty list, so an omitted key would detach every plugin association —
   including an authentication plugin — with a `200`. `PUT /proxies/{id}` is
@@ -871,7 +872,7 @@ through `PUT /proxies/{id}` and stay valid for any proxy in the namespace. File
 mode is unchanged: the configuration file's association arrays are the only
 attachment surface there.
 
-Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes.
+Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes. The shared OpenAPI wrapper matches that admission: plugin-specific `config` schemas apply only while `enabled` is true (or omitted on `POST`, which defaults to true), and plugins whose constructors accept JSON `null` (`stdout_logging`, `prometheus_metrics`, `mtls_auth`, `compression`) document `config` as `[object, null]`.
 
 Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
 

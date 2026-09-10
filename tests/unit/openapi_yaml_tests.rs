@@ -324,7 +324,9 @@ fn typed_component_properties_match_serde_field_inventories() {
         rust_only = ["credentials"],
         schema_only = []
     );
-    check!(PluginConfig, "PluginConfig");
+    // Properties live on PluginConfigBase; PluginConfig/Create/Replace compose
+    // presence requirements on top of that shared bag.
+    check!(PluginConfig, "PluginConfigBase");
     check!(PluginAssociation, "PluginAssociation");
     check!(Upstream, "Upstream");
     check!(UpstreamTarget, "UpstreamTarget");
@@ -467,10 +469,10 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     assert!(!password_pattern.is_match("embedded\0null"));
     assert!(password_pattern.is_match("tabs\tand\nnewlines\rremain valid"));
 
-    let plugin_config = &spec["components"]["schemas"]["PluginConfig"];
+    let plugin_config = &spec["components"]["schemas"]["PluginConfigBase"];
     let config_description = plugin_config["properties"]["config"]["description"]
         .as_str()
-        .expect("PluginConfig config description");
+        .expect("PluginConfigBase config description");
     assert!(config_description.contains("Disabled plugin configs are stored without construction"));
     assert!(config_description.contains("Enabling performs full validation"));
 
@@ -3678,10 +3680,35 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
 }
 
 fn plugin_config_schema_mapping(spec: &serde_json::Value) -> BTreeMap<String, String> {
-    let all_of = spec
-        .pointer("/components/schemas/PluginConfig/allOf")
+    let base_all_of = spec
+        .pointer("/components/schemas/PluginConfigBase/allOf")
         .and_then(serde_json::Value::as_array)
-        .expect("PluginConfig allOf should be an array");
+        .expect("PluginConfigBase allOf should be an array");
+    assert!(
+        base_all_of.len() >= 2,
+        "PluginConfigBase must gate construction and keep the prometheus_metrics scope guard"
+    );
+    let enabled_gate = &base_all_of[0];
+    assert_eq!(
+        enabled_gate.pointer("/if/properties/enabled/not/const"),
+        Some(&json!(false)),
+        "plugin-specific construction schemas must not apply when enabled is false"
+    );
+    assert_eq!(
+        base_all_of[1].pointer("/if/properties/plugin_name/const"),
+        Some(&json!("prometheus_metrics")),
+        "disabled prometheus_metrics must still require global scope"
+    );
+    assert_eq!(
+        base_all_of[1].pointer("/then/properties/scope/const"),
+        Some(&json!("global")),
+        "disabled prometheus_metrics must still require global scope"
+    );
+
+    let all_of = enabled_gate
+        .pointer("/then/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("enabled PluginConfigBase conditionals should be an array");
 
     let mut mapping = BTreeMap::new();
     for entry in all_of {
@@ -3880,6 +3907,119 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         validator.validate(&custom).is_ok(),
         "custom plugins should keep generic PluginConfig config shape"
     );
+}
+
+/// Issue #4996: shared PluginConfig/Create/Replace must admit the same null,
+/// disabled, and POST-default bodies as `validate_plugin_config_definition`
+/// and PUT's explicit `enabled` presence check, without loosening enabled
+/// construction or PUT replace semantics.
+#[test]
+fn plugin_config_shared_schema_matches_admin_admission() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    assert_eq!(
+        spec["paths"]["/plugins/config"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        json!("#/components/schemas/PluginConfigCreate")
+    );
+    assert_eq!(
+        spec["paths"]["/plugins/config/{id}"]["put"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/PluginConfigReplace")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["BatchCreateRequest"]["properties"]["plugin_configs"]
+            ["items"]["$ref"],
+        json!("#/components/schemas/PluginConfigCreate")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigBase"]["properties"]["config"]["type"],
+        json!(["object", "null"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigCreate"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfigReplace"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope", "enabled"])
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["PluginConfig"]["allOf"][1]["required"],
+        json!(["plugin_name", "scope", "enabled"])
+    );
+
+    let stdout_null = json!({
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": null
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &stdout_null, true);
+    assert_component_validity(&spec, "PluginConfig", &stdout_null, true);
+    assert_component_validity(&spec, "PluginConfigReplace", &stdout_null, true);
+
+    let disabled_http_logging = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {}
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &disabled_http_logging, true);
+    assert_component_validity(&spec, "PluginConfig", &disabled_http_logging, true);
+    assert_component_validity(&spec, "PluginConfigReplace", &disabled_http_logging, true);
+
+    let post_defaults = json!({
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "config": {}
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &post_defaults, true);
+    assert_component_validity(&spec, "PluginConfig", &post_defaults, false);
+    assert_component_validity(&spec, "PluginConfigReplace", &post_defaults, false);
+
+    let enabled_http_logging_missing_endpoint = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {}
+    });
+    assert_component_validity(
+        &spec,
+        "PluginConfigCreate",
+        &enabled_http_logging_missing_endpoint,
+        false,
+    );
+    assert_component_validity(&spec, "PluginConfig", &enabled_http_logging_missing_endpoint, false);
+
+    let object_only_null = json!({
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": null
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &object_only_null, false);
+    assert_component_validity(&spec, "PluginConfigReplace", &object_only_null, false);
+
+    for plugin_name in ["prometheus_metrics", "mtls_auth", "compression"] {
+        let body = json!({
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "enabled": true,
+            "config": null
+        });
+        assert_component_validity(&spec, "PluginConfigCreate", &body, true);
+    }
+
+    let disabled_prometheus_proxy = json!({
+        "plugin_name": "prometheus_metrics",
+        "scope": "proxy",
+        "proxy_id": "p1",
+        "enabled": false,
+        "config": {}
+    });
+    assert_component_validity(&spec, "PluginConfigCreate", &disabled_prometheus_proxy, false);
 }
 
 #[test]
@@ -8814,9 +8954,9 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
     }
 
     let plugin_config_desc = spec
-        .pointer("/components/schemas/PluginConfig/properties/config/description")
+        .pointer("/components/schemas/PluginConfigBase/properties/config/description")
         .and_then(|v| v.as_str())
-        .expect("PluginConfig.config description");
+        .expect("PluginConfigBase.config description");
     assert!(
         plugin_config_desc.contains("OptionalFailOpen"),
         "generic PluginConfig.config must document OptionalFailOpen omission"
