@@ -6426,11 +6426,48 @@ fn merge_sse_scalar_fragment(target: &mut String, fragment: &str) {
 
 const MAX_JSON_REDACTION_DEPTH: usize = 64;
 
-fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
-    redact_json_value_strings_at_depth(redactor, value, 0);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonRedactionContext {
+    Normal,
+    DataSourceItem,
 }
 
-fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value, depth: usize) {
+fn compact_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_azure_data_sources_key(key: &str) -> bool {
+    compact_json_key(key) == "datasources"
+}
+
+fn is_azure_parameters_key(key: &str) -> bool {
+    compact_json_key(key) == "parameters"
+}
+
+fn wholesale_redact_data_source_parameters(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for entry in map.values_mut() {
+                *entry = Value::String(REDACTED_PLACEHOLDER.to_string());
+            }
+        }
+        _ => *value = Value::String(REDACTED_PLACEHOLDER.to_string()),
+    }
+}
+
+fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
+    redact_json_value_strings_at_depth(redactor, value, 0, JsonRedactionContext::Normal);
+}
+
+fn redact_json_value_strings_at_depth(
+    redactor: &PiiRedactor,
+    value: &mut Value,
+    depth: usize,
+    ctx: JsonRedactionContext,
+) {
     if depth >= MAX_JSON_REDACTION_DEPTH {
         *value = Value::String(REDACTED_PLACEHOLDER.to_string());
         return;
@@ -6443,7 +6480,7 @@ fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value,
             if let Ok(mut embedded) = serde_json::from_str::<Value>(text)
                 && matches!(embedded, Value::Object(_) | Value::Array(_))
             {
-                redact_json_value_strings_at_depth(redactor, &mut embedded, depth + 1);
+                redact_json_value_strings_at_depth(redactor, &mut embedded, depth + 1, ctx);
                 if let Ok(serialized) = serde_json::to_string(&embedded) {
                     *text = redactor.redact(&serialized);
                     return;
@@ -6460,7 +6497,7 @@ fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value,
         }
         Value::Array(values) => {
             for value in values {
-                redact_json_value_strings_at_depth(redactor, value, depth + 1);
+                redact_json_value_strings_at_depth(redactor, value, depth + 1, ctx);
             }
         }
         Value::Object(map) => {
@@ -6479,8 +6516,28 @@ fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value,
             for (key, mut value) in entries {
                 if sensitive_json_field(&key) {
                     value = Value::String(REDACTED_PLACEHOLDER.to_string());
+                } else if ctx == JsonRedactionContext::DataSourceItem
+                    && is_azure_parameters_key(&key)
+                {
+                    wholesale_redact_data_source_parameters(&mut value);
+                } else if ctx == JsonRedactionContext::Normal && is_azure_data_sources_key(&key) {
+                    if let Value::Array(sources) = &mut value {
+                        for source in sources.iter_mut() {
+                            redact_json_value_strings_at_depth(
+                                redactor,
+                                source,
+                                depth + 1,
+                                JsonRedactionContext::DataSourceItem,
+                            );
+                        }
+                    }
                 } else {
-                    redact_json_value_strings_at_depth(redactor, &mut value, depth + 1);
+                    let next_ctx = if ctx == JsonRedactionContext::DataSourceItem {
+                        JsonRedactionContext::DataSourceItem
+                    } else {
+                        JsonRedactionContext::Normal
+                    };
+                    redact_json_value_strings_at_depth(redactor, &mut value, depth + 1, next_ctx);
                 }
                 map.insert(redactor.redact(&key), value);
             }
@@ -6531,6 +6588,13 @@ fn sensitive_json_field(key: &str) -> bool {
                 | "bearertoken"
                 | "sessiontoken"
                 | "csrftoken"
+                | "key"
+                | "passphrase"
+                | "accesskey"
+                | "signature"
+                | "assertion"
+                | "jwt"
+                | "embeddingkey"
         )
 }
 

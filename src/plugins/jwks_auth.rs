@@ -497,14 +497,15 @@ impl JwksAuth {
         let mut declared_dpop_scopes: Vec<ReplayScope> = Vec::new();
         // Equivalent providers (same exact issuer) converge on one replay
         // domain. They may share that domain only when they agree on
-        // `require_dpop`, and when DPoP is required, on replay scope/store and
-        // process-lane capacity. Matching order, a reload, or a rolling replica
-        // would otherwise pick which authority a proof is claimed against and
-        // admit it twice. Track the first admission per issuer realm so a
-        // disagreement is refused order-independently, without binding JWKS
-        // contents, source URL, scope, or capacity into the replay identity
-        // (that would reopen live proofs on an ordinary key rotation or cap
-        // edit).
+        // `require_dpop`, `require_mtls_binding`, `required_scopes`,
+        // `required_roles`, and when DPoP is required, on replay scope/store
+        // and process-lane capacity. Matching order, a reload, or a rolling
+        // replica would otherwise pick which sibling validates the token and
+        // which sender-constraint or scope/role gate applies. Track the first
+        // admission per issuer realm so a disagreement is refused
+        // order-independently, without binding JWKS contents, source URL, or
+        // replay scope/capacity into the replay identity (that would reopen
+        // live proofs on an ordinary key rotation or cap edit).
         let mut equivalent_provider_replay: HashMap<String, EquivalentProviderReplayAdmission> =
             HashMap::new();
 
@@ -677,24 +678,19 @@ impl JwksAuth {
             // cannot skip the proof the DPoP provider exists to demand.
             let provider_identity = issuer.as_deref().map(dpop_provider_identity);
             if let Some(identity) = provider_identity.as_ref() {
+                let admission = EquivalentProviderReplayAdmission {
+                    idx,
+                    require_dpop,
+                    scope: declared_scope,
+                    process_capacity: dpop_replay_max_entries,
+                    require_mtls_binding,
+                    required_scopes: required_scopes.clone(),
+                    required_roles: required_roles.clone(),
+                };
                 if let Some(earlier) = equivalent_provider_replay.get(identity) {
-                    reject_equivalent_provider_replay_disagreement(
-                        earlier,
-                        idx,
-                        require_dpop,
-                        declared_scope,
-                        dpop_replay_max_entries,
-                    )?;
+                    reject_equivalent_provider_replay_disagreement(earlier, &admission)?;
                 } else {
-                    equivalent_provider_replay.insert(
-                        identity.clone(),
-                        EquivalentProviderReplayAdmission {
-                            idx,
-                            require_dpop,
-                            scope: declared_scope,
-                            process_capacity: dpop_replay_max_entries,
-                        },
-                    );
+                    equivalent_provider_replay.insert(identity.clone(), admission);
                 }
             }
             let dpop_replay_domain = match (require_dpop, provider_identity.as_ref()) {
@@ -2204,34 +2200,37 @@ struct EquivalentProviderReplayAdmission {
     require_dpop: bool,
     scope: Option<ReplayScope>,
     process_capacity: usize,
+    require_mtls_binding: bool,
+    required_scopes: Vec<String>,
+    required_roles: Vec<String>,
 }
 
-/// Refuse an equivalent provider that would split DPoP authority.
+/// Refuse an equivalent provider that would split DPoP or authorization authority.
 ///
 /// A token that verifies against this issuer realm is matched to the first
 /// succeeding provider. If that pair disagrees on `require_dpop`, matching
 /// order is an authentication bypass (one sibling demands a single-use proof
-/// and the other accepts the bearer alone). If both require DPoP but disagree
-/// on `dpop_replay_scope`, the same proof is claimed in the process store by
-/// one sibling and in Redis by the other — exactly the cross-authority replay
-/// the issuer-realm identity exists to prevent. Process-lane capacity stays a
+/// and the other accepts the bearer alone). The same bypass applies when one
+/// sibling requires RFC 8705 certificate binding or a stricter scope/role gate
+/// and the other does not. If both require DPoP but disagree on
+/// `dpop_replay_scope`, the same proof is claimed in the process store by one
+/// sibling and in Redis by the other — exactly the cross-authority replay the
+/// issuer-realm identity exists to prevent. Process-lane capacity stays a
 /// same-scope equality rule so matching order cannot pick which cap applies.
 fn reject_equivalent_provider_replay_disagreement(
     earlier: &EquivalentProviderReplayAdmission,
-    idx: usize,
-    require_dpop: bool,
-    declared_scope: Option<ReplayScope>,
-    dpop_replay_max_entries: usize,
+    later: &EquivalentProviderReplayAdmission,
 ) -> Result<(), String> {
     let earlier_idx = earlier.idx;
-    if earlier.require_dpop != require_dpop {
+    let idx = later.idx;
+    if earlier.require_dpop != later.require_dpop {
         return Err(format!(
             "jwks_auth: equivalent providers must agree on 'require_dpop'; \
              provider[{earlier_idx}] and provider[{idx}] share one issuer \
              realm with incompatible DPoP requirements"
         ));
     }
-    if require_dpop && earlier.scope != declared_scope {
+    if later.require_dpop && earlier.scope != later.scope {
         return Err(format!(
             "jwks_auth: equivalent DPoP providers must declare the same \
              'dpop_replay_scope'; provider[{earlier_idx}] and \
@@ -2239,15 +2238,36 @@ fn reject_equivalent_provider_replay_disagreement(
              replay authorities"
         ));
     }
-    if require_dpop
-        && declared_scope == Some(ReplayScope::Process)
-        && earlier.process_capacity != dpop_replay_max_entries
+    if later.require_dpop
+        && later.scope == Some(ReplayScope::Process)
+        && earlier.process_capacity != later.process_capacity
     {
         return Err(format!(
             "jwks_auth: equivalent DPoP providers must declare the same \
              'dpop_replay_max_entries'; provider[{earlier_idx}] and \
              provider[{idx}] share one replay domain with incompatible \
              capacities"
+        ));
+    }
+    if earlier.require_mtls_binding != later.require_mtls_binding {
+        return Err(format!(
+            "jwks_auth: equivalent providers must agree on 'require_mtls_binding'; \
+             provider[{earlier_idx}] and provider[{idx}] share one issuer \
+             realm with incompatible certificate-binding requirements"
+        ));
+    }
+    if earlier.required_scopes != later.required_scopes {
+        return Err(format!(
+            "jwks_auth: equivalent providers must agree on 'required_scopes'; \
+             provider[{earlier_idx}] and provider[{idx}] share one issuer \
+             realm with incompatible scope requirements"
+        ));
+    }
+    if earlier.required_roles != later.required_roles {
+        return Err(format!(
+            "jwks_auth: equivalent providers must agree on 'required_roles'; \
+             provider[{earlier_idx}] and provider[{idx}] share one issuer \
+             realm with incompatible role requirements"
         ));
     }
     Ok(())
@@ -2284,16 +2304,16 @@ fn reject_equivalent_provider_replay_disagreement(
 /// identity that survives key-set and source-endpoint rotation. Issuer
 /// matching remains exact: an issuer is not a URL endpoint and is not
 /// normalized here. Providers in one policy that share that exact issuer
-/// share one replay realm even when their JWKS sources, audiences, scopes, or
-/// key sets differ or overlap; they must therefore agree on `require_dpop`,
-/// and when DPoP is required they must agree on replay scope and process
-/// capacity. A non-DPoP sibling for the same issuer is refused as a
-/// bearer-only bypass. Different exact issuers remain isolated.
+/// share one replay realm even when their JWKS sources, audiences, or key sets
+/// differ or overlap; they must therefore agree on `require_dpop`,
+/// `require_mtls_binding`, `required_scopes`, and `required_roles`, and when
+/// DPoP is required they must agree on replay scope and process capacity. A
+/// non-DPoP sibling for the same issuer is refused as a bearer-only bypass.
+/// Different exact issuers remain isolated.
 ///
 /// # What it deliberately does not bind
 ///
-/// JWKS contents, key ids, source kind, source URL, `audiences`,
-/// `required_scopes`, `required_roles`, claim/header mappings, token
+/// JWKS contents, key ids, source kind, source URL, `audiences`, claim/header
 /// locations, `forward_original_token`, `jwks_max_stale_seconds`,
 /// `dpop_replay_max_entries`, `dpop_replay_scope`, and
 /// `dpop_clock_skew_secs`. Folding any of those in would reopen live proofs

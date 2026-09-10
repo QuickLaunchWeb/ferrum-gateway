@@ -2509,7 +2509,11 @@ fn all_six_retry_callers_pass_request_authority_to_shared_helper() {
     // configured `*.` into a concrete dial host for retries).
     for (label, source, needle) in [
         ("proxy/mod.rs", proxy_src, "select_next_retry_target("),
-        ("http3/server.rs", h3_server, "select_next_retry_target("),
+        (
+            "http3/server.rs",
+            h3_server,
+            "select_next_h3_eligible_retry_target(",
+        ),
         (
             "http3/cross_protocol.rs",
             h3_cross,

@@ -542,26 +542,6 @@ async fn send_h3_backend_admission_rejection<S>(
     write_h3_finalized_reject_body(stream, status, rejection.body, headers).await;
 }
 
-/// H3 WebSocket entry point for the shared HALF_OPEN probe release (issue
-/// #4792).
-///
-/// Delegates to [`crate::proxy::release_circuit_breaker_probe_on_admission_reject`]
-/// so the H1/H2/WebSocket/gRPC handler, the H3 request path, and this path
-/// cannot drift into three separately-maintained copies of one invariant.
-pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
-    state: &ProxyState,
-    proxy: &Proxy,
-    target_key: Option<&str>,
-    is_half_open_probe: bool,
-) {
-    crate::proxy::release_circuit_breaker_probe_on_admission_reject(
-        state,
-        proxy,
-        target_key,
-        is_half_open_probe,
-    );
-}
-
 /// Status, body, and transaction-log rejection phase for an H3 WebSocket
 /// upgrade refused because its session deadline already elapsed. Mirrors the
 /// H1/H2 mapping in `handle_websocket_request_authenticated` exactly so the
@@ -614,7 +594,10 @@ pub(crate) async fn handle_h3_websocket(
     sticky_cookie_needed: bool,
     start_time: Instant,
     cb_target_key: Option<String>,
-    cb_is_half_open_probe: bool,
+    // Ownership of the HALF_OPEN circuit-breaker probe slot admitted for this
+    // upgrade, moved in from the H3 dispatcher. Dropping it releases the slot
+    // NEUTRALLY (GHSA-4cq4-3f3f-mq76).
+    mut cb_probe: crate::proxy::HalfOpenProbeGuard,
     backend_url: String,
     query_string: String,
     proxy_headers: HashMap<String, String>,
@@ -648,12 +631,7 @@ pub(crate) async fn handle_h3_websocket(
         crate::proxy::record_request(&state, 501);
         // Gateway-side reject after the caller's CB check — release a claimed
         // HALF_OPEN probe slot so the breaker doesn't wedge.
-        release_h3_ws_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         return Ok(());
     }
 
@@ -700,12 +678,7 @@ pub(crate) async fn handle_h3_websocket(
         )
         .await;
         crate::proxy::record_request(&state, status.as_u16());
-        release_h3_ws_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            cb_target_key.as_deref(),
-            cb_is_half_open_probe,
-        );
+        cb_probe.release_neutral();
         return Ok(());
     }
 
@@ -747,12 +720,7 @@ pub(crate) async fn handle_h3_websocket(
             .await;
             // Gateway-side reject after the caller's CB check — release a
             // claimed HALF_OPEN probe slot so the breaker doesn't wedge.
-            release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return Ok(());
         }
     };
@@ -791,12 +759,7 @@ pub(crate) async fn handle_h3_websocket(
                 &initial_response_header_policy_plugins,
             )
             .await;
-            release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return Ok(());
         }
     };
@@ -869,7 +832,6 @@ pub(crate) async fn handle_h3_websocket(
     let mut current_cb_target_key = cb_target_key;
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: Instant;
-    let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
     // Connection-wide idle tracker created BEFORE the backend dial so the
@@ -929,7 +891,7 @@ pub(crate) async fn handle_h3_websocket(
                 502,
                 false,
                 Some(retry::ErrorClass::DispatchPolicyRejected),
-                ws_cb_probe_slot_available,
+                cb_probe.take_slot(),
                 false,
                 start_time.elapsed(),
             );
@@ -1016,12 +978,7 @@ pub(crate) async fn handle_h3_websocket(
                 .await;
                 // Gateway-side reject after the CB check — release a claimed
                 // HALF_OPEN probe slot so the breaker doesn't wedge.
-                release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    current_cb_target_key.as_deref(),
-                    ws_cb_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 drop(ws_connection_permit);
                 return Ok(());
             }
@@ -1040,12 +997,7 @@ pub(crate) async fn handle_h3_websocket(
                 Ok(permits) => permits,
                 Err(rejection) => {
                     drop(conn_slot);
-                    release_h3_ws_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        current_cb_target_key.as_deref(),
-                        ws_cb_probe_slot_available,
-                    );
+                    cb_probe.release_neutral();
                     send_h3_backend_admission_rejection(
                         &mut stream,
                         rejection,
@@ -1215,8 +1167,7 @@ pub(crate) async fn handle_h3_websocket(
                             current_cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
-                        ws_cb_probe_slot_available = false;
+                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
                         cb_failure_already_recorded = true;
                     }
 
@@ -1317,8 +1268,11 @@ pub(crate) async fn handle_h3_websocket(
                             retry_cb_target_key.as_deref(),
                             cb_config,
                         ) {
-                            Ok((_cb, is_half_open_probe)) => {
-                                ws_cb_probe_slot_available = is_half_open_probe;
+                            Ok((cb, is_half_open_probe)) => {
+                                // Re-point the probe guard at the rotated target's
+                                // breaker: the prior target's slot was taken by the
+                                // intermediate failure record above.
+                                cb_probe.rearm(&cb, is_half_open_probe);
                             }
                             Err(_) => {
                                 retry_admitted_by_cb = false;
@@ -1378,9 +1332,9 @@ pub(crate) async fn handle_h3_websocket(
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY so the breaker can
                         // recover, rather than leaking it by skipping the record.
-                        cb.record_neutral(ws_cb_probe_slot_available);
+                        cb.record_neutral(cb_probe.take_slot());
                     } else {
-                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
                     }
                 }
 
@@ -1436,7 +1390,7 @@ pub(crate) async fn handle_h3_websocket(
             current_cb_target_key.as_deref(),
             cb_config,
         );
-        cb.record_success(ws_cb_probe_slot_available);
+        cb.record_success(cb_probe.take_slot());
     }
 
     if ws_session_deadline.at <= tokio::time::Instant::now() {

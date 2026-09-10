@@ -751,7 +751,8 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         }),
         "ldap_auth" => json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
         "api_chargeback" => {

@@ -2061,7 +2061,8 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         }),
         "ldap_auth" => json!({
             "ldap_url": "ldaps://ldap.example.com:636",
-            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid"
         }),
         "hmac_auth" => json!({
             "clock_skew_seconds": 300,

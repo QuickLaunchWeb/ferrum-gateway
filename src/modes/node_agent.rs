@@ -1342,13 +1342,13 @@ async fn start_node_agent_admin_listeners(
             Some(shutdown_tx.subscribe()),
         )? {
             crate::modes::startup_security::AdminHttpsListenerPlan::Enabled(planned) => {
-                if env_config.admin_tls_client_ca_bundle_path.is_some() {
-                    info!(
-                        "Node agent admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
-                    );
-                } else if env_config.admin_tls_no_verify {
+                if env_config.admin_tls_no_verify {
                     warn!(
                         "Node agent admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
+                    );
+                } else if env_config.admin_tls_client_ca_bundle_path.is_some() {
+                    info!(
+                        "Node agent admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
                     );
                 } else {
                     info!(
