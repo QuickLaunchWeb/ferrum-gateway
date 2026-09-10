@@ -10695,6 +10695,11 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Cache-build diagnostic: whether this instance has an execution trigger.
+    fn has_execution_trigger(&self) -> bool {
+        false
+    }
+
     /// Whether this authentication instance applies to the current request.
     ///
     /// Ordinary authentication plugins are always applicable. Instance

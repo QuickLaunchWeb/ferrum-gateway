@@ -3115,6 +3115,44 @@ async fn streaming_response_inspect_cuts_on_gemini_leak() {
 }
 
 #[tokio::test]
+async fn streaming_response_inspect_fails_closed_on_multiple_gemini_candidates() {
+    // Candidate 1 must not be able to consume the aggregate overlap and evict
+    // candidate 0's partial prohibited phrase before its continuation arrives.
+    // Windowed inspection cannot retain independent candidate overlap yet, so
+    // the safe behavior is to reject a multi-candidate Gemini stream.
+    let mut config = inspect_config();
+    config["on_error"] = json!("reject");
+    let plugin = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let opening = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[",
+        "{\"text\":\"My sys\"}]}}]}\n\n",
+    );
+    assert!(matches!(
+        inspector.on_chunk(opening.as_bytes()).await,
+        ResponseStreamAction::Forward(_)
+    ));
+
+    let padding = format!("{}.", "benign ".repeat(48));
+    let padded_candidate = format!(
+        "data: {{\"candidates\":[{{\"index\":1,\"content\":{{\"parts\":[\
+         {{\"text\":{}}}]}}}}]}}\n\n",
+        serde_json::to_string(&padding).expect("serialize test padding")
+    );
+
+    assert!(
+        matches!(
+            inspector.on_chunk(padded_candidate.as_bytes()).await,
+            ResponseStreamAction::Terminate(_)
+        ),
+        "multi-candidate Gemini must fail closed before aggregate overlap can discard continuity"
+    );
+}
+
+#[tokio::test]
 async fn streaming_response_inspect_cuts_on_anthropic_leak() {
     // Windowed `inspect` mode: the leak is split across Anthropic `text_delta`
     // fragments and completes a sentence, so the window flushes, the

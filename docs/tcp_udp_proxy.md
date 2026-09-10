@@ -850,13 +850,17 @@ Both stream listeners bound how much of a listener one source IP may hold, indep
 | Variable | Default | Enforced |
 |----------|---------|----------|
 | `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` | `256` | In the TCP accept path, **before** the frontend TLS handshake |
-| `FERRUM_UDP_MAX_SESSIONS_PER_IP` | `1024` | At UDP/DTLS session-slot reservation |
+| `FERRUM_UDP_MAX_SESSIONS_PER_IP` | `1024` | At UDP/DTLS session-slot reservation, and at frontend-DTLS ClientHello admission |
 
 `0` means unlimited for either variable.
 
 **TCP ordering.** The bound is applied as soon as the connection's effective client IP is known and **before** `handle_tcp_connection` runs, so a refused connection reaches no frontend TLS handshake, no `on_stream_connect` plugin chain, and no backend dial — the socket is closed at accept. This is the gap the opt-in `tcp_connection_throttle` plugin cannot close: its `on_stream_connect` hook runs *after* the handshake on `tcp_tls` proxies, so it can never bound concurrent pre-handshake state from one source. The plugin remains available and unchanged for policy-level throttling on top of this bound.
 
 **UDP/DTLS ordering.** The per-source bound shares one admission point and one release path with the listener-wide `FERRUM_UDP_MAX_SESSIONS` bound, so neither slot can be taken without the other and neither can leak. The session's slot is released exactly once with its other per-session guards on idle expiry, authorization-lifetime expiry, backend teardown, and listener shutdown.
+
+**Frontend-DTLS ordering.** A terminating DTLS peer occupies gateway state *before* a session exists: the demuxer allocates a per-peer entry on the peer's first ClientHello, holds it for up to `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`, and only then delivers an accepted connection. `FERRUM_UDP_MAX_SESSIONS_PER_IP` is therefore taken a second time, on the ClientHello admission path in the demux loop — before any per-peer channel or task allocation, and before the listener-wide `FERRUM_UDP_MAX_SESSIONS` reservation, so a refusal unwinds nothing. Without it one source can fill the entire pre-handshake table with unauthenticated ClientHellos and deny DTLS service to every other client, because the session-level bound above is downstream of that exposure.
+
+The pre-handshake slot and the session slot come from the **same** gateway-wide counter, and the demuxer releases its slot the moment the accepted connection is handed to the accept loop, where the session reservation takes over. An established DTLS session therefore counts once against its source's budget, not twice, and a source's total (handshakes in flight plus established sessions) never exceeds the configured limit. On every other exit path — refused handshake, handshake timeout, socket fault, listener shutdown — the slot is released by the driver task's guard.
 
 **Effective source.** Both bounds key on the *effective* client IP, never the raw socket peer alone:
 
@@ -865,7 +869,7 @@ Both stream listeners bound how much of a listener one source IP may hold, indep
 
 A trusted L4 load balancer in front of the gateway is therefore not collapsed into a single source. IPv4-mapped IPv6 peers are folded to one canonical representation, so a dual-stack listener cannot be used to double a source's budget.
 
-**Observability.** Each listener keeps a fixed-cardinality rejection counter and emits a rate-limited warning (first refusal, then every 100th) naming the proxy, the listen port, and the limit. Client addresses are deliberately never logged or used as a metric label on these paths.
+**Observability.** Each listener keeps a fixed-cardinality rejection counter and emits a rate-limited warning naming the proxy, the listen port, and the limit — the TCP and UDP session paths on the first refusal and every 100th, the frontend-DTLS ClientHello path at most once per rate-limit window with the refusals it withheld. Client addresses are deliberately never logged or used as a metric label on these paths.
 
 ## UDP Session Management
 
@@ -1084,7 +1088,7 @@ Notes:
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` | `256` | Maximum concurrent TCP stream-proxy connections per effective source IP; `0` = unlimited. See [Per-source admission](#per-source-admission) |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
-| `FERRUM_UDP_MAX_SESSIONS_PER_IP` | `1024` | Maximum concurrent UDP/DTLS stream-proxy sessions per effective source IP; `0` = unlimited. See [Per-source admission](#per-source-admission) |
+| `FERRUM_UDP_MAX_SESSIONS_PER_IP` | `1024` | Maximum concurrent UDP/DTLS stream-proxy sessions per effective source IP, and the bound on frontend-DTLS pre-handshake demux entries per source; `0` = unlimited. See [Per-source admission](#per-source-admission) |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
 | `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT` | `6000` | Datagrams drained per UDP recv wakeup when adaptive batching is **disabled** (`FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=false`), and the initial value before a proxy's first traffic sample. When adaptation is enabled (default) the per-proxy limit then moves across fixed internal tiers (64 / 256 / 2000 / 6000) by observed traffic and is **not** capped by this value. Raising it increases the disabled/initial limit |
 

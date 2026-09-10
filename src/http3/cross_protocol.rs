@@ -247,7 +247,7 @@ where
     pub upstream_target: Option<&'a UpstreamTarget>,
     pub upstream_balancer: Option<&'a Arc<LoadBalancer>>,
     pub cb_target_key: Option<&'a str>,
-    pub cb_is_half_open_probe: bool,
+    pub cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
     pub flavor: HttpFlavor,
     pub prebuffered_body: Option<Vec<u8>>,
     /// The request body was already transformed and passed through final-body
@@ -323,7 +323,7 @@ fn record_cross_protocol_header_write_disconnect(
     cb_target_key: Option<&str>,
     backend_outcome_status: u16,
     admission_status: u16,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
@@ -338,7 +338,7 @@ fn record_cross_protocol_header_write_disconnect(
         backend_outcome_status,
         false,
         Some(ErrorClass::ClientDisconnect),
-        cb_is_half_open_probe,
+        cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
@@ -445,7 +445,7 @@ struct PlainPeerGoneBeforeResponseHeadersCtx<'a> {
     upstream_balancer: Option<&'a Arc<LoadBalancer>>,
     current_target: Option<&'a Arc<UpstreamTarget>>,
     cb_target_key: Option<&'a str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     backend_admission_permits: &'a mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
@@ -463,7 +463,7 @@ struct PlainBackendTimeoutTerminalCtx<'a> {
     upstream_balancer: Option<&'a Arc<LoadBalancer>>,
     current_target: Option<&'a UpstreamTarget>,
     cb_target_key: Option<&'a str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     backend_admission_elapsed: Duration,
     bytes_sent: u64,
@@ -510,7 +510,7 @@ where
         504,
         false,
         Some(ErrorClass::ReadWriteTimeout),
-        args.cb_is_half_open_probe,
+        args.cb_probe.take_slot(),
         false,
         args.backend_start.elapsed(),
     );
@@ -542,7 +542,7 @@ fn plain_peer_gone_before_response_headers(
         ctx.cb_target_key,
         0,
         0,
-        ctx.cb_is_half_open_probe,
+        ctx.cb_probe,
         ctx.backend_start,
         ctx.backend_admission_permits,
         ctx.backend_admission_elapsed,
@@ -586,26 +586,6 @@ fn cross_protocol_header_write_disconnect_outcome(
     }
 }
 
-fn release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-    state: &ProxyState,
-    proxy: &Proxy,
-    target_key: Option<&str>,
-    is_half_open_probe: bool,
-) {
-    if !is_half_open_probe {
-        return;
-    }
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            &proxy.id,
-            target_key,
-            cb_config,
-        );
-        cb.record_neutral(true);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_cross_protocol_backend_admission_or_reject<S>(
     backend_admission_plugins: &[Arc<dyn Plugin>],
@@ -618,8 +598,7 @@ async fn run_cross_protocol_backend_admission_or_reject<S>(
     backend_start: Instant,
     bytes_sent: u64,
     state: &ProxyState,
-    cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     pending_slot_to_release_before_reject: Option<
         &mut Option<crate::backend_pending_limit::BackendPendingGuard>,
     >,
@@ -642,12 +621,7 @@ where
             // the writes below use `await?`, so an H3 client closing mid-write
             // returns early. The callers release only on the `Err(outcome)` arm,
             // so releasing here guarantees the slot is freed even on write error.
-            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                state,
-                proxy,
-                cb_target_key,
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             if let Some(slot) = pending_slot_to_release_before_reject {
                 drop(slot.take());
             }
@@ -905,7 +879,7 @@ where
         upstream_target,
         upstream_balancer,
         cb_target_key,
-        cb_is_half_open_probe,
+        cb_probe,
         flavor,
         prebuffered_body,
         request_body_prepared,
@@ -975,12 +949,7 @@ where
                     // This is a client/request-body policy outcome before any
                     // backend dispatch. Release a HALF_OPEN probe neutrally so
                     // a client-fault rejection cannot wedge the breaker.
-                    release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                        state,
-                        proxy,
-                        cb_target_key,
-                        cb_is_half_open_probe,
-                    );
+                    cb_probe.release_neutral();
                     return write_final_body_reject(
                         stream,
                         flavor,
@@ -1019,7 +988,7 @@ where
                 upstream_target,
                 upstream_balancer,
                 cb_target_key,
-                cb_is_half_open_probe,
+                cb_probe,
                 prebuffered_body,
                 raw_prebuffered_body_bytes,
                 client_ip,
@@ -1055,7 +1024,7 @@ where
                 upstream_target,
                 upstream_balancer,
                 cb_target_key,
-                cb_is_half_open_probe,
+                cb_probe,
                 prebuffered_body,
                 raw_prebuffered_body_bytes,
                 client_ip,
@@ -1379,7 +1348,7 @@ async fn get_cross_protocol_client<S>(
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     current_target: Option<&UpstreamTarget>,
     current_cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
@@ -1406,7 +1375,7 @@ where
                 upstream_balancer,
                 current_target,
                 current_cb_target_key,
-                cb_is_half_open_probe,
+                cb_probe,
                 backend_start,
                 backend_admission_permits,
                 backend_admission_elapsed,
@@ -1452,7 +1421,7 @@ fn record_cross_protocol_client_acquire_failure(
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     current_target: Option<&UpstreamTarget>,
     current_cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
@@ -1481,7 +1450,7 @@ fn record_cross_protocol_client_acquire_failure(
         502,
         true,
         None,
-        cb_is_half_open_probe,
+        cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
@@ -1549,7 +1518,7 @@ async fn run_plain_attempt_local_policy_or_reject<'a, S>(
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     current_target: Option<&UpstreamTarget>,
     current_cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     current_url: &str,
     effective_host: &str,
@@ -1586,7 +1555,7 @@ where
             502,
             false,
             Some(ErrorClass::DispatchPolicyRejected),
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -1633,7 +1602,7 @@ where
             502,
             false,
             Some(ErrorClass::DispatchPolicyRejected),
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -1713,7 +1682,7 @@ where
                     502,
                     false,
                     Some(ErrorClass::DispatchPolicyRejected),
-                    cb_is_half_open_probe,
+                    cb_probe.take_slot(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -1807,7 +1776,7 @@ where
                     503,
                     false,
                     Some(ErrorClass::DispatchPolicyRejected),
-                    cb_is_half_open_probe,
+                    cb_probe.take_slot(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -1846,7 +1815,7 @@ fn record_plain_grpc_web_client_deadline(
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     current_target: Option<&UpstreamTarget>,
     current_cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
@@ -1861,7 +1830,7 @@ fn record_plain_grpc_web_client_deadline(
         StatusCode::OK.as_u16(),
         false,
         Some(ErrorClass::ClientDisconnect),
-        cb_is_half_open_probe,
+        cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
@@ -1890,7 +1859,7 @@ fn record_plain_grpc_web_client_deadline_after_backend_response(
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     current_target: Option<&UpstreamTarget>,
     current_cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
@@ -1906,7 +1875,7 @@ fn record_plain_grpc_web_client_deadline_after_backend_response(
             upstream_balancer,
             current_target,
             current_cb_target_key,
-            cb_is_half_open_probe,
+            cb_probe,
             backend_start,
             backend_admission_permits,
             backend_admission_elapsed,
@@ -1924,7 +1893,7 @@ fn record_plain_grpc_web_client_deadline_after_backend_response(
         backend_status,
         backend_connection_error,
         backend_error_class,
-        cb_is_half_open_probe,
+        cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
@@ -2126,7 +2095,7 @@ fn boxed_dispatch_plain<'a, S>(
     upstream_target: Option<&'a UpstreamTarget>,
     upstream_balancer: Option<&'a Arc<LoadBalancer>>,
     cb_target_key: Option<&'a str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &'a str,
@@ -2163,7 +2132,7 @@ where
             upstream_target,
             upstream_balancer,
             cb_target_key,
-            cb_is_half_open_probe,
+            cb_probe,
             prebuffered_body,
             raw_prebuffered_body_bytes,
             client_ip,
@@ -2201,7 +2170,7 @@ async fn dispatch_plain<S>(
     upstream_target: Option<&UpstreamTarget>,
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
@@ -2306,7 +2275,6 @@ where
     let mut current_target = upstream_target.cloned().map(Arc::new);
     let mut current_cb_target_key = cb_target_key.map(str::to_owned);
     let mut current_url = backend_url.to_string();
-    let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     // Absolute route ceiling retained on Proxy.retry (never permanently lowered
     // to the initial target's DestinationRule cap). Retry authorization uses
     // min(route_retry_ceiling, current_or_candidate_cap).
@@ -2348,12 +2316,7 @@ where
                 (Some(body), len)
             }
             Ok(None) => {
-                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                    state,
-                    proxy,
-                    cb_target_key,
-                    cb_retry_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 return write_plain_gateway_error(
                     stream,
                     ctx,
@@ -2369,12 +2332,7 @@ where
             // wake cannot reattribute a strictly earlier client RPC deadline to
             // the gateway's security decision.
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
-                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                    state,
-                    proxy,
-                    cb_target_key,
-                    cb_retry_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 if let Some(termination) = authorization_expiry {
                     ctx.record_authorization_termination_once(
                         termination,
@@ -2402,12 +2360,7 @@ where
             }
             Err(super::server::H3RequestBodyReadError::TimedOut)
             | Err(super::server::H3RequestBodyReadError::Read(_)) => {
-                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                    state,
-                    proxy,
-                    cb_target_key,
-                    cb_retry_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 return write_plain_gateway_error(
                     stream,
                     ctx,
@@ -2478,7 +2431,7 @@ where
                         upstream_balancer,
                         current_target.as_deref(),
                         current_cb_target_key.as_deref(),
-                        cb_retry_probe_slot_available,
+                        cb_probe,
                         backend_start,
                         &current_url,
                         effective_host,
@@ -2510,8 +2463,7 @@ where
                                 backend_start,
                                 bytes_sent,
                                 state,
-                                current_cb_target_key.as_deref(),
-                                cb_retry_probe_slot_available,
+                                cb_probe,
                                 Some(&mut pending_slot),
                             )
                             .await?
@@ -2614,9 +2566,8 @@ where
                                     current_cb_target_key.as_deref(),
                                     attempt_result.status_code,
                                     attempt_result.connection_error,
-                                    cb_retry_probe_slot_available,
+                                    cb_probe.take_slot(),
                                 );
-                                cb_retry_probe_slot_available = false;
                                 let delay = crate::retry::retry_delay(retry_config, attempt);
                                 if crate::plugins::await_deadline_first(
                                     plain_write_bound.deadline(),
@@ -2724,7 +2675,7 @@ where
                                 mesh_status,
                                 mesh_connection_error,
                                 mesh_error_class,
-                                cb_retry_probe_slot_available,
+                                cb_probe.take_slot(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -2773,7 +2724,7 @@ where
                             upstream_balancer,
                             current_target.as_deref(),
                             current_cb_target_key.as_deref(),
-                            cb_retry_probe_slot_available,
+                            cb_probe,
                             backend_start,
                             &mut backend_admission_permits,
                             backend_admission_start.elapsed(),
@@ -2809,7 +2760,7 @@ where
                                     401,
                                     false,
                                     None,
-                                    cb_retry_probe_slot_available,
+                                    cb_probe.take_slot(),
                                     false,
                                     backend_start.elapsed(),
                                 );
@@ -2828,7 +2779,7 @@ where
                                 upstream_balancer,
                                 current_target.as_deref(),
                                 current_cb_target_key.as_deref(),
-                                cb_retry_probe_slot_available,
+                                cb_probe,
                                 backend_start,
                                 &mut backend_admission_permits,
                                 backend_admission_start.elapsed(),
@@ -2977,7 +2928,7 @@ where
                                     upstream_balancer,
                                     current_target: current_target.as_deref(),
                                     cb_target_key: current_cb_target_key.as_deref(),
-                                    cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                    cb_probe,
                                     backend_start,
                                     backend_admission_elapsed: backend_admission_start.elapsed(),
                                     bytes_sent,
@@ -3006,7 +2957,7 @@ where
                                     upstream_balancer,
                                     current_target: current_target.as_deref(),
                                     cb_target_key: current_cb_target_key.as_deref(),
-                                    cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                    cb_probe,
                                     backend_start,
                                     backend_admission_elapsed: backend_admission_start.elapsed(),
                                     bytes_sent,
@@ -3040,7 +2991,7 @@ where
                                     401,
                                     false,
                                     None,
-                                    cb_retry_probe_slot_available,
+                                    cb_probe.take_slot(),
                                     false,
                                     backend_start.elapsed(),
                                 );
@@ -3059,7 +3010,7 @@ where
                                 upstream_balancer,
                                 current_target.as_deref(),
                                 current_cb_target_key.as_deref(),
-                                cb_retry_probe_slot_available,
+                                cb_probe,
                                 backend_start,
                                 &mut backend_admission_permits,
                                 backend_admission_start.elapsed(),
@@ -3087,7 +3038,7 @@ where
                                     upstream_balancer,
                                     current_target: current_target.as_ref(),
                                     cb_target_key: current_cb_target_key.as_deref(),
-                                    cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                    cb_probe,
                                     backend_start,
                                     backend_admission_permits: &mut backend_admission_permits,
                                     backend_admission_elapsed: backend_admission_start.elapsed(),
@@ -3159,9 +3110,8 @@ where
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
                                         false,
-                                        cb_retry_probe_slot_available,
+                                        cb_probe.take_slot(),
                                     );
-                                    cb_retry_probe_slot_available = false;
                                     let delay = crate::retry::retry_delay(retry_config, attempt);
                                     if crate::plugins::await_deadline_first(
                                         plain_write_bound.deadline(),
@@ -3281,9 +3231,8 @@ where
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
                                         attempt_result.connection_error,
-                                        cb_retry_probe_slot_available,
+                                        cb_probe.take_slot(),
                                     );
-                                    cb_retry_probe_slot_available = false;
                                     let delay = crate::retry::retry_delay(retry_config, attempt);
                                     if crate::plugins::await_deadline_first(
                                         plain_write_bound.deadline(),
@@ -3364,7 +3313,7 @@ where
                                 attempt_result.status_code,
                                 attempt_result.connection_error,
                                 attempt_result.error_class,
-                                cb_retry_probe_slot_available,
+                                cb_probe.take_slot(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -3409,12 +3358,7 @@ where
                     proxy_headers,
                     effective_max_request_body_size_bytes,
                 ) {
-                    release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                        state,
-                        proxy,
-                        current_cb_target_key.as_deref(),
-                        cb_retry_probe_slot_available,
-                    );
+                    cb_probe.release_neutral();
                     return write_plain_gateway_error(
                         stream,
                         ctx,
@@ -3470,7 +3414,7 @@ where
                     upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
+                    cb_probe,
                     backend_start,
                     &current_url,
                     effective_host,
@@ -3499,8 +3443,7 @@ where
                         backend_start,
                         0,
                         state,
-                        current_cb_target_key.as_deref(),
-                        cb_retry_probe_slot_available,
+                        cb_probe,
                         Some(&mut pending_slot),
                     )
                     .await?
@@ -3530,7 +3473,7 @@ where
                         upstream_balancer,
                         current_target.as_deref(),
                         current_cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
+                        cb_probe,
                         backend_start,
                         &mut backend_admission_permits,
                         backend_admission_start.elapsed(),
@@ -3567,7 +3510,7 @@ where
                                 401,
                                 false,
                                 None,
-                                cb_is_half_open_probe,
+                                cb_probe.take_slot(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -3586,7 +3529,7 @@ where
                             upstream_balancer,
                             current_target.as_deref(),
                             current_cb_target_key.as_deref(),
-                            cb_is_half_open_probe,
+                            cb_probe,
                             backend_start,
                             &mut backend_admission_permits,
                             backend_admission_start.elapsed(),
@@ -4079,7 +4022,7 @@ where
                             401,
                             false,
                             None,
-                            cb_retry_probe_slot_available,
+                            cb_probe.take_slot(),
                             false,
                             backend_start.elapsed(),
                         );
@@ -4124,7 +4067,7 @@ where
                                 upstream_balancer,
                                 current_target: current_target.as_deref(),
                                 cb_target_key: current_cb_target_key.as_deref(),
-                                cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                cb_probe,
                                 backend_start,
                                 backend_admission_elapsed: backend_admission_start.elapsed(),
                                 bytes_sent,
@@ -4142,7 +4085,7 @@ where
                                 upstream_balancer,
                                 current_target: current_target.as_ref(),
                                 cb_target_key: current_cb_target_key.as_deref(),
-                                cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                cb_probe,
                                 backend_start,
                                 backend_admission_permits: &mut backend_admission_permits,
                                 backend_admission_elapsed: backend_admission_start.elapsed(),
@@ -4159,7 +4102,7 @@ where
                         upstream_balancer,
                         current_target.as_deref(),
                         current_cb_target_key.as_deref(),
-                        cb_retry_probe_slot_available,
+                        cb_probe,
                         backend_start,
                         &mut backend_admission_permits,
                         backend_admission_start.elapsed(),
@@ -4194,7 +4137,7 @@ where
                         413,
                         false,
                         None,
-                        cb_retry_probe_slot_available,
+                        cb_probe.take_slot(),
                         false,
                         backend_start.elapsed(),
                     );
@@ -4252,7 +4195,7 @@ where
                             attempt_result.status_code,
                             attempt_result.connection_error,
                             attempt_result.error_class,
-                            cb_retry_probe_slot_available,
+                            cb_probe.take_slot(),
                             false,
                             backend_start.elapsed(),
                         );
@@ -4361,7 +4304,7 @@ where
             } else {
                 None
             },
-            cb_retry_probe_slot_available,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -4424,7 +4367,7 @@ where
             status,
             terminal_connection_error,
             terminal_error_class,
-            cb_retry_probe_slot_available,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -4572,7 +4515,7 @@ where
                     reject_status,
                     false,
                     error_class,
-                    cb_retry_probe_slot_available,
+                    cb_probe.take_slot(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -4607,7 +4550,7 @@ where
                     upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
+                    cb_probe,
                     backend_start,
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
@@ -4772,7 +4715,7 @@ where
                 upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
-                cb_retry_probe_slot_available,
+                cb_probe,
                 backend_start,
                 &mut backend_admission_permits,
                 backend_admission_elapsed,
@@ -4846,7 +4789,7 @@ where
                     upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
+                    cb_probe,
                     backend_start,
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
@@ -4899,7 +4842,7 @@ where
                     status,
                     terminal_connection_error,
                     terminal_error_class,
-                    cb_retry_probe_slot_available,
+                    cb_probe.take_slot(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -4920,7 +4863,7 @@ where
                     current_cb_target_key.as_deref(),
                     response_status,
                     status,
-                    cb_retry_probe_slot_available,
+                    cb_probe,
                     backend_start,
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
@@ -4965,7 +4908,7 @@ where
                         upstream_balancer,
                         current_target.as_deref(),
                         current_cb_target_key.as_deref(),
-                        cb_retry_probe_slot_available,
+                        cb_probe,
                         backend_start,
                         &mut backend_admission_permits,
                         backend_admission_elapsed,
@@ -5034,7 +4977,7 @@ where
             response_status,
             terminal_connection_error,
             terminal_error_class,
-            cb_retry_probe_slot_available,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -5101,7 +5044,7 @@ where
                 status,
                 terminal_connection_error,
                 terminal_error_class,
-                cb_retry_probe_slot_available,
+                cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
@@ -5183,7 +5126,7 @@ where
                 upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
-                cb_retry_probe_slot_available,
+                cb_probe,
                 backend_start,
                 &mut backend_admission_permits,
                 backend_admission_elapsed,
@@ -5227,7 +5170,7 @@ where
             current_cb_target_key.as_deref(),
             status,
             status,
-            cb_retry_probe_slot_available,
+            cb_probe,
             backend_start,
             &mut backend_admission_permits,
             backend_admission_elapsed,
@@ -5294,7 +5237,7 @@ where
                     upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
+                    cb_probe,
                     backend_start,
                     &mut backend_admission_permits,
                     backend_admission_elapsed,
@@ -5337,7 +5280,7 @@ where
         status,
         false,
         None,
-        cb_retry_probe_slot_available,
+        cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
@@ -5563,7 +5506,7 @@ async fn handle_h3_grpc_streaming_response<S>(
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     current_target: Option<&Arc<UpstreamTarget>>,
     current_cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     backend_start: Instant,
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_start: Instant,
@@ -5620,7 +5563,7 @@ where
             200,
             false,
             Some(ErrorClass::RequestBodyTooLarge),
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -5733,7 +5676,7 @@ where
                     current_cb_target_key,
                     reject_status,
                     streaming.status,
-                    cb_is_half_open_probe,
+                    cb_probe,
                     backend_start,
                     backend_admission_permits,
                     backend_admission_start.elapsed(),
@@ -5758,7 +5701,7 @@ where
             outcome.response_status,
             false,
             None,
-            cb_is_half_open_probe,
+            cb_probe.take_slot(),
             false,
             backend_start.elapsed(),
         );
@@ -5882,7 +5825,7 @@ where
             current_cb_target_key,
             streaming.status,
             streaming.status,
-            cb_is_half_open_probe,
+            cb_probe,
             backend_start,
             backend_admission_permits,
             backend_admission_start.elapsed(),
@@ -6290,7 +6233,7 @@ where
         outcome_status,
         false,
         outcome_error_class,
-        cb_is_half_open_probe,
+        cb_probe.take_slot(),
         false,
         backend_start.elapsed(),
     );
@@ -6400,7 +6343,7 @@ async fn dispatch_grpc<S>(
     upstream_target: Option<&UpstreamTarget>,
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
@@ -6450,7 +6393,6 @@ where
     let mut current_target = upstream_target.cloned().map(Arc::new);
     let mut current_cb_target_key = cb_target_key.map(str::to_owned);
     let mut current_url = backend_url.to_string();
-    let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
 
     // FAIL CLOSED on a target whose mesh transport this bridge cannot dispatch
     // over, BEFORE reading the request body or dialing (issues #2003, #3284,
@@ -6479,12 +6421,7 @@ where
                 "cross-protocol H3→gRPC: no dispatchable mesh transport for the selected target; \
                  failing closed with gRPC UNAVAILABLE instead of an unauthenticated direct dial"
             );
-            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                state,
-                proxy,
-                current_cb_target_key.as_deref(),
-                cb_retry_probe_slot_available,
-            );
+            cb_probe.release_neutral();
             return write_grpc_error_for_request(
                 stream,
                 ctx,
@@ -6520,12 +6457,7 @@ where
             Ok(None) => {
                 // Default writer emits HEADERS then STOP_SENDING; do not reverse
                 // that order with a pre-write halt (would duplicate STOP_SENDING).
-                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                    state,
-                    proxy,
-                    current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 return write_grpc_error_for_request(
                     stream,
                     ctx,
@@ -6543,12 +6475,7 @@ where
                     error = %e,
                     "cross-protocol H3→gRPC: request body read failed"
                 );
-                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                    state,
-                    proxy,
-                    current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 return write_grpc_error_for_request(
                     stream,
                     ctx,
@@ -6561,12 +6488,7 @@ where
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::TimedOut) => {
-                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                    state,
-                    proxy,
-                    current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 // Request-aware writer with halt_recv=false so the bounded
                 // terminal write completes before STOP_SENDING. The vendored
                 // h3-quinn transport keeps the receive stream reachable after
@@ -6621,12 +6543,7 @@ where
             // deadline: it can never carry an authorization termination.
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {
                 ctx.mark_gateway_deadline_response_selected();
-                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                    state,
-                    proxy,
-                    current_cb_target_key.as_deref(),
-                    cb_retry_probe_slot_available,
-                );
+                cb_probe.release_neutral();
                 let mut outcome = write_final_body_reject(
                     stream,
                     HttpFlavor::Grpc,
@@ -6729,8 +6646,7 @@ where
                 backend_start,
                 bytes_sent,
                 state,
-                current_cb_target_key.as_deref(),
-                cb_retry_probe_slot_available,
+                cb_probe,
                 None,
             )
             .await?
@@ -6859,9 +6775,8 @@ where
                 current_cb_target_key.as_deref(),
                 502,
                 true,
-                cb_retry_probe_slot_available,
+                cb_probe.take_slot(),
             );
-            cb_retry_probe_slot_available = false;
 
             let delay = crate::retry::retry_delay(retry_config, attempt);
             if let Some(deadline) = ctx.grpc_deadline_at() {
@@ -6950,8 +6865,7 @@ where
                 backend_start,
                 bytes_sent,
                 state,
-                current_cb_target_key.as_deref(),
-                cb_retry_probe_slot_available,
+                cb_probe,
                 None,
             )
             .await?
@@ -7146,7 +7060,7 @@ where
                             current_cb_target_key.as_deref(),
                             reject_status,
                             resp.status,
-                            cb_retry_probe_slot_available,
+                            cb_probe,
                             backend_start,
                             &mut backend_admission_permits,
                             backend_admission_start.elapsed(),
@@ -7171,7 +7085,7 @@ where
                     outcome.response_status,
                     false,
                     None,
-                    cb_retry_probe_slot_available,
+                    cb_probe.take_slot(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -7648,7 +7562,7 @@ where
                     current_cb_target_key.as_deref(),
                     response_status,
                     response_status,
-                    cb_retry_probe_slot_available,
+                    cb_probe,
                     backend_start,
                     &mut backend_admission_permits,
                     backend_admission_start.elapsed(),
@@ -7801,7 +7715,7 @@ where
                 response_status,
                 false,
                 None,
-                cb_retry_probe_slot_available,
+                cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
@@ -7857,7 +7771,7 @@ where
                 upstream_balancer,
                 current_target.as_ref(),
                 current_cb_target_key.as_deref(),
-                cb_retry_probe_slot_available,
+                cb_probe,
                 backend_start,
                 &mut backend_admission_permits,
                 backend_admission_start,
@@ -7943,7 +7857,7 @@ where
                 502,
                 connection_error,
                 Some(error_class),
-                cb_retry_probe_slot_available,
+                cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
@@ -8001,7 +7915,7 @@ pub(crate) async fn dispatch_grpc_streaming(
     upstream_target: Option<&UpstreamTarget>,
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
-    cb_is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
     client_ip: &str,
     xff_append_ip: &str,
     backend_start: Instant,
@@ -8056,12 +7970,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                  selected target; failing closed with gRPC UNAVAILABLE instead of an \
                  unauthenticated direct dial"
             );
-            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                state,
-                proxy,
-                current_cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
+            cb_probe.release_neutral();
             return write_grpc_error_for_request(
                 &mut stream,
                 ctx,
@@ -8118,8 +8027,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         backend_start,
         0,
         state,
-        current_cb_target_key.as_deref(),
-        cb_is_half_open_probe,
+        cb_probe,
         None,
     )
     .await?
@@ -8331,7 +8239,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 upstream_balancer,
                 current_target.as_ref(),
                 current_cb_target_key.as_deref(),
-                cb_is_half_open_probe,
+                cb_probe,
                 backend_start,
                 &mut backend_admission_permits,
                 backend_admission_start,
@@ -8361,7 +8269,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 500,
                 false,
                 Some(ErrorClass::ProtocolError),
-                cb_is_half_open_probe,
+                cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
@@ -8482,7 +8390,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 502,
                 connection_error,
                 Some(error_class),
-                cb_is_half_open_probe,
+                cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
@@ -11068,7 +10976,6 @@ mod tests {
         cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
         normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
         record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
-        release_cross_protocol_circuit_breaker_probe_on_admission_reject,
         sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
         should_skip_cross_protocol_backend_header,
     };
@@ -11959,12 +11866,8 @@ mod tests {
             "single probe slot should be occupied before neutral release"
         );
 
-        release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-            &state,
-            &proxy,
-            target_key,
-            is_half_open_probe,
-        );
+        crate::proxy::HalfOpenProbeGuard::new(&state, &proxy, target_key, is_half_open_probe)
+            .release_neutral();
 
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");
@@ -12064,7 +11967,7 @@ mod tests {
             Some(&balancer),
             Some(target.as_ref()),
             None,
-            false,
+            &crate::proxy::HalfOpenProbeGuard::none(),
             Instant::now(),
             &mut permits,
             std::time::Duration::ZERO,
