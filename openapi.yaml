@@ -11186,6 +11186,7 @@ components:
               plugin_name:
                 const: request_termination
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/RequestTerminationConfig"
@@ -24759,7 +24760,10 @@ components:
               type: integer
               minimum: 200
               maximum: 599
-              description: Final HTTP status returned when the abort fault triggers
+              description: >-
+                Final HTTP status returned when the abort fault triggers.
+                JSON numbers with a zero fractional part (for example 503.0)
+                are accepted as integers.
             percentage:
               type: number
               exclusiveMinimum: 0
@@ -24769,11 +24773,20 @@ components:
               type: integer
               minimum: 0
               maximum: 16
-              description: Optional gRPC status emitted only for native application/grpc requests; plain HTTP, WebSocket, and gRPC-Web rejects omit it
+              description: >-
+                Optional gRPC status emitted only for native application/grpc
+                requests; plain HTTP, WebSocket, and gRPC-Web rejects omit it.
+                JSON numbers with a zero fractional part (for example 14.0)
+                are accepted as integers.
             body:
-              type: string
+              type: [string, "null"]
               default: ""
-              description: HTTP response body returned with the abort
+              description: >-
+                HTTP response body returned with the abort. Null is equivalent
+                to omission and yields an empty body. Non-gRPC responses label
+                a body that parses as JSON `application/json` and every other
+                body, including empty, `text/plain`. Native gRPC still
+                normalizes to trailers-only.
           required: [status_code, percentage]
         delay:
           type: [object, "null"]
@@ -24784,7 +24797,10 @@ components:
               format: uint64
               minimum: 1
               maximum: 60000
-              description: Delay duration before continuing or aborting, capped at one minute
+              description: >-
+                Delay duration before continuing or aborting, capped at one
+                minute. JSON numbers with a zero fractional part (for example
+                80.0) are accepted as integers.
             percentage:
               type: number
               exclusiveMinimum: 0
@@ -24793,11 +24809,13 @@ components:
           required: [duration_ms, percentage]
         runtime_overlay_scope:
           type: [string, "null"]
-          pattern: '\S'
+          pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           description: |
             Optional RTDS scope containing at least one non-whitespace
-            character; null is equivalent to omission, and leading and
-            trailing whitespace is trimmed. The accepted request epoch captures
+            character after Rust `str::trim` Unicode White_Space trimming;
+            null is equivalent to omission. The published pattern uses the same
+            White_Space set as Rust (including U+0085, excluding U+FEFF), not
+            ECMAScript `\S`. The accepted request epoch captures
             `ferrum.fault_injection.<scope>.abort_percent` and `.delay_percent`
             atomically with this plugin config. Missing or malformed keys fall
             back independently to the static percentage.
@@ -25541,6 +25559,40 @@ components:
         Configuration must be an object; unknown top-level and trigger keys
         are rejected. Null/scalar/array configs and explicit null property
         values are rejected; omit optional properties to select their defaults.
+        Native gRPC (`application/grpc` on H2/H3) is terminated as a mapped
+        trailers-only error: HTTP 200, `content-type: application/grpc`,
+        a nonzero `grpc-status` from the gateway HTTP-to-gRPC map, and no
+        DATA body. A configured HTTP 2xx does not mock a successful RPC
+        (`200` maps to INTERNAL / 13). `grpc-message` is derived from the
+        canned body text, not returned as RPC DATA. gRPC-Web uses browser
+        framing rather than the configured body. WebSocket support applies
+        to the handshake only.
+      allOf:
+        - if:
+            required: [status_code]
+            properties:
+              status_code:
+                enum: [204, 205, 304]
+          then:
+            properties:
+              body:
+                maxLength: 0
+        - if:
+            required: [content_type]
+            properties:
+              content_type:
+                pattern: '(?:/[Xx][Mm][Ll]|\+[Xx][Mm][Ll])(?:[\t ]|;|$)'
+            not:
+              anyOf:
+                - required: [body]
+                - required: [status_code]
+                  properties:
+                    status_code:
+                      enum: [204, 205, 304]
+          then:
+            properties:
+              message:
+                pattern: '^[^\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]*$'
       properties:
         status_code:
           type: integer
@@ -25549,22 +25601,35 @@ components:
           maximum: 599
           default: 503
           description: >-
-            Final HTTP status code returned. Must be an integer from 200 to 599;
-            informational statuses (including 101) and out-of-range values are
-            rejected at construction rather than coerced. Statuses 204, 205, and
-            304 force an empty body. A configured 2xx status never establishes a
-            CONNECT/Extended CONNECT tunnel — those requests fail closed with 403.
+            Final HTTP status code returned for ordinary HTTP. Must be an
+            integer from 200 to 599, including JSON numbers with a zero
+            fractional part (for example 503.0); informational statuses
+            (including 101) and out-of-range values are rejected at
+            construction rather than coerced. Statuses 204, 205, and 304
+            force an empty body. A configured 2xx status never establishes a
+            CONNECT/Extended CONNECT tunnel — those requests fail closed with
+            403. Native gRPC ignores this as a wire HTTP status and maps it
+            to `grpc-status` under HTTP 200; 503 maps to UNAVAILABLE (14) and
+            unmapped codes including 200 map to INTERNAL (13).
         content_type:
           type: string
+          minLength: 1
           default: application/json
+          allOf:
+            - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+            - pattern: '^[\t\u0020-\u007E]+$'
           description: >-
-            `Content-Type` header value. The default-body renderer classifies the
-            media subtype exactly as `json`/`xml` or an RFC 6838 structured
-            suffix (`+json`/`+xml`) after stripping parameters — not by arbitrary
-            substring match (so `application/notjson` is plain text). JSON types
-            pass a valid JSON `message` through as the body and fail safe to the
+            `Content-Type` header value for ordinary HTTP. Surrounding
+            whitespace is trimmed; the result must be nonempty and a valid
+            HTTP header value (visible ASCII plus HTAB). The default-body
+            renderer classifies the media subtype exactly as `json`/`xml` or
+            an RFC 6838 structured suffix (`+json`/`+xml`) after stripping
+            parameters — not by arbitrary substring match (so
+            `application/notjson` is plain text). JSON types pass a valid JSON
+            `message` through as the body and fail safe to the
             `{message,status_code}` envelope when it is not; XML and other types
-            keep their envelope or plain-text renderers.
+            keep their envelope or plain-text renderers. Native gRPC responses
+            overwrite this with `application/grpc`.
         body:
           type: string
           description: >-
@@ -25572,6 +25637,7 @@ components:
             explicit empty string — it is returned verbatim and `message` is
             ignored. Omitting the field selects the default renderer built from
             `message`. Must be empty or omitted for statuses 204, 205, and 304.
+            Native gRPC does not send these bytes as RPC DATA.
         message:
           type: string
           default: Service unavailable
@@ -25611,14 +25677,20 @@ components:
           properties:
             path_prefix:
               type: string
+              minLength: 1
+              allOf:
+                - pattern: '^(\*|/[^?#\u0000-\u0020\u007F%\\]*)$'
+                - not:
+                    pattern: '(^|/)\.\.?(?:/|$)'
               description: >-
                 Only terminate when the canonical request path starts with this
                 prefix. Must start with `/`, or be exactly `*` to match the
                 asterisk-form target of a server-wide `OPTIONS *` request, and
-                contain no control characters; any other value can never match
-                a request path. The prefix must also already be a canonical
-                policy path: request paths are canonicalized at the frontend
-                boundary (percent-escapes of characters that are legal
+                contain no control characters, query delimiter (`?`), fragment
+                delimiter (`#`), or literal space; any other value can never
+                match a parsed `Uri::path()`. The prefix must also already be a
+                canonical policy path: request paths are canonicalized at the
+                frontend boundary (percent-escapes of characters that are legal
                 literally in a path are decoded, and every other escape —
                 separators, double encodings, control characters, invalid
                 escapes, and escapes of bytes outside that decode set such as
@@ -25626,18 +25698,21 @@ components:
                 as are dot segments and backslashes in either spelling). No
                 percent escape, literal `\`, or literal `.`/`..` segment can
                 appear in a canonical path, so a prefix such as `/%61dmin`,
-                `/api%2Fadmin`, `/api%20name`, `/api/../admin`, or
-                `/api\admin` is rejected at admission rather than silently
-                never matching. A `.` inside a segment is fine. See
+                `/api%2Fadmin`, `/api%20name`, `/api/../admin`, `/a?b`,
+                `/api name`, or `/api\admin` is rejected at admission rather than
+                silently never matching. A `.` inside a segment is fine. See
                 `docs/request_path_canonicalization.md`. Mutually exclusive
                 with `header`.
             header:
               type: string
+              minLength: 1
+              pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[!#$%&''*+\-.0-9A-Z^_`a-z|~]+[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
               description: >-
                 Only terminate when this request header is present on any raw
-                field line (including non-UTF-8 values). The comparison is
-                case-insensitive on the header name. Mutually exclusive with
-                `path_prefix`.
+                field line (including non-UTF-8 values). Surrounding whitespace
+                is trimmed; the result must be a nonempty HTTP field name
+                (RFC 7230 token). The comparison is case-insensitive on the
+                header name. Mutually exclusive with `path_prefix`.
             header_value:
               type: string
               default: ""

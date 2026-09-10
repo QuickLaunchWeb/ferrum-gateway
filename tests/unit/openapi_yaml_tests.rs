@@ -3801,6 +3801,17 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "ws_message_size_limiting should reject a zero max_message_bytes"
     );
 
+    let empty_termination = plugin_config("request_termination", Some(json!({})));
+    assert!(
+        validator.validate(&empty_termination).is_ok(),
+        "empty request_termination config remains the maintenance-mode default"
+    );
+    let omitted_termination = plugin_config("request_termination", None);
+    assert!(
+        validator.validate(&omitted_termination).is_err(),
+        "enabled request_termination rows must require config"
+    );
+
     for (plugin_name, config) in [
         ("correlation_id", json!({})),
         ("bot_detection", json!({})),
@@ -9464,6 +9475,99 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
 }
 
 #[test]
+fn fault_injection_schema_matches_runtime_contract() {
+    use ferrum_edge::plugins::fault_injection::FaultInjectionPlugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let scope_pattern = spec
+        .pointer(
+            "/components/schemas/FaultInjectionConfig/properties/runtime_overlay_scope/pattern",
+        )
+        .and_then(serde_json::Value::as_str)
+        .expect("runtime_overlay_scope pattern");
+    assert!(
+        scope_pattern.contains("\\u0085") || scope_pattern.contains('\u{0085}'),
+        "scope pattern must encode Rust White_Space including U+0085, got {scope_pattern}"
+    );
+    assert!(
+        !scope_pattern.contains("\\S"),
+        "scope pattern must not use ECMAScript \\S: {scope_pattern}"
+    );
+
+    let body_type = spec
+        .pointer("/components/schemas/FaultInjectionConfig/properties/abort/properties/body/type")
+        .expect("abort.body type");
+    assert!(
+        body_type.as_array().is_some_and(|types| {
+            types.iter().any(|value| value == "string")
+                && types.iter().any(|value| value == "null")
+        }),
+        "abort.body must accept string or null, got {body_type}"
+    );
+
+    for valid in [
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": null}}),
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": ""}}),
+        json!({"abort": {"status_code": 503, "percentage": 100}}),
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": "fault injected"}}),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "checkout"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{FEFF}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": null
+        }),
+        serde_json::from_str(r#"{"abort":{"status_code":503.0,"percentage":100}}"#)
+            .expect("integral status"),
+        serde_json::from_str(r#"{"delay":{"duration_ms":80.0,"percentage":100}}"#)
+            .expect("integral duration"),
+        serde_json::from_str(
+            r#"{"abort":{"status_code":503,"percentage":100,"grpc_status":14.0}}"#,
+        )
+        .expect("integral grpc status"),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &valid, true);
+        FaultInjectionPlugin::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        json!({"abort": {"status_code": 503, "percentage": 100, "body": 1}}),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{0085}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": "\u{00A0}"
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 100},
+            "runtime_overlay_scope": " \t "
+        }),
+        serde_json::from_str(r#"{"abort":{"status_code":503.1,"percentage":100}}"#)
+            .expect("fractional status"),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &invalid, false);
+        assert!(
+            FaultInjectionPlugin::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("abort.body: null"));
+    assert!(guide.contains("application/json"));
+    assert!(guide.contains("text/plain"));
+}
+
+#[test]
 fn request_termination_schema_matches_strict_runtime_contract() {
     use ferrum_edge::plugins::request_termination::{
         REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
@@ -9512,6 +9616,23 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     let runtime_trigger: BTreeSet<_> = REQUEST_TERMINATION_TRIGGER_KEYS.iter().copied().collect();
     assert_eq!(trigger_fields, runtime_trigger);
 
+    let request_termination_branch = spec
+        .pointer("/components/schemas/PluginConfig/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("PluginConfig allOf")
+        .iter()
+        .find(|entry| {
+            entry
+                .pointer("/if/properties/plugin_name/const")
+                .and_then(serde_json::Value::as_str)
+                == Some("request_termination")
+        })
+        .expect("request_termination PluginConfig branch");
+    assert_eq!(
+        request_termination_branch.pointer("/then/required"),
+        Some(&json!(["config"]))
+    );
+
     let status_desc = schema["properties"]["status_code"]["description"]
         .as_str()
         .unwrap_or_default();
@@ -9550,6 +9671,7 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({}),
         json!({"status_code": 451, "message": "unavailable"}),
         json!({"status_code": 204}),
+        json!({"status_code": 204, "body": ""}),
         json!({"body": "", "message": "ignored"}),
         json!({
             "status_code": 403,
@@ -9567,6 +9689,14 @@ fn request_termination_schema_matches_strict_runtime_contract() {
             "content_type": "application/json",
             "message": "{invalid"
         }),
+        json!({"trigger": {"path_prefix": "*"}}),
+        json!({"trigger": {"path_prefix": "/"}}),
+        json!({
+            "content_type": "application/xml",
+            "body": "<ok/>",
+            "message": "\u{0001}"
+        }),
+        serde_json::from_str(r#"{"status_code":503.0}"#).expect("integral JSON number"),
     ] {
         assert_component_validity(&spec, "RequestTerminationConfig", &valid, true);
         RequestTermination::new(&valid)
@@ -9583,11 +9713,20 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({"status_code": 700}),
         json!({"status_code": null}),
         json!({"content_type": null}),
+        json!({"content_type": ""}),
+        json!({"content_type": "   "}),
         json!({"body": null}),
         json!({"message": null}),
         json!({"trigger": null}),
         json!({"trigger": {"path_prefix": null}}),
+        json!({"trigger": {"path_prefix": ""}}),
+        json!({"trigger": {"path_prefix": "admin"}}),
+        json!({"trigger": {"path_prefix": "/a?b"}}),
+        json!({"trigger": {"path_prefix": "/admin "}}),
+        json!({"trigger": {"path_prefix": "/a/../b"}}),
         json!({"trigger": {"header": null}}),
+        json!({"trigger": {"header": ""}}),
+        json!({"trigger": {"header": "invalid name"}}),
         json!({"trigger": {"header": "x-policy", "header_value": null}}),
         json!({"trigger": {}}),
         json!({"trigger": {"path_prefix": "/a", "header": "x-policy"}}),
@@ -9595,22 +9734,13 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({"trigger": {"header_value": "1"}}),
         json!({"trigger": {"path_prefix": "/a", "extra": true}}),
         json!({"unknown": true}),
+        json!({"status_code": 204, "body": "x"}),
+        json!({"content_type": "application/xml", "message": "\u{0001}"}),
     ] {
         assert_component_validity(&spec, "RequestTerminationConfig", &invalid, false);
         assert!(
             RequestTermination::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
-        );
-    }
-
-    // Runtime contracts deliberately left to construction-time validation.
-    for runtime_only in [
-        json!({"status_code": 204, "body": "x"}),
-        json!({"content_type": "application/xml", "message": "\u{0001}"}),
-    ] {
-        assert!(
-            RequestTermination::new(&runtime_only).is_err(),
-            "runtime must reject {runtime_only}"
         );
     }
 
@@ -9625,6 +9755,9 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("unambiguous JSON value"));
     assert!(guide.contains("fail safe into that envelope"));
     assert!(guide.contains(r#"message: '{"error":"scheduled-maintenance"}'"#));
+    assert!(guide.contains("trailers-only"));
+    assert!(guide.contains("INTERNAL"));
+    assert!(guide.contains("query delimiter"));
 }
 
 #[test]
