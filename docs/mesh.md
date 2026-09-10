@@ -2052,7 +2052,7 @@ A bare `source.serviceAccount` is namespace-relative, so the same policy text me
 
 ### SPIFFE Identity
 
-The `spiffe_identity` plugin (priority 940) extracts the peer SPIFFE ID from TLS/DTLS client certificates on every inbound request. This identity feeds into:
+The [`spiffe_identity`](plugins.md#spiffe_identity) plugin (priority 940) extracts the peer SPIFFE ID from TLS/DTLS client certificates on every inbound request. Configuration, admission, hooks, outputs, and invalid-SVID behavior are documented in that plugin reference. This identity feeds into:
 
 - `mesh_authz` principal matching
 - Workload metrics labels (`source.principal`, `destination.principal`)

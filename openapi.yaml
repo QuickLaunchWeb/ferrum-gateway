@@ -19571,12 +19571,24 @@ components:
               cn:
                 type: string
                 minLength: 1
+                pattern: '.*\S.*'
+                description: >-
+                  Issuer CN filter. Surrounding whitespace is trimmed; the
+                  trimmed value must contain a non-whitespace character.
               o:
                 type: string
                 minLength: 1
+                pattern: '.*\S.*'
+                description: >-
+                  Issuer O filter. Surrounding whitespace is trimmed; the
+                  trimmed value must contain a non-whitespace character.
               ou:
                 type: string
                 minLength: 1
+                pattern: '.*\S.*'
+                description: >-
+                  Issuer OU filter. Surrounding whitespace is trimmed; the
+                  trimmed value must contain a non-whitespace character.
               ca_certificate_pem:
                 type: string
                 minLength: 1
@@ -19584,23 +19596,32 @@ components:
                   Required for every allowed_issuers entry. Must contain exactly
                   one currently valid PEM-encoded CA certificate with
                   basicConstraints CA:TRUE and keyUsage keyCertSign. Ferrum
-                  verifies the leaf signature path to this pinned key; DN labels
-                  alone never authorize an issuer. UDP+DTLS exposes no
-                  intermediate chain, so its pin must be the immediate issuing CA.
+                  verifies the leaf signature path through any presented
+                  intermediates to this pinned key; DN labels alone never
+                  authorize an issuer. The pin may be an intermediate or a
+                  higher-level root. A root issuer pin can succeed when the client
+                  omits that certificate from the presented chain. UDP+DTLS uses
+                  the same leaf-first verified presented chain as terminated
+                  TCP+TLS.
           description: >-
             Per-proxy issuer pins. DN fields are descriptive filters (AND within
             an entry, OR across entries) and must match the pinned CA subject;
             the certificate signature path must also reach ca_certificate_pem.
+            DN strings are trimmed; whitespace-only cn/o/ou values are rejected.
         allowed_ca_fingerprints_sha256:
           type: array
           minItems: 1
           items:
             type: string
-            pattern: '^[0-9A-Fa-f]{64}$'
+            pattern: '^\s*[0-9A-Fa-f]{64}\s*$'
           description: >-
             SHA-256 fingerprints of allowed verified, client-presented
-            intermediate/CA certificates. Rejected for UDP+DTLS because that
-            frontend exposes only the leaf certificate.
+            intermediate/CA certificates. Matching uses the leaf-first
+            presented chain on HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket,
+            terminated TCP+TLS, and UDP+DTLS. The leaf is never a CA
+            fingerprint candidate; the corresponding CA certificate must be
+            presented. Surrounding whitespace is trimmed before hex decoding;
+            uppercase and lowercase hex are accepted.
 
     JwksAuthConfig:
       type: object
@@ -26632,24 +26653,29 @@ components:
       allOf:
         - anyOf:
             - required: [allow_methods]
+              properties:
+                allow_methods:
+                  type: array
             - required: [deny_methods]
               properties:
                 deny_methods:
+                  type: array
                   minItems: 1
             - required: [method_rate_limits]
               properties:
                 method_rate_limits:
+                  type: object
                   minProperties: 1
         - if:
             required: [sync_mode]
             properties:
               sync_mode:
-                const: redis
+                pattern: '^[Rr][Ee][Dd][Ii][Ss]$'
           then:
             required: [redis_url]
       properties:
         allow_methods:
-          type: array
+          type: [array, "null"]
           uniqueItems: true
           items:
             type: string
@@ -26659,9 +26685,10 @@ components:
             full method path like /package.Service/Method. Leading/trailing
             whitespace and one optional leading slash are normalized by the
             runtime. Duplicate normalized forms are rejected at runtime; JSON
-            Schema uniqueItems can reject only byte-identical duplicates.
+            Schema uniqueItems can reject only byte-identical duplicates. `null`
+            is the same as omission. An empty array is valid block-all policy.
         deny_methods:
-          type: array
+          type: [array, "null"]
           uniqueItems: true
           items:
             type: string
@@ -26671,8 +26698,9 @@ components:
             These gRPC methods are explicitly blocked. Deny takes precedence
             over allow. Duplicate normalized forms are rejected at runtime;
             JSON Schema uniqueItems can reject only byte-identical duplicates.
+            `null` is the same as omission (no deny rules).
         method_rate_limits:
-          type: object
+          type: [object, "null"]
           propertyNames:
             pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
           additionalProperties:
@@ -26681,18 +26709,21 @@ components:
             Per-method rate limits keyed by full method path
             (e.g., /myapp.UserService/CreateUser). Duplicate normalized keys
             cannot be expressed by JSON Schema and are rejected at runtime.
+            `null` is the same as omission (no per-method rates).
         limit_by:
-          type: string
-          enum: [ip, consumer]
+          type: [string, "null"]
+          pattern: '^[Ii][Pp]$|^[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]$'
           default: ip
           description: >-
-            Rate limit key. When consumer, uses identified_consumer then
-            authenticated_identity then client IP as fallback.
+            Rate limit key. Canonical values are `ip` and `consumer`; ASCII
+            case is ignored (`CONSUMER` and `Ip` are admitted). `null` is the
+            same as omission (`ip`). When consumer, uses identified_consumer
+            then authenticated_identity then client IP as fallback.
         sync_mode:
           type: string
-          enum: [local, redis]
+          pattern: '^[Ll][Oo][Cc][Aa][Ll]$|^[Rr][Ee][Dd][Ii][Ss]$'
           default: local
-          description: "gRPC method rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
+          description: "gRPC method rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). ASCII case is ignored. Database-backed counters are unsupported."
         redis_url:
           type: string
           minLength: 1
@@ -26739,7 +26770,9 @@ components:
             meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
+          format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 5
           description: >-
             Effective Redis connection-attempt timeout in seconds (must be ≥ 1).
@@ -26749,7 +26782,9 @@ components:
             hostname runs before this timeout starts.
         redis_health_check_interval_seconds:
           type: integer
+          format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           default: 5
           description: Health check ping interval when Redis is unavailable
 
@@ -26822,18 +26857,24 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: Cap incoming deadlines to this value (milliseconds)
         default_deadline_ms:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 18446744073709551615
           description: Inject grpc-timeout when client omits it
         subtract_gateway_processing:
           type: boolean
           default: false
           description: >-
-            Subtract elapsed gateway processing time before forwarding.
-            Returns gRPC DEADLINE_EXCEEDED (status 4) if remaining time is zero.
+            Plugin-checkpoint remaining-budget control. When true, the plugin
+            writes remaining receipt-anchored milliseconds into grpc-timeout
+            and grpc_adjusted_deadline_ms, and rejects with gRPC
+            DEADLINE_EXCEEDED (status 4) if that remaining time is already zero.
+            Backend H2/H3 dispatch always rewrites grpc-timeout to the remaining
+            absolute budget independently of this flag.
         reject_no_deadline:
           type: boolean
           default: false
