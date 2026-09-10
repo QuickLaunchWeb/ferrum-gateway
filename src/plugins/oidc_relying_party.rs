@@ -4613,26 +4613,28 @@ mod tests {
     }
 
     #[test]
-    fn secure_correlation_cookie_prefix_tracks_the_callback_path() {
-        let cases = [("/", "__Host-"), ("/oauth/callback", "__Secure-")];
-        for (callback_path, expected_prefix) in cases {
+    fn secure_correlation_cookie_is_host_prefixed_regardless_of_the_callback_path() {
+        // `__Host-` is what makes the browser refuse a sibling-host cookie of
+        // the same name, so a secure correlation cookie always earns it: it is
+        // root-scoped (`Path=/`) and domain-less even when the callback path
+        // is deeper than `/`.
+        for callback_path in ["/", "/oauth/callback"] {
             let mut config = plugin_config_without_optional_defaults(&format!(
                 "https://app.example.com{callback_path}"
             ));
             config["providers"][0]["callback_path"] = Value::String(callback_path.to_string());
             let plugin = build_plugin_without_workers(&config);
             let correlation_cookie = plugin.correlation_cookie("state", "browser-binding");
-            let expected_name = format!("{expected_prefix}ferrum_oidc_state_");
-            let expected_path = format!("Path={callback_path};");
             let session_name = &plugin.session.cookie_name;
 
             assert!(
-                correlation_cookie.starts_with(&expected_name),
+                correlation_cookie.starts_with("__Host-ferrum_oidc_state_"),
                 "unexpected correlation cookie name: {correlation_cookie}"
             );
             assert!(correlation_cookie.contains("; Secure"));
             assert!(!correlation_cookie.contains("Domain="));
-            assert!(correlation_cookie.contains(&expected_path));
+            assert!(correlation_cookie.contains("Path=/;"));
+            assert!(!correlation_cookie.contains("Path=/oauth/callback"));
             assert!(
                 session_name.starts_with("__Host-ferrum_session_"),
                 "unexpected session cookie name: {session_name}"
