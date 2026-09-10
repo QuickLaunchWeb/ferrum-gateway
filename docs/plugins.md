@@ -2433,7 +2433,7 @@ Logout expires the browser cookie and, with an authentic session cookie, sends `
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
 | `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
 | `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`) |
-| `session.domain` | String (optional) | Durable session Domain only; correlation cookies are host-only and scoped to `callback_path` |
+| `session.domain` | String (optional) | Durable session Domain only; correlation cookies never inherit it and secure correlation cookies use browser-enforced `__Host-` scope (`Path=/`) |
 | `session.secure` | Boolean | Default `true`; when false, generated cookie names carry no `__Host-`/`__Secure-` prefix because a prefixed cookie without `Secure` is rejected by browsers |
 | `behavior.rp_initiated_logout` | Boolean | Default `true`; send the sealed session ID token as a logout hint and attempt discovered refresh-token revocation (five-second bound) |
 | `behavior.state_cache_max_entries` | u64 | Per-instance maximum pending login starts (default: `10000`); does not block cross-replica callbacks |

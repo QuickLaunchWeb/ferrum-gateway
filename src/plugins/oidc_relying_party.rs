@@ -899,9 +899,9 @@ impl OidcRelyingParty {
         session_aad.extend_from_slice(&session_context);
         let mut pending_aad = b"ferrum-edge/oidc-pending-flow/v1\0".to_vec();
         pending_aad.extend_from_slice(&session_context);
-        // The correlation cookie is scoped to the callback path and never carries
-        // a `Domain`, so it only earns `__Host-` when that path is the root.
-        let correlation_prefix = cookie_name_prefix(secure, None, &callback_path);
+        // Secure correlation cookies are root-scoped so `__Host-` gives the
+        // browser-enforced host-only integrity required by the OIDC state flow.
+        let correlation_prefix = if secure { "__Host-" } else { "" };
         let correlation_cookie_name_prefix = derived_cookie_name(
             &format!("{correlation_prefix}ferrum_oidc_state"),
             &session_context,
@@ -3494,7 +3494,8 @@ fn build_cookie_attrs(
 /// parent `Domain` would let sibling hosts receive or overwrite the sealed
 /// authorization-code flow.
 fn build_correlation_cookie_attrs(secure: bool, callback_path: &str) -> String {
-    build_cookie_attrs(secure, true, "Lax", None, callback_path)
+    let path = if secure { "/" } else { callback_path };
+    build_cookie_attrs(secure, true, "Lax", None, path)
 }
 
 /// Pick the `Set-Cookie` name prefix that matches the attributes the cookie is
@@ -4612,26 +4613,28 @@ mod tests {
     }
 
     #[test]
-    fn secure_correlation_cookie_prefix_tracks_the_callback_path() {
-        let cases = [("/", "__Host-"), ("/oauth/callback", "__Secure-")];
-        for (callback_path, expected_prefix) in cases {
+    fn secure_correlation_cookie_is_host_prefixed_regardless_of_the_callback_path() {
+        // `__Host-` is what makes the browser refuse a sibling-host cookie of
+        // the same name, so a secure correlation cookie always earns it: it is
+        // root-scoped (`Path=/`) and domain-less even when the callback path
+        // is deeper than `/`.
+        for callback_path in ["/", "/oauth/callback"] {
             let mut config = plugin_config_without_optional_defaults(&format!(
                 "https://app.example.com{callback_path}"
             ));
             config["providers"][0]["callback_path"] = Value::String(callback_path.to_string());
             let plugin = build_plugin_without_workers(&config);
             let correlation_cookie = plugin.correlation_cookie("state", "browser-binding");
-            let expected_name = format!("{expected_prefix}ferrum_oidc_state_");
-            let expected_path = format!("Path={callback_path};");
             let session_name = &plugin.session.cookie_name;
 
             assert!(
-                correlation_cookie.starts_with(&expected_name),
+                correlation_cookie.starts_with("__Host-ferrum_oidc_state_"),
                 "unexpected correlation cookie name: {correlation_cookie}"
             );
             assert!(correlation_cookie.contains("; Secure"));
             assert!(!correlation_cookie.contains("Domain="));
-            assert!(correlation_cookie.contains(&expected_path));
+            assert!(correlation_cookie.contains("Path=/;"));
+            assert!(!correlation_cookie.contains("Path=/oauth/callback"));
             assert!(
                 session_name.starts_with("__Host-ferrum_session_"),
                 "unexpected session cookie name: {session_name}"

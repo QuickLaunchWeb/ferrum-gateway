@@ -203,16 +203,14 @@ fn cookie_name(cookie: &str) -> &str {
 }
 
 fn assert_host_only_correlation_cookie(cookie: &str, expected_max_age: &str) {
-    // The correlation cookie is scoped to the callback path, so `__Host-` (which
-    // demands `Path=/`) is not available to it here; `__Secure-` is.
     assert!(
-        cookie_name(cookie).starts_with("__Secure-ferrum_oidc_state_"),
+        cookie_name(cookie).starts_with("__Host-ferrum_oidc_state_"),
         "{cookie}"
     );
     assert_eq!(cookie_attribute(cookie, "domain"), None, "{cookie}");
     assert_eq!(
         cookie_attribute(cookie, "path"),
-        Some(Some("/oauth/callback")),
+        Some(Some("/")),
         "{cookie}"
     );
     assert_eq!(
@@ -1287,7 +1285,7 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
         .expect("both response-owned cookies must reach the client");
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
-    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert!(cookies[0].contains("Path=/"));
     assert!(cookies[1].starts_with("ferrum="));
     assert_eq!(
         cookies
@@ -1395,8 +1393,8 @@ async fn oidc_multi_auth_keeps_later_clear_for_shared_session_cookie() {
         .expect("the selected challenge cookies must reach the client");
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
-    assert!(cookies[0].starts_with("__Secure-ferrum_oidc_state_"));
-    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert!(cookies[0].starts_with("__Host-ferrum_oidc_state_"));
+    assert!(cookies[0].contains("Path=/"));
     assert_eq!(
         cookies[1],
         "ferrum=; Max-Age=0; Path=/; SameSite=lax; Secure; HttpOnly"
@@ -3114,8 +3112,8 @@ async fn generated_session_cookies_enforce_prefix_attributes_and_allow_explicit_
             "{cookie}"
         );
 
-        // The correlation cookie is always host-only and always scoped to the
-        // callback path, so it can never reach `__Host-` with this base config.
+        // Secure correlation cookies use browser-enforced host-only scope;
+        // insecure loopback development retains callback-path scoping.
         let challenge = issue_browser_challenge(&plugin).await;
         if secure {
             assert_host_only_correlation_cookie(&challenge.cookie, "600");
